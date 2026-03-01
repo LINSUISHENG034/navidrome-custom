@@ -94,6 +94,9 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
           if (isLocalDevice) {
             // Switching back to local browser playback
             jukeboxClient.stop().catch(() => {})
+            if (audioInstance) {
+              audioInstance.muted = false
+            }
             if (audioInstance && audioInstance.paused) {
               audioInstance.play().catch(() => {})
             }
@@ -106,9 +109,9 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
               ? Math.floor(audioInstance.currentTime || 0)
               : 0
 
-            // Pause browser audio first
-            if (audioInstance && !audioInstance.paused) {
-              audioInstance.pause()
+            // Keep browser controls active while preventing local output.
+            if (audioInstance) {
+              audioInstance.muted = true
             }
 
             if (trackIds.length > 0) {

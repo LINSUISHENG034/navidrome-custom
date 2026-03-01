@@ -33,6 +33,12 @@ import { keyMap } from '../hotkeys'
 import keyHandlers from './keyHandlers'
 import { calculateGain } from '../utils/calculateReplayGain'
 import jukeboxClient from './jukeboxClient'
+import {
+  enforceBrowserAudioMode,
+  syncJukeboxQueue,
+  syncJukeboxSeek,
+  syncJukeboxTrackChange,
+} from './jukeboxSync'
 
 const Player = () => {
   const theme = useCurrentTheme()
@@ -173,8 +179,13 @@ const Player = () => {
   }, [playerState, defaultOptions, isMobilePlayer])
 
   const onAudioListsChange = useCallback(
-    (_, audioLists, audioInfo) => dispatch(syncQueue(audioInfo, audioLists)),
-    [dispatch],
+    (_, audioLists, audioInfo) => {
+      dispatch(syncQueue(audioInfo, audioLists))
+      if (playerState.jukeboxMode) {
+        syncJukeboxQueue(jukeboxClient, audioLists).catch(() => {})
+      }
+    },
+    [dispatch, playerState.jukeboxMode],
   )
 
   const nextSong = useCallback(() => {
@@ -231,6 +242,7 @@ const Player = () => {
   const onAudioPlay = useCallback(
     (info) => {
       if (playerState.jukeboxMode) {
+        enforceBrowserAudioMode(audioInstance, true)
         jukeboxClient.play().catch(() => {})
       }
 
@@ -268,17 +280,34 @@ const Player = () => {
         }
       }
     },
-    [context, dispatch, playerState.jukeboxMode, showNotifications, startTime],
+    [
+      audioInstance,
+      context,
+      dispatch,
+      playerState.jukeboxMode,
+      showNotifications,
+      startTime,
+    ],
   )
 
-  const onAudioPlayTrackChange = useCallback(() => {
-    if (scrobbled) {
-      setScrobbled(false)
-    }
-    if (startTime !== null) {
-      setStartTime(null)
-    }
-  }, [scrobbled, startTime])
+  const onAudioPlayTrackChange = useCallback(
+    (playId, audioLists, info) => {
+      if (scrobbled) {
+        setScrobbled(false)
+      }
+      if (startTime !== null) {
+        setStartTime(null)
+      }
+      if (playerState.jukeboxMode) {
+        syncJukeboxTrackChange(jukeboxClient, {
+          audioLists,
+          playId,
+          audioInfo: info,
+        }).catch(() => {})
+      }
+    },
+    [playerState.jukeboxMode, scrobbled, startTime],
+  )
 
   const onAudioPause = useCallback(
     (info) => {
@@ -288,6 +317,15 @@ const Player = () => {
       }
     },
     [dispatch, playerState.jukeboxMode],
+  )
+
+  const onAudioSeeked = useCallback(
+    (info) => {
+      if (playerState.jukeboxMode) {
+        syncJukeboxSeek(jukeboxClient, info).catch(() => {})
+      }
+    },
+    [playerState.jukeboxMode],
   )
 
   const onAudioEnded = useCallback(
@@ -345,12 +383,10 @@ const Player = () => {
     return () => clearInterval(interval)
   }, [playerState.jukeboxMode, dispatch])
 
-  // In Jukebox mode, keep browser audio paused
+  // In Jukebox mode, browser audio stays muted while controls still work.
   useEffect(() => {
-    if (playerState.jukeboxMode && audioInstance && !audioInstance.paused) {
-      audioInstance.pause()
-    }
-  }, [playerState.jukeboxMode, audioInstance])
+    enforceBrowserAudioMode(audioInstance, playerState.jukeboxMode)
+  }, [playerState.jukeboxMode, audioInstance, playerState.current?.uuid])
 
   return (
     <ThemeProvider theme={createMuiTheme(theme)}>
@@ -360,6 +396,7 @@ const Player = () => {
         onAudioListsChange={onAudioListsChange}
         onAudioVolumeChange={onAudioVolumeChange}
         onAudioProgress={onAudioProgress}
+        onAudioSeeked={onAudioSeeked}
         onAudioPlay={onAudioPlay}
         onAudioPlayTrackChange={onAudioPlayTrackChange}
         onAudioPause={onAudioPause}
