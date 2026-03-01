@@ -41,6 +41,7 @@ const defaultConfig = {
   enableInspect: true,
   pluginsEnabled: true,
   jukeboxEnabled: false,
+  bluetoothManagementEnabled: false,
 }
 
 let config

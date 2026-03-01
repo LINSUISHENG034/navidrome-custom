@@ -2,7 +2,7 @@ import React from 'react'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { useMediaQuery } from '@material-ui/core'
 import { useGetOne } from 'react-admin'
-import { useDispatch } from 'react-redux'
+import { useDispatch, useSelector } from 'react-redux'
 import { useToggleLove } from '../common'
 import { openSaveQueueDialog } from '../actions'
 import PlayerToolbar from './PlayerToolbar'
@@ -22,6 +22,7 @@ vi.mock('react-admin', () => ({
 
 vi.mock('react-redux', () => ({
   useDispatch: vi.fn(),
+  useSelector: vi.fn(),
 }))
 
 vi.mock('../common', () => ({
@@ -41,6 +42,10 @@ vi.mock('react-hotkeys', () => ({
   GlobalHotKeys: () => <div data-testid="global-hotkeys" />,
 }))
 
+vi.mock('./DeviceSelector', () => ({
+  default: () => <div data-testid="device-selector" />,
+}))
+
 describe('<PlayerToolbar />', () => {
   const mockToggleLove = vi.fn()
   const mockDispatch = vi.fn()
@@ -51,6 +56,9 @@ describe('<PlayerToolbar />', () => {
     useGetOne.mockReturnValue({ data: mockSongData, loading: false })
     useToggleLove.mockReturnValue([mockToggleLove, false])
     useDispatch.mockReturnValue(mockDispatch)
+    useSelector.mockImplementation((selector) =>
+      selector({ player: { jukeboxMode: false, jukeboxDevice: null } }),
+    )
     openSaveQueueDialog.mockReturnValue({ type: 'OPEN_SAVE_QUEUE_DIALOG' })
   })
 
@@ -69,6 +77,7 @@ describe('<PlayerToolbar />', () => {
       expect(listItems).toHaveLength(1)
 
       // Verify both buttons are rendered
+      expect(screen.getByTestId('device-selector')).toBeInTheDocument()
       expect(screen.getByTestId('save-queue-button')).toBeInTheDocument()
       expect(screen.getByTestId('love-button')).toBeInTheDocument()
 
@@ -114,9 +123,10 @@ describe('<PlayerToolbar />', () => {
 
       // Each button should be in its own list item
       const listItems = screen.getAllByRole('listitem')
-      expect(listItems).toHaveLength(2)
+      expect(listItems).toHaveLength(3)
 
       // Verify both buttons are rendered
+      expect(screen.getByTestId('device-selector')).toBeInTheDocument()
       expect(screen.getByTestId('save-queue-button')).toBeInTheDocument()
       expect(screen.getByTestId('love-button')).toBeInTheDocument()
 

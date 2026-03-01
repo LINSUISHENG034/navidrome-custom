@@ -14,8 +14,8 @@ import (
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core"
 	"github.com/navidrome/navidrome/core/metrics"
-	playlistsvc "github.com/navidrome/navidrome/core/playlists"
 	"github.com/navidrome/navidrome/core/playback"
+	playlistsvc "github.com/navidrome/navidrome/core/playlists"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
@@ -37,15 +37,16 @@ type PluginManager interface {
 
 type Router struct {
 	http.Handler
-	ds            model.DataStore
-	share         core.Share
-	playlists     playlistsvc.Playlists
-	insights      metrics.Insights
-	libs          core.Library
-	users         core.User
-	maintenance   core.Maintenance
-	pluginManager PluginManager
-	playback      playback.PlaybackServer
+	ds               model.DataStore
+	share            core.Share
+	playlists        playlistsvc.Playlists
+	insights         metrics.Insights
+	libs             core.Library
+	users            core.User
+	maintenance      core.Maintenance
+	pluginManager    PluginManager
+	playback         playback.PlaybackServer
+	bluetoothManager bluetoothManager
 }
 
 func New(ds model.DataStore, share core.Share, playlists playlistsvc.Playlists, insights metrics.Insights, libraryService core.Library, userService core.User, maintenance core.Maintenance, pluginManager PluginManager, playbackServer playback.PlaybackServer) *Router {
@@ -95,6 +96,9 @@ func (api *Router) routes() http.Handler {
 			if conf.Server.Jukebox.Enabled {
 				api.addJukeboxDeviceRoute(r)
 				api.addJukeboxControlRoute(r)
+				if conf.Server.Jukebox.BluetoothManagement {
+					api.addBluetoothRoute(r)
+				}
 			}
 		})
 	})

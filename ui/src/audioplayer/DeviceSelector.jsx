@@ -14,6 +14,7 @@ import RefreshIcon from '@material-ui/icons/Refresh'
 import config from '../config'
 import httpClient from '../dataProvider/httpClient'
 import jukeboxClient from './jukeboxClient'
+import bluetoothClient from './bluetoothClient'
 import { setJukeboxMode } from '../actions'
 
 const POLL_INTERVAL_MS = 10000
@@ -35,6 +36,7 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
   const dispatch = useDispatch()
   const [anchorEl, setAnchorEl] = useState(null)
   const [devices, setDevices] = useState([])
+  const [bluetoothDevices, setBluetoothDevices] = useState([])
   const playerState = useSelector((state) => state.player)
   const audioInstance = playerState.audioInstance
 
@@ -44,12 +46,28 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
       .catch(() => setDevices([]))
   }, [])
 
+  const fetchBluetoothDevices = useCallback(() => {
+    if (!config.bluetoothManagementEnabled) {
+      setBluetoothDevices([])
+      return
+    }
+    bluetoothClient
+      .list()
+      .then((data) => setBluetoothDevices(data))
+      .catch(() => setBluetoothDevices([]))
+  }, [])
+
   useEffect(() => {
     if (!config.jukeboxEnabled) return
     fetchDevices()
+    fetchBluetoothDevices()
     const interval = setInterval(fetchDevices, POLL_INTERVAL_MS)
-    return () => clearInterval(interval)
-  }, [fetchDevices])
+    const btInterval = setInterval(fetchBluetoothDevices, POLL_INTERVAL_MS)
+    return () => {
+      clearInterval(interval)
+      clearInterval(btInterval)
+    }
+  }, [fetchDevices, fetchBluetoothDevices])
 
   const handleOpen = useCallback((e) => {
     setAnchorEl(e.currentTarget)
@@ -97,7 +115,7 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
               jukeboxClient
                 .set(trackIds)
                 .then(() => jukeboxClient.skip(currentIndex, currentTime))
-                .then(() => jukeboxClient.start())
+                .then(() => jukeboxClient.play())
                 .catch(() => {})
             }
 
@@ -117,7 +135,46 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
       .catch(() => {})
   }, [])
 
-  if (!config.jukeboxEnabled || devices.length <= 1) {
+  const handleScan = useCallback(() => {
+    bluetoothClient
+      .scan()
+      .then(() => {
+        fetchDevices()
+        fetchBluetoothDevices()
+      })
+      .catch(() => {})
+  }, [fetchDevices, fetchBluetoothDevices])
+
+  const handleBluetoothConnect = useCallback(
+    (mac) => {
+      bluetoothClient
+        .connect(mac)
+        .then(() => {
+          fetchDevices()
+          fetchBluetoothDevices()
+        })
+        .catch(() => {})
+    },
+    [fetchDevices, fetchBluetoothDevices],
+  )
+
+  const handleBluetoothDisconnect = useCallback(
+    (mac) => {
+      bluetoothClient
+        .disconnect(mac)
+        .then(() => {
+          fetchDevices()
+          fetchBluetoothDevices()
+        })
+        .catch(() => {})
+    },
+    [fetchDevices, fetchBluetoothDevices],
+  )
+
+  if (
+    !config.jukeboxEnabled ||
+    (devices.length <= 1 && !config.bluetoothManagementEnabled)
+  ) {
     return null
   }
 
@@ -179,6 +236,36 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
           </ListItemIcon>
           <ListItemText primary="Refresh devices" />
         </MenuItem>
+        {config.bluetoothManagementEnabled && (
+          <MenuItem onClick={handleScan}>
+            <ListItemIcon className={classes.activeIcon}>
+              <RefreshIcon fontSize="small" />
+            </ListItemIcon>
+            <ListItemText primary="Scan for devices" />
+          </MenuItem>
+        )}
+        {config.bluetoothManagementEnabled &&
+          bluetoothDevices.map((device) => {
+            const action = device.connected ? 'Disconnect' : 'Connect'
+            const onClick = () =>
+              device.connected
+                ? handleBluetoothDisconnect(device.mac)
+                : handleBluetoothConnect(device.mac)
+            return (
+              <MenuItem key={`bluetooth-${device.mac}`} onClick={onClick}>
+                <ListItemIcon className={classes.activeIcon}>
+                  {device.connected ? (
+                    <BluetoothDisabledIcon fontSize="small" />
+                  ) : (
+                    <BluetoothIcon fontSize="small" />
+                  )}
+                </ListItemIcon>
+                <ListItemText
+                  primary={`${action} ${device.name || device.mac}`}
+                />
+              </MenuItem>
+            )
+          })}
       </Menu>
     </>
   )
