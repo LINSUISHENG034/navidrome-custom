@@ -5,9 +5,12 @@ services:
       - PULSE_SERVER=unix:/run/user/1000/pulse/native
       - ND_JUKEBOX_ENABLED=true
       - ND_JUKEBOX_AUTODISCOVERBLUETOOTH=true
+      - ND_JUKEBOX_BLUETOOTHMANAGEMENT=true
+      - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
     volumes:
       - /run/user/1000/pulse/native:/run/user/1000/pulse/native
       - /run/dbus:/run/dbus
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
       - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
     devices:
       - /dev/snd:/dev/snd

@@ -64,6 +64,17 @@ var _ = Describe("serveIndex", func() {
 		Expect(config).To(HaveKeyWithValue("firstTime", false))
 	})
 
+	It("exposes bluetoothManagementEnabled in app config", func() {
+		conf.Server.Jukebox.BluetoothManagement = true
+		r := httptest.NewRequest("GET", "/index.html", nil)
+		w := httptest.NewRecorder()
+
+		serveIndex(ds, fs, nil)(w, r)
+
+		config := extractAppConfig(w.Body.String())
+		Expect(config).To(HaveKeyWithValue("bluetoothManagementEnabled", true))
+	})
+
 	DescribeTable("sets configuration values",
 		func(configSetter func(), configKey string, expectedValue any) {
 			configSetter()
