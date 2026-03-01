@@ -1,0 +1,5 @@
+FROM deluan/navidrome:latest
+# Add pulseaudio-utils for Bluetooth device discovery via pactl
+RUN apk add --no-cache pulseaudio-utils
+# Replace binary with Bluetooth-enabled build
+COPY navidrome-bt /app/navidrome

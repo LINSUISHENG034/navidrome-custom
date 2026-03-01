@@ -1,0 +1,15 @@
+version: '3.6'
+services:
+  navidrome:
+    environment:
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+      - ND_JUKEBOX_ENABLED=true
+      - ND_JUKEBOX_AUTODISCOVERBLUETOOTH=true
+    volumes:
+      - /run/user/1000/pulse/native:/run/user/1000/pulse/native
+      - /run/dbus:/run/dbus
+      - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio

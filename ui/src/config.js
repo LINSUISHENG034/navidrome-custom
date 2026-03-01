@@ -40,6 +40,7 @@ const defaultConfig = {
   separator: '/',
   enableInspect: true,
   pluginsEnabled: true,
+  jukeboxEnabled: false,
 }
 
 let config

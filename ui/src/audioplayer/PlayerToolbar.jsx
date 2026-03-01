@@ -1,14 +1,16 @@
 import React, { useCallback } from 'react'
-import { useDispatch } from 'react-redux'
+import { useDispatch, useSelector } from 'react-redux'
 import { useGetOne } from 'react-admin'
 import { GlobalHotKeys } from 'react-hotkeys'
 import IconButton from '@material-ui/core/IconButton'
-import { useMediaQuery } from '@material-ui/core'
+import { useMediaQuery, Typography } from '@material-ui/core'
 import { RiSaveLine } from 'react-icons/ri'
+import BluetoothIcon from '@material-ui/icons/Bluetooth'
 import { LoveButton, useToggleLove } from '../common'
 import { openSaveQueueDialog } from '../actions'
 import { keyMap } from '../hotkeys'
 import { makeStyles } from '@material-ui/core/styles'
+import DeviceSelector from './DeviceSelector'
 
 const useStyles = makeStyles((theme) => ({
   toolbar: {
@@ -53,6 +55,23 @@ const useStyles = makeStyles((theme) => ({
     display: 'flex',
     alignItems: 'center',
   },
+  jukeboxIndicator: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.25rem',
+    color: theme.palette.primary.main,
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+  },
+  jukeboxIcon: {
+    fontSize: '1rem',
+  },
+  jukeboxLabel: {
+    fontSize: '0.75rem',
+    maxWidth: 120,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  },
 }))
 
 const PlayerToolbar = ({ id, isRadio }) => {
@@ -61,6 +80,8 @@ const PlayerToolbar = ({ id, isRadio }) => {
   const [toggleLove, toggling] = useToggleLove('song', data)
   const isDesktop = useMediaQuery('(min-width:810px)')
   const classes = useStyles()
+  const jukeboxMode = useSelector((state) => state.player.jukeboxMode)
+  const jukeboxDevice = useSelector((state) => state.player.jukeboxDevice)
 
   const handlers = {
     TOGGLE_LOVE: useCallback(() => toggleLove(), [toggleLove]),
@@ -99,16 +120,33 @@ const PlayerToolbar = ({ id, isRadio }) => {
     />
   )
 
+  const jukeboxIndicator = jukeboxMode && jukeboxDevice && (
+    <span className={classes.jukeboxIndicator} title={jukeboxDevice}>
+      <BluetoothIcon className={classes.jukeboxIcon} />
+      {isDesktop && (
+        <Typography variant="caption" className={classes.jukeboxLabel}>
+          {jukeboxDevice}
+        </Typography>
+      )}
+    </span>
+  )
+
   return (
     <>
       <GlobalHotKeys keyMap={keyMap} handlers={handlers} allowChanges />
       {isDesktop ? (
         <li className={`${listItemClass} item`}>
+          {jukeboxIndicator}
+          <DeviceSelector isDesktop={isDesktop} buttonClass={buttonClass} />
           {saveQueueButton}
           {loveButton}
         </li>
       ) : (
         <>
+          <li className={`${listItemClass} item`}>
+            {jukeboxIndicator}
+            <DeviceSelector isDesktop={isDesktop} buttonClass={buttonClass} />
+          </li>
           <li className={`${listItemClass} item`}>{saveQueueButton}</li>
           <li className={`${listItemClass} item`}>{loveButton}</li>
         </>

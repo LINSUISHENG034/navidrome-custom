@@ -7,6 +7,9 @@ export const PLAYER_PLAY_TRACKS = 'PLAYER_PLAY_TRACKS'
 export const PLAYER_CURRENT = 'PLAYER_CURRENT'
 export const PLAYER_SET_VOLUME = 'PLAYER_SET_VOLUME'
 export const PLAYER_SET_MODE = 'PLAYER_SET_MODE'
+export const PLAYER_SET_JUKEBOX_MODE = 'PLAYER_SET_JUKEBOX_MODE'
+export const PLAYER_JUKEBOX_STATUS = 'PLAYER_JUKEBOX_STATUS'
+export const PLAYER_SET_AUDIO_INSTANCE = 'PLAYER_SET_AUDIO_INSTANCE'
 
 export const setTrack = (data) => ({
   type: PLAYER_SET_TRACK,
@@ -101,4 +104,19 @@ export const setVolume = (volume) => ({
 export const setPlayMode = (mode) => ({
   type: PLAYER_SET_MODE,
   data: { mode },
+})
+
+export const setJukeboxMode = (enabled, device = null) => ({
+  type: PLAYER_SET_JUKEBOX_MODE,
+  data: { enabled, device },
+})
+
+export const updateJukeboxStatus = (status) => ({
+  type: PLAYER_JUKEBOX_STATUS,
+  data: status,
+})
+
+export const setAudioInstance = (instance) => ({
+  type: PLAYER_SET_AUDIO_INSTANCE,
+  data: instance,
 })
