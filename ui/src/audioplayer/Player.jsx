@@ -22,6 +22,8 @@ import {
   setPlayMode,
   setVolume,
   syncQueue,
+  setAudioInstance as setAudioInstanceAction,
+  updateJukeboxStatus,
 } from '../actions'
 import PlayerToolbar from './PlayerToolbar'
 import { sendNotification } from '../utils'
@@ -30,6 +32,7 @@ import locale from './locale'
 import { keyMap } from '../hotkeys'
 import keyHandlers from './keyHandlers'
 import { calculateGain } from '../utils/calculateReplayGain'
+import jukeboxClient from './jukeboxClient'
 
 const Player = () => {
   const theme = useCurrentTheme()
@@ -41,7 +44,15 @@ const Player = () => {
   const [startTime, setStartTime] = useState(null)
   const [scrobbled, setScrobbled] = useState(false)
   const [preloaded, setPreload] = useState(false)
-  const [audioInstance, setAudioInstance] = useState(null)
+  const [audioInstance, setAudioInstanceLocal] = useState(null)
+
+  const handleAudioInstance = useCallback(
+    (instance) => {
+      setAudioInstanceLocal(instance)
+      dispatch(setAudioInstanceAction(instance))
+    },
+    [dispatch],
+  )
   const isDesktop = useMediaQuery('(min-width:810px)')
   const isMobilePlayer =
     /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
@@ -208,8 +219,13 @@ const Player = () => {
 
   const onAudioVolumeChange = useCallback(
     // sqrt to compensate for the logarithmic volume
-    (volume) => dispatch(setVolume(Math.sqrt(volume))),
-    [dispatch],
+    (volume) => {
+      dispatch(setVolume(Math.sqrt(volume)))
+      if (playerState.jukeboxMode) {
+        jukeboxClient.volume(volume).catch(() => {})
+      }
+    },
+    [dispatch, playerState.jukeboxMode],
   )
 
   const onAudioPlay = useCallback(
@@ -306,6 +322,27 @@ const Player = () => {
     }
   }, [isMobilePlayer, audioInstance])
 
+  // Jukebox status polling — poll every 2s when in Jukebox mode
+  useEffect(() => {
+    if (!playerState.jukeboxMode) return
+    const poll = () => {
+      jukeboxClient
+        .status()
+        .then((status) => dispatch(updateJukeboxStatus(status)))
+        .catch(() => {})
+    }
+    poll()
+    const interval = setInterval(poll, 2000)
+    return () => clearInterval(interval)
+  }, [playerState.jukeboxMode, dispatch])
+
+  // In Jukebox mode, keep browser audio paused
+  useEffect(() => {
+    if (playerState.jukeboxMode && audioInstance && !audioInstance.paused) {
+      audioInstance.pause()
+    }
+  }, [playerState.jukeboxMode, audioInstance])
+
   return (
     <ThemeProvider theme={createMuiTheme(theme)}>
       <ReactJkMusicPlayer
@@ -321,7 +358,7 @@ const Player = () => {
         onAudioEnded={onAudioEnded}
         onCoverClick={onCoverClick}
         onBeforeDestroy={onBeforeDestroy}
-        getAudioInstance={setAudioInstance}
+        getAudioInstance={handleAudioInstance}
       />
       <GlobalHotKeys handlers={handlers} keyMap={keyMap} allowChanges />
     </ThemeProvider>

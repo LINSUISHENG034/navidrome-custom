@@ -10,6 +10,9 @@ import {
   PLAYER_SET_VOLUME,
   PLAYER_SYNC_QUEUE,
   PLAYER_SET_MODE,
+  PLAYER_SET_JUKEBOX_MODE,
+  PLAYER_JUKEBOX_STATUS,
+  PLAYER_SET_AUDIO_INSTANCE,
 } from '../actions'
 import config from '../config'
 
@@ -19,6 +22,10 @@ const initialState = {
   clear: false,
   volume: config.defaultUIVolume / 100,
   savedPlayIndex: 0,
+  jukeboxMode: false,
+  jukeboxDevice: null,
+  jukeboxStatus: null,
+  audioInstance: null,
 }
 
 const pad = (value) => {
@@ -210,6 +217,25 @@ export const playerReducer = (previousState = initialState, payload) => {
       return reduceCurrent(previousState, payload)
     case PLAYER_SET_MODE:
       return reduceMode(previousState, payload)
+    case PLAYER_SET_JUKEBOX_MODE:
+      return {
+        ...previousState,
+        jukeboxMode: payload.data.enabled,
+        jukeboxDevice: payload.data.device,
+        jukeboxStatus: payload.data.enabled
+          ? previousState.jukeboxStatus
+          : null,
+      }
+    case PLAYER_JUKEBOX_STATUS:
+      return {
+        ...previousState,
+        jukeboxStatus: payload.data,
+      }
+    case PLAYER_SET_AUDIO_INSTANCE:
+      return {
+        ...previousState,
+        audioInstance: payload.data,
+      }
     default:
       return previousState
   }
