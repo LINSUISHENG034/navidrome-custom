@@ -14,8 +14,18 @@ const jukeboxClient = {
       ({ json }) => json,
     ),
 
+  play: () =>
+    httpClient('/api/jukebox/play', { method: 'POST' }).then(
+      ({ json }) => json,
+    ),
+
   stop: () =>
     httpClient('/api/jukebox/stop', { method: 'POST' }).then(
+      ({ json }) => json,
+    ),
+
+  pause: () =>
+    httpClient('/api/jukebox/pause', { method: 'POST' }).then(
       ({ json }) => json,
     ),
 
@@ -23,6 +33,12 @@ const jukeboxClient = {
     httpClient('/api/jukebox/skip', {
       method: 'POST',
       body: JSON.stringify({ index, offset }),
+    }).then(({ json }) => json),
+
+  seek: (position) =>
+    httpClient('/api/jukebox/seek', {
+      method: 'POST',
+      body: JSON.stringify({ position }),
     }).then(({ json }) => json),
 
   volume: (gain) =>
