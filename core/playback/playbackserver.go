@@ -42,6 +42,16 @@ type playbackServer struct {
 	playbackDevices []playbackDevice
 }
 
+// playbackDeviceContext returns the long-lived playback service context when
+// available. This prevents devices discovered during short-lived HTTP requests
+// from inheriting a canceled request context.
+func (ps *playbackServer) playbackDeviceContext(fallback context.Context) context.Context {
+	if ps.ctx != nil {
+		return *ps.ctx
+	}
+	return fallback
+}
+
 // GetInstance returns the playback-server singleton
 func GetInstance(ds model.DataStore) PlaybackServer {
 	return singleton.GetInstance(func() *playbackServer {
@@ -190,12 +200,13 @@ func (ps *playbackServer) GetDeviceForUser(user string) (*playbackDevice, error)
 // mergeBluetoothDevices discovers Bluetooth sinks and appends any new ones to playbackDevices.
 func (ps *playbackServer) mergeBluetoothDevices(ctx context.Context) {
 	btSinks := bluetooth.DiscoverBluetoothSinks(ctx)
+	deviceCtx := ps.playbackDeviceContext(ctx)
 	for _, sink := range btSinks {
 		devName := sink.MPVDeviceName()
 		if ps.hasDevice(devName) {
 			continue
 		}
-		dev := NewPlaybackDevice(ctx, ps, sink.FriendlyName(), devName)
+		dev := NewPlaybackDevice(deviceCtx, ps, sink.FriendlyName(), devName)
 		ps.playbackDevices = append(ps.playbackDevices, *dev)
 		log.Info(ctx, "Discovered Bluetooth device", "name", sink.FriendlyName(), "device", devName)
 	}
