@@ -31,7 +31,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/go-chi/cors v1.2.2
 	github.com/go-chi/httprate v0.15.0
-	github.com/go-chi/jwtauth/v5 v5.3.3
+	github.com/go-chi/jwtauth/v5 v5.4.0
 	github.com/go-viper/encoding/ini v0.1.1
 	github.com/gohugoio/hashstructure v0.6.0
 	github.com/google/go-pipeline v0.0.0-20230411140531-6cbedfc1d3fc
@@ -111,7 +111,9 @@ require (
 	github.com/lestrrat-go/blackmagic v1.0.4 // indirect
 	github.com/lestrrat-go/httpcc v1.0.1 // indirect
 	github.com/lestrrat-go/httprc v1.0.6 // indirect
+	github.com/lestrrat-go/httprc/v3 v3.0.0-beta2 // indirect
 	github.com/lestrrat-go/iter v1.0.2 // indirect
+	github.com/lestrrat-go/jwx/v3 v3.0.2 // indirect
 	github.com/lestrrat-go/option v1.0.1 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
