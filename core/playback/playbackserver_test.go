@@ -112,4 +112,26 @@ var _ = Describe("PlaybackServer", func() {
 			Expect(err).To(HaveOccurred())
 		})
 	})
+
+	Describe("playbackDeviceContext", func() {
+		It("prefers server context over canceled request context", func() {
+			serverCtx := context.Background()
+			ps.ctx = &serverCtx
+
+			reqCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			got := ps.playbackDeviceContext(reqCtx)
+			Expect(got.Err()).To(BeNil())
+		})
+
+		It("falls back to request context when server context is not set", func() {
+			ps.ctx = nil
+			reqCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			got := ps.playbackDeviceContext(reqCtx)
+			Expect(got.Err()).ToNot(BeNil())
+		})
+	})
 })
