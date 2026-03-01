@@ -35,7 +35,14 @@ volumes:
   # 新增：D-Bus system bus socket
   - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
 environment:
+  - ND_JUKEBOX_BLUETOOTHMANAGEMENT=true
   - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
+```
+
+容器镜像需安装 `dbus` 包以提供 D-Bus 客户端工具链：
+
+```dockerfile
+RUN apk add -U --no-cache ffmpeg mpv sqlite pulseaudio-utils dbus
 ```
 
 ### BlueZ D-Bus API 关键接口

@@ -21,8 +21,11 @@ func (api *Router) addJukeboxControlRoute(r chi.Router) {
 	r.Get("/jukebox/status", api.jukeboxStatus)
 	r.Post("/jukebox/set", api.jukeboxSet)
 	r.Post("/jukebox/start", api.jukeboxStart)
+	r.Post("/jukebox/play", api.jukeboxStart)
 	r.Post("/jukebox/stop", api.jukeboxStop)
+	r.Post("/jukebox/pause", api.jukeboxStop)
 	r.Post("/jukebox/skip", api.jukeboxSkip)
+	r.Post("/jukebox/seek", api.jukeboxSeek)
 	r.Post("/jukebox/volume", api.jukeboxVolume)
 }
 
@@ -147,6 +150,38 @@ func (api *Router) jukeboxVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status, err := pb.SetGain(r.Context(), req.Gain)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	api.writeJukeboxJSON(w, r, toStatusResponse(status))
+}
+
+func (api *Router) jukeboxSeek(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Position int `json:"position"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Position < 0 {
+		http.Error(w, "position must be >= 0", http.StatusBadRequest)
+		return
+	}
+
+	user, _ := request.UserFrom(r.Context())
+	pb, err := api.playback.GetDeviceForUser(user.UserName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	current, err := pb.Status(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	status, err := pb.Skip(r.Context(), current.CurrentIndex, req.Position)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -230,6 +230,10 @@ const Player = () => {
 
   const onAudioPlay = useCallback(
     (info) => {
+      if (playerState.jukeboxMode) {
+        jukeboxClient.play().catch(() => {})
+      }
+
       // Do this to start the context; on chrome-based browsers, the context
       // will start paused since it is created prior to user interaction
       if (context && context.state !== 'running') {
@@ -264,7 +268,7 @@ const Player = () => {
         }
       }
     },
-    [context, dispatch, showNotifications, startTime],
+    [context, dispatch, playerState.jukeboxMode, showNotifications, startTime],
   )
 
   const onAudioPlayTrackChange = useCallback(() => {
@@ -277,8 +281,13 @@ const Player = () => {
   }, [scrobbled, startTime])
 
   const onAudioPause = useCallback(
-    (info) => dispatch(currentPlaying(info)),
-    [dispatch],
+    (info) => {
+      dispatch(currentPlaying(info))
+      if (playerState.jukeboxMode) {
+        jukeboxClient.pause().catch(() => {})
+      }
+    },
+    [dispatch, playerState.jukeboxMode],
   )
 
   const onAudioEnded = useCallback(

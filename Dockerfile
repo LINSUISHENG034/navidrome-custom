@@ -127,8 +127,8 @@ FROM public.ecr.aws/docker/library/alpine:3.20 AS final
 LABEL maintainer="deluan@navidrome.org"
 LABEL org.opencontainers.image.source="https://github.com/navidrome/navidrome"
 
-# Install ffmpeg and mpv
-RUN apk add -U --no-cache ffmpeg mpv sqlite pulseaudio-utils
+# Install ffmpeg, mpv, and dbus for Bluetooth management via system bus
+RUN apk add -U --no-cache ffmpeg mpv sqlite pulseaudio-utils dbus
 
 # Copy navidrome binary
 COPY --from=build /out/navidrome /app/
@@ -144,4 +144,3 @@ EXPOSE ${ND_PORT}
 WORKDIR /app
 
 ENTRYPOINT ["/app/navidrome"]
-
