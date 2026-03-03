@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/navidrome/navidrome/conf"
@@ -37,6 +38,7 @@ type DeviceInfo struct {
 }
 
 type playbackServer struct {
+	mu              sync.Mutex
 	ctx             *context.Context
 	datastore       model.DataStore
 	playbackDevices []playbackDevice
@@ -67,13 +69,17 @@ func (ps *playbackServer) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ps.mu.Lock()
 	ps.playbackDevices = devices
+	ps.mu.Unlock()
 
 	if conf.Server.Jukebox.AutoDiscoverBluetooth {
 		ps.mergeBluetoothDevices(ctx)
 	}
 
+	ps.mu.Lock()
 	log.Info(ctx, fmt.Sprintf("%d audio devices found", len(ps.playbackDevices)))
+	ps.mu.Unlock()
 
 	defaultDevice, _ := ps.getDefaultDevice()
 
@@ -114,6 +120,8 @@ func (ps *playbackServer) checkBluetoothConnections(ctx context.Context) {
 		activeSinks[sink.MPVDeviceName()] = true
 	}
 
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	for idx := range ps.playbackDevices {
 		d := &ps.playbackDevices[idx]
 		if !strings.HasPrefix(d.DeviceName, "pulse/bluez_") {
@@ -171,13 +179,19 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 	return pbDevices, nil
 }
 
-func (ps *playbackServer) getDefaultDevice() (*playbackDevice, error) {
+func (ps *playbackServer) getDefaultDeviceLocked() (*playbackDevice, error) {
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].Default {
 			return &ps.playbackDevices[idx], nil
 		}
 	}
 	return nil, fmt.Errorf("no default device found")
+}
+
+func (ps *playbackServer) getDefaultDevice() (*playbackDevice, error) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.getDefaultDeviceLocked()
 }
 
 // GetMediaFile retrieves the MediaFile given by the id parameter
@@ -189,7 +203,9 @@ func (ps *playbackServer) GetMediaFile(id string) (*model.MediaFile, error) {
 func (ps *playbackServer) GetDeviceForUser(user string) (*playbackDevice, error) {
 	log.Debug("Processing GetDevice", "user", user)
 	// README: here we might plug-in the user-device mapping one fine day
-	device, err := ps.getDefaultDevice()
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	device, err := ps.getDefaultDeviceLocked()
 	if err != nil {
 		return nil, err
 	}
@@ -201,9 +217,11 @@ func (ps *playbackServer) GetDeviceForUser(user string) (*playbackDevice, error)
 func (ps *playbackServer) mergeBluetoothDevices(ctx context.Context) {
 	btSinks := bluetooth.DiscoverBluetoothSinks(ctx)
 	deviceCtx := ps.playbackDeviceContext(ctx)
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	for _, sink := range btSinks {
 		devName := sink.MPVDeviceName()
-		if ps.hasDevice(devName) {
+		if ps.hasDeviceLocked(devName) {
 			continue
 		}
 		dev := NewPlaybackDevice(deviceCtx, ps, sink.FriendlyName(), devName)
@@ -212,13 +230,19 @@ func (ps *playbackServer) mergeBluetoothDevices(ctx context.Context) {
 	}
 }
 
-func (ps *playbackServer) hasDevice(deviceName string) bool {
+func (ps *playbackServer) hasDeviceLocked(deviceName string) bool {
 	for _, d := range ps.playbackDevices {
 		if d.DeviceName == deviceName {
 			return true
 		}
 	}
 	return false
+}
+
+func (ps *playbackServer) hasDevice(deviceName string) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.hasDeviceLocked(deviceName)
 }
 
 // ListDevices returns info about all configured playback devices, including live connection status.
@@ -236,6 +260,8 @@ func (ps *playbackServer) ListDevices() []DeviceInfo {
 		}
 	}
 
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	devices := make([]DeviceInfo, len(ps.playbackDevices))
 	for i, d := range ps.playbackDevices {
 		isBT := strings.HasPrefix(d.DeviceName, "pulse/bluez_")
@@ -258,6 +284,9 @@ func (ps *playbackServer) ListDevices() []DeviceInfo {
 // playing, the queue and playback state are migrated to the new device and playback
 // resumes at the same position.
 func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
 	var newDev *playbackDevice
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].DeviceName == deviceName {
