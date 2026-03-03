@@ -75,6 +75,34 @@ func (pd *Queue) Clear() {
 	pd.Items = nil
 }
 
+// Move moves a track from fromIndex to toIndex, adjusting the current index
+// to continue pointing at the same track.
+func (pd *Queue) Move(fromIndex, toIndex int) {
+	if fromIndex == toIndex {
+		return
+	}
+	if fromIndex < 0 || fromIndex >= len(pd.Items) || toIndex < 0 || toIndex >= len(pd.Items) {
+		return
+	}
+
+	current := pd.Current()
+	backupID := ""
+	if current != nil {
+		backupID = current.ID
+	}
+
+	item := pd.Items[fromIndex]
+	pd.Items = append(pd.Items[:fromIndex], pd.Items[fromIndex+1:]...)
+	pd.Items = append(pd.Items[:toIndex], append(model.MediaFiles{item}, pd.Items[toIndex:]...)...)
+
+	if backupID != "" {
+		idx, err := pd.getMediaFileIndexByID(backupID)
+		if err == nil {
+			pd.Index = idx
+		}
+	}
+}
+
 // idx Zero-based index of the song to skip to or remove.
 func (pd *Queue) Remove(idx int) {
 	current := pd.Current()
