@@ -254,13 +254,11 @@ func (pd *playbackDevice) Remove(ctx context.Context, index int) (DeviceStatus, 
 	pd.mu.Lock()
 	defer pd.mu.Unlock()
 	log.Debug(ctx, "Processing Remove action", "index", index, "device", pd)
-	// pausing if attempting to remove running track
-	if pd.isPlaying() && pd.PlaybackQueue.Index == index {
-		_, err := pd.stopLocked(ctx)
-		if err != nil {
-			log.Error(ctx, "error stopping running track")
-			return pd.getStatus(), err
-		}
+	// close and nil the active track if removing the currently playing track
+	if pd.PlaybackQueue.Index == index && pd.ActiveTrack != nil {
+		pd.ActiveTrack.Pause()
+		pd.ActiveTrack.Close()
+		pd.ActiveTrack = nil
 	}
 
 	if index > -1 && index < pd.PlaybackQueue.Size() {
@@ -268,6 +266,19 @@ func (pd *playbackDevice) Remove(ctx context.Context, index int) (DeviceStatus, 
 	} else {
 		log.Error(ctx, "Index to remove out of range: "+fmt.Sprint(index))
 	}
+	return pd.getStatus(), nil
+}
+
+func (pd *playbackDevice) Move(ctx context.Context, fromIndex, toIndex int) (DeviceStatus, error) {
+	pd.mu.Lock()
+	defer pd.mu.Unlock()
+	log.Debug(ctx, "Processing Move action", "from", fromIndex, "to", toIndex, "device", pd)
+
+	if fromIndex < 0 || fromIndex >= pd.PlaybackQueue.Size() || toIndex < 0 || toIndex >= pd.PlaybackQueue.Size() {
+		return pd.getStatus(), fmt.Errorf("index out of range: from=%d, to=%d, size=%d", fromIndex, toIndex, pd.PlaybackQueue.Size())
+	}
+
+	pd.PlaybackQueue.Move(fromIndex, toIndex)
 	return pd.getStatus(), nil
 }
 
