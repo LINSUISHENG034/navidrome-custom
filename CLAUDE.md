@@ -179,12 +179,26 @@ WASM plugins via Extism SDK. Plugin manager in `plugins/manager.go`. Host functi
 
 ### Known Issues (Open)
 
-4. **Client vs Jukebox mode**: The DeviceSelector only switches the Jukebox output device. It does NOT switch the playback mode from client-side to Jukebox. Users clicking a Bluetooth device still hear audio from their browser. Implementing seamless mode switching requires Native API Jukebox control endpoints and frontend playback mode toggling — see `docs/plans/PLAN-bluetooth-auto-connect.md` Phase 6.
-
-5. **Bluetooth connection instability**: Bluetooth devices auto-disconnect when idle (no audio stream). PulseAudio/PipeWire suspends the sink, and the BT device drops. This is a host-level issue, not a Navidrome bug.
+4. **Bluetooth connection instability**: Bluetooth devices auto-disconnect when idle (no audio stream). PulseAudio/PipeWire suspends the sink, and the BT device drops. This is a host-level issue, not a Navidrome bug.
 
 ### Architecture Notes
 
 - Jukebox device routes are registered under `adminOnlyMiddleware` — only admin users can access `/api/jukebox/devices`
 - `serve_index.go` injects `jukeboxEnabled` into `__APP_CONFIG__` for the frontend; verify with `curl -sL http://host:port/app/ | grep APP_CONFIG`
-- Navidrome has two playback paths: client-side (`/rest/stream` → browser `<audio>`) and server-side Jukebox (`jukeboxControl` → MPV subprocess). The Web UI currently only implements client-side playback; Jukebox is only accessible via Subsonic API from third-party clients
+- Navidrome has two playback paths: client-side (`/rest/stream` → browser `<audio>`) and server-side Jukebox (`jukeboxControl` → MPV subprocess). The Web UI DeviceSelector switches between these modes: selecting a remote device enters Jukebox mode (browser audio paused, server plays via MPV), selecting "Local" returns to client-side playback
+- Jukebox queue sync uses incremental diff (`computeQueueDiff` in `jukeboxSync.js`): only sends `add`/`remove` operations instead of `set()` which kills the active MPV process. Falls back to full `set()` only when the queue order changes completely
+- Keyboard shortcuts (`keyHandlers.jsx`) are Jukebox-aware: in Jukebox mode, play/pause/volume/skip proxy to `jukeboxClient` API calls instead of the browser `<audio>` element
+- `playbackDevice` and `playbackServer` both have `sync.Mutex` protection for concurrent access from status polling, queue modifications, and track-switch goroutines
+
+### Docker Runtime — Lessons Learned
+
+6. **AppArmor blocks D-Bus in containers**: Bluetooth management (`/api/bluetooth/*`) requires D-Bus access to BlueZ. Docker's default AppArmor profile blocks D-Bus `method_call` from containers even when the socket is bind-mounted. **Must** add `--security-opt apparmor=unconfined` to `docker run`. Symptom: all `/api/bluetooth/*` endpoints return HTTP 503; container logs show no bluetooth-related errors (the error is at the D-Bus connection level). Verify with: `docker exec <container> dbus-send --system --dest=org.bluez --type=method_call --print-reply / org.freedesktop.DBus.Peer.Ping`
+
+7. **Container recreation checklist**: When recreating the navidrome container (e.g., after image rebuild), capture ALL runtime options from the old container BEFORE removing it. Critical options often missed:
+   - `--security-opt apparmor=unconfined` (required for D-Bus/Bluetooth)
+   - `--group-add audio` (required for ALSA/PulseAudio)
+   - `--device /dev/snd:/dev/snd` (sound device passthrough)
+   - All `-v` volume mounts (dbus socket, pulse socket, pulse cookie, data, music)
+   - Use `docker inspect <container> --format '{{json .HostConfig}}'` to capture the full config before `docker rm`
+
+8. **`go:embed` build dependency**: Running `go test` directly on packages that transitively import the `ui` package (e.g., `server/nativeapi/...`) fails with `pattern build/*: cannot embed directory build/3rdparty: contains no embeddable files` when the UI hasn't been built. Workaround: `touch ui/build/3rdparty/placeholder` before running tests. Packages like `core/playback/...` that don't import `ui` are unaffected
