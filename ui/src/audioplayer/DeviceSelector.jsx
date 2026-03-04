@@ -96,8 +96,6 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
             jukeboxClient.stop().catch(() => {})
             if (audioInstance) {
               audioInstance.muted = false
-            }
-            if (audioInstance && audioInstance.paused) {
               audioInstance.play().catch(() => {})
             }
             dispatch(setJukeboxMode(false))
@@ -109,9 +107,9 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
               ? Math.floor(audioInstance.currentTime || 0)
               : 0
 
-            // Keep browser controls active while preventing local output.
+            // Fully pause browser audio — no more silent streaming
             if (audioInstance) {
-              audioInstance.muted = true
+              audioInstance.pause()
             }
 
             if (trackIds.length > 0) {
