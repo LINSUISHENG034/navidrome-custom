@@ -112,7 +112,7 @@ describe('<DeviceSelector />', () => {
     })
   })
 
-  it('mutes browser audio when switching to a bluetooth jukebox device', async () => {
+  it('pauses browser audio when switching to a bluetooth jukebox device', async () => {
     playerStateMock.queue = [{ trackId: 't1' }]
     audioInstanceMock.paused = false
     audioInstanceMock.currentTime = 42
@@ -137,8 +137,7 @@ describe('<DeviceSelector />', () => {
     })
 
     await waitFor(() => {
-      expect(audioInstanceMock.muted).toBe(true)
-      expect(audioInstanceMock.pause).not.toHaveBeenCalled()
+      expect(audioInstanceMock.pause).toHaveBeenCalled()
       expect(jukeboxClient.set).toHaveBeenCalledWith(['t1'])
     })
   })
