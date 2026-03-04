@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useDispatch, useSelector } from 'react-redux'
 import { useMediaQuery } from '@material-ui/core'
 import { ThemeProvider } from '@material-ui/core/styles'
@@ -34,8 +34,9 @@ import keyHandlers from './keyHandlers'
 import { calculateGain } from '../utils/calculateReplayGain'
 import jukeboxClient from './jukeboxClient'
 import {
-  enforceBrowserAudioMode,
-  syncJukeboxQueue,
+  computeQueueDiff,
+  enforceBrowserAudioPause,
+  syncJukeboxQueueIncremental,
   syncJukeboxSeek,
   syncJukeboxTrackChange,
 } from './jukeboxSync'
@@ -51,6 +52,7 @@ const Player = () => {
   const [scrobbled, setScrobbled] = useState(false)
   const [preloaded, setPreload] = useState(false)
   const [audioInstance, setAudioInstanceLocal] = useState(null)
+  const prevQueueRef = useRef([])
 
   const handleAudioInstance = useCallback(
     (instance) => {
@@ -182,8 +184,10 @@ const Player = () => {
     (_, audioLists, audioInfo) => {
       dispatch(syncQueue(audioInfo, audioLists))
       if (playerState.jukeboxMode) {
-        syncJukeboxQueue(jukeboxClient, audioLists).catch(() => {})
+        const diff = computeQueueDiff(prevQueueRef.current, audioLists)
+        syncJukeboxQueueIncremental(jukeboxClient, diff).catch(() => {})
       }
+      prevQueueRef.current = audioLists
     },
     [dispatch, playerState.jukeboxMode],
   )
@@ -242,7 +246,7 @@ const Player = () => {
   const onAudioPlay = useCallback(
     (info) => {
       if (playerState.jukeboxMode) {
-        enforceBrowserAudioMode(audioInstance, true)
+        enforceBrowserAudioPause(audioInstance, true)
         jukeboxClient.play().catch(() => {})
       }
 
@@ -383,9 +387,9 @@ const Player = () => {
     return () => clearInterval(interval)
   }, [playerState.jukeboxMode, dispatch])
 
-  // In Jukebox mode, browser audio stays muted while controls still work.
+  // In Jukebox mode, browser audio is fully paused while server plays.
   useEffect(() => {
-    enforceBrowserAudioMode(audioInstance, playerState.jukeboxMode)
+    enforceBrowserAudioPause(audioInstance, playerState.jukeboxMode)
   }, [playerState.jukeboxMode, audioInstance, playerState.current?.uuid])
 
   return (
