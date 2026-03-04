@@ -188,9 +188,7 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
         data-testid="device-selector-button"
         aria-label="Select audio device"
       >
-        <BluetoothIcon
-          fontSize={isDesktop ? 'default' : 'inherit'}
-        />
+        <BluetoothIcon fontSize={isDesktop ? 'default' : 'inherit'} />
       </IconButton>
       <Menu
         anchorEl={anchorEl}
@@ -208,11 +206,7 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
             disabled={device.isBluetooth && !device.connected}
           >
             <ListItemIcon className={classes.activeIcon}>
-              {device.isDefault ? (
-                <CheckIcon fontSize="small" />
-              ) : (
-                <span />
-              )}
+              {device.isDefault ? <CheckIcon fontSize="small" /> : <span />}
             </ListItemIcon>
             <ListItemIcon className={classes.activeIcon}>
               {device.isBluetooth ? (
@@ -227,7 +221,9 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
             </ListItemIcon>
             <ListItemText
               primary={device.name}
-              secondary={device.isBluetooth && !device.connected ? 'Disconnected' : null}
+              secondary={
+                device.isBluetooth && !device.connected ? 'Disconnected' : null
+              }
             />
           </MenuItem>
         ))}
