@@ -27,6 +27,9 @@ func (api *Router) addJukeboxControlRoute(r chi.Router) {
 	r.Post("/jukebox/skip", api.jukeboxSkip)
 	r.Post("/jukebox/seek", api.jukeboxSeek)
 	r.Post("/jukebox/volume", api.jukeboxVolume)
+	r.Post("/jukebox/add", api.jukeboxAdd)
+	r.Post("/jukebox/remove", api.jukeboxRemove)
+	r.Post("/jukebox/move", api.jukeboxMove)
 }
 
 func toStatusResponse(s playback.DeviceStatus) *jukeboxStatusResponse {
@@ -182,6 +185,73 @@ func (api *Router) jukeboxSeek(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status, err := pb.Skip(r.Context(), current.CurrentIndex, req.Position)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	api.writeJukeboxJSON(w, r, toStatusResponse(status))
+}
+
+func (api *Router) jukeboxAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	user, _ := request.UserFrom(r.Context())
+	pb, err := api.playback.GetDeviceForUser(user.UserName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	status, err := pb.Add(r.Context(), req.IDs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	api.writeJukeboxJSON(w, r, toStatusResponse(status))
+}
+
+func (api *Router) jukeboxRemove(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Index int `json:"index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	user, _ := request.UserFrom(r.Context())
+	pb, err := api.playback.GetDeviceForUser(user.UserName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	status, err := pb.Remove(r.Context(), req.Index)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	api.writeJukeboxJSON(w, r, toStatusResponse(status))
+}
+
+func (api *Router) jukeboxMove(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		From int `json:"from"`
+		To   int `json:"to"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	user, _ := request.UserFrom(r.Context())
+	pb, err := api.playback.GetDeviceForUser(user.UserName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	status, err := pb.Move(r.Context(), req.From, req.To)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

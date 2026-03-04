@@ -35,3 +35,32 @@ func TestJukeboxControlAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestJukeboxIncrementalRoutes(t *testing.T) {
+	api := &Router{}
+	r := chi.NewRouter()
+	api.addJukeboxControlRoute(r)
+
+	want := map[string]bool{
+		"POST /jukebox/add":    true,
+		"POST /jukebox/remove": true,
+		"POST /jukebox/move":   true,
+	}
+
+	err := chi.Walk(r, func(method string, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		key := method + " " + route
+		if _, ok := want[key]; ok {
+			want[key] = false
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk routes: %v", err)
+	}
+
+	for route, missing := range want {
+		if missing {
+			t.Fatalf("missing expected route: %s", route)
+		}
+	}
+}
