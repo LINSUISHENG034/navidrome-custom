@@ -5,6 +5,7 @@ import Menu from '@material-ui/core/Menu'
 import MenuItem from '@material-ui/core/MenuItem'
 import ListItemIcon from '@material-ui/core/ListItemIcon'
 import ListItemText from '@material-ui/core/ListItemText'
+import Divider from '@material-ui/core/Divider'
 import { makeStyles } from '@material-ui/core/styles'
 import BluetoothIcon from '@material-ui/icons/Bluetooth'
 import BluetoothDisabledIcon from '@material-ui/icons/BluetoothDisabled'
@@ -16,6 +17,7 @@ import httpClient from '../dataProvider/httpClient'
 import jukeboxClient from './jukeboxClient'
 import bluetoothClient from './bluetoothClient'
 import { setJukeboxMode } from '../actions'
+import { useNotify } from 'react-admin'
 
 const POLL_INTERVAL_MS = 10000
 
@@ -34,10 +36,13 @@ const useStyles = makeStyles(() => ({
 const DeviceSelector = ({ isDesktop, buttonClass }) => {
   const classes = useStyles()
   const dispatch = useDispatch()
+  const notify = useNotify()
   const [anchorEl, setAnchorEl] = useState(null)
   const [devices, setDevices] = useState([])
   const [bluetoothDevices, setBluetoothDevices] = useState([])
   const playerState = useSelector((state) => state.player)
+  const jukeboxMode = useSelector((state) => state.player.jukeboxMode)
+  const jukeboxDevice = useSelector((state) => state.player.jukeboxDevice)
   const audioInstance = playerState.audioInstance
 
   const fetchDevices = useCallback(() => {
@@ -117,15 +122,19 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
                 .set(trackIds)
                 .then(() => jukeboxClient.skip(currentIndex, currentTime))
                 .then(() => jukeboxClient.play())
-                .catch(() => {})
+                .catch(() => {
+                  notify('Failed to start playback on remote device', 'warning')
+                })
             }
 
             dispatch(setJukeboxMode(true, device.name))
           }
         })
-        .catch(() => {})
+        .catch(() => {
+          notify('Failed to switch audio device', 'warning')
+        })
     },
-    [handleClose, audioInstance, playerState, dispatch],
+    [handleClose, audioInstance, playerState, dispatch, notify],
   )
 
   const handleRefresh = useCallback(() => {
@@ -133,8 +142,10 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
       method: 'POST',
     })
       .then(({ json }) => setDevices(json))
-      .catch(() => {})
-  }, [])
+      .catch(() => {
+        notify('Failed to refresh device list', 'warning')
+      })
+  }, [notify])
 
   const handleScan = useCallback(() => {
     bluetoothClient
@@ -143,8 +154,10 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
         fetchDevices()
         fetchBluetoothDevices()
       })
-      .catch(() => {})
-  }, [fetchDevices, fetchBluetoothDevices])
+      .catch(() => {
+        notify('Bluetooth scan failed', 'warning')
+      })
+  }, [fetchDevices, fetchBluetoothDevices, notify])
 
   const handleBluetoothConnect = useCallback(
     (mac) => {
@@ -154,9 +167,11 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
           fetchDevices()
           fetchBluetoothDevices()
         })
-        .catch(() => {})
+        .catch(() => {
+          notify('Failed to connect Bluetooth device', 'warning')
+        })
     },
-    [fetchDevices, fetchBluetoothDevices],
+    [fetchDevices, fetchBluetoothDevices, notify],
   )
 
   const handleBluetoothDisconnect = useCallback(
@@ -167,9 +182,11 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
           fetchDevices()
           fetchBluetoothDevices()
         })
-        .catch(() => {})
+        .catch(() => {
+          notify('Failed to disconnect Bluetooth device', 'warning')
+        })
     },
-    [fetchDevices, fetchBluetoothDevices],
+    [fetchDevices, fetchBluetoothDevices, notify],
   )
 
   if (
@@ -187,8 +204,12 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
         className={buttonClass}
         data-testid="device-selector-button"
         aria-label="Select audio device"
+        title={jukeboxMode && jukeboxDevice ? jukeboxDevice : undefined}
       >
-        <BluetoothIcon fontSize={isDesktop ? 'default' : 'inherit'} />
+        <BluetoothIcon
+          fontSize={isDesktop ? 'default' : 'inherit'}
+          color={jukeboxMode ? 'primary' : 'inherit'}
+        />
       </IconButton>
       <Menu
         anchorEl={anchorEl}
@@ -227,6 +248,7 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
             />
           </MenuItem>
         ))}
+        <Divider />
         <MenuItem onClick={handleRefresh}>
           <ListItemIcon className={classes.activeIcon}>
             <RefreshIcon fontSize="small" />
@@ -240,6 +262,9 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
             </ListItemIcon>
             <ListItemText primary="Scan for devices" />
           </MenuItem>
+        )}
+        {config.bluetoothManagementEnabled && bluetoothDevices.length > 0 && (
+          <Divider />
         )}
         {config.bluetoothManagementEnabled &&
           bluetoothDevices.map((device) => {
