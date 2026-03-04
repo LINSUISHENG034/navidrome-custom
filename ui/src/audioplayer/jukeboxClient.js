@@ -46,6 +46,24 @@ const jukeboxClient = {
       method: 'POST',
       body: JSON.stringify({ gain }),
     }).then(({ json }) => json),
+
+  add: (ids) =>
+    httpClient('/api/jukebox/add', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    }).then(({ json }) => json),
+
+  remove: (index) =>
+    httpClient('/api/jukebox/remove', {
+      method: 'POST',
+      body: JSON.stringify({ index }),
+    }).then(({ json }) => json),
+
+  move: (from, to) =>
+    httpClient('/api/jukebox/move', {
+      method: 'POST',
+      body: JSON.stringify({ from, to }),
+    }).then(({ json }) => json),
 }
 
 export default jukeboxClient
