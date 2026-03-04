@@ -4,6 +4,12 @@ import DeviceSelector from './DeviceSelector'
 import httpClient from '../dataProvider/httpClient'
 import jukeboxClient from './jukeboxClient'
 
+const notifyMock = vi.fn()
+
+vi.mock('react-admin', () => ({
+  useNotify: () => notifyMock,
+}))
+
 vi.mock('../config', () => ({
   default: {
     jukeboxEnabled: true,
@@ -69,10 +75,7 @@ describe('<DeviceSelector />', () => {
           ],
         })
       }
-      if (
-        url === '/api/jukebox/devices/switch' &&
-        options?.method === 'POST'
-      ) {
+      if (url === '/api/jukebox/devices/switch' && options?.method === 'POST') {
         return Promise.resolve({
           json: [
             { deviceName: 'auto', name: 'Local', isDefault: false },
@@ -139,6 +142,99 @@ describe('<DeviceSelector />', () => {
     await waitFor(() => {
       expect(audioInstanceMock.pause).toHaveBeenCalled()
       expect(jukeboxClient.set).toHaveBeenCalledWith(['t1'])
+    })
+  })
+
+  it('renders Dividers between menu sections', async () => {
+    render(<DeviceSelector isDesktop buttonClass="" />)
+
+    const openButton = await screen.findByTestId('device-selector-button')
+    fireEvent.click(openButton)
+
+    await screen.findByText('Local')
+
+    const menu = screen.getByRole('menu')
+    const dividers = menu.querySelectorAll('hr')
+    expect(dividers.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('shows notification when device switch fails', async () => {
+    httpClient.mockImplementation((url, options) => {
+      if (url === '/api/jukebox/devices') {
+        return Promise.resolve({
+          json: [
+            { deviceName: 'auto', name: 'Local', isDefault: true },
+            {
+              deviceName: 'pulse/bluez_sink',
+              name: 'BT Speaker',
+              isBluetooth: true,
+              connected: true,
+            },
+          ],
+        })
+      }
+      if (url === '/api/jukebox/devices/switch') {
+        return Promise.reject(new Error('Network error'))
+      }
+      if (url === '/api/bluetooth/devices') {
+        return Promise.resolve({ json: [] })
+      }
+      return Promise.resolve({ json: [] })
+    })
+
+    render(<DeviceSelector isDesktop buttonClass="" />)
+
+    const openButton = await screen.findByTestId('device-selector-button')
+    fireEvent.click(openButton)
+
+    const btDevice = await screen.findByText('BT Speaker')
+    fireEvent.click(btDevice)
+
+    await waitFor(() => {
+      expect(notifyMock).toHaveBeenCalledWith(
+        'Failed to switch audio device',
+        'warning',
+      )
+    })
+  })
+
+  it('shows notification when Bluetooth scan fails', async () => {
+    httpClient.mockImplementation((url, options) => {
+      if (url === '/api/jukebox/devices') {
+        return Promise.resolve({
+          json: [
+            { deviceName: 'auto', name: 'Local', isDefault: true },
+            {
+              deviceName: 'pulse/bluez_sink',
+              name: 'BT Speaker',
+              isBluetooth: true,
+              connected: true,
+            },
+          ],
+        })
+      }
+      if (url === '/api/bluetooth/devices') {
+        return Promise.resolve({ json: [] })
+      }
+      if (url === '/api/bluetooth/scan') {
+        return Promise.reject(new Error('Scan failed'))
+      }
+      return Promise.resolve({ json: [] })
+    })
+
+    render(<DeviceSelector isDesktop buttonClass="" />)
+
+    const openButton = await screen.findByTestId('device-selector-button')
+    fireEvent.click(openButton)
+
+    const scanItem = await screen.findByText('Scan for devices')
+    fireEvent.click(scanItem)
+
+    await waitFor(() => {
+      expect(notifyMock).toHaveBeenCalledWith(
+        'Bluetooth scan failed',
+        'warning',
+      )
     })
   })
 })

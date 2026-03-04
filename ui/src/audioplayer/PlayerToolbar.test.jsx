@@ -2,7 +2,7 @@ import React from 'react'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { useMediaQuery } from '@material-ui/core'
 import { useGetOne } from 'react-admin'
-import { useDispatch, useSelector } from 'react-redux'
+import { useDispatch } from 'react-redux'
 import { useToggleLove } from '../common'
 import { openSaveQueueDialog } from '../actions'
 import PlayerToolbar from './PlayerToolbar'
@@ -22,7 +22,6 @@ vi.mock('react-admin', () => ({
 
 vi.mock('react-redux', () => ({
   useDispatch: vi.fn(),
-  useSelector: vi.fn(),
 }))
 
 vi.mock('../common', () => ({
@@ -56,9 +55,6 @@ describe('<PlayerToolbar />', () => {
     useGetOne.mockReturnValue({ data: mockSongData, loading: false })
     useToggleLove.mockReturnValue([mockToggleLove, false])
     useDispatch.mockReturnValue(mockDispatch)
-    useSelector.mockImplementation((selector) =>
-      selector({ player: { jukeboxMode: false, jukeboxDevice: null } }),
-    )
     openSaveQueueDialog.mockReturnValue({ type: 'OPEN_SAVE_QUEUE_DIALOG' })
   })
 
