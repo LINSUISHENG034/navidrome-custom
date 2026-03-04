@@ -131,11 +131,12 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, error)
 		if !pd.PlaybackQueue.IsEmpty() {
 			idx := pd.PlaybackQueue.Index
 			pd.mu.Unlock()
-			err := pd.switchActiveTrackByIndex(idx)
+			track, err := pd.switchActiveTrackByIndex(idx)
 			pd.mu.Lock()
 			if err != nil {
 				return pd.getStatus(), err
 			}
+			pd.assignTrack(track)
 			if pd.ActiveTrack != nil {
 				pd.ActiveTrack.Unpause()
 			}
@@ -178,11 +179,12 @@ func (pd *playbackDevice) Skip(ctx context.Context, index int, offset int) (Devi
 
 	if pd.ActiveTrack == nil {
 		pd.mu.Unlock()
-		err := pd.switchActiveTrackByIndex(index)
+		track, err := pd.switchActiveTrackByIndex(index)
 		pd.mu.Lock()
 		if err != nil {
 			return pd.getStatus(), err
 		}
+		pd.assignTrack(track)
 	}
 
 	if pd.ActiveTrack != nil {
@@ -328,13 +330,14 @@ func (pd *playbackDevice) trackSwitcherGoroutine() {
 				pd.mu.Unlock()
 
 				log.Debug("Switching to next song", "index", idx)
-				err := pd.switchActiveTrackByIndex(idx)
+				track, err := pd.switchActiveTrackByIndex(idx)
 				if err != nil {
 					log.Error("Error switching track", err)
 					continue
 				}
 
 				pd.mu.Lock()
+				pd.assignTrack(track)
 				if pd.ActiveTrack != nil {
 					pd.ActiveTrack.Unpause()
 				}
@@ -350,18 +353,27 @@ func (pd *playbackDevice) trackSwitcherGoroutine() {
 	}
 }
 
-func (pd *playbackDevice) switchActiveTrackByIndex(index int) error {
+func (pd *playbackDevice) switchActiveTrackByIndex(index int) (Track, error) {
 	pd.PlaybackQueue.SetIndex(index)
 	currentTrack := pd.PlaybackQueue.Current()
 	if currentTrack == nil {
-		return errors.New("could not get current track")
+		return nil, errors.New("could not get current track")
 	}
 
 	track, err := mpv.NewTrack(pd.serviceCtx, pd.PlaybackDone, pd.DeviceName, *currentTrack)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	pd.ActiveTrack = track
-	pd.ActiveTrack.SetVolume(pd.Gain)
-	return nil
+	track.SetVolume(pd.Gain)
+	return track, nil
+}
+
+// assignTrack safely replaces the active track while holding the mutex.
+// If another goroutine set ActiveTrack during the unlock window, the
+// orphaned process is closed before the new track is assigned.
+func (pd *playbackDevice) assignTrack(newTrack Track) {
+	if pd.ActiveTrack != nil {
+		pd.ActiveTrack.Close()
+	}
+	pd.ActiveTrack = newTrack
 }

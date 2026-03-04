@@ -33,9 +33,11 @@ import { keyMap } from '../hotkeys'
 import keyHandlers from './keyHandlers'
 import { calculateGain } from '../utils/calculateReplayGain'
 import jukeboxClient from './jukeboxClient'
+import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
 import {
   computeQueueDiff,
   enforceBrowserAudioPause,
+  isJukeboxEnforcingPause,
   syncJukeboxQueueIncremental,
   syncJukeboxSeek,
   syncJukeboxTrackChange,
@@ -185,7 +187,9 @@ const Player = () => {
       dispatch(syncQueue(audioInfo, audioLists))
       if (playerState.jukeboxMode) {
         const diff = computeQueueDiff(prevQueueRef.current, audioLists)
-        syncJukeboxQueueIncremental(jukeboxClient, diff).catch(() => {})
+        enqueueJukeboxCommand(() =>
+          syncJukeboxQueueIncremental(jukeboxClient, diff),
+        ).catch(() => {})
       }
       prevQueueRef.current = audioLists
     },
@@ -237,7 +241,9 @@ const Player = () => {
     (volume) => {
       dispatch(setVolume(Math.sqrt(volume)))
       if (playerState.jukeboxMode) {
-        jukeboxClient.volume(volume).catch(() => {})
+        enqueueJukeboxCommand(() => jukeboxClient.volume(volume)).catch(
+          () => {},
+        )
       }
     },
     [dispatch, playerState.jukeboxMode],
@@ -247,7 +253,7 @@ const Player = () => {
     (info) => {
       if (playerState.jukeboxMode) {
         enforceBrowserAudioPause(audioInstance, true)
-        jukeboxClient.play().catch(() => {})
+        enqueueJukeboxCommand(() => jukeboxClient.play()).catch(() => {})
       }
 
       // Do this to start the context; on chrome-based browsers, the context
@@ -303,11 +309,13 @@ const Player = () => {
         setStartTime(null)
       }
       if (playerState.jukeboxMode) {
-        syncJukeboxTrackChange(jukeboxClient, {
-          audioLists,
-          playId,
-          audioInfo: info,
-        }).catch(() => {})
+        enqueueJukeboxCommand(() =>
+          syncJukeboxTrackChange(jukeboxClient, {
+            audioLists,
+            playId,
+            audioInfo: info,
+          }),
+        ).catch(() => {})
       }
     },
     [playerState.jukeboxMode, scrobbled, startTime],
@@ -316,8 +324,8 @@ const Player = () => {
   const onAudioPause = useCallback(
     (info) => {
       dispatch(currentPlaying(info))
-      if (playerState.jukeboxMode) {
-        jukeboxClient.pause().catch(() => {})
+      if (playerState.jukeboxMode && !isJukeboxEnforcingPause()) {
+        enqueueJukeboxCommand(() => jukeboxClient.pause()).catch(() => {})
       }
     },
     [dispatch, playerState.jukeboxMode],
@@ -326,7 +334,9 @@ const Player = () => {
   const onAudioSeeked = useCallback(
     (info) => {
       if (playerState.jukeboxMode) {
-        syncJukeboxSeek(jukeboxClient, info).catch(() => {})
+        enqueueJukeboxCommand(() =>
+          syncJukeboxSeek(jukeboxClient, info),
+        ).catch(() => {})
       }
     },
     [playerState.jukeboxMode],

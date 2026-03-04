@@ -15,6 +15,7 @@ import RefreshIcon from '@material-ui/icons/Refresh'
 import config from '../config'
 import httpClient from '../dataProvider/httpClient'
 import jukeboxClient from './jukeboxClient'
+import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
 import bluetoothClient from './bluetoothClient'
 import { setJukeboxMode } from '../actions'
 import { useNotify } from 'react-admin'
@@ -98,7 +99,7 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
 
           if (isLocalDevice) {
             // Switching back to local browser playback
-            jukeboxClient.stop().catch(() => {})
+            enqueueJukeboxCommand(() => jukeboxClient.stop()).catch(() => {})
             if (audioInstance) {
               audioInstance.muted = false
               audioInstance.play().catch(() => {})
@@ -118,13 +119,14 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
             }
 
             if (trackIds.length > 0) {
-              jukeboxClient
-                .set(trackIds)
-                .then(() => jukeboxClient.skip(currentIndex, currentTime))
-                .then(() => jukeboxClient.play())
-                .catch(() => {
-                  notify('Failed to start playback on remote device', 'warning')
-                })
+              enqueueJukeboxCommand(() =>
+                jukeboxClient
+                  .set(trackIds)
+                  .then(() => jukeboxClient.skip(currentIndex, currentTime))
+                  .then(() => jukeboxClient.play()),
+              ).catch(() => {
+                notify('Failed to start playback on remote device', 'warning')
+              })
             }
 
             dispatch(setJukeboxMode(true, device.name))
