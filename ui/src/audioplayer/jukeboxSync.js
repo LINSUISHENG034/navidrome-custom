@@ -19,18 +19,93 @@ const resolvePlayIndex = ({ audioLists = [], playId, trackId }) => {
   return 0
 }
 
-export const syncJukeboxQueue = async (client, audioLists = []) => {
-  const trackIds = toTrackIds(audioLists)
-  if (!client?.set || trackIds.length === 0) return
-  await client.set(trackIds)
+/**
+ * Compute the diff between old and new queue.
+ * Returns { added, removed, fullReplace, newTrackIds }.
+ * - added: [{ trackId, index }] — tracks present in new but not old
+ * - removed: [index] — indices in old queue that are missing from new (sorted ascending)
+ * - fullReplace: true if the diff is too complex for incremental ops
+ */
+export const computeQueueDiff = (oldQueue = [], newQueue = []) => {
+  const oldIds = toTrackIds(oldQueue)
+  const newIds = toTrackIds(newQueue)
+
+  // Fast path: identical
+  if (
+    oldIds.length === newIds.length &&
+    oldIds.every((id, i) => id === newIds[i])
+  ) {
+    return { added: [], removed: [], fullReplace: false }
+  }
+
+  const oldSet = new Set(oldIds)
+  const newSet = new Set(newIds)
+
+  const removed = []
+  for (let i = 0; i < oldIds.length; i++) {
+    if (!newSet.has(oldIds[i])) {
+      removed.push(i)
+    }
+  }
+
+  const added = []
+  for (let i = 0; i < newIds.length; i++) {
+    if (!oldSet.has(newIds[i])) {
+      added.push({ trackId: newIds[i], index: i })
+    }
+  }
+
+  // If there are only adds or only removes, use incremental.
+  // If both or if the remaining items changed order, fall back to full replace.
+  const remainingOld = oldIds.filter((id) => newSet.has(id))
+  const remainingNew = newIds.filter((id) => oldSet.has(id))
+  const orderChanged =
+    remainingOld.length !== remainingNew.length ||
+    remainingOld.some((id, i) => id !== remainingNew[i])
+
+  if (orderChanged || (added.length > 0 && removed.length > 0)) {
+    return { added: [], removed: [], fullReplace: true, newTrackIds: newIds }
+  }
+
+  return { added, removed, fullReplace: false }
 }
 
+/**
+ * Send incremental queue operations to the server.
+ * Only falls back to set() when the diff is a full replacement.
+ */
+export const syncJukeboxQueueIncremental = async (client, diff) => {
+  if (!client) return
+
+  if (diff.fullReplace) {
+    if (client.set && diff.newTrackIds?.length > 0) {
+      await client.set(diff.newTrackIds)
+    }
+    return
+  }
+
+  // Remove in reverse order to keep indices valid
+  if (client.remove) {
+    for (const idx of [...diff.removed].reverse()) {
+      await client.remove(idx)
+    }
+  }
+
+  // Add new tracks
+  if (client.add && diff.added.length > 0) {
+    const ids = diff.added.map((item) => item.trackId)
+    await client.add(ids)
+  }
+}
+
+/**
+ * Sync track change: just skip to the right index (queue is already synced incrementally).
+ */
 export const syncJukeboxTrackChange = async (
   client,
   { audioLists = [], playId, audioInfo = {} } = {},
 ) => {
-  const trackIds = toTrackIds(audioLists)
-  if (!client?.set || !client?.skip || trackIds.length === 0) return
+  if (!client?.skip || audioLists.length === 0) return
 
   const index = resolvePlayIndex({
     audioLists,
@@ -39,7 +114,6 @@ export const syncJukeboxTrackChange = async (
   })
   const offset = toSeconds(audioInfo?.currentTime)
 
-  await client.set(trackIds)
   await client.skip(index, offset)
 }
 
@@ -48,8 +122,13 @@ export const syncJukeboxSeek = async (client, audioInfo = {}) => {
   await client.seek(toSeconds(audioInfo?.currentTime))
 }
 
-export const enforceBrowserAudioMode = (audioInstance, jukeboxMode) => {
+/**
+ * In Jukebox mode, pause the browser audio element entirely.
+ * When leaving Jukebox mode, caller is responsible for resuming.
+ */
+export const enforceBrowserAudioPause = (audioInstance, jukeboxMode) => {
   if (!audioInstance) return
-  audioInstance.muted = Boolean(jukeboxMode)
+  if (jukeboxMode && !audioInstance.paused) {
+    audioInstance.pause()
+  }
 }
-
