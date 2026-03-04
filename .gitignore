@@ -38,3 +38,5 @@ AGENTS.md
 *.ndp
 openspec/
 go.work*
+node_modules/
+docs/plans/
