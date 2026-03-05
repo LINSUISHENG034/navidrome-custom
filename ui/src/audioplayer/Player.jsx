@@ -36,8 +36,6 @@ import jukeboxClient from './jukeboxClient'
 import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
 import {
   computeQueueDiff,
-  enforceBrowserAudioPause,
-  isJukeboxEnforcingPause,
   syncJukeboxQueueIncremental,
   syncJukeboxSeek,
   syncJukeboxTrackChange,
@@ -108,11 +106,15 @@ const Player = () => {
 
   useEffect(() => {
     if (gainNode) {
-      const current = playerState.current || {}
-      const song = current.song || {}
-
-      const numericGain = calculateGain(gainInfo, song)
-      gainNode.gain.setValueAtTime(numericGain, context.currentTime)
+      if (playerState.jukeboxMode) {
+        // Silence AudioContext output in jukebox mode to prevent dual audio
+        gainNode.gain.setValueAtTime(0, context.currentTime)
+      } else {
+        const current = playerState.current || {}
+        const song = current.song || {}
+        const numericGain = calculateGain(gainInfo, song)
+        gainNode.gain.setValueAtTime(numericGain, context.currentTime)
+      }
     }
   }, [audioInstance, context, gainNode, playerState, gainInfo])
 
@@ -252,8 +254,13 @@ const Player = () => {
   const onAudioPlay = useCallback(
     (info) => {
       if (playerState.jukeboxMode) {
-        enforceBrowserAudioPause(audioInstance, true)
-        enqueueJukeboxCommand(() => jukeboxClient.play()).catch(() => {})
+        if (audioInstance) audioInstance.muted = true
+        // Only forward play to Jukebox when the tab is visible.
+        // When the tab becomes visible, the browser may auto-resume audio —
+        // this is NOT a user-initiated play and must not restart the Jukebox.
+        if (!document.hidden) {
+          enqueueJukeboxCommand(() => jukeboxClient.play()).catch(() => {})
+        }
       }
 
       // Do this to start the context; on chrome-based browsers, the context
@@ -324,7 +331,10 @@ const Player = () => {
   const onAudioPause = useCallback(
     (info) => {
       dispatch(currentPlaying(info))
-      if (playerState.jukeboxMode && !isJukeboxEnforcingPause()) {
+      // Only forward pause to Jukebox when the tab is visible.
+      // When hidden, the browser may auto-pause muted audio for power saving —
+      // this is NOT a user-initiated pause and must not stop the Jukebox.
+      if (playerState.jukeboxMode && !document.hidden) {
         enqueueJukeboxCommand(() => jukeboxClient.pause()).catch(() => {})
       }
     },
@@ -397,10 +407,11 @@ const Player = () => {
     return () => clearInterval(interval)
   }, [playerState.jukeboxMode, dispatch])
 
-  // In Jukebox mode, browser audio is fully paused while server plays.
+  // In Jukebox mode, mute browser audio while server plays.
   useEffect(() => {
-    enforceBrowserAudioPause(audioInstance, playerState.jukeboxMode)
-  }, [playerState.jukeboxMode, audioInstance, playerState.current?.uuid])
+    if (!audioInstance) return
+    audioInstance.muted = !!playerState.jukeboxMode
+  }, [playerState.jukeboxMode, audioInstance])
 
   return (
     <ThemeProvider theme={createMuiTheme(theme)}>
