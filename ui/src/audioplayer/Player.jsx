@@ -27,6 +27,7 @@ import {
 } from '../actions'
 import PlayerToolbar from './PlayerToolbar'
 import { sendNotification } from '../utils'
+import { baseUrl } from '../utils/urls'
 import subsonic from '../subsonic'
 import locale from './locale'
 import { keyMap } from '../hotkeys'
@@ -412,6 +413,26 @@ const Player = () => {
     if (!audioInstance) return
     audioInstance.muted = !!playerState.jukeboxMode
   }, [playerState.jukeboxMode, audioInstance])
+
+  // Stop Jukebox playback when the browser window/tab is closed.
+  // Uses fetch with keepalive to ensure the request survives page unload.
+  useEffect(() => {
+    const handlePageHide = () => {
+      if (!playerState.jukeboxMode) return
+      const token = localStorage.getItem('token')
+      if (!token) return
+      fetch(baseUrl('/api/jukebox/pause'), {
+        method: 'POST',
+        headers: {
+          'X-ND-Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        keepalive: true,
+      }).catch(() => {})
+    }
+    window.addEventListener('pagehide', handlePageHide)
+    return () => window.removeEventListener('pagehide', handlePageHide)
+  }, [playerState.jukeboxMode])
 
   return (
     <ThemeProvider theme={createMuiTheme(theme)}>
