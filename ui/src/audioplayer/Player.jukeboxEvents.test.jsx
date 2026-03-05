@@ -100,7 +100,10 @@ describe('Jukebox visibility guard logic', () => {
     it('sends pause request with keepalive on pagehide in jukebox mode', () => {
       const calls = []
       const origFetch = globalThis.fetch
-      globalThis.fetch = (...args) => { calls.push(args); return Promise.resolve(new Response()) }
+      globalThis.fetch = (...args) => {
+        calls.push(args)
+        return Promise.resolve(new Response())
+      }
       localStorage.setItem('token', 'fake-jwt-token')
 
       // Simulate: jukeboxMode is true, pagehide fires
@@ -138,11 +141,17 @@ describe('Jukebox visibility guard logic', () => {
     it('does not send pause request on pagehide when not in jukebox mode', () => {
       const calls = []
       const origFetch = globalThis.fetch
-      globalThis.fetch = (...args) => { calls.push(args); return Promise.resolve(new Response()) }
+      globalThis.fetch = (...args) => {
+        calls.push(args)
+        return Promise.resolve(new Response())
+      }
 
       const jukeboxMode = false
       if (jukeboxMode) {
-        globalThis.fetch('/api/jukebox/pause', { method: 'POST', keepalive: true })
+        globalThis.fetch('/api/jukebox/pause', {
+          method: 'POST',
+          keepalive: true,
+        })
       }
 
       expect(calls).toHaveLength(0)
@@ -153,7 +162,10 @@ describe('Jukebox visibility guard logic', () => {
     it('does not send pause request when no auth token exists', () => {
       const calls = []
       const origFetch = globalThis.fetch
-      globalThis.fetch = (...args) => { calls.push(args); return Promise.resolve(new Response()) }
+      globalThis.fetch = (...args) => {
+        calls.push(args)
+        return Promise.resolve(new Response())
+      }
       // Ensure no token is set (clear and re-add only username)
       localStorage.clear()
       localStorage.setItem('username', 'admin')
@@ -162,7 +174,10 @@ describe('Jukebox visibility guard logic', () => {
       if (jukeboxMode) {
         const token = localStorage.getItem('token')
         if (token) {
-          globalThis.fetch('/api/jukebox/pause', { method: 'POST', keepalive: true })
+          globalThis.fetch('/api/jukebox/pause', {
+            method: 'POST',
+            keepalive: true,
+          })
         }
       }
 
@@ -181,35 +196,43 @@ describe('Jukebox visibility guard logic', () => {
     }
 
     it('prevents unload in jukebox mode when a track is loaded', () => {
-      expect(shouldPreventUnload({
-        jukeboxMode: true,
-        currentUuid: 'some-uuid',
-        audioPaused: true,
-      })).toBe(true)
+      expect(
+        shouldPreventUnload({
+          jukeboxMode: true,
+          currentUuid: 'some-uuid',
+          audioPaused: true,
+        }),
+      ).toBe(true)
     })
 
     it('does not prevent unload in jukebox mode when no track is loaded', () => {
-      expect(shouldPreventUnload({
-        jukeboxMode: true,
-        currentUuid: undefined,
-        audioPaused: true,
-      })).toBe(false)
+      expect(
+        shouldPreventUnload({
+          jukeboxMode: true,
+          currentUuid: undefined,
+          audioPaused: true,
+        }),
+      ).toBe(false)
     })
 
     it('prevents unload in local mode when audio is playing', () => {
-      expect(shouldPreventUnload({
-        jukeboxMode: false,
-        currentUuid: 'some-uuid',
-        audioPaused: false,
-      })).toBe(true)
+      expect(
+        shouldPreventUnload({
+          jukeboxMode: false,
+          currentUuid: 'some-uuid',
+          audioPaused: false,
+        }),
+      ).toBe(true)
     })
 
     it('does not prevent unload in local mode when audio is paused', () => {
-      expect(shouldPreventUnload({
-        jukeboxMode: false,
-        currentUuid: 'some-uuid',
-        audioPaused: true,
-      })).toBe(false)
+      expect(
+        shouldPreventUnload({
+          jukeboxMode: false,
+          currentUuid: 'some-uuid',
+          audioPaused: true,
+        }),
+      ).toBe(false)
     })
   })
 })

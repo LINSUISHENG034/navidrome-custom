@@ -127,7 +127,11 @@ const Player = () => {
         // so check for an active track instead
         isPlaying = !!playerState.current?.uuid
       } else {
-        isPlaying = !!(playerState.current?.uuid && audioInstance && !audioInstance.paused)
+        isPlaying = !!(
+          playerState.current?.uuid &&
+          audioInstance &&
+          !audioInstance.paused
+        )
       }
       if (isPlaying) {
         e.preventDefault()
@@ -352,9 +356,9 @@ const Player = () => {
   const onAudioSeeked = useCallback(
     (info) => {
       if (playerState.jukeboxMode) {
-        enqueueJukeboxCommand(() =>
-          syncJukeboxSeek(jukeboxClient, info),
-        ).catch(() => {})
+        enqueueJukeboxCommand(() => syncJukeboxSeek(jukeboxClient, info)).catch(
+          () => {},
+        )
       }
     },
     [playerState.jukeboxMode],
