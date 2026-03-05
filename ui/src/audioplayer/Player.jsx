@@ -121,10 +121,17 @@ const Player = () => {
 
   useEffect(() => {
     const handleBeforeUnload = (e) => {
-      // Check there's a current track and is actually playing/not paused
-      if (playerState.current?.uuid && audioInstance && !audioInstance.paused) {
+      let isPlaying
+      if (playerState.jukeboxMode) {
+        // In Jukebox mode, audio element is muted (not paused),
+        // so check for an active track instead
+        isPlaying = !!playerState.current?.uuid
+      } else {
+        isPlaying = !!(playerState.current?.uuid && audioInstance && !audioInstance.paused)
+      }
+      if (isPlaying) {
         e.preventDefault()
-        e.returnValue = '' // Chrome requires returnValue to be set
+        e.returnValue = ''
       }
     }
 
