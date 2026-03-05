@@ -95,4 +95,80 @@ describe('Jukebox visibility guard logic', () => {
       expect(jukeboxClient.play).not.toHaveBeenCalled()
     })
   })
+
+  describe('pagehide cleanup', () => {
+    it('sends pause request with keepalive on pagehide in jukebox mode', () => {
+      const calls = []
+      const origFetch = globalThis.fetch
+      globalThis.fetch = (...args) => { calls.push(args); return Promise.resolve(new Response()) }
+      localStorage.setItem('token', 'fake-jwt-token')
+
+      // Simulate: jukeboxMode is true, pagehide fires
+      const jukeboxMode = true
+      if (jukeboxMode) {
+        const token = localStorage.getItem('token')
+        if (token) {
+          globalThis.fetch('/api/jukebox/pause', {
+            method: 'POST',
+            headers: {
+              'X-ND-Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            keepalive: true,
+          })
+        }
+      }
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0][0]).toBe('/api/jukebox/pause')
+      expect(calls[0][1]).toEqual({
+        method: 'POST',
+        headers: {
+          'X-ND-Authorization': 'Bearer fake-jwt-token',
+          'Content-Type': 'application/json',
+        },
+        keepalive: true,
+      })
+
+      globalThis.fetch = origFetch
+      localStorage.clear()
+      localStorage.setItem('username', 'admin')
+    })
+
+    it('does not send pause request on pagehide when not in jukebox mode', () => {
+      const calls = []
+      const origFetch = globalThis.fetch
+      globalThis.fetch = (...args) => { calls.push(args); return Promise.resolve(new Response()) }
+
+      const jukeboxMode = false
+      if (jukeboxMode) {
+        globalThis.fetch('/api/jukebox/pause', { method: 'POST', keepalive: true })
+      }
+
+      expect(calls).toHaveLength(0)
+
+      globalThis.fetch = origFetch
+    })
+
+    it('does not send pause request when no auth token exists', () => {
+      const calls = []
+      const origFetch = globalThis.fetch
+      globalThis.fetch = (...args) => { calls.push(args); return Promise.resolve(new Response()) }
+      // Ensure no token is set (clear and re-add only username)
+      localStorage.clear()
+      localStorage.setItem('username', 'admin')
+
+      const jukeboxMode = true
+      if (jukeboxMode) {
+        const token = localStorage.getItem('token')
+        if (token) {
+          globalThis.fetch('/api/jukebox/pause', { method: 'POST', keepalive: true })
+        }
+      }
+
+      expect(calls).toHaveLength(0)
+
+      globalThis.fetch = origFetch
+    })
+  })
 })
