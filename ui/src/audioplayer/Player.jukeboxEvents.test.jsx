@@ -171,4 +171,45 @@ describe('Jukebox visibility guard logic', () => {
       globalThis.fetch = origFetch
     })
   })
+
+  describe('beforeunload guard', () => {
+    const shouldPreventUnload = ({ jukeboxMode, currentUuid, audioPaused }) => {
+      if (jukeboxMode) {
+        return !!currentUuid
+      }
+      return !!(currentUuid && !audioPaused)
+    }
+
+    it('prevents unload in jukebox mode when a track is loaded', () => {
+      expect(shouldPreventUnload({
+        jukeboxMode: true,
+        currentUuid: 'some-uuid',
+        audioPaused: true,
+      })).toBe(true)
+    })
+
+    it('does not prevent unload in jukebox mode when no track is loaded', () => {
+      expect(shouldPreventUnload({
+        jukeboxMode: true,
+        currentUuid: undefined,
+        audioPaused: true,
+      })).toBe(false)
+    })
+
+    it('prevents unload in local mode when audio is playing', () => {
+      expect(shouldPreventUnload({
+        jukeboxMode: false,
+        currentUuid: 'some-uuid',
+        audioPaused: false,
+      })).toBe(true)
+    })
+
+    it('does not prevent unload in local mode when audio is paused', () => {
+      expect(shouldPreventUnload({
+        jukeboxMode: false,
+        currentUuid: 'some-uuid',
+        audioPaused: true,
+      })).toBe(false)
+    })
+  })
 })
