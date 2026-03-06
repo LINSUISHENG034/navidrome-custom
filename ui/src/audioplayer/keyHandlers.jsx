@@ -1,4 +1,5 @@
 import jukeboxClient from './jukeboxClient'
+import { clamp01 } from './volumeMapping'
 
 const keyHandlers = (audioInstance, playerState) => {
   const nextSong = () => {
@@ -34,7 +35,7 @@ const keyHandlers = (audioInstance, playerState) => {
     VOL_UP: () => {
       if (isJukebox) {
         const current = playerState.jukeboxStatus?.gain ?? 0.5
-        jukeboxClient.volume(Math.min(1, current + 0.1)).catch(() => {})
+        jukeboxClient.volume(clamp01(current + 0.1)).catch(() => {})
       } else {
         audioInstance.volume = Math.min(1, audioInstance.volume + 0.1)
       }
@@ -42,7 +43,7 @@ const keyHandlers = (audioInstance, playerState) => {
     VOL_DOWN: () => {
       if (isJukebox) {
         const current = playerState.jukeboxStatus?.gain ?? 0.5
-        jukeboxClient.volume(Math.max(0, current - 0.1)).catch(() => {})
+        jukeboxClient.volume(clamp01(current - 0.1)).catch(() => {})
       } else {
         audioInstance.volume = Math.max(0, audioInstance.volume - 0.1)
       }

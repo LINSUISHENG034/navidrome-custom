@@ -122,27 +122,3 @@ export const syncJukeboxSeek = async (client, audioInfo = {}) => {
   await client.seek(toSeconds(audioInfo?.currentTime))
 }
 
-/**
- * Guard flag: true while we are programmatically pausing browser audio
- * to prevent the pause event from propagating to jukeboxClient.pause().
- */
-let _jukeboxEnforcingPause = false
-
-export const isJukeboxEnforcingPause = () => _jukeboxEnforcingPause
-
-/**
- * In Jukebox mode, pause the browser audio element entirely.
- * Sets a guard flag so that the resulting 'pause' event does not
- * trigger jukeboxClient.pause() in the onAudioPause callback.
- * When leaving Jukebox mode, caller is responsible for resuming.
- */
-export const enforceBrowserAudioPause = (audioInstance, jukeboxMode) => {
-  if (!audioInstance) return
-  if (jukeboxMode && !audioInstance.paused) {
-    _jukeboxEnforcingPause = true
-    audioInstance.pause()
-    Promise.resolve().then(() => {
-      _jukeboxEnforcingPause = false
-    })
-  }
-}

@@ -22,7 +22,7 @@ func (api *Router) addJukeboxControlRoute(r chi.Router) {
 	r.Post("/jukebox/set", api.jukeboxSet)
 	r.Post("/jukebox/start", api.jukeboxStart)
 	r.Post("/jukebox/play", api.jukeboxStart)
-	r.Post("/jukebox/stop", api.jukeboxStop)
+	r.Post("/jukebox/stop", api.jukeboxShutdown)
 	r.Post("/jukebox/pause", api.jukeboxStop)
 	r.Post("/jukebox/skip", api.jukeboxSkip)
 	r.Post("/jukebox/seek", api.jukeboxSeek)
@@ -108,6 +108,21 @@ func (api *Router) jukeboxStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status, err := pb.Stop(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	api.writeJukeboxJSON(w, r, toStatusResponse(status))
+}
+
+func (api *Router) jukeboxShutdown(w http.ResponseWriter, r *http.Request) {
+	user, _ := request.UserFrom(r.Context())
+	pb, err := api.playback.GetDeviceForUser(user.UserName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	status, err := pb.Shutdown(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
