@@ -15,6 +15,7 @@ import {
   PLAYER_SET_AUDIO_INSTANCE,
 } from '../actions'
 import config from '../config'
+import { audioVolumeToUiVolume } from '../audioplayer/volumeMapping'
 
 const initialState = {
   queue: [],
@@ -230,6 +231,9 @@ export const playerReducer = (previousState = initialState, payload) => {
       return {
         ...previousState,
         jukeboxStatus: payload.data,
+        volume: previousState.jukeboxMode
+          ? audioVolumeToUiVolume(payload.data.gain)
+          : previousState.volume,
       }
     case PLAYER_SET_AUDIO_INSTANCE:
       return {

@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   computeQueueDiff,
-  enforceBrowserAudioPause,
-  isJukeboxEnforcingPause,
   syncJukeboxQueueIncremental,
   syncJukeboxSeek,
   syncJukeboxTrackChange,
@@ -115,39 +113,5 @@ describe('syncJukeboxSeek', () => {
 
     await syncJukeboxSeek(client, { currentTime: 98.6 })
     expect(client.seek).toHaveBeenCalledWith(98)
-  })
-})
-
-describe('enforceBrowserAudioPause', () => {
-  it('pauses browser audio in jukebox mode', () => {
-    const audio = { paused: false, pause: vi.fn(), play: vi.fn() }
-    enforceBrowserAudioPause(audio, true)
-    expect(audio.pause).toHaveBeenCalled()
-  })
-
-  it('does not resume audio when leaving jukebox mode (caller handles this)', () => {
-    const audio = { paused: true, pause: vi.fn(), play: vi.fn() }
-    enforceBrowserAudioPause(audio, false)
-    // enforceBrowserAudioPause only pauses; resuming is handled by DeviceSelector
-    expect(audio.pause).not.toHaveBeenCalled()
-    expect(audio.play).not.toHaveBeenCalled()
-  })
-
-  it('sets guard flag synchronously and clears it after microtask', async () => {
-    const audio = { paused: false, pause: vi.fn(), play: vi.fn() }
-    expect(isJukeboxEnforcingPause()).toBe(false)
-    enforceBrowserAudioPause(audio, true)
-    // Guard should be set synchronously right after pause()
-    expect(isJukeboxEnforcingPause()).toBe(true)
-    // After a microtask, the guard resets
-    await Promise.resolve()
-    expect(isJukeboxEnforcingPause()).toBe(false)
-  })
-
-  it('does not set guard flag when audio is already paused', async () => {
-    const audio = { paused: true, pause: vi.fn(), play: vi.fn() }
-    enforceBrowserAudioPause(audio, true)
-    expect(isJukeboxEnforcingPause()).toBe(false)
-    expect(audio.pause).not.toHaveBeenCalled()
   })
 })

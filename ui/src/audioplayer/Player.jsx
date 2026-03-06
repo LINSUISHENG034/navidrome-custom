@@ -35,12 +35,14 @@ import keyHandlers from './keyHandlers'
 import { calculateGain } from '../utils/calculateReplayGain'
 import jukeboxClient from './jukeboxClient'
 import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
+import { shouldForwardJukeboxMediaEvent } from './jukeboxLifecycle'
 import {
   computeQueueDiff,
   syncJukeboxQueueIncremental,
   syncJukeboxSeek,
   syncJukeboxTrackChange,
 } from './jukeboxSync'
+import { audioVolumeToUiVolume, clamp01 } from './volumeMapping'
 
 const Player = () => {
   const theme = useCurrentTheme()
@@ -251,13 +253,12 @@ const Player = () => {
   )
 
   const onAudioVolumeChange = useCallback(
-    // sqrt to compensate for the logarithmic volume
     (volume) => {
-      dispatch(setVolume(Math.sqrt(volume)))
+      dispatch(setVolume(audioVolumeToUiVolume(volume)))
       if (playerState.jukeboxMode) {
-        enqueueJukeboxCommand(() => jukeboxClient.volume(volume)).catch(
-          () => {},
-        )
+        enqueueJukeboxCommand(() =>
+          jukeboxClient.volume(clamp01(volume)),
+        ).catch(() => {})
       }
     },
     [dispatch, playerState.jukeboxMode],
@@ -267,10 +268,12 @@ const Player = () => {
     (info) => {
       if (playerState.jukeboxMode) {
         if (audioInstance) audioInstance.muted = true
-        // Only forward play to Jukebox when the tab is visible.
-        // When the tab becomes visible, the browser may auto-resume audio —
-        // this is NOT a user-initiated play and must not restart the Jukebox.
-        if (!document.hidden) {
+        if (
+          shouldForwardJukeboxMediaEvent({
+            jukeboxMode: playerState.jukeboxMode,
+            hidden: document.hidden,
+          })
+        ) {
           enqueueJukeboxCommand(() => jukeboxClient.play()).catch(() => {})
         }
       }
@@ -343,10 +346,12 @@ const Player = () => {
   const onAudioPause = useCallback(
     (info) => {
       dispatch(currentPlaying(info))
-      // Only forward pause to Jukebox when the tab is visible.
-      // When hidden, the browser may auto-pause muted audio for power saving —
-      // this is NOT a user-initiated pause and must not stop the Jukebox.
-      if (playerState.jukeboxMode && !document.hidden) {
+      if (
+        shouldForwardJukeboxMediaEvent({
+          jukeboxMode: playerState.jukeboxMode,
+          hidden: document.hidden,
+        })
+      ) {
         enqueueJukeboxCommand(() => jukeboxClient.pause()).catch(() => {})
       }
     },
@@ -432,7 +437,7 @@ const Player = () => {
       if (!playerState.jukeboxMode) return
       const token = localStorage.getItem('token')
       if (!token) return
-      fetch(baseUrl('/api/jukebox/pause'), {
+      fetch(baseUrl('/api/jukebox/stop'), {
         method: 'POST',
         headers: {
           'X-ND-Authorization': `Bearer ${token}`,

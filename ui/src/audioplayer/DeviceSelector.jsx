@@ -17,6 +17,8 @@ import httpClient from '../dataProvider/httpClient'
 import jukeboxClient from './jukeboxClient'
 import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
 import bluetoothClient from './bluetoothClient'
+import { suppressJukeboxMediaEvents } from './jukeboxLifecycle'
+import { clamp01 } from './volumeMapping'
 import { setJukeboxMode } from '../actions'
 import { useNotify } from 'react-admin'
 
@@ -100,11 +102,13 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
           if (isLocalDevice) {
             // Switching back to local browser playback
             enqueueJukeboxCommand(() => jukeboxClient.stop()).catch(() => {})
+            dispatch(setJukeboxMode(false))
             if (audioInstance) {
               audioInstance.muted = false
-              audioInstance.play().catch(() => {})
+              if (audioInstance.paused) {
+                audioInstance.play().catch(() => {})
+              }
             }
-            dispatch(setJukeboxMode(false))
           } else {
             // Switching to remote device — enter Jukebox mode
             const trackIds = playerState.queue.map((item) => item.trackId)
@@ -112,10 +116,14 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
             const currentTime = audioInstance
               ? Math.floor(audioInstance.currentTime || 0)
               : 0
+            const currentGain = audioInstance
+              ? clamp01(audioInstance.volume)
+              : 1
 
-            // Fully pause browser audio — no more silent streaming
+            // Mute browser audio — keeps element "playing" so UI stays correct
             if (audioInstance) {
-              audioInstance.pause()
+              suppressJukeboxMediaEvents()
+              audioInstance.muted = true
             }
 
             if (trackIds.length > 0) {
@@ -123,6 +131,7 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
                 jukeboxClient
                   .set(trackIds)
                   .then(() => jukeboxClient.skip(currentIndex, currentTime))
+                  .then(() => jukeboxClient.volume(currentGain))
                   .then(() => jukeboxClient.play()),
               ).catch(() => {
                 notify('Failed to start playback on remote device', 'warning')

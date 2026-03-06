@@ -25,6 +25,7 @@ vi.mock('./jukeboxClient', () => ({
   default: {
     set: vi.fn(() => Promise.resolve({})),
     skip: vi.fn(() => Promise.resolve({})),
+    volume: vi.fn(() => Promise.resolve({})),
     play: vi.fn(() => Promise.resolve({})),
     start: vi.fn(() => Promise.resolve({})),
     stop: vi.fn(() => Promise.resolve({})),
@@ -35,6 +36,7 @@ const dispatchMock = vi.fn()
 const audioInstanceMock = {
   paused: true,
   muted: false,
+  volume: 1,
   play: vi.fn(() => Promise.resolve()),
   pause: vi.fn(),
   currentTime: 0,
@@ -58,6 +60,7 @@ describe('<DeviceSelector />', () => {
     vi.clearAllMocks()
     audioInstanceMock.paused = true
     audioInstanceMock.muted = false
+    audioInstanceMock.volume = 1
     playerStateMock.queue = []
     playerStateMock.savedPlayIndex = 0
 
@@ -115,9 +118,10 @@ describe('<DeviceSelector />', () => {
     })
   })
 
-  it('pauses browser audio when switching to a bluetooth jukebox device', async () => {
+  it('mutes browser audio when switching to a bluetooth jukebox device', async () => {
     playerStateMock.queue = [{ trackId: 't1' }]
     audioInstanceMock.paused = false
+    audioInstanceMock.volume = 0.36
     audioInstanceMock.currentTime = 42
 
     render(<DeviceSelector isDesktop buttonClass="" />)
@@ -140,8 +144,15 @@ describe('<DeviceSelector />', () => {
     })
 
     await waitFor(() => {
-      expect(audioInstanceMock.pause).toHaveBeenCalled()
+      expect(audioInstanceMock.muted).toBe(true)
+      expect(audioInstanceMock.pause).not.toHaveBeenCalled()
       expect(jukeboxClient.set).toHaveBeenCalledWith(['t1'])
+      expect(jukeboxClient.skip).toHaveBeenCalledWith(0, 42)
+      expect(jukeboxClient.volume).toHaveBeenCalledWith(0.36)
+      expect(jukeboxClient.play).toHaveBeenCalled()
+      expect(jukeboxClient.volume.mock.invocationCallOrder[0]).toBeLessThan(
+        jukeboxClient.play.mock.invocationCallOrder[0],
+      )
     })
   })
 

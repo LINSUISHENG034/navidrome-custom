@@ -152,6 +152,12 @@ func (pd *playbackDevice) Stop(ctx context.Context) (DeviceStatus, error) {
 	return pd.stopLocked(ctx)
 }
 
+func (pd *playbackDevice) Shutdown(ctx context.Context) (DeviceStatus, error) {
+	pd.mu.Lock()
+	defer pd.mu.Unlock()
+	return pd.shutdownLocked(ctx)
+}
+
 // stopLocked contains the Stop logic and must be called with pd.mu held.
 func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, error) {
 	log.Debug(ctx, "Processing Stop action", "device", pd)
@@ -161,10 +167,27 @@ func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, error) 
 	return pd.getStatus(), nil
 }
 
+func (pd *playbackDevice) shutdownLocked(ctx context.Context) (DeviceStatus, error) {
+	log.Debug(ctx, "Processing Shutdown action", "device", pd)
+	if pd.ActiveTrack != nil {
+		pd.ActiveTrack.Pause()
+		pd.ActiveTrack.Close()
+		pd.ActiveTrack = nil
+	}
+	return pd.getStatus(), nil
+}
+
 func (pd *playbackDevice) Skip(ctx context.Context, index int, offset int) (DeviceStatus, error) {
 	pd.mu.Lock()
 	defer pd.mu.Unlock()
 	log.Debug(ctx, "Processing Skip action", "index", index, "offset", offset, "device", pd)
+
+	// Skip is a no-op if already playing the requested track at offset 0.
+	// This prevents the browser's auto-advance onAudioPlayTrackChange from
+	// resetting the jukebox position after trackSwitcherGoroutine already advanced.
+	if index == pd.PlaybackQueue.Index && offset == 0 && pd.ActiveTrack != nil && pd.isPlaying() {
+		return pd.getStatus(), nil
+	}
 
 	wasPlaying := pd.isPlaying()
 

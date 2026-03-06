@@ -15,6 +15,11 @@ vi.mock('./jukeboxCommandQueue', () => ({
 
 import jukeboxClient from './jukeboxClient'
 import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
+import {
+  shouldForwardJukeboxMediaEvent,
+  suppressJukeboxMediaEvents,
+  resetJukeboxMediaEventSuppression,
+} from './jukeboxLifecycle'
 
 describe('Jukebox visibility guard logic', () => {
   let originalHidden
@@ -22,6 +27,7 @@ describe('Jukebox visibility guard logic', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     originalHidden = Object.getOwnPropertyDescriptor(document, 'hidden')
+    resetJukeboxMediaEventSuppression()
   })
 
   afterEach(() => {
@@ -37,7 +43,12 @@ describe('Jukebox visibility guard logic', () => {
 
   describe('onAudioPause guard', () => {
     const simulateOnAudioPause = (jukeboxMode) => {
-      if (jukeboxMode && !document.hidden) {
+      if (
+        shouldForwardJukeboxMediaEvent({
+          jukeboxMode,
+          hidden: document.hidden,
+        })
+      ) {
         enqueueJukeboxCommand(() => jukeboxClient.pause())
       }
     }
@@ -72,7 +83,12 @@ describe('Jukebox visibility guard logic', () => {
 
   describe('onAudioPlay guard', () => {
     const simulateOnAudioPlay = (jukeboxMode) => {
-      if (jukeboxMode && !document.hidden) {
+      if (
+        shouldForwardJukeboxMediaEvent({
+          jukeboxMode,
+          hidden: document.hidden,
+        })
+      ) {
         enqueueJukeboxCommand(() => jukeboxClient.play())
       }
     }
@@ -97,7 +113,7 @@ describe('Jukebox visibility guard logic', () => {
   })
 
   describe('pagehide cleanup', () => {
-    it('sends pause request with keepalive on pagehide in jukebox mode', () => {
+    it('sends stop request with keepalive on pagehide in jukebox mode', () => {
       const calls = []
       const origFetch = globalThis.fetch
       globalThis.fetch = (...args) => {
@@ -111,7 +127,7 @@ describe('Jukebox visibility guard logic', () => {
       if (jukeboxMode) {
         const token = localStorage.getItem('token')
         if (token) {
-          globalThis.fetch('/api/jukebox/pause', {
+          globalThis.fetch('/api/jukebox/stop', {
             method: 'POST',
             headers: {
               'X-ND-Authorization': `Bearer ${token}`,
@@ -123,7 +139,7 @@ describe('Jukebox visibility guard logic', () => {
       }
 
       expect(calls).toHaveLength(1)
-      expect(calls[0][0]).toBe('/api/jukebox/pause')
+      expect(calls[0][0]).toBe('/api/jukebox/stop')
       expect(calls[0][1]).toEqual({
         method: 'POST',
         headers: {
@@ -138,7 +154,7 @@ describe('Jukebox visibility guard logic', () => {
       localStorage.setItem('username', 'admin')
     })
 
-    it('does not send pause request on pagehide when not in jukebox mode', () => {
+    it('does not send stop request on pagehide when not in jukebox mode', () => {
       const calls = []
       const origFetch = globalThis.fetch
       globalThis.fetch = (...args) => {
@@ -159,7 +175,7 @@ describe('Jukebox visibility guard logic', () => {
       globalThis.fetch = origFetch
     })
 
-    it('does not send pause request when no auth token exists', () => {
+    it('does not send stop request when no auth token exists', () => {
       const calls = []
       const origFetch = globalThis.fetch
       globalThis.fetch = (...args) => {
@@ -184,6 +200,31 @@ describe('Jukebox visibility guard logic', () => {
       expect(calls).toHaveLength(0)
 
       globalThis.fetch = origFetch
+    })
+  })
+
+  describe('suppression window', () => {
+    it('suppresses visible-tab events during the temporary guard window', () => {
+      vi.useFakeTimers()
+      suppressJukeboxMediaEvents(500)
+
+      expect(
+        shouldForwardJukeboxMediaEvent({
+          jukeboxMode: true,
+          hidden: false,
+        }),
+      ).toBe(false)
+
+      vi.advanceTimersByTime(501)
+
+      expect(
+        shouldForwardJukeboxMediaEvent({
+          jukeboxMode: true,
+          hidden: false,
+        }),
+      ).toBe(true)
+
+      vi.useRealTimers()
     })
   })
 
