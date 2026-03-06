@@ -40,3 +40,5 @@ go.work*
 node_modules/
 docs/plans/
 CLAUDE.md
+
+.worktrees/
