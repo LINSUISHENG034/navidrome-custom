@@ -66,6 +66,24 @@ for [more contributors](https://www.navidrome.org/docs/developers/translations/)
 <img height="32" src="https://github.com/user-attachments/assets/c19b1d2b-01e1-4682-a007-12356c42147c">
 </a>
 
+## Local Docker Rebuild Workflow
+
+This repository includes a project-local `rebuild.sh` helper for rebuilding and restarting the custom Docker image used in local development.
+
+Typical usage:
+
+```bash
+./rebuild.sh
+```
+
+Practical notes:
+
+- The script builds `navidrome-bt:dev` with `docker buildx build --load`, so the image is immediately available to `docker compose up`.
+- The root `docker-compose.yml` is the primary local runtime definition. It already includes the Bluetooth/Jukebox-related PulseAudio, D-Bus, `/dev/snd`, `group_add: audio`, and `apparmor=unconfined` settings needed by this custom branch.
+- `contrib/docker-compose/docker-compose.bluetooth.yml` is now kept as a minimal tracked override so that layering it on top of the root compose file does not duplicate Bluetooth runtime options.
+- After rebuilding UI changes, unregister the browser Service Worker and hard-refresh (`Ctrl+Shift+R`), otherwise the old frontend bundle may still be served from cache.
+- If you recreate containers manually instead of using `rebuild.sh`, make sure you preserve all Bluetooth-related runtime options and mounts, especially PulseAudio and D-Bus bindings.
+
 ## Documentation
 All documentation can be found in the project's website: https://www.navidrome.org/docs. 
 Here are some useful direct links:
