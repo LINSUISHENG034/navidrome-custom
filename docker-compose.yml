@@ -1,0 +1,28 @@
+services:
+  navidrome:
+    image: navidrome-bt:dev
+    container_name: navidrome
+    ports:
+      - "4538:4533"
+    volumes:
+      - ./data:/data
+      - /mnt/sda3/Music:/music:ro
+      - /run/user/1000/pulse/native:/run/user/1000/pulse/native
+      - /run/dbus:/run/dbus
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
+      - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+    environment:
+      - ND_ENABLETRANSCODINGCONFIG=true
+      - ND_TRANSCODINGCACHESIZE=100MB
+      - ND_JUKEBOX_ENABLED=true
+      - ND_JUKEBOX_AUTODISCOVERBLUETOOTH=true
+      - ND_JUKEBOX_BLUETOOTHMANAGEMENT=true
+      - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+    devices:
+      - /dev/snd:/dev/snd
+    security_opt:
+      - apparmor=unconfined
+    group_add:
+      - audio
+    restart: unless-stopped
