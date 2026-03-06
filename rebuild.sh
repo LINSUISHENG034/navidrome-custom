@@ -16,8 +16,15 @@ docker buildx build \
   --load \
   .
 
-echo "==> Restarting container..."
-docker compose down
+echo "==> Stopping and removing existing containers..."
+docker compose down --remove-orphans
+# Also remove any standalone container with the same project name
+CONTAINER_NAME="${COMPOSE_PROJECT_NAME:-$(basename "$(pwd)")}"
+if docker ps -aq --filter "name=${CONTAINER_NAME}" | grep -q .; then
+  docker rm -f $(docker ps -aq --filter "name=${CONTAINER_NAME}") 2>/dev/null || true
+fi
+
+echo "==> Starting container..."
 docker compose up -d
 
 echo "==> Done. Waiting for health..."
