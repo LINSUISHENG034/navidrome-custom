@@ -46,6 +46,7 @@ type configOptions struct {
 	EnableTranscodingCancellation   bool
 	EnableDownloads                 bool
 	EnableExternalServices          bool
+	EnableM3UExternalAlbumArt       bool
 	EnableInsightsCollector         bool
 	EnableMediaFileCoverArt         bool
 	TranscodingCacheSize            string
@@ -75,6 +76,7 @@ type configOptions struct {
 	EnableFavourites                bool
 	EnableStarRating                bool
 	EnableUserEditing               bool
+	EnableCoverArtUpload            bool
 	EnableSharing                   bool
 	ShareURL                        string
 	DefaultShareExpiration          time.Duration
@@ -130,7 +132,6 @@ type configOptions struct {
 	DevExternalScanner                bool
 	DevScannerThreads                 uint
 	DevSelectiveWatcher               bool
-	DevLegacyEmbedImage               bool
 	DevInsightsInitialDelay           time.Duration
 	DevEnablePlayerInsights           bool
 	DevEnablePluginsInsights          bool
@@ -305,6 +306,12 @@ func Load(noConfigDump bool) {
 		os.Exit(1)
 	}
 
+	err = os.MkdirAll(filepath.Join(Server.DataFolder, consts.ArtworkFolder), os.ModePerm)
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "FATAL: Error creating artwork path:", err)
+		os.Exit(1)
+	}
+
 	if Server.Plugins.Enabled {
 		if Server.Plugins.Folder == "" {
 			Server.Plugins.Folder = filepath.Join(Server.DataFolder, "plugins")
@@ -470,6 +477,7 @@ func parseIniFileConfiguration() {
 func disableExternalServices() {
 	log.Info("All external integrations are DISABLED!")
 	Server.EnableInsightsCollector = false
+	Server.EnableM3UExternalAlbumArt = false
 	Server.LastFM.Enabled = false
 	Server.Spotify.ID = ""
 	Server.Deezer.Enabled = false
@@ -634,6 +642,7 @@ func setViperDefaults() {
 	viper.SetDefault("smartPlaylistRefreshDelay", 5*time.Second)
 	viper.SetDefault("enabledownloads", true)
 	viper.SetDefault("enableexternalservices", true)
+	viper.SetDefault("enablem3uexternalalbumart", false)
 	viper.SetDefault("enablemediafilecoverart", true)
 	viper.SetDefault("autotranscodedownload", false)
 	viper.SetDefault("defaultdownsamplingformat", consts.DefaultDownsamplingFormat)
@@ -661,6 +670,7 @@ func setViperDefaults() {
 	viper.SetDefault("enablereplaygain", true)
 	viper.SetDefault("enablecoveranimation", true)
 	viper.SetDefault("enablenowplaying", true)
+	viper.SetDefault("enablecoverartupload", true)
 	viper.SetDefault("enablesharing", false)
 	viper.SetDefault("shareurl", "")
 	viper.SetDefault("defaultshareexpiration", 8760*time.Hour)
