@@ -89,19 +89,24 @@ func (sm *SessionManager) Heartbeat(sessionID, clientID string) error {
 }
 
 func (sm *SessionManager) Detach(sessionID, clientID string) error {
+	_, err := sm.DetachSnapshot(sessionID, clientID)
+	return err
+}
+
+func (sm *SessionManager) DetachSnapshot(sessionID, clientID string) (Session, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	session, ok := sm.sessions[sessionID]
 	if !ok {
-		return ErrSessionNotFound
+		return Session{}, ErrSessionNotFound
 	}
 	if session.OwnerClientID != clientID {
-		return ErrSessionOwnership
+		return Session{}, ErrSessionOwnership
 	}
 
 	delete(sm.sessions, sessionID)
-	return nil
+	return session, nil
 }
 
 func (sm *SessionManager) Get(sessionID string) (Session, bool) {

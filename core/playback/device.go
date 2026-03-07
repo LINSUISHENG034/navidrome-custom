@@ -31,6 +31,7 @@ type playbackDevice struct {
 	Name                 string
 	DeviceName           string
 	PlaybackQueue        *Queue
+	queueVersion         int
 	Gain                 float32
 	PlaybackDone         chan bool
 	ActiveTrack          Track
@@ -43,6 +44,7 @@ type DeviceStatus struct {
 	Playing      bool
 	Gain         float32
 	Position     int
+	QueueVersion int
 }
 
 const DefaultGain float32 = 1.0
@@ -67,6 +69,10 @@ func (pd *playbackDevice) stateChangeNotifierLocked() func() {
 	}
 }
 
+func (pd *playbackDevice) incrementQueueVersionLocked() {
+	pd.queueVersion++
+}
+
 func (pd *playbackDevice) getStatus() DeviceStatus {
 	pos := 0
 	if pd.ActiveTrack != nil {
@@ -77,6 +83,7 @@ func (pd *playbackDevice) getStatus() DeviceStatus {
 		Playing:      pd.isPlaying(),
 		Gain:         pd.Gain,
 		Position:     pos,
+		QueueVersion: pd.queueVersion,
 	}
 }
 
@@ -119,10 +126,15 @@ func (pd *playbackDevice) Set(ctx context.Context, ids []string) (DeviceStatus, 
 	pd.mu.Lock()
 	log.Debug(ctx, "Processing Set action", "ids", ids, "device", pd)
 
+	queueChanged := !pd.PlaybackQueue.IsEmpty() || len(ids) > 0
 	pd.clearLocked(ctx)
 	status, err := pd.addLocked(ctx, ids)
+	if err == nil && queueChanged {
+		pd.incrementQueueVersionLocked()
+		status = pd.getStatus()
+	}
 	notify := pd.stateChangeNotifierLocked()
-	if err != nil {
+	if err != nil || !queueChanged {
 		notify = nil
 	}
 	pd.mu.Unlock()
@@ -292,6 +304,10 @@ func (pd *playbackDevice) skipLocked(ctx context.Context, index int, offset int)
 func (pd *playbackDevice) Add(ctx context.Context, ids []string) (DeviceStatus, error) {
 	pd.mu.Lock()
 	status, err := pd.addLocked(ctx, ids)
+	if err == nil && len(ids) > 0 {
+		pd.incrementQueueVersionLocked()
+		status = pd.getStatus()
+	}
 	notify := pd.stateChangeNotifierLocked()
 	if err != nil || len(ids) == 0 {
 		notify = nil
@@ -304,6 +320,10 @@ func (pd *playbackDevice) Add(ctx context.Context, ids []string) (DeviceStatus, 
 func (pd *playbackDevice) Insert(ctx context.Context, index int, ids []string) (DeviceStatus, error) {
 	pd.mu.Lock()
 	status, err := pd.insertLocked(ctx, index, ids)
+	if err == nil && len(ids) > 0 {
+		pd.incrementQueueVersionLocked()
+		status = pd.getStatus()
+	}
 	notify := pd.stateChangeNotifierLocked()
 	if err != nil || len(ids) == 0 {
 		notify = nil
@@ -357,7 +377,11 @@ func (pd *playbackDevice) insertLocked(ctx context.Context, index int, ids []str
 func (pd *playbackDevice) Clear(ctx context.Context) (DeviceStatus, error) {
 	pd.mu.Lock()
 	changed := pd.ActiveTrack != nil || !pd.PlaybackQueue.IsEmpty()
+	queueChanged := !pd.PlaybackQueue.IsEmpty()
 	pd.clearLocked(ctx)
+	if queueChanged {
+		pd.incrementQueueVersionLocked()
+	}
 	status := pd.getStatus()
 	notify := pd.stateChangeNotifierLocked()
 	if !changed {
@@ -392,6 +416,7 @@ func (pd *playbackDevice) Remove(ctx context.Context, index int) (DeviceStatus, 
 
 	if index > -1 && index < pd.PlaybackQueue.Size() {
 		pd.PlaybackQueue.Remove(index)
+		pd.incrementQueueVersionLocked()
 	} else {
 		log.Error(ctx, "Index to remove out of range: "+fmt.Sprint(index))
 	}
@@ -416,6 +441,7 @@ func (pd *playbackDevice) Move(ctx context.Context, fromIndex, toIndex int) (Dev
 	}
 
 	pd.PlaybackQueue.Move(fromIndex, toIndex)
+	pd.incrementQueueVersionLocked()
 	status := pd.getStatus()
 	notify := pd.stateChangeNotifierLocked()
 	pd.mu.Unlock()
@@ -429,6 +455,7 @@ func (pd *playbackDevice) Shuffle(ctx context.Context) (DeviceStatus, error) {
 	changed := pd.PlaybackQueue.Size() > 1
 	if pd.PlaybackQueue.Size() > 1 {
 		pd.PlaybackQueue.Shuffle()
+		pd.incrementQueueVersionLocked()
 	}
 	status := pd.getStatus()
 	notify := pd.stateChangeNotifierLocked()

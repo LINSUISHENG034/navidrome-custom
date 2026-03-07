@@ -17,10 +17,12 @@ type jukeboxSessionRequest struct {
 }
 
 func (api *Router) addJukeboxSessionRoute(r chi.Router) {
-	r.Post("/jukebox/session/attach", api.jukeboxSessionAttach)
-	r.Post("/jukebox/session/heartbeat", api.jukeboxSessionHeartbeat)
-	r.Post("/jukebox/session/detach", api.jukeboxSessionDetach)
-	r.Get("/jukebox/session/status", api.jukeboxSessionStatus)
+	r.Route("/jukebox/session", func(r chi.Router) {
+		r.Post("/attach", api.jukeboxSessionAttach)
+		r.Post("/heartbeat", api.jukeboxSessionHeartbeat)
+		r.Post("/detach", api.jukeboxSessionDetach)
+		r.Get("/status", api.jukeboxSessionStatus)
+	})
 }
 
 func (api *Router) jukeboxSessionAttach(w http.ResponseWriter, r *http.Request) {
@@ -80,16 +82,13 @@ func (api *Router) jukeboxSessionDetach(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := api.playback.DetachSession(r.Context(), req.SessionID, req.ClientID); err != nil {
+	status, err := api.playback.DetachSession(r.Context(), req.SessionID, req.ClientID)
+	if err != nil {
 		api.writeJukeboxSessionError(w, err)
 		return
 	}
 
-	api.writeJukeboxJSON(w, r, playback.SessionStatus{
-		SessionID:     req.SessionID,
-		OwnerClientID: req.ClientID,
-		Attached:      false,
-	})
+	api.writeJukeboxJSON(w, r, status)
 }
 
 func (api *Router) jukeboxSessionStatus(w http.ResponseWriter, r *http.Request) {

@@ -28,7 +28,7 @@ type PlaybackServer interface {
 	RefreshDevices(ctx context.Context) error
 	AttachSession(ctx context.Context, req AttachRequest) (SessionStatus, error)
 	HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
-	DetachSession(ctx context.Context, sessionID, clientID string) error
+	DetachSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
 	SessionStatus(ctx context.Context, sessionID string) (SessionStatus, error)
 }
 
@@ -102,7 +102,7 @@ func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 	status.Playing = deviceStatus.Playing
 	status.Position = deviceStatus.Position
 	status.Gain = deviceStatus.Gain
-	status.QueueVersion = device.PlaybackQueue.Size()
+	status.QueueVersion = device.queueVersion
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
 	}
@@ -130,8 +130,14 @@ func (ps *playbackServer) HeartbeatSession(ctx context.Context, sessionID, clien
 	return ps.SessionStatus(ctx, sessionID)
 }
 
-func (ps *playbackServer) DetachSession(_ context.Context, sessionID, clientID string) error {
-	return ps.ensureSessionManager().Detach(sessionID, clientID)
+func (ps *playbackServer) DetachSession(_ context.Context, sessionID, clientID string) (SessionStatus, error) {
+	session, err := ps.ensureSessionManager().DetachSnapshot(sessionID, clientID)
+	if err != nil {
+		return SessionStatus{}, err
+	}
+	status := ps.statusFromSession(session)
+	status.Attached = false
+	return status, nil
 }
 
 func (ps *playbackServer) SessionStatus(_ context.Context, sessionID string) (SessionStatus, error) {

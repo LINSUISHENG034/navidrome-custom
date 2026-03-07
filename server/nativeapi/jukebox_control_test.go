@@ -75,6 +75,6 @@ func TestJukeboxSessionPlaybackAPIsCompile(t *testing.T) {
 
 	_, _ = api.playback.AttachSession(context.Background(), playback.AttachRequest{SessionID: "s1", ClientID: "tab-1"})
 	_, _ = api.playback.HeartbeatSession(context.Background(), "s1", "tab-1")
-	_ = api.playback.DetachSession(context.Background(), "s1", "tab-1")
+	_, _ = api.playback.DetachSession(context.Background(), "s1", "tab-1")
 	_, _ = api.playback.SessionStatus(context.Background(), "s1")
 }
