@@ -26,6 +26,10 @@ type PlaybackServer interface {
 	ListDevices() []DeviceInfo
 	SwitchDevice(ctx context.Context, deviceName string) error
 	RefreshDevices(ctx context.Context) error
+	AttachSession(ctx context.Context, req AttachRequest) (SessionStatus, error)
+	HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
+	DetachSession(ctx context.Context, sessionID, clientID string) error
+	SessionStatus(ctx context.Context, sessionID string) (SessionStatus, error)
 }
 
 // DeviceInfo represents an audio output device exposed via the API.
@@ -54,6 +58,87 @@ func (ps *playbackServer) newPlaybackDevice(ctx context.Context, name string, de
 		}
 	}
 	return device
+}
+
+func (ps *playbackServer) ensureSessionManager() *SessionManager {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.sessionManager == nil {
+		ps.sessionManager = NewSessionManager(defaultSessionTTL)
+	}
+	return ps.sessionManager
+}
+
+func (ps *playbackServer) getDeviceByName(deviceName string) *playbackDevice {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	for idx := range ps.playbackDevices {
+		if ps.playbackDevices[idx].DeviceName == deviceName {
+			return &ps.playbackDevices[idx]
+		}
+	}
+	return nil
+}
+
+func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
+	status := SessionStatus{
+		SessionID:     session.SessionID,
+		DeviceName:    session.DeviceName,
+		OwnerClientID: session.OwnerClientID,
+		Attached:      true,
+		LastHeartbeat: session.LastHeartbeat,
+	}
+
+	device := ps.getDeviceByName(session.DeviceName)
+	if device == nil {
+		return status
+	}
+
+	device.mu.Lock()
+	defer device.mu.Unlock()
+
+	deviceStatus := device.getStatus()
+	status.CurrentIndex = deviceStatus.CurrentIndex
+	status.Playing = deviceStatus.Playing
+	status.Position = deviceStatus.Position
+	status.Gain = deviceStatus.Gain
+	if current := device.PlaybackQueue.Current(); current != nil {
+		status.TrackID = current.ID
+	}
+
+	return status
+}
+
+func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) (SessionStatus, error) {
+	if req.DeviceName == "" && req.User != "" {
+		device, err := ps.GetDeviceForUser(req.User)
+		if err != nil {
+			return SessionStatus{}, err
+		}
+		req.DeviceName = device.DeviceName
+	}
+
+	session := ps.ensureSessionManager().Attach(req)
+	return ps.statusFromSession(session), nil
+}
+
+func (ps *playbackServer) HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error) {
+	if err := ps.ensureSessionManager().Heartbeat(sessionID, clientID); err != nil {
+		return SessionStatus{}, err
+	}
+	return ps.SessionStatus(ctx, sessionID)
+}
+
+func (ps *playbackServer) DetachSession(_ context.Context, sessionID, clientID string) error {
+	return ps.ensureSessionManager().Detach(sessionID, clientID)
+}
+
+func (ps *playbackServer) SessionStatus(_ context.Context, sessionID string) (SessionStatus, error) {
+	session, ok := ps.ensureSessionManager().Get(sessionID)
+	if !ok {
+		return SessionStatus{}, ErrSessionNotFound
+	}
+	return ps.statusFromSession(session), nil
 }
 
 // playbackDeviceContext returns the long-lived playback service context when

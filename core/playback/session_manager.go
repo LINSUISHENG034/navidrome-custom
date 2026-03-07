@@ -27,6 +27,20 @@ type Session struct {
 	LastHeartbeat time.Time `json:"lastHeartbeat"`
 }
 
+type SessionStatus struct {
+	SessionID     string    `json:"sessionId"`
+	DeviceName    string    `json:"deviceName"`
+	OwnerClientID string    `json:"ownerClientId"`
+	CurrentIndex  int       `json:"currentIndex"`
+	TrackID       string    `json:"trackId"`
+	Playing       bool      `json:"playing"`
+	Position      int       `json:"position"`
+	Gain          float32   `json:"gain"`
+	Attached      bool      `json:"attached"`
+	QueueVersion  int       `json:"queueVersion"`
+	LastHeartbeat time.Time `json:"lastHeartbeat"`
+}
+
 type SessionManager struct {
 	mu       sync.RWMutex
 	ttl      time.Duration

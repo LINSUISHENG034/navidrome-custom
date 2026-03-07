@@ -1,10 +1,12 @@
 package nativeapi
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/navidrome/navidrome/core/playback"
 )
 
 func TestJukeboxControlAliases(t *testing.T) {
@@ -63,4 +65,16 @@ func TestJukeboxIncrementalRoutes(t *testing.T) {
 			t.Fatalf("missing expected route: %s", route)
 		}
 	}
+}
+
+func TestJukeboxSessionPlaybackAPIsCompile(t *testing.T) {
+	var api Router
+	if api.playback == nil {
+		return
+	}
+
+	_, _ = api.playback.AttachSession(context.Background(), playback.AttachRequest{SessionID: "s1", ClientID: "tab-1"})
+	_, _ = api.playback.HeartbeatSession(context.Background(), "s1", "tab-1")
+	_ = api.playback.DetachSession(context.Background(), "s1", "tab-1")
+	_, _ = api.playback.SessionStatus(context.Background(), "s1")
 }
