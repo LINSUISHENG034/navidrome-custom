@@ -3,7 +3,9 @@ package playback
 import (
 	"context"
 	"sync"
+	"testing"
 
+	"github.com/navidrome/navidrome/model"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -36,6 +38,31 @@ func (m *mockTrack) Close() {
 	m.closeCalls++
 }
 func (m *mockTrack) String() string { return "mockTrack" }
+
+func TestPlaybackDeviceInvokesStateChangeCallbackOnSkip(t *testing.T) {
+	called := make(chan DeviceStatus, 1)
+	pd := &playbackDevice{
+		PlaybackQueue: NewQueue(),
+		PlaybackDone:  make(chan bool, 1),
+		ActiveTrack:   &mockTrack{},
+		onStateChange: func(status DeviceStatus) { called <- status },
+	}
+	pd.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
+
+	status, err := pd.Skip(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatalf("skip failed: %v", err)
+	}
+
+	select {
+	case got := <-called:
+		if got != status {
+			t.Fatalf("expected callback status %#v, got %#v", status, got)
+		}
+	default:
+		t.Fatal("expected state change callback to be invoked")
+	}
+}
 
 var _ = Describe("playbackDevice concurrency", func() {
 	It("handles concurrent Status and Clear calls without panic", func() {

@@ -38,10 +38,21 @@ type DeviceInfo struct {
 }
 
 type playbackServer struct {
-	mu              sync.Mutex
-	ctx             *context.Context
-	datastore       model.DataStore
-	playbackDevices []playbackDevice
+	mu                  sync.Mutex
+	ctx                 *context.Context
+	datastore           model.DataStore
+	onDeviceStateChange func(*playbackDevice, DeviceStatus)
+	playbackDevices     []playbackDevice
+}
+
+func (ps *playbackServer) newPlaybackDevice(ctx context.Context, name string, deviceName string) *playbackDevice {
+	device := NewPlaybackDevice(ctx, ps, name, deviceName)
+	device.onStateChange = func(status DeviceStatus) {
+		if ps.onDeviceStateChange != nil {
+			ps.onDeviceStateChange(device, status)
+		}
+	}
+	return device
 }
 
 // playbackDeviceContext returns the long-lived playback service context when
@@ -141,7 +152,7 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 	if defaultDevice == "" {
 		// if there are no devices given and no default device, we create a synthetic device named "auto"
 		if len(devices) == 0 {
-			pbDevices[0] = *NewPlaybackDevice(ctx, ps, "auto", "auto")
+			pbDevices[0] = *ps.newPlaybackDevice(ctx, "auto", "auto")
 		}
 
 		// if there is but only one entry and no default given, just use that.
@@ -149,7 +160,7 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 			if len(devices[0]) != 2 {
 				return []playbackDevice{}, fmt.Errorf("audio device definition ought to contain 2 fields, found: %d ", len(devices[0]))
 			}
-			pbDevices[0] = *NewPlaybackDevice(ctx, ps, devices[0][0], devices[0][1])
+			pbDevices[0] = *ps.newPlaybackDevice(ctx, devices[0][0], devices[0][1])
 		}
 
 		if len(devices) > 1 {
@@ -165,7 +176,7 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 			return []playbackDevice{}, fmt.Errorf("audio device definition ought to contain 2 fields, found: %d ", len(audioDevice))
 		}
 
-		pbDevices[idx] = *NewPlaybackDevice(ctx, ps, audioDevice[0], audioDevice[1])
+		pbDevices[idx] = *ps.newPlaybackDevice(ctx, audioDevice[0], audioDevice[1])
 
 		if audioDevice[0] == defaultDevice {
 			pbDevices[idx].Default = true
@@ -224,7 +235,7 @@ func (ps *playbackServer) mergeBluetoothDevices(ctx context.Context) {
 		if ps.hasDeviceLocked(devName) {
 			continue
 		}
-		dev := NewPlaybackDevice(deviceCtx, ps, sink.FriendlyName(), devName)
+		dev := ps.newPlaybackDevice(deviceCtx, sink.FriendlyName(), devName)
 		ps.playbackDevices = append(ps.playbackDevices, *dev)
 		log.Info(ctx, "Discovered Bluetooth device", "name", sink.FriendlyName(), "device", devName)
 	}
