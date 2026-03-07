@@ -8,12 +8,29 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/navidrome/navidrome/core/playback"
 	"github.com/navidrome/navidrome/model/request"
+	serverevents "github.com/navidrome/navidrome/server/events"
 )
 
 type jukeboxSessionRequest struct {
 	SessionID  string `json:"sessionId"`
 	ClientID   string `json:"clientId"`
 	DeviceName string `json:"deviceName,omitempty"`
+}
+
+func publishJukeboxSessionEvent(r *http.Request, status playback.SessionStatus) {
+	serverevents.GetBroker().SendMessage(r.Context(), &serverevents.JukeboxStateUpdated{
+		SessionID:     status.SessionID,
+		DeviceName:    status.DeviceName,
+		OwnerClientID: status.OwnerClientID,
+		CurrentIndex:  status.CurrentIndex,
+		TrackID:       status.TrackID,
+		Playing:       status.Playing,
+		Position:      status.Position,
+		Gain:          status.Gain,
+		Attached:      status.Attached,
+		QueueVersion:  status.QueueVersion,
+		LastHeartbeat: status.LastHeartbeat,
+	})
 }
 
 func (api *Router) addJukeboxSessionRoute(r chi.Router) {
@@ -48,6 +65,7 @@ func (api *Router) jukeboxSessionAttach(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	publishJukeboxSessionEvent(r, status)
 	api.writeJukeboxJSON(w, r, status)
 }
 
@@ -68,6 +86,7 @@ func (api *Router) jukeboxSessionHeartbeat(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	publishJukeboxSessionEvent(r, status)
 	api.writeJukeboxJSON(w, r, status)
 }
 
@@ -88,6 +107,7 @@ func (api *Router) jukeboxSessionDetach(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	publishJukeboxSessionEvent(r, status)
 	api.writeJukeboxJSON(w, r, status)
 }
 

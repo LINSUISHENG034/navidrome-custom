@@ -3,6 +3,7 @@ package events
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"testing"
 )
 
 var _ = Describe("Events", func() {
@@ -44,3 +45,10 @@ var _ = Describe("Events", func() {
 		})
 	})
 })
+
+func TestJukeboxStateUpdatedEventName(t *testing.T) {
+	evt := &JukeboxStateUpdated{SessionID: "s1", CurrentIndex: 1, TrackID: "t2"}
+	if evt.Name(evt) != "jukeboxStateUpdated" {
+		t.Fatalf("unexpected name: %s", evt.Name(evt))
+	}
+}

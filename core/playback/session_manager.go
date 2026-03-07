@@ -117,6 +117,19 @@ func (sm *SessionManager) Get(sessionID string) (Session, bool) {
 	return session, ok
 }
 
+func (sm *SessionManager) FindByDevice(deviceName string) []Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	sessions := make([]Session, 0)
+	for _, session := range sm.sessions {
+		if session.DeviceName == deviceName {
+			sessions = append(sessions, session)
+		}
+	}
+	return sessions
+}
+
 func (sm *SessionManager) ReapExpired() []Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
