@@ -102,6 +102,7 @@ func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 	status.Playing = deviceStatus.Playing
 	status.Position = deviceStatus.Position
 	status.Gain = deviceStatus.Gain
+	status.QueueVersion = device.PlaybackQueue.Size()
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
 	}

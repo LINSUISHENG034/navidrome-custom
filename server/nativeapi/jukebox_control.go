@@ -41,7 +41,7 @@ func toStatusResponse(s playback.DeviceStatus) *jukeboxStatusResponse {
 	}
 }
 
-func (api *Router) writeJukeboxJSON(w http.ResponseWriter, r *http.Request, resp *jukeboxStatusResponse) {
+func (api *Router) writeJukeboxJSON(w http.ResponseWriter, r *http.Request, resp any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Error(r.Context(), "Error encoding jukebox status", err)
