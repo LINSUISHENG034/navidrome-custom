@@ -47,10 +47,10 @@ const jukeboxClient = {
       body: JSON.stringify({ gain }),
     }).then(({ json }) => json),
 
-  add: (ids) =>
+  add: (ids, index = null) =>
     httpClient('/api/jukebox/add', {
       method: 'POST',
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify(index === null ? { ids } : { ids, index }),
     }).then(({ json }) => json),
 
   remove: (index) =>

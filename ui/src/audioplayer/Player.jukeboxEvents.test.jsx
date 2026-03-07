@@ -6,6 +6,7 @@ vi.mock('./jukeboxClient', () => ({
     pause: vi.fn(() => Promise.resolve({})),
     status: vi.fn(() => Promise.resolve({ playing: true })),
     volume: vi.fn(() => Promise.resolve({})),
+    skip: vi.fn(() => Promise.resolve({})),
   },
 }))
 
@@ -20,6 +21,7 @@ import {
   suppressJukeboxMediaEvents,
   resetJukeboxMediaEventSuppression,
 } from './jukeboxLifecycle'
+import { syncJukeboxTrackChangeAfterQueueSync } from './jukeboxSync'
 
 describe('Jukebox visibility guard logic', () => {
   let originalHidden
@@ -225,6 +227,59 @@ describe('Jukebox visibility guard logic', () => {
       ).toBe(true)
 
       vi.useRealTimers()
+    })
+  })
+
+
+  describe('queue sync ordering', () => {
+    it('waits for pending queue sync before sending skip', async () => {
+      const calls = []
+      let resolveQueueSync
+      const pendingQueueSync = new Promise((resolve) => {
+        resolveQueueSync = () => {
+          calls.push('queue-sync')
+          resolve()
+        }
+      })
+
+      const trackChangePromise = syncJukeboxTrackChangeAfterQueueSync(
+        pendingQueueSync,
+        jukeboxClient,
+        {
+          audioLists: [
+            { uuid: 'u1', trackId: 't1' },
+            { uuid: 'u2', trackId: 't2' },
+          ],
+          playId: 'u2',
+          audioInfo: { currentTime: 9 },
+        },
+      )
+
+      await Promise.resolve()
+      expect(jukeboxClient.skip).not.toHaveBeenCalled()
+
+      resolveQueueSync()
+      await trackChangePromise
+
+      expect(jukeboxClient.skip).toHaveBeenCalledWith(1, 0)
+      expect(calls).toEqual(['queue-sync'])
+    })
+
+    it('does not forward stale previous-track time during queue-click switching', async () => {
+      await syncJukeboxTrackChangeAfterQueueSync(
+        Promise.resolve(),
+        jukeboxClient,
+        {
+          audioLists: [
+            { uuid: 'u1', trackId: 't1' },
+            { uuid: 'u2', trackId: 't2' },
+          ],
+          playId: 'u2',
+          audioInfo: { trackId: 't1', currentTime: 42 },
+        },
+      )
+
+      expect(jukeboxClient.skip).toHaveBeenCalledWith(1, 0)
     })
   })
 

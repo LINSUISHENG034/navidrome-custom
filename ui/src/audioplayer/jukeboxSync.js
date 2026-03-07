@@ -1,6 +1,15 @@
 const toTrackIds = (audioLists = []) =>
   audioLists.map((item) => item?.trackId).filter(Boolean)
 
+const toOccurrenceKeys = (trackIds = []) => {
+  const seen = new Map()
+  return trackIds.map((trackId) => {
+    const count = seen.get(trackId) || 0
+    seen.set(trackId, count + 1)
+    return `${trackId}#${count}`
+  })
+}
+
 const toSeconds = (value) => Math.max(0, Math.floor(Number(value) || 0))
 
 const resolvePlayIndex = ({ audioLists = [], playId, trackId }) => {
@@ -19,6 +28,22 @@ const resolvePlayIndex = ({ audioLists = [], playId, trackId }) => {
   return 0
 }
 
+const groupContiguousAdds = (added = []) => {
+  if (added.length === 0) return []
+
+  const groups = [{ ids: [added[0].trackId], index: added[0].index }]
+  for (let i = 1; i < added.length; i++) {
+    const current = added[i]
+    const prev = groups[groups.length - 1]
+    if (current.index === prev.index + prev.ids.length) {
+      prev.ids.push(current.trackId)
+      continue
+    }
+    groups.push({ ids: [current.trackId], index: current.index })
+  }
+  return groups
+}
+
 /**
  * Compute the diff between old and new queue.
  * Returns { added, removed, fullReplace, newTrackIds }.
@@ -30,7 +55,6 @@ export const computeQueueDiff = (oldQueue = [], newQueue = []) => {
   const oldIds = toTrackIds(oldQueue)
   const newIds = toTrackIds(newQueue)
 
-  // Fast path: identical
   if (
     oldIds.length === newIds.length &&
     oldIds.every((id, i) => id === newIds[i])
@@ -38,27 +62,27 @@ export const computeQueueDiff = (oldQueue = [], newQueue = []) => {
     return { added: [], removed: [], fullReplace: false }
   }
 
-  const oldSet = new Set(oldIds)
-  const newSet = new Set(newIds)
+  const oldKeys = toOccurrenceKeys(oldIds)
+  const newKeys = toOccurrenceKeys(newIds)
+  const oldSet = new Set(oldKeys)
+  const newSet = new Set(newKeys)
 
   const removed = []
-  for (let i = 0; i < oldIds.length; i++) {
-    if (!newSet.has(oldIds[i])) {
+  for (let i = 0; i < oldKeys.length; i++) {
+    if (!newSet.has(oldKeys[i])) {
       removed.push(i)
     }
   }
 
   const added = []
-  for (let i = 0; i < newIds.length; i++) {
-    if (!oldSet.has(newIds[i])) {
+  for (let i = 0; i < newKeys.length; i++) {
+    if (!oldSet.has(newKeys[i])) {
       added.push({ trackId: newIds[i], index: i })
     }
   }
 
-  // If there are only adds or only removes, use incremental.
-  // If both or if the remaining items changed order, fall back to full replace.
-  const remainingOld = oldIds.filter((id) => newSet.has(id))
-  const remainingNew = newIds.filter((id) => oldSet.has(id))
+  const remainingOld = oldKeys.filter((id) => newSet.has(id))
+  const remainingNew = newKeys.filter((id) => oldSet.has(id))
   const orderChanged =
     remainingOld.length !== remainingNew.length ||
     remainingOld.some((id, i) => id !== remainingNew[i])
@@ -78,23 +102,22 @@ export const syncJukeboxQueueIncremental = async (client, diff) => {
   if (!client) return
 
   if (diff.fullReplace) {
-    if (client.set && diff.newTrackIds?.length > 0) {
-      await client.set(diff.newTrackIds)
+    if (client.set) {
+      await client.set(diff.newTrackIds || [])
     }
     return
   }
 
-  // Remove in reverse order to keep indices valid
   if (client.remove) {
     for (const idx of [...diff.removed].reverse()) {
       await client.remove(idx)
     }
   }
 
-  // Add new tracks
   if (client.add && diff.added.length > 0) {
-    const ids = diff.added.map((item) => item.trackId)
-    await client.add(ids)
+    for (const group of groupContiguousAdds(diff.added)) {
+      await client.add(group.ids, group.index)
+    }
   }
 }
 
@@ -112,13 +135,20 @@ export const syncJukeboxTrackChange = async (
     playId,
     trackId: audioInfo?.trackId,
   })
-  const offset = toSeconds(audioInfo?.currentTime)
 
-  await client.skip(index, offset)
+  await client.skip(index, 0)
+}
+
+export const syncJukeboxTrackChangeAfterQueueSync = async (
+  pendingQueueSync,
+  client,
+  payload,
+) => {
+  await pendingQueueSync
+  return syncJukeboxTrackChange(client, payload)
 }
 
 export const syncJukeboxSeek = async (client, audioInfo = {}) => {
   if (!client?.seek) return
   await client.seek(toSeconds(audioInfo?.currentTime))
 }
-

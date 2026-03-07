@@ -40,9 +40,12 @@ import {
   computeQueueDiff,
   syncJukeboxQueueIncremental,
   syncJukeboxSeek,
-  syncJukeboxTrackChange,
+  syncJukeboxTrackChangeAfterQueueSync,
 } from './jukeboxSync'
 import { audioVolumeToUiVolume, clamp01 } from './volumeMapping'
+
+const snapshotQueue = (audioLists = []) =>
+  audioLists.map((item) => ({ ...item }))
 
 const Player = () => {
   const theme = useCurrentTheme()
@@ -56,6 +59,7 @@ const Player = () => {
   const [preloaded, setPreload] = useState(false)
   const [audioInstance, setAudioInstanceLocal] = useState(null)
   const prevQueueRef = useRef([])
+  const pendingQueueSyncRef = useRef(Promise.resolve())
 
   const handleAudioInstance = useCallback(
     (instance) => {
@@ -186,7 +190,7 @@ const Player = () => {
     const current = playerState.current || {}
     return {
       ...defaultOptions,
-      audioLists: playerState.queue.map((item) => item),
+      audioLists: snapshotQueue(playerState.queue),
       playIndex: playerState.playIndex,
       autoPlay: playerState.clear || playerState.playIndex === 0,
       clearPriorAudioLists: playerState.clear,
@@ -200,14 +204,17 @@ const Player = () => {
 
   const onAudioListsChange = useCallback(
     (_, audioLists, audioInfo) => {
-      dispatch(syncQueue(audioInfo, audioLists))
+      const queueSnapshot = snapshotQueue(audioLists)
+      dispatch(syncQueue(audioInfo, queueSnapshot))
       if (playerState.jukeboxMode) {
-        const diff = computeQueueDiff(prevQueueRef.current, audioLists)
-        enqueueJukeboxCommand(() =>
+        const diff = computeQueueDiff(prevQueueRef.current, queueSnapshot)
+        pendingQueueSyncRef.current = enqueueJukeboxCommand(() =>
           syncJukeboxQueueIncremental(jukeboxClient, diff),
         ).catch(() => {})
+      } else {
+        pendingQueueSyncRef.current = Promise.resolve()
       }
-      prevQueueRef.current = audioLists
+      prevQueueRef.current = queueSnapshot
     },
     [dispatch, playerState.jukeboxMode],
   )
@@ -332,11 +339,15 @@ const Player = () => {
       }
       if (playerState.jukeboxMode) {
         enqueueJukeboxCommand(() =>
-          syncJukeboxTrackChange(jukeboxClient, {
-            audioLists,
-            playId,
-            audioInfo: info,
-          }),
+          syncJukeboxTrackChangeAfterQueueSync(
+            pendingQueueSyncRef.current,
+            jukeboxClient,
+            {
+              audioLists,
+              playId,
+              audioInfo: info,
+            },
+          ),
         ).catch(() => {})
       }
     },

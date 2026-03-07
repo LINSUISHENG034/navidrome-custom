@@ -235,6 +235,12 @@ func (pd *playbackDevice) Add(ctx context.Context, ids []string) (DeviceStatus, 
 	return pd.addLocked(ctx, ids)
 }
 
+func (pd *playbackDevice) Insert(ctx context.Context, index int, ids []string) (DeviceStatus, error) {
+	pd.mu.Lock()
+	defer pd.mu.Unlock()
+	return pd.insertLocked(ctx, index, ids)
+}
+
 // addLocked contains the Add logic and must be called with pd.mu held.
 func (pd *playbackDevice) addLocked(ctx context.Context, ids []string) (DeviceStatus, error) {
 	log.Debug(ctx, "Processing Add action", "ids", ids, "device", pd)
@@ -254,6 +260,25 @@ func (pd *playbackDevice) addLocked(ctx context.Context, ids []string) (DeviceSt
 	}
 	pd.PlaybackQueue.Add(items)
 
+	return pd.getStatus(), nil
+}
+
+func (pd *playbackDevice) insertLocked(ctx context.Context, index int, ids []string) (DeviceStatus, error) {
+	log.Debug(ctx, "Processing Insert action", "ids", ids, "index", index, "device", pd)
+	if len(ids) < 1 {
+		return pd.getStatus(), nil
+	}
+
+	items := model.MediaFiles{}
+	for _, id := range ids {
+		mf, err := pd.ParentPlaybackServer.GetMediaFile(id)
+		if err != nil {
+			return DeviceStatus{}, err
+		}
+		log.Debug(ctx, "Found mediafile: "+mf.Path)
+		items = append(items, *mf)
+	}
+	pd.PlaybackQueue.Insert(index, items)
 	return pd.getStatus(), nil
 }
 
