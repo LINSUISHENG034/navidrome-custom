@@ -83,6 +83,34 @@ func (ps *playbackServer) publishJukeboxStateUpdates(device *playbackDevice) {
 	}
 }
 
+func (ps *playbackServer) reapExpiredSessions() {
+	if ps.sessionManager == nil {
+		return
+	}
+	for _, session := range ps.sessionManager.ReapExpired() {
+		if session.User == "" {
+			continue
+		}
+		status := ps.statusFromSession(session)
+		status.Attached = false
+		ps.getEventBroker().SendMessage(jukeboxTargetContext(session.User), NewJukeboxStateUpdatedEvent(status))
+	}
+}
+
+func (ps *playbackServer) monitorSessionExpiry(ctx context.Context) {
+	ticker := time.NewTicker(sessionReapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ps.reapExpiredSessions()
+		}
+	}
+}
+
 func (ps *playbackServer) ensureSessionManager() *SessionManager {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -215,6 +243,7 @@ func (ps *playbackServer) Run(ctx context.Context) error {
 	if conf.Server.Jukebox.AutoDiscoverBluetooth {
 		go ps.monitorBluetoothConnections(ctx)
 	}
+	go ps.monitorSessionExpiry(ctx)
 
 	<-ctx.Done()
 
@@ -223,6 +252,7 @@ func (ps *playbackServer) Run(ctx context.Context) error {
 }
 
 const btMonitorInterval = 10 * time.Second
+const sessionReapInterval = 15 * time.Second
 
 // monitorBluetoothConnections periodically checks whether Bluetooth sinks are still
 // available. If the active default device is a BT sink that has disappeared, playback

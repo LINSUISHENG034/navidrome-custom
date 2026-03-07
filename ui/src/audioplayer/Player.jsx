@@ -24,6 +24,7 @@ import {
   syncQueue,
   setAudioInstance as setAudioInstanceAction,
   updateJukeboxStatus,
+  updateJukeboxSessionStatus,
 } from '../actions'
 import PlayerToolbar from './PlayerToolbar'
 import { sendNotification } from '../utils'
@@ -51,6 +52,37 @@ import { audioVolumeToUiVolume, clamp01 } from './volumeMapping'
 
 const snapshotQueue = (audioLists = []) =>
   audioLists.map((item) => ({ ...item }))
+
+
+const JUKEBOX_HEARTBEAT_INTERVAL_MS = 15000
+const JUKEBOX_SESSION_ID_PREFIX = 'jukebox-session:'
+const JUKEBOX_CLIENT_ID_KEY = 'jukebox-client-id'
+
+const getJukeboxSessionId = () => {
+  const username = localStorage.getItem('username')
+  return username ? `${JUKEBOX_SESSION_ID_PREFIX}${username}` : null
+}
+
+const getOrCreateJukeboxClientId = () => {
+  const existing = sessionStorage.getItem(JUKEBOX_CLIENT_ID_KEY)
+  if (existing) return existing
+  const next =
+    globalThis.crypto?.randomUUID?.() ||
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  sessionStorage.setItem(JUKEBOX_CLIENT_ID_KEY, next)
+  return next
+}
+
+const startJukeboxHeartbeatLoop = ({
+  jukeboxMode,
+  sessionId,
+  clientId,
+  onHeartbeat,
+}) => {
+  if (!jukeboxMode || !sessionId || !clientId || !onHeartbeat) return () => {}
+  const interval = setInterval(onHeartbeat, JUKEBOX_HEARTBEAT_INTERVAL_MS)
+  return () => clearInterval(interval)
+}
 
 const syncRemotePositionIfNeeded = ({
   jukeboxMode,
@@ -452,6 +484,44 @@ const Player = () => {
     }
   }, [isMobilePlayer, audioInstance])
 
+  useEffect(() => {
+    if (!playerState.jukeboxMode) return
+
+    const sessionId = getJukeboxSessionId()
+    const clientId = getOrCreateJukeboxClientId()
+    if (!sessionId || !clientId) return
+
+    let cancelled = false
+    let cleanupHeartbeat = () => {}
+
+    const heartbeat = () =>
+      jukeboxClient
+        .heartbeatSession(sessionId, clientId)
+        .then((status) => {
+          if (!cancelled) dispatch(updateJukeboxSessionStatus(status))
+        })
+        .catch(() => {})
+
+    jukeboxClient
+      .attachSession(sessionId, clientId)
+      .then((status) => {
+        if (cancelled) return
+        dispatch(updateJukeboxSessionStatus(status))
+        cleanupHeartbeat = startJukeboxHeartbeatLoop({
+          jukeboxMode: true,
+          sessionId,
+          clientId,
+          onHeartbeat: heartbeat,
+        })
+      })
+      .catch(() => {})
+
+    return () => {
+      cancelled = true
+      cleanupHeartbeat()
+    }
+  }, [playerState.jukeboxMode, dispatch])
+
   // Jukebox status polling — poll every 2s when in Jukebox mode
   useEffect(() => {
     if (!playerState.jukeboxMode) return
@@ -532,4 +602,10 @@ const Player = () => {
   )
 }
 
-export { Player, syncRemotePositionIfNeeded }
+export {
+  Player,
+  getJukeboxSessionId,
+  getOrCreateJukeboxClientId,
+  startJukeboxHeartbeatLoop,
+  syncRemotePositionIfNeeded,
+}

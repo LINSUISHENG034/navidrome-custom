@@ -5,6 +5,7 @@ vi.mock('navidrome-music-player', () => ({
 }))
 
 vi.mock('./jukeboxClient', () => ({
+
   default: {
     play: vi.fn(() => Promise.resolve({})),
     pause: vi.fn(() => Promise.resolve({})),
@@ -12,6 +13,8 @@ vi.mock('./jukeboxClient', () => ({
     volume: vi.fn(() => Promise.resolve({})),
     skip: vi.fn(() => Promise.resolve({})),
     seek: vi.fn(() => Promise.resolve({})),
+    attachSession: vi.fn(() => Promise.resolve({})),
+    heartbeatSession: vi.fn(() => Promise.resolve({})),
   },
 }))
 
@@ -32,7 +35,12 @@ import {
   syncJukeboxSeek,
   syncJukeboxTrackChangeAfterQueueSync,
 } from './jukeboxSync'
-import { syncRemotePositionIfNeeded } from './Player'
+import {
+  getJukeboxSessionId,
+  getOrCreateJukeboxClientId,
+  startJukeboxHeartbeatLoop,
+  syncRemotePositionIfNeeded,
+} from './Player'
 import keyHandlers from './keyHandlers'
 
 describe('Jukebox visibility guard logic', () => {
@@ -439,5 +447,54 @@ describe('remote-state-first jukebox controls', () => {
     handlers.VOL_DOWN()
     expect(jukeboxClient.volume).toHaveBeenCalledTimes(1)
     expect(jukeboxClient.volume.mock.calls[0][0]).toBeCloseTo(0.7)
+  })
+})
+
+
+describe('jukebox session heartbeat lifecycle', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+    sessionStorage.clear()
+    localStorage.setItem('username', 'admin')
+  })
+
+  it('starts heartbeat polling in jukebox mode and stops it on cleanup', () => {
+    vi.useFakeTimers()
+    const cleanup = startJukeboxHeartbeatLoop({
+      jukeboxMode: true,
+      sessionId: 's1',
+      clientId: 'tab-1',
+      onHeartbeat: () => jukeboxClient.heartbeatSession('s1', 'tab-1'),
+    })
+
+    vi.advanceTimersByTime(15000)
+    expect(jukeboxClient.heartbeatSession).toHaveBeenCalledWith('s1', 'tab-1')
+
+    cleanup()
+    vi.advanceTimersByTime(15000)
+    expect(jukeboxClient.heartbeatSession).toHaveBeenCalledTimes(1)
+    vi.useRealTimers()
+  })
+
+  it('does not send heartbeat when no session id/client id is available', () => {
+    vi.useFakeTimers()
+    startJukeboxHeartbeatLoop({
+      jukeboxMode: true,
+      sessionId: null,
+      clientId: null,
+      onHeartbeat: () => jukeboxClient.heartbeatSession('s1', 'tab-1'),
+    })
+    vi.advanceTimersByTime(30000)
+    expect(jukeboxClient.heartbeatSession).not.toHaveBeenCalled()
+    vi.useRealTimers()
+  })
+
+  it('derives a stable session id and per-tab client id', () => {
+    expect(getJukeboxSessionId()).toBe('jukebox-session:admin')
+    const first = getOrCreateJukeboxClientId()
+    const second = getOrCreateJukeboxClientId()
+    expect(first).toBe(second)
+    expect(first).toBeTruthy()
   })
 })

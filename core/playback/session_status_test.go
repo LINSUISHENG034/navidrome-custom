@@ -188,3 +188,38 @@ func TestPlaybackServerPublishJukeboxStateUpdatesTargetsMatchingDeviceSessions(t
 		t.Fatalf("unexpected event payload: %#v", state)
 	}
 }
+
+func TestPlaybackServerReaperBroadcastsDetachOnExpiry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	broker := &fakeEventBroker{}
+	ps := &playbackServer{
+		ctx:            &ctx,
+		sessionManager: NewSessionManager(50 * time.Millisecond),
+		eventBroker:    broker,
+		playbackDevices: []playbackDevice{
+			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+		},
+	}
+
+	now := time.Now()
+	ps.sessionManager.now = func() time.Time { return now }
+	ps.sessionManager.Attach(AttachRequest{
+		SessionID:  "s1",
+		ClientID:   "tab-1",
+		User:       "admin",
+		DeviceName: "pulse/test",
+	})
+
+	now = now.Add(80 * time.Millisecond)
+	ps.reapExpiredSessions()
+
+	if len(broker.sent) != 1 {
+		t.Fatalf("expected 1 detach event, got %d", len(broker.sent))
+	}
+	state, ok := broker.sent[0].event.(*serverevents.JukeboxStateUpdated)
+	if !ok || state.Attached {
+		t.Fatalf("expected detach event with Attached=false, got %#v", broker.sent[0].event)
+	}
+}

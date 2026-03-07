@@ -9,7 +9,7 @@ import (
 var (
 	ErrSessionNotFound  = errors.New("session not found")
 	ErrSessionOwnership = errors.New("session owned by another client")
-	defaultSessionTTL   = time.Minute
+	defaultSessionTTL   = 45 * time.Second
 )
 
 type AttachRequest struct {
