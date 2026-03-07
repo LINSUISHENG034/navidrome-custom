@@ -33,6 +33,7 @@ import {
   syncJukeboxTrackChangeAfterQueueSync,
 } from './jukeboxSync'
 import { syncRemotePositionIfNeeded } from './Player'
+import keyHandlers from './keyHandlers'
 
 describe('Jukebox visibility guard logic', () => {
   let originalHidden
@@ -397,5 +398,46 @@ describe('remote-state control safety', () => {
     })
     expect(changed).toBe(false)
     expect(audioInstance.currentTime).toBe(5)
+  })
+})
+
+
+describe('remote-state-first jukebox controls', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('uses remote session playing state for toggle play', () => {
+    const handlers = keyHandlers(
+      { togglePlay: vi.fn(), volume: 0.5 },
+      {
+        jukeboxMode: true,
+        queue: [],
+        current: {},
+        jukeboxStatus: { playing: false },
+        jukeboxSession: { playing: true },
+      },
+    )
+
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    expect(jukeboxClient.pause).toHaveBeenCalledTimes(1)
+    expect(jukeboxClient.play).not.toHaveBeenCalled()
+  })
+
+  it('uses remote session gain for volume changes', () => {
+    const handlers = keyHandlers(
+      { togglePlay: vi.fn(), volume: 0.5 },
+      {
+        jukeboxMode: true,
+        queue: [],
+        current: {},
+        jukeboxStatus: { gain: 0.2 },
+        jukeboxSession: { gain: 0.8 },
+      },
+    )
+
+    handlers.VOL_DOWN()
+    expect(jukeboxClient.volume).toHaveBeenCalledTimes(1)
+    expect(jukeboxClient.volume.mock.calls[0][0]).toBeCloseTo(0.7)
   })
 })

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { selectEffectiveCurrentTrack } from './playerSelectors'
+import {
+  selectEffectiveCurrentTrack,
+  selectEffectiveJukeboxGain,
+  selectEffectiveJukeboxPlaying,
+  selectEffectiveJukeboxPosition,
+} from './playerSelectors'
 
 describe('playerSelectors', () => {
   it('selects remote current track in jukebox mode', () => {
@@ -81,5 +86,33 @@ describe('playerSelectors', () => {
     }
 
     expect(selectEffectiveCurrentTrack(state)).toBe(current)
+  })
+
+  it('prefers jukeboxSession playing/gain/position with fallback to jukeboxStatus', () => {
+    const state = {
+      player: {
+        jukeboxMode: true,
+        jukeboxStatus: { playing: false, gain: 0.4, position: 12 },
+        jukeboxSession: { playing: true, gain: 0.8, position: 41 },
+      },
+    }
+
+    expect(selectEffectiveJukeboxPlaying(state)).toBe(true)
+    expect(selectEffectiveJukeboxGain(state)).toBe(0.8)
+    expect(selectEffectiveJukeboxPosition(state)).toBe(41)
+  })
+
+  it('falls back to jukeboxStatus when jukeboxSession is unavailable', () => {
+    const state = {
+      player: {
+        jukeboxMode: true,
+        jukeboxStatus: { playing: false, gain: 0.4, position: 12 },
+        jukeboxSession: null,
+      },
+    }
+
+    expect(selectEffectiveJukeboxPlaying(state)).toBe(false)
+    expect(selectEffectiveJukeboxGain(state)).toBe(0.4)
+    expect(selectEffectiveJukeboxPosition(state)).toBe(12)
   })
 })
