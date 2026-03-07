@@ -35,7 +35,11 @@ import keyHandlers from './keyHandlers'
 import { calculateGain } from '../utils/calculateReplayGain'
 import jukeboxClient from './jukeboxClient'
 import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
-import { shouldForwardJukeboxMediaEvent } from './jukeboxLifecycle'
+import {
+  markPendingRemoteSeek,
+  shouldForwardJukeboxMediaEvent,
+  shouldSuppressRemoteSeekEcho,
+} from './jukeboxLifecycle'
 import {
   computeQueueDiff,
   syncJukeboxQueueIncremental,
@@ -44,8 +48,34 @@ import {
 } from './jukeboxSync'
 import { audioVolumeToUiVolume, clamp01 } from './volumeMapping'
 
+
 const snapshotQueue = (audioLists = []) =>
   audioLists.map((item) => ({ ...item }))
+
+const syncRemotePositionIfNeeded = ({
+  jukeboxMode,
+  audioInstance,
+  session,
+  currentTrackId,
+  driftThreshold = 2,
+}) => {
+  if (!jukeboxMode || !audioInstance || !session) return false
+
+  const sessionTrackId = session.trackId
+  if (sessionTrackId && currentTrackId && sessionTrackId !== currentTrackId) {
+    return false
+  }
+
+  const nextPosition = Math.max(0, Number(session.position) || 0)
+  const currentPosition = Math.max(0, Number(audioInstance.currentTime) || 0)
+  if (Math.abs(currentPosition - nextPosition) <= driftThreshold) {
+    return false
+  }
+
+  markPendingRemoteSeek({ position: nextPosition })
+  audioInstance.currentTime = nextPosition
+  return true
+}
 
 const Player = () => {
   const theme = useCurrentTheme()
@@ -371,11 +401,12 @@ const Player = () => {
 
   const onAudioSeeked = useCallback(
     (info) => {
-      if (playerState.jukeboxMode) {
-        enqueueJukeboxCommand(() => syncJukeboxSeek(jukeboxClient, info)).catch(
-          () => {},
-        )
-      }
+      if (!playerState.jukeboxMode) return
+      if (shouldSuppressRemoteSeekEcho(info.currentTime)) return
+
+      enqueueJukeboxCommand(() => syncJukeboxSeek(jukeboxClient, info)).catch(
+        () => {},
+      )
     },
     [playerState.jukeboxMode],
   )
@@ -435,6 +466,23 @@ const Player = () => {
     return () => clearInterval(interval)
   }, [playerState.jukeboxMode, dispatch])
 
+  useEffect(() => {
+    syncRemotePositionIfNeeded({
+      jukeboxMode: playerState.jukeboxMode,
+      audioInstance,
+      session: playerState.jukeboxSession,
+      currentTrackId:
+        playerState.current?.trackId || playerState.current?.song?.id || null,
+    })
+  }, [
+    playerState.jukeboxMode,
+    playerState.jukeboxSession?.position,
+    playerState.jukeboxSession?.trackId,
+    playerState.current?.trackId,
+    playerState.current?.song?.id,
+    audioInstance,
+  ])
+
   // In Jukebox mode, mute browser audio while server plays.
   useEffect(() => {
     if (!audioInstance) return
@@ -484,4 +532,4 @@ const Player = () => {
   )
 }
 
-export { Player }
+export { Player, syncRemotePositionIfNeeded }

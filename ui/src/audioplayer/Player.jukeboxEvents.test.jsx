@@ -1,5 +1,9 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
+vi.mock('navidrome-music-player', () => ({
+  default: () => null,
+}))
+
 vi.mock('./jukeboxClient', () => ({
   default: {
     play: vi.fn(() => Promise.resolve({})),
@@ -18,11 +22,17 @@ vi.mock('./jukeboxCommandQueue', () => ({
 import jukeboxClient from './jukeboxClient'
 import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
 import {
+  markPendingRemoteSeek,
+  shouldSuppressRemoteSeekEcho,
   shouldForwardJukeboxMediaEvent,
   suppressJukeboxMediaEvents,
   resetJukeboxMediaEventSuppression,
 } from './jukeboxLifecycle'
-import { syncJukeboxSeek, syncJukeboxTrackChangeAfterQueueSync } from './jukeboxSync'
+import {
+  syncJukeboxSeek,
+  syncJukeboxTrackChangeAfterQueueSync,
+} from './jukeboxSync'
+import { syncRemotePositionIfNeeded } from './Player'
 
 describe('Jukebox visibility guard logic', () => {
   let originalHidden
@@ -125,7 +135,6 @@ describe('Jukebox visibility guard logic', () => {
       }
       localStorage.setItem('token', 'fake-jwt-token')
 
-      // Simulate: jukeboxMode is true, pagehide fires
       const jukeboxMode = true
       if (jukeboxMode) {
         const token = localStorage.getItem('token')
@@ -185,7 +194,6 @@ describe('Jukebox visibility guard logic', () => {
         calls.push(args)
         return Promise.resolve(new Response())
       }
-      // Ensure no token is set (clear and re-add only username)
       localStorage.clear()
       localStorage.setItem('username', 'admin')
 
@@ -209,8 +217,8 @@ describe('Jukebox visibility guard logic', () => {
   describe('suppression window', () => {
     it('suppresses visible-tab events during the temporary guard window', () => {
       vi.useFakeTimers()
-      suppressJukeboxMediaEvents(500)
 
+      suppressJukeboxMediaEvents(500)
       expect(
         shouldForwardJukeboxMediaEvent({
           jukeboxMode: true,
@@ -230,7 +238,6 @@ describe('Jukebox visibility guard logic', () => {
       vi.useRealTimers()
     })
   })
-
 
   describe('queue sync ordering', () => {
     it('waits for pending queue sync before sending skip', async () => {
@@ -334,89 +341,61 @@ describe('Jukebox visibility guard logic', () => {
   })
 })
 
-
-describe('remote-state control spike', () => {
+describe('remote-state control safety', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetJukeboxMediaEventSuppression()
   })
 
-  const forceSyncRemotePosition = ({ audioInstance, remotePosition }) => {
-    if (!audioInstance) return false
-    const targetTime = Math.max(0, Number(remotePosition) || 0)
-    const currentTime = Number(audioInstance.currentTime) || 0
-    if (Math.abs(currentTime - targetTime) < 1) return false
-
-    suppressJukeboxMediaEvents()
-    audioInstance.currentTime = targetTime
-    return true
-  }
-
   const simulateCurrentSeekHandler = async ({ jukeboxMode, info }) => {
-    if (jukeboxMode) {
+    if (jukeboxMode && !shouldSuppressRemoteSeekEcho(info.currentTime)) {
       await enqueueJukeboxCommand(() => syncJukeboxSeek(jukeboxClient, info))
     }
   }
 
-  it('can force-sync audio currentTime from remote position updates', () => {
+  it('suppresses the next seek echo after programmatic remote position sync', () => {
+    markPendingRemoteSeek({ position: 42, ttlMs: 1000 })
+    expect(shouldSuppressRemoteSeekEcho(42)).toBe(true)
+    expect(shouldSuppressRemoteSeekEcho(42)).toBe(false)
+  })
+
+  it('stops suppressing after TTL expires even if position matches', () => {
     vi.useFakeTimers()
+    markPendingRemoteSeek({ position: 42, ttlMs: 50 })
+    vi.advanceTimersByTime(100)
+    expect(shouldSuppressRemoteSeekEcho(42)).toBe(false)
+    vi.useRealTimers()
+  })
 
-    const audioInstance = { currentTime: 5, muted: true }
-    const changed = forceSyncRemotePosition({
-      audioInstance,
-      remotePosition: 42,
+  it('does not suppress a user seek when no remote sync is pending', async () => {
+    await simulateCurrentSeekHandler({
+      jukeboxMode: true,
+      info: { currentTime: 17 },
     })
+    expect(jukeboxClient.seek).toHaveBeenCalledWith(17)
+  })
 
+  it('forces local audio position toward remote state only when drift is large', () => {
+    const audioInstance = { currentTime: 5, muted: true }
+    const changed = syncRemotePositionIfNeeded({
+      jukeboxMode: true,
+      audioInstance,
+      session: { position: 42, trackId: 't1' },
+      currentTrackId: 't1',
+    })
     expect(changed).toBe(true)
     expect(audioInstance.currentTime).toBe(42)
-    expect(
-      shouldForwardJukeboxMediaEvent({
-        jukeboxMode: true,
-        hidden: false,
-      }),
-    ).toBe(false)
-
-    vi.useRealTimers()
   })
 
-  it('shows programmatic seek would still echo through the current seek handler', async () => {
-    vi.useFakeTimers()
-
+  it('does not force-sync remote position when track ids do not match', () => {
     const audioInstance = { currentTime: 5, muted: true }
-    forceSyncRemotePosition({
-      audioInstance,
-      remotePosition: 42,
-    })
-
-    await simulateCurrentSeekHandler({
+    const changed = syncRemotePositionIfNeeded({
       jukeboxMode: true,
-      info: { currentTime: audioInstance.currentTime },
-    })
-
-    expect(jukeboxClient.seek).toHaveBeenCalledWith(42)
-    expect(
-      shouldForwardJukeboxMediaEvent({
-        jukeboxMode: true,
-        hidden: false,
-      }),
-    ).toBe(false)
-
-    vi.useRealTimers()
-  })
-
-  it('keeps browser audio muted during remote sync but does not eliminate seek churn risk', async () => {
-    const audioInstance = { currentTime: 0, muted: true }
-
-    forceSyncRemotePosition({
       audioInstance,
-      remotePosition: 17,
+      session: { position: 42, trackId: 't2' },
+      currentTrackId: 't1',
     })
-    await simulateCurrentSeekHandler({
-      jukeboxMode: true,
-      info: { currentTime: audioInstance.currentTime },
-    })
-
-    expect(audioInstance.muted).toBe(true)
-    expect(jukeboxClient.seek).toHaveBeenCalledTimes(1)
+    expect(changed).toBe(false)
+    expect(audioInstance.currentTime).toBe(5)
   })
 })
