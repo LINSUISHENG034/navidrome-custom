@@ -7,6 +7,7 @@ vi.mock('./jukeboxClient', () => ({
     status: vi.fn(() => Promise.resolve({ playing: true })),
     volume: vi.fn(() => Promise.resolve({})),
     skip: vi.fn(() => Promise.resolve({})),
+    seek: vi.fn(() => Promise.resolve({})),
   },
 }))
 
@@ -21,7 +22,7 @@ import {
   suppressJukeboxMediaEvents,
   resetJukeboxMediaEventSuppression,
 } from './jukeboxLifecycle'
-import { syncJukeboxTrackChangeAfterQueueSync } from './jukeboxSync'
+import { syncJukeboxSeek, syncJukeboxTrackChangeAfterQueueSync } from './jukeboxSync'
 
 describe('Jukebox visibility guard logic', () => {
   let originalHidden
@@ -330,5 +331,92 @@ describe('Jukebox visibility guard logic', () => {
         }),
       ).toBe(false)
     })
+  })
+})
+
+
+describe('remote-state control spike', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetJukeboxMediaEventSuppression()
+  })
+
+  const forceSyncRemotePosition = ({ audioInstance, remotePosition }) => {
+    if (!audioInstance) return false
+    const targetTime = Math.max(0, Number(remotePosition) || 0)
+    const currentTime = Number(audioInstance.currentTime) || 0
+    if (Math.abs(currentTime - targetTime) < 1) return false
+
+    suppressJukeboxMediaEvents()
+    audioInstance.currentTime = targetTime
+    return true
+  }
+
+  const simulateCurrentSeekHandler = async ({ jukeboxMode, info }) => {
+    if (jukeboxMode) {
+      await enqueueJukeboxCommand(() => syncJukeboxSeek(jukeboxClient, info))
+    }
+  }
+
+  it('can force-sync audio currentTime from remote position updates', () => {
+    vi.useFakeTimers()
+
+    const audioInstance = { currentTime: 5, muted: true }
+    const changed = forceSyncRemotePosition({
+      audioInstance,
+      remotePosition: 42,
+    })
+
+    expect(changed).toBe(true)
+    expect(audioInstance.currentTime).toBe(42)
+    expect(
+      shouldForwardJukeboxMediaEvent({
+        jukeboxMode: true,
+        hidden: false,
+      }),
+    ).toBe(false)
+
+    vi.useRealTimers()
+  })
+
+  it('shows programmatic seek would still echo through the current seek handler', async () => {
+    vi.useFakeTimers()
+
+    const audioInstance = { currentTime: 5, muted: true }
+    forceSyncRemotePosition({
+      audioInstance,
+      remotePosition: 42,
+    })
+
+    await simulateCurrentSeekHandler({
+      jukeboxMode: true,
+      info: { currentTime: audioInstance.currentTime },
+    })
+
+    expect(jukeboxClient.seek).toHaveBeenCalledWith(42)
+    expect(
+      shouldForwardJukeboxMediaEvent({
+        jukeboxMode: true,
+        hidden: false,
+      }),
+    ).toBe(false)
+
+    vi.useRealTimers()
+  })
+
+  it('keeps browser audio muted during remote sync but does not eliminate seek churn risk', async () => {
+    const audioInstance = { currentTime: 0, muted: true }
+
+    forceSyncRemotePosition({
+      audioInstance,
+      remotePosition: 17,
+    })
+    await simulateCurrentSeekHandler({
+      jukeboxMode: true,
+      info: { currentTime: audioInstance.currentTime },
+    })
+
+    expect(audioInstance.muted).toBe(true)
+    expect(jukeboxClient.seek).toHaveBeenCalledTimes(1)
   })
 })
