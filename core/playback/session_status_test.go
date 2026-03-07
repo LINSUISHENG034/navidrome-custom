@@ -2,10 +2,13 @@ package playback
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/navidrome/navidrome/model"
+	"github.com/navidrome/navidrome/model/request"
+	serverevents "github.com/navidrome/navidrome/server/events"
 )
 
 type sessionStatusStubServer struct {
@@ -99,5 +102,89 @@ func TestPlaybackDeviceQueueVersionIncrementsOnSameLengthMutations(t *testing.T)
 	}
 	if pd.queueVersion <= firstVersion+1 {
 		t.Fatalf("expected queueVersion to advance across same-length mutations, got %d after first version %d", pd.queueVersion, firstVersion)
+	}
+}
+
+type capturedBrokerMessage struct {
+	ctx   context.Context
+	event any
+}
+
+type fakeEventBroker struct {
+	sent       []capturedBrokerMessage
+	broadcasts []capturedBrokerMessage
+}
+
+func (f *fakeEventBroker) ServeHTTP(http.ResponseWriter, *http.Request) {}
+
+func (f *fakeEventBroker) SendMessage(ctx context.Context, event serverevents.Event) {
+	f.sent = append(f.sent, capturedBrokerMessage{ctx: ctx, event: event})
+}
+
+func (f *fakeEventBroker) SendBroadcastMessage(ctx context.Context, event serverevents.Event) {
+	f.broadcasts = append(f.broadcasts, capturedBrokerMessage{ctx: ctx, event: event})
+}
+
+func TestNewJukeboxStateUpdatedEvent(t *testing.T) {
+	status := SessionStatus{
+		SessionID:     "s1",
+		DeviceName:    "pulse/test",
+		OwnerClientID: "tab-1",
+		CurrentIndex:  2,
+		TrackID:       "track-3",
+		Playing:       true,
+		Position:      17,
+		Gain:          0.8,
+		Attached:      true,
+		QueueVersion:  9,
+		LastHeartbeat: time.Unix(123, 0).UTC(),
+	}
+
+	evt := NewJukeboxStateUpdatedEvent(status)
+	if evt.SessionID != status.SessionID || evt.TrackID != status.TrackID || evt.QueueVersion != status.QueueVersion {
+		t.Fatalf("unexpected event payload: %#v", evt)
+	}
+}
+
+func TestPlaybackServerPublishJukeboxStateUpdatesTargetsMatchingDeviceSessions(t *testing.T) {
+	ctx := context.Background()
+	broker := &fakeEventBroker{}
+	ps := &playbackServer{
+		ctx:            &ctx,
+		sessionManager: NewSessionManager(time.Minute),
+		eventBroker:    broker,
+		playbackDevices: []playbackDevice{
+			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+			*NewPlaybackDevice(ctx, nil, "Other", "pulse/other"),
+		},
+	}
+	ps.playbackDevices[0].PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
+	ps.playbackDevices[0].queueVersion = 3
+	ps.playbackDevices[0].Gain = 0.9
+	ps.sessionManager.Attach(AttachRequest{SessionID: "s1", ClientID: "tab-1", User: "admin", DeviceName: "pulse/test"})
+	ps.sessionManager.Attach(AttachRequest{SessionID: "s2", ClientID: "tab-2", User: "admin", DeviceName: "pulse/other"})
+
+	ps.publishJukeboxStateUpdates(&ps.playbackDevices[0])
+
+	if len(broker.sent) != 1 {
+		t.Fatalf("expected 1 targeted event, got %d", len(broker.sent))
+	}
+	if len(broker.broadcasts) != 0 {
+		t.Fatalf("expected no broadcast events, got %d", len(broker.broadcasts))
+	}
+	username, ok := request.UsernameFrom(broker.sent[0].ctx)
+	if !ok || username != "admin" {
+		t.Fatalf("expected targeted username context, got %q", username)
+	}
+	clientID, ok := request.ClientUniqueIdFrom(broker.sent[0].ctx)
+	if !ok || clientID == "" {
+		t.Fatal("expected synthetic clientUniqueId for same-user targeting")
+	}
+	state, ok := broker.sent[0].event.(*serverevents.JukeboxStateUpdated)
+	if !ok {
+		t.Fatalf("unexpected event type: %T", broker.sent[0].event)
+	}
+	if state.SessionID != "s1" || state.DeviceName != "pulse/test" || state.QueueVersion != 3 {
+		t.Fatalf("unexpected event payload: %#v", state)
 	}
 }

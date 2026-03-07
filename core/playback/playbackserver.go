@@ -16,7 +16,6 @@ import (
 	"github.com/navidrome/navidrome/core/playback/bluetooth"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
-	"github.com/navidrome/navidrome/model/request"
 	serverevents "github.com/navidrome/navidrome/server/events"
 	"github.com/navidrome/navidrome/utils/singleton"
 )
@@ -71,33 +70,16 @@ func (ps *playbackServer) getEventBroker() serverevents.Broker {
 	return serverevents.GetBroker()
 }
 
-func jukeboxStateEventFromStatus(status SessionStatus) *serverevents.JukeboxStateUpdated {
-	return &serverevents.JukeboxStateUpdated{
-		SessionID:     status.SessionID,
-		DeviceName:    status.DeviceName,
-		OwnerClientID: status.OwnerClientID,
-		CurrentIndex:  status.CurrentIndex,
-		TrackID:       status.TrackID,
-		Playing:       status.Playing,
-		Position:      status.Position,
-		Gain:          status.Gain,
-		Attached:      status.Attached,
-		QueueVersion:  status.QueueVersion,
-		LastHeartbeat: status.LastHeartbeat,
-	}
-}
-
 func (ps *playbackServer) publishJukeboxStateUpdates(device *playbackDevice) {
 	if ps.sessionManager == nil || device == nil {
 		return
 	}
 	for _, session := range ps.sessionManager.FindByDevice(device.DeviceName) {
-		status := ps.statusFromSession(session)
-		ctx := context.Background()
-		if session.User != "" {
-			ctx = request.WithUsername(ctx, session.User)
+		if session.User == "" {
+			continue
 		}
-		ps.getEventBroker().SendMessage(ctx, jukeboxStateEventFromStatus(status))
+		status := ps.statusFromSession(session)
+		ps.getEventBroker().SendMessage(jukeboxTargetContext(session.User), NewJukeboxStateUpdatedEvent(status))
 	}
 }
 

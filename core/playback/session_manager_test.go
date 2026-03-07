@@ -216,3 +216,18 @@ func TestSessionManager_HeartbeatRefreshesTTL(t *testing.T) {
 		t.Fatal("heartbeat should have refreshed TTL, but session expired")
 	}
 }
+
+func TestSessionManager_FindByDevice(t *testing.T) {
+	mgr := NewSessionManager(time.Minute)
+	mgr.Attach(AttachRequest{SessionID: "s1", ClientID: "tab-1", User: "admin", DeviceName: "pulse/test"})
+	mgr.Attach(AttachRequest{SessionID: "s2", ClientID: "tab-2", User: "admin", DeviceName: "pulse/test"})
+	mgr.Attach(AttachRequest{SessionID: "s3", ClientID: "tab-3", User: "admin", DeviceName: "pulse/other"})
+
+	sessions := mgr.FindByDevice("pulse/test")
+	if len(sessions) != 2 {
+		t.Fatalf("expected 2 sessions for device, got %d", len(sessions))
+	}
+	if sessions[0].DeviceName != "pulse/test" || sessions[1].DeviceName != "pulse/test" {
+		t.Fatalf("unexpected sessions: %#v", sessions)
+	}
+}

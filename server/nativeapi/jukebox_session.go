@@ -17,20 +17,11 @@ type jukeboxSessionRequest struct {
 	DeviceName string `json:"deviceName,omitempty"`
 }
 
+// publishJukeboxSessionEvent intentionally uses the request context so the initiating
+// client does not receive an echoed SSE event; it already has the authoritative
+// HTTP response payload. Other same-user clients still receive the update.
 func publishJukeboxSessionEvent(r *http.Request, status playback.SessionStatus) {
-	serverevents.GetBroker().SendMessage(r.Context(), &serverevents.JukeboxStateUpdated{
-		SessionID:     status.SessionID,
-		DeviceName:    status.DeviceName,
-		OwnerClientID: status.OwnerClientID,
-		CurrentIndex:  status.CurrentIndex,
-		TrackID:       status.TrackID,
-		Playing:       status.Playing,
-		Position:      status.Position,
-		Gain:          status.Gain,
-		Attached:      status.Attached,
-		QueueVersion:  status.QueueVersion,
-		LastHeartbeat: status.LastHeartbeat,
-	})
+	serverevents.GetBroker().SendMessage(r.Context(), playback.NewJukeboxStateUpdatedEvent(status))
 }
 
 func (api *Router) addJukeboxSessionRoute(r chi.Router) {
