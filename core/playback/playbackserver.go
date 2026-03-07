@@ -41,6 +41,7 @@ type playbackServer struct {
 	mu                  sync.Mutex
 	ctx                 *context.Context
 	datastore           model.DataStore
+	sessionManager      *SessionManager
 	onDeviceStateChange func(*playbackDevice, DeviceStatus)
 	playbackDevices     []playbackDevice
 }
@@ -68,7 +69,7 @@ func (ps *playbackServer) playbackDeviceContext(fallback context.Context) contex
 // GetInstance returns the playback-server singleton
 func GetInstance(ds model.DataStore) PlaybackServer {
 	return singleton.GetInstance(func() *playbackServer {
-		return &playbackServer{datastore: ds}
+		return &playbackServer{datastore: ds, sessionManager: NewSessionManager(defaultSessionTTL)}
 	})
 }
 

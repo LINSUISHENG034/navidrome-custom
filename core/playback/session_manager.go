@@ -1,0 +1,119 @@
+package playback
+
+import (
+	"errors"
+	"sync"
+	"time"
+)
+
+var (
+	ErrSessionNotFound  = errors.New("session not found")
+	ErrSessionOwnership = errors.New("session owned by another client")
+	defaultSessionTTL   = time.Minute
+)
+
+type AttachRequest struct {
+	SessionID  string
+	User       string
+	ClientID   string
+	DeviceName string
+}
+
+type Session struct {
+	SessionID     string    `json:"sessionId"`
+	User          string    `json:"user"`
+	OwnerClientID string    `json:"ownerClientId"`
+	DeviceName    string    `json:"deviceName"`
+	LastHeartbeat time.Time `json:"lastHeartbeat"`
+}
+
+type SessionManager struct {
+	mu       sync.RWMutex
+	ttl      time.Duration
+	now      func() time.Time
+	sessions map[string]Session
+}
+
+func NewSessionManager(ttl time.Duration) *SessionManager {
+	return &SessionManager{
+		ttl:      ttl,
+		now:      time.Now,
+		sessions: make(map[string]Session),
+	}
+}
+
+func (sm *SessionManager) Attach(req AttachRequest) Session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	session := Session{
+		SessionID:     req.SessionID,
+		User:          req.User,
+		OwnerClientID: req.ClientID,
+		DeviceName:    req.DeviceName,
+		LastHeartbeat: sm.now().UTC(),
+	}
+	sm.sessions[req.SessionID] = session
+	return session
+}
+
+func (sm *SessionManager) Heartbeat(sessionID, clientID string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	session, ok := sm.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	if session.OwnerClientID != clientID {
+		return ErrSessionOwnership
+	}
+
+	session.LastHeartbeat = sm.now().UTC()
+	sm.sessions[sessionID] = session
+	return nil
+}
+
+func (sm *SessionManager) Detach(sessionID, clientID string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	session, ok := sm.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	if session.OwnerClientID != clientID {
+		return ErrSessionOwnership
+	}
+
+	delete(sm.sessions, sessionID)
+	return nil
+}
+
+func (sm *SessionManager) Get(sessionID string) (Session, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	session, ok := sm.sessions[sessionID]
+	return session, ok
+}
+
+func (sm *SessionManager) ReapExpired() []Session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.ttl <= 0 {
+		return nil
+	}
+
+	now := sm.now().UTC()
+	expired := make([]Session, 0)
+	for id, session := range sm.sessions {
+		if now.Sub(session.LastHeartbeat) <= sm.ttl {
+			continue
+		}
+		expired = append(expired, session)
+		delete(sm.sessions, id)
+	}
+	return expired
+}
