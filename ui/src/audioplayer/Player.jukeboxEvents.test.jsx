@@ -26,7 +26,9 @@ import jukeboxClient from './jukeboxClient'
 import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
 import {
   markPendingRemoteSeek,
+  markPendingRemoteTrackChange,
   shouldSuppressRemoteSeekEcho,
+  shouldSuppressRemoteTrackEcho,
   shouldForwardJukeboxMediaEvent,
   suppressJukeboxMediaEvents,
   resetJukeboxMediaEventSuppression,
@@ -38,6 +40,7 @@ import {
 import {
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
+  resolveControlledJukeboxPlayIndex,
   resolvePlayerUiState,
   startJukeboxHeartbeatLoop,
   syncRemotePositionIfNeeded,
@@ -519,5 +522,52 @@ describe('remote-state-first player selection', () => {
     const resolved = resolvePlayerUiState(state)
     expect(resolved.current).toBe(remoteTrack)
     expect(resolved.playIndex).toBe(1)
+  })
+})
+
+
+describe('queue highlight stabilization', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetJukeboxMediaEventSuppression()
+  })
+
+  it('consumes a remote track-change echo only once', () => {
+    markPendingRemoteTrackChange({ index: 2, ttlMs: 3000 })
+    expect(shouldSuppressRemoteTrackEcho(2)).toBe(true)
+    expect(shouldSuppressRemoteTrackEcho(2)).toBe(false)
+  })
+
+  it('keeps the last stable playIndex while queue sync is pending', () => {
+    expect(
+      resolveControlledJukeboxPlayIndex({
+        jukeboxMode: true,
+        queueSyncPending: true,
+        remotePlayIndex: 2,
+        lastStablePlayIndex: 1,
+      }),
+    ).toBe(1)
+  })
+
+  it('uses the remote playIndex once queue sync is settled', () => {
+    expect(
+      resolveControlledJukeboxPlayIndex({
+        jukeboxMode: true,
+        queueSyncPending: false,
+        remotePlayIndex: 2,
+        lastStablePlayIndex: 1,
+      }),
+    ).toBe(2)
+  })
+
+  it('suppresses remote-originated track change from re-sending skip', async () => {
+    const nextIndex = 2
+    markPendingRemoteTrackChange({ index: nextIndex, ttlMs: 3000 })
+
+    if (!shouldSuppressRemoteTrackEcho(nextIndex)) {
+      await enqueueJukeboxCommand(() => jukeboxClient.skip(nextIndex, 0))
+    }
+
+    expect(jukeboxClient.skip).not.toHaveBeenCalled()
   })
 })

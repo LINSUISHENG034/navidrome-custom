@@ -38,8 +38,10 @@ import jukeboxClient from './jukeboxClient'
 import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
 import {
   markPendingRemoteSeek,
+  markPendingRemoteTrackChange,
   shouldForwardJukeboxMediaEvent,
   shouldSuppressRemoteSeekEcho,
+  shouldSuppressRemoteTrackEcho,
 } from './jukeboxLifecycle'
 import {
   computeQueueDiff,
@@ -114,6 +116,17 @@ const syncRemotePositionIfNeeded = ({
 }
 
 
+const resolveControlledJukeboxPlayIndex = ({
+  jukeboxMode,
+  queueSyncPending,
+  remotePlayIndex,
+  lastStablePlayIndex,
+}) => {
+  if (!jukeboxMode) return remotePlayIndex
+  if (queueSyncPending) return lastStablePlayIndex
+  return remotePlayIndex ?? lastStablePlayIndex
+}
+
 const resolvePlayerUiState = (playerState) => {
   const state = { player: playerState }
   const effectiveCurrentTrack = selectEffectiveCurrentTrack(state)
@@ -144,6 +157,8 @@ const Player = () => {
   const [audioInstance, setAudioInstanceLocal] = useState(null)
   const prevQueueRef = useRef([])
   const pendingQueueSyncRef = useRef(Promise.resolve())
+  const lastStablePlayIndexRef = useRef(undefined)
+  const [queueSyncPending, setQueueSyncPending] = useState(false)
 
   const handleAudioInstance = useCallback(
     (instance) => {
@@ -272,11 +287,29 @@ const Player = () => {
 
   const options = useMemo(() => {
     const { current, playIndex } = resolvePlayerUiState(playerState)
+    const controlledPlayIndex = resolveControlledJukeboxPlayIndex({
+      jukeboxMode: playerState.jukeboxMode,
+      queueSyncPending,
+      remotePlayIndex: playIndex,
+      lastStablePlayIndex: lastStablePlayIndexRef.current,
+    })
+
+    if (playerState.jukeboxMode) {
+      if (!queueSyncPending && controlledPlayIndex !== undefined) {
+        if (controlledPlayIndex !== lastStablePlayIndexRef.current) {
+          markPendingRemoteTrackChange({ index: controlledPlayIndex })
+          lastStablePlayIndexRef.current = controlledPlayIndex
+        }
+      }
+    } else {
+      lastStablePlayIndexRef.current = controlledPlayIndex
+    }
+
     return {
       ...defaultOptions,
       audioLists: snapshotQueue(playerState.queue),
-      playIndex,
-      autoPlay: playerState.clear || playIndex === 0,
+      playIndex: controlledPlayIndex,
+      autoPlay: playerState.clear || controlledPlayIndex === 0,
       clearPriorAudioLists: playerState.clear,
       extendsContent: (
         <PlayerToolbar id={current.trackId} isRadio={current.isRadio} />
@@ -284,7 +317,7 @@ const Player = () => {
       defaultVolume: isMobilePlayer ? 1 : playerState.volume,
       showMediaSession: !current.isRadio,
     }
-  }, [playerState, defaultOptions, isMobilePlayer])
+  }, [playerState, defaultOptions, isMobilePlayer, queueSyncPending])
 
   const onAudioListsChange = useCallback(
     (_, audioLists, audioInfo) => {
@@ -292,11 +325,15 @@ const Player = () => {
       dispatch(syncQueue(audioInfo, queueSnapshot))
       if (playerState.jukeboxMode) {
         const diff = computeQueueDiff(prevQueueRef.current, queueSnapshot)
+        setQueueSyncPending(true)
         pendingQueueSyncRef.current = enqueueJukeboxCommand(() =>
           syncJukeboxQueueIncremental(jukeboxClient, diff),
-        ).catch(() => {})
+        )
+          .catch(() => {})
+          .finally(() => setQueueSyncPending(false))
       } else {
         pendingQueueSyncRef.current = Promise.resolve()
+        setQueueSyncPending(false)
       }
       prevQueueRef.current = queueSnapshot
     },
@@ -422,6 +459,11 @@ const Player = () => {
         setStartTime(null)
       }
       if (playerState.jukeboxMode) {
+        const nextIndex = audioLists.findIndex((item) => item?.uuid === playId)
+        if (shouldSuppressRemoteTrackEcho(nextIndex)) {
+          return
+        }
+
         enqueueJukeboxCommand(() =>
           syncJukeboxTrackChangeAfterQueueSync(
             pendingQueueSyncRef.current,
@@ -628,6 +670,7 @@ export {
   Player,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
+  resolveControlledJukeboxPlayIndex,
   resolvePlayerUiState,
   startJukeboxHeartbeatLoop,
   syncRemotePositionIfNeeded,

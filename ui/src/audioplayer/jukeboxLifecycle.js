@@ -1,5 +1,6 @@
 let suppressUntil = 0
 let pendingRemoteSeek = null
+let pendingRemoteTrackChange = null
 
 export const suppressJukeboxMediaEvents = (ms = 500) => {
   suppressUntil = Date.now() + ms
@@ -27,6 +28,26 @@ export const shouldSuppressRemoteSeekEcho = (currentTime) => {
   return false
 }
 
+export const markPendingRemoteTrackChange = ({ index, ttlMs = 3000 }) => {
+  pendingRemoteTrackChange = {
+    index,
+    expiresAt: Date.now() + ttlMs,
+  }
+}
+
+export const shouldSuppressRemoteTrackEcho = (index) => {
+  if (!pendingRemoteTrackChange) return false
+  if (Date.now() > pendingRemoteTrackChange.expiresAt) {
+    pendingRemoteTrackChange = null
+    return false
+  }
+  if (pendingRemoteTrackChange.index === index) {
+    pendingRemoteTrackChange = null
+    return true
+  }
+  return false
+}
+
 export const shouldForwardJukeboxMediaEvent = ({ jukeboxMode, hidden }) => {
   if (!jukeboxMode) return false
   if (hidden) return false
@@ -36,4 +57,5 @@ export const shouldForwardJukeboxMediaEvent = ({ jukeboxMode, hidden }) => {
 export const resetJukeboxMediaEventSuppression = () => {
   suppressUntil = 0
   pendingRemoteSeek = null
+  pendingRemoteTrackChange = null
 }
