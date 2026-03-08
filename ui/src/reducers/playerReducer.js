@@ -12,6 +12,7 @@ import {
   PLAYER_SET_MODE,
   PLAYER_SET_JUKEBOX_MODE,
   PLAYER_JUKEBOX_STATUS,
+  PLAYER_JUKEBOX_SESSION_STATUS,
   PLAYER_SET_AUDIO_INSTANCE,
 } from '../actions'
 import config from '../config'
@@ -26,6 +27,7 @@ const initialState = {
   jukeboxMode: false,
   jukeboxDevice: null,
   jukeboxStatus: null,
+  jukeboxSession: null,
   audioInstance: null,
 }
 
@@ -124,11 +126,12 @@ const reduceSetTrack = (state, { data }) => {
 }
 
 const reduceAddTracks = (state, { data }) => {
-  const queue = state.queue
-  Object.keys(data).forEach((id) => {
-    queue.push(mapToAudioLists(data[id]))
-  })
-  return { ...state, queue, clear: false }
+  const appended = Object.keys(data).map((id) => mapToAudioLists(data[id]))
+  return {
+    ...state,
+    queue: [...state.queue, ...appended],
+    clear: false,
+  }
 }
 
 const reducePlayNext = (state, { data }) => {
@@ -170,7 +173,7 @@ const reduceSetVolume = (state, { data: { volume } }) => {
 const reduceSyncQueue = (state, { data: { audioInfo, audioLists } }) => {
   return {
     ...state,
-    queue: audioLists,
+    queue: audioLists.map((item) => ({ ...item })),
     clear: false,
     playIndex: undefined,
   }
@@ -226,6 +229,9 @@ export const playerReducer = (previousState = initialState, payload) => {
         jukeboxStatus: payload.data.enabled
           ? previousState.jukeboxStatus
           : null,
+        jukeboxSession: payload.data.enabled
+          ? previousState.jukeboxSession
+          : null,
       }
     case PLAYER_JUKEBOX_STATUS:
       return {
@@ -234,6 +240,15 @@ export const playerReducer = (previousState = initialState, payload) => {
         volume: previousState.jukeboxMode
           ? audioVolumeToUiVolume(payload.data.gain)
           : previousState.volume,
+      }
+    case PLAYER_JUKEBOX_SESSION_STATUS:
+      return {
+        ...previousState,
+        jukeboxSession: payload.data,
+        volume:
+          previousState.jukeboxMode && typeof payload.data?.gain === 'number'
+            ? audioVolumeToUiVolume(payload.data.gain)
+            : previousState.volume,
       }
     case PLAYER_SET_AUDIO_INSTANCE:
       return {

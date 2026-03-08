@@ -96,6 +96,7 @@ func (api *Router) routes() http.Handler {
 			if conf.Server.Jukebox.Enabled {
 				api.addJukeboxDeviceRoute(r)
 				api.addJukeboxControlRoute(r)
+				api.addJukeboxSessionRoute(r)
 				if conf.Server.Jukebox.BluetoothManagement {
 					api.addBluetoothRoute(r)
 				}

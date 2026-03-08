@@ -1,4 +1,5 @@
 import React from 'react'
+import { useSelector } from 'react-redux'
 import { useMediaQuery } from '@material-ui/core'
 import { Link } from 'react-router-dom'
 import clsx from 'clsx'
@@ -6,13 +7,17 @@ import { QualityInfo } from '../common'
 import useStyle from './styles'
 import { useDrag } from 'react-dnd'
 import { DraggableTypes } from '../consts'
+import { selectEffectiveCurrentTrack } from '../selectors/playerSelectors'
 
 const AudioTitle = React.memo(({ audioInfo, gainInfo, isMobile }) => {
+  const effectiveCurrentTrack = useSelector(selectEffectiveCurrentTrack)
+  const jukeboxMode = useSelector((state) => state.player?.jukeboxMode)
   const classes = useStyle()
   const className = classes.audioTitle
   const isDesktop = useMediaQuery('(min-width:810px)')
 
-  const song = audioInfo.song
+  const resolvedAudioInfo = jukeboxMode && effectiveCurrentTrack ? effectiveCurrentTrack : audioInfo
+  const song = resolvedAudioInfo.song
   const [, dragSongRef] = useDrag(
     () => ({
       type: DraggableTypes.SONG,
@@ -38,8 +43,8 @@ const AudioTitle = React.memo(({ audioInfo, gainInfo, isMobile }) => {
   const subtitle = song.tags?.['subtitle']
   const title = song.title + (subtitle ? ` (${subtitle})` : '')
 
-  const linkTo = audioInfo.isRadio
-    ? `/radio/${audioInfo.trackId}/show`
+  const linkTo = resolvedAudioInfo.isRadio
+    ? `/radio/${resolvedAudioInfo.trackId}/show`
     : song.playlistId
       ? `/playlist/${song.playlistId}/show`
       : `/album/${song.albumId}/show`

@@ -3,6 +3,27 @@ import httpClient from '../dataProvider/httpClient'
 const jukeboxClient = {
   status: () => httpClient('/api/jukebox/status').then(({ json }) => json),
 
+
+  attachSession: (sessionId, clientId, deviceName = null) =>
+    httpClient('/api/jukebox/session/attach', {
+      method: 'POST',
+      body: JSON.stringify(
+        deviceName ? { sessionId, clientId, deviceName } : { sessionId, clientId },
+      ),
+    }).then(({ json }) => json),
+
+  heartbeatSession: (sessionId, clientId) =>
+    httpClient('/api/jukebox/session/heartbeat', {
+      method: 'POST',
+      body: JSON.stringify({ sessionId, clientId }),
+    }).then(({ json }) => json),
+
+  detachSession: (sessionId, clientId) =>
+    httpClient('/api/jukebox/session/detach', {
+      method: 'POST',
+      body: JSON.stringify({ sessionId, clientId }),
+    }).then(({ json }) => json),
+
   set: (ids) =>
     httpClient('/api/jukebox/set', {
       method: 'POST',
@@ -47,10 +68,10 @@ const jukeboxClient = {
       body: JSON.stringify({ gain }),
     }).then(({ json }) => json),
 
-  add: (ids) =>
+  add: (ids, index = null) =>
     httpClient('/api/jukebox/add', {
       method: 'POST',
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify(index === null ? { ids } : { ids, index }),
     }).then(({ json }) => json),
 
   remove: (index) =>

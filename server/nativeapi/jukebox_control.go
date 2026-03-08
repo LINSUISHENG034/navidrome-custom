@@ -41,7 +41,7 @@ func toStatusResponse(s playback.DeviceStatus) *jukeboxStatusResponse {
 	}
 }
 
-func (api *Router) writeJukeboxJSON(w http.ResponseWriter, r *http.Request, resp *jukeboxStatusResponse) {
+func (api *Router) writeJukeboxJSON(w http.ResponseWriter, r *http.Request, resp any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Error(r.Context(), "Error encoding jukebox status", err)
@@ -209,7 +209,8 @@ func (api *Router) jukeboxSeek(w http.ResponseWriter, r *http.Request) {
 
 func (api *Router) jukeboxAdd(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs []string `json:"ids"`
+		IDs   []string `json:"ids"`
+		Index *int     `json:"index,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -221,7 +222,13 @@ func (api *Router) jukeboxAdd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	status, err := pb.Add(r.Context(), req.IDs)
+
+	var status playback.DeviceStatus
+	if req.Index != nil {
+		status, err = pb.Insert(r.Context(), *req.Index, req.IDs)
+	} else {
+		status, err = pb.Add(r.Context(), req.IDs)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

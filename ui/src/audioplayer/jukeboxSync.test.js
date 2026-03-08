@@ -19,7 +19,7 @@ describe('computeQueueDiff', () => {
     const oldQueue = [{ trackId: 'a' }, { trackId: 'b' }, { trackId: 'c' }]
     const newQueue = [{ trackId: 'a' }, { trackId: 'c' }]
     const diff = computeQueueDiff(oldQueue, newQueue)
-    expect(diff.removed).toEqual([1]) // index 1 in old queue
+    expect(diff.removed).toEqual([1])
     expect(diff.added).toEqual([])
   })
 
@@ -37,6 +37,27 @@ describe('computeQueueDiff', () => {
     expect(diff.removed).toEqual([])
     expect(diff.fullReplace).toBe(false)
   })
+
+  it('treats duplicate additions as incremental changes', () => {
+    const diff = computeQueueDiff(
+      [{ trackId: 'a' }, { trackId: 'b' }],
+      [{ trackId: 'a' }, { trackId: 'b' }, { trackId: 'b' }],
+    )
+    expect(diff.added).toEqual([{ trackId: 'b', index: 2 }])
+    expect(diff.removed).toEqual([])
+    expect(diff.fullReplace).toBe(false)
+  })
+
+  it('treats removing one duplicate as an incremental removal', () => {
+    const diff = computeQueueDiff(
+      [{ trackId: 'a' }, { trackId: 'b' }, { trackId: 'b' }],
+      [{ trackId: 'a' }, { trackId: 'b' }],
+    )
+    expect(diff.removed).toEqual([2])
+    expect(diff.added).toEqual([])
+    expect(diff.fullReplace).toBe(false)
+  })
+
 })
 
 describe('syncJukeboxQueueIncremental', () => {
@@ -46,10 +67,31 @@ describe('syncJukeboxQueueIncremental', () => {
       remove: vi.fn(() => Promise.resolve({})),
       set: vi.fn(() => Promise.resolve({})),
     }
-    const diff = { added: [{ trackId: 'c', index: 2 }], removed: [], fullReplace: false }
+    const diff = {
+      added: [{ trackId: 'c', index: 2 }],
+      removed: [],
+      fullReplace: false,
+    }
     await syncJukeboxQueueIncremental(client, diff)
-    expect(client.add).toHaveBeenCalledWith(['c'])
+    expect(client.add).toHaveBeenCalledWith(['c'], 2)
     expect(client.remove).not.toHaveBeenCalled()
+    expect(client.set).not.toHaveBeenCalled()
+  })
+
+  it('preserves a middle insertion instead of append-only add', async () => {
+    const client = {
+      add: vi.fn(() => Promise.resolve({})),
+      remove: vi.fn(() => Promise.resolve({})),
+      set: vi.fn(() => Promise.resolve({})),
+    }
+    const diff = computeQueueDiff(
+      [{ trackId: 'a' }, { trackId: 'c' }],
+      [{ trackId: 'a' }, { trackId: 'b' }, { trackId: 'c' }],
+    )
+
+    await syncJukeboxQueueIncremental(client, diff)
+
+    expect(client.add).toHaveBeenCalledWith(['b'], 1)
     expect(client.set).not.toHaveBeenCalled()
   })
 
@@ -61,7 +103,6 @@ describe('syncJukeboxQueueIncremental', () => {
     }
     const diff = { added: [], removed: [1, 3], fullReplace: false }
     await syncJukeboxQueueIncremental(client, diff)
-    // Must remove in reverse order to keep indices valid
     expect(client.remove).toHaveBeenCalledTimes(2)
     expect(client.remove).toHaveBeenNthCalledWith(1, 3)
     expect(client.remove).toHaveBeenNthCalledWith(2, 1)
@@ -82,9 +123,45 @@ describe('syncJukeboxQueueIncremental', () => {
     await syncJukeboxQueueIncremental(client, diff)
     expect(client.set).toHaveBeenCalledWith(['x', 'y'])
   })
+
+  it('sends set([]) when the queue becomes empty', async () => {
+    const client = {
+      add: vi.fn(() => Promise.resolve({})),
+      remove: vi.fn(() => Promise.resolve({})),
+      set: vi.fn(() => Promise.resolve({})),
+    }
+
+    await syncJukeboxQueueIncremental(client, {
+      added: [],
+      removed: [],
+      fullReplace: true,
+      newTrackIds: [],
+    })
+
+    expect(client.set).toHaveBeenCalledWith([])
+  })
 })
 
 describe('syncJukeboxTrackChange', () => {
+  it('resolves third-party player playId via __PLAYER_KEY__ before uuid', async () => {
+    const client = {
+      skip: vi.fn(() => Promise.resolve({})),
+    }
+    const audioLists = [
+      { __PLAYER_KEY__: 'p1', uuid: 'u1', trackId: 't1' },
+      { __PLAYER_KEY__: 'p2', uuid: 'u2', trackId: 't2' },
+      { __PLAYER_KEY__: 'p3', uuid: 'u3', trackId: 't3' },
+    ]
+
+    await syncJukeboxTrackChange(client, {
+      audioLists,
+      playId: 'p2',
+      audioInfo: { currentTime: 17 },
+    })
+
+    expect(client.skip).toHaveBeenCalledWith(1, 0)
+  })
+
   it('sends skip to correct index', async () => {
     const client = {
       skip: vi.fn(() => Promise.resolve({})),
@@ -101,7 +178,26 @@ describe('syncJukeboxTrackChange', () => {
       audioInfo: { currentTime: 17 },
     })
 
-    expect(client.skip).toHaveBeenCalledWith(1, 17)
+    expect(client.skip).toHaveBeenCalledWith(1, 0)
+  })
+
+  it('resets offset to 0 when switching to a different queue track', async () => {
+    const client = {
+      skip: vi.fn(() => Promise.resolve({})),
+    }
+    const audioLists = [
+      { uuid: 'u1', trackId: 't1' },
+      { uuid: 'u2', trackId: 't2' },
+      { uuid: 'u3', trackId: 't3' },
+    ]
+
+    await syncJukeboxTrackChange(client, {
+      audioLists,
+      playId: 'u3',
+      audioInfo: { trackId: 't1', currentTime: 87 },
+    })
+
+    expect(client.skip).toHaveBeenCalledWith(2, 0)
   })
 })
 

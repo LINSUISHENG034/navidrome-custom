@@ -16,6 +16,7 @@ import (
 	"github.com/navidrome/navidrome/core/playback/bluetooth"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
+	serverevents "github.com/navidrome/navidrome/server/events"
 	"github.com/navidrome/navidrome/utils/singleton"
 )
 
@@ -26,6 +27,10 @@ type PlaybackServer interface {
 	ListDevices() []DeviceInfo
 	SwitchDevice(ctx context.Context, deviceName string) error
 	RefreshDevices(ctx context.Context) error
+	AttachSession(ctx context.Context, req AttachRequest) (SessionStatus, error)
+	HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
+	DetachSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
+	SessionStatus(ctx context.Context, sessionID string) (SessionStatus, error)
 }
 
 // DeviceInfo represents an audio output device exposed via the API.
@@ -38,10 +43,160 @@ type DeviceInfo struct {
 }
 
 type playbackServer struct {
-	mu              sync.Mutex
-	ctx             *context.Context
-	datastore       model.DataStore
-	playbackDevices []playbackDevice
+	mu                  sync.Mutex
+	ctx                 *context.Context
+	datastore           model.DataStore
+	sessionManager      *SessionManager
+	eventBroker         serverevents.Broker
+	onDeviceStateChange func(*playbackDevice, DeviceStatus)
+	playbackDevices     []playbackDevice
+}
+
+func (ps *playbackServer) newPlaybackDevice(ctx context.Context, name string, deviceName string) *playbackDevice {
+	device := NewPlaybackDevice(ctx, ps, name, deviceName)
+	device.onStateChange = func(status DeviceStatus) {
+		if ps.onDeviceStateChange != nil {
+			ps.onDeviceStateChange(device, status)
+		}
+		ps.publishJukeboxStateUpdates(device)
+	}
+	return device
+}
+
+func (ps *playbackServer) getEventBroker() serverevents.Broker {
+	if ps.eventBroker != nil {
+		return ps.eventBroker
+	}
+	return serverevents.GetBroker()
+}
+
+func (ps *playbackServer) publishJukeboxStateUpdates(device *playbackDevice) {
+	if ps.sessionManager == nil || device == nil {
+		return
+	}
+	for _, session := range ps.sessionManager.FindByDevice(device.DeviceName) {
+		if session.User == "" {
+			continue
+		}
+		status := ps.statusFromSession(session)
+		ps.getEventBroker().SendMessage(jukeboxTargetContext(session.User), NewJukeboxStateUpdatedEvent(status))
+	}
+}
+
+func (ps *playbackServer) reapExpiredSessions() {
+	if ps.sessionManager == nil {
+		return
+	}
+	for _, session := range ps.sessionManager.ReapExpired() {
+		if session.User == "" {
+			continue
+		}
+		status := ps.statusFromSession(session)
+		status.Attached = false
+		ps.getEventBroker().SendMessage(jukeboxTargetContext(session.User), NewJukeboxStateUpdatedEvent(status))
+	}
+}
+
+func (ps *playbackServer) monitorSessionExpiry(ctx context.Context) {
+	ticker := time.NewTicker(sessionReapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ps.reapExpiredSessions()
+		}
+	}
+}
+
+func (ps *playbackServer) ensureSessionManager() *SessionManager {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.sessionManager == nil {
+		ps.sessionManager = NewSessionManager(defaultSessionTTL)
+	}
+	return ps.sessionManager
+}
+
+func (ps *playbackServer) getDeviceByName(deviceName string) *playbackDevice {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	for idx := range ps.playbackDevices {
+		if ps.playbackDevices[idx].DeviceName == deviceName {
+			return &ps.playbackDevices[idx]
+		}
+	}
+	return nil
+}
+
+func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
+	status := SessionStatus{
+		SessionID:     session.SessionID,
+		DeviceName:    session.DeviceName,
+		OwnerClientID: session.OwnerClientID,
+		Attached:      true,
+		LastHeartbeat: session.LastHeartbeat,
+	}
+
+	device := ps.getDeviceByName(session.DeviceName)
+	if device == nil {
+		return status
+	}
+
+	device.mu.Lock()
+	defer device.mu.Unlock()
+
+	deviceStatus := device.getStatus()
+	status.CurrentIndex = deviceStatus.CurrentIndex
+	status.Playing = deviceStatus.Playing
+	status.Position = deviceStatus.Position
+	status.Gain = deviceStatus.Gain
+	status.QueueVersion = device.queueVersion
+	if current := device.PlaybackQueue.Current(); current != nil {
+		status.TrackID = current.ID
+	}
+
+	return status
+}
+
+func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) (SessionStatus, error) {
+	if req.DeviceName == "" && req.User != "" {
+		device, err := ps.GetDeviceForUser(req.User)
+		if err != nil {
+			return SessionStatus{}, err
+		}
+		req.DeviceName = device.DeviceName
+	}
+
+	session := ps.ensureSessionManager().Attach(req)
+	return ps.statusFromSession(session), nil
+}
+
+func (ps *playbackServer) HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error) {
+	if err := ps.ensureSessionManager().Heartbeat(sessionID, clientID); err != nil {
+		return SessionStatus{}, err
+	}
+	return ps.SessionStatus(ctx, sessionID)
+}
+
+func (ps *playbackServer) DetachSession(_ context.Context, sessionID, clientID string) (SessionStatus, error) {
+	session, err := ps.ensureSessionManager().DetachSnapshot(sessionID, clientID)
+	if err != nil {
+		return SessionStatus{}, err
+	}
+	status := ps.statusFromSession(session)
+	status.Attached = false
+	return status, nil
+}
+
+func (ps *playbackServer) SessionStatus(_ context.Context, sessionID string) (SessionStatus, error) {
+	session, ok := ps.ensureSessionManager().Get(sessionID)
+	if !ok {
+		return SessionStatus{}, ErrSessionNotFound
+	}
+	return ps.statusFromSession(session), nil
 }
 
 // playbackDeviceContext returns the long-lived playback service context when
@@ -57,7 +212,7 @@ func (ps *playbackServer) playbackDeviceContext(fallback context.Context) contex
 // GetInstance returns the playback-server singleton
 func GetInstance(ds model.DataStore) PlaybackServer {
 	return singleton.GetInstance(func() *playbackServer {
-		return &playbackServer{datastore: ds}
+		return &playbackServer{datastore: ds, sessionManager: NewSessionManager(defaultSessionTTL)}
 	})
 }
 
@@ -88,6 +243,7 @@ func (ps *playbackServer) Run(ctx context.Context) error {
 	if conf.Server.Jukebox.AutoDiscoverBluetooth {
 		go ps.monitorBluetoothConnections(ctx)
 	}
+	go ps.monitorSessionExpiry(ctx)
 
 	<-ctx.Done()
 
@@ -96,6 +252,7 @@ func (ps *playbackServer) Run(ctx context.Context) error {
 }
 
 const btMonitorInterval = 10 * time.Second
+const sessionReapInterval = 15 * time.Second
 
 // monitorBluetoothConnections periodically checks whether Bluetooth sinks are still
 // available. If the active default device is a BT sink that has disappeared, playback
@@ -141,7 +298,7 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 	if defaultDevice == "" {
 		// if there are no devices given and no default device, we create a synthetic device named "auto"
 		if len(devices) == 0 {
-			pbDevices[0] = *NewPlaybackDevice(ctx, ps, "auto", "auto")
+			pbDevices[0] = *ps.newPlaybackDevice(ctx, "auto", "auto")
 		}
 
 		// if there is but only one entry and no default given, just use that.
@@ -149,7 +306,7 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 			if len(devices[0]) != 2 {
 				return []playbackDevice{}, fmt.Errorf("audio device definition ought to contain 2 fields, found: %d ", len(devices[0]))
 			}
-			pbDevices[0] = *NewPlaybackDevice(ctx, ps, devices[0][0], devices[0][1])
+			pbDevices[0] = *ps.newPlaybackDevice(ctx, devices[0][0], devices[0][1])
 		}
 
 		if len(devices) > 1 {
@@ -165,7 +322,7 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 			return []playbackDevice{}, fmt.Errorf("audio device definition ought to contain 2 fields, found: %d ", len(audioDevice))
 		}
 
-		pbDevices[idx] = *NewPlaybackDevice(ctx, ps, audioDevice[0], audioDevice[1])
+		pbDevices[idx] = *ps.newPlaybackDevice(ctx, audioDevice[0], audioDevice[1])
 
 		if audioDevice[0] == defaultDevice {
 			pbDevices[idx].Default = true
@@ -224,7 +381,7 @@ func (ps *playbackServer) mergeBluetoothDevices(ctx context.Context) {
 		if ps.hasDeviceLocked(devName) {
 			continue
 		}
-		dev := NewPlaybackDevice(deviceCtx, ps, sink.FriendlyName(), devName)
+		dev := ps.newPlaybackDevice(deviceCtx, sink.FriendlyName(), devName)
 		ps.playbackDevices = append(ps.playbackDevices, *dev)
 		log.Info(ctx, "Discovered Bluetooth device", "name", sink.FriendlyName(), "device", devName)
 	}

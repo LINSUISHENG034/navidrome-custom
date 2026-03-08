@@ -9,6 +9,7 @@ export const PLAYER_SET_VOLUME = 'PLAYER_SET_VOLUME'
 export const PLAYER_SET_MODE = 'PLAYER_SET_MODE'
 export const PLAYER_SET_JUKEBOX_MODE = 'PLAYER_SET_JUKEBOX_MODE'
 export const PLAYER_JUKEBOX_STATUS = 'PLAYER_JUKEBOX_STATUS'
+export const PLAYER_JUKEBOX_SESSION_STATUS = 'jukeboxStateUpdated'
 export const PLAYER_SET_AUDIO_INSTANCE = 'PLAYER_SET_AUDIO_INSTANCE'
 
 export const setTrack = (data) => ({
@@ -119,4 +120,9 @@ export const updateJukeboxStatus = (status) => ({
 export const setAudioInstance = (instance) => ({
   type: PLAYER_SET_AUDIO_INSTANCE,
   data: instance,
+})
+
+export const updateJukeboxSessionStatus = (status) => ({
+  type: PLAYER_JUKEBOX_SESSION_STATUS,
+  data: status,
 })

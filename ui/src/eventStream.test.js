@@ -1,4 +1,4 @@
-import { describe, it, beforeEach, vi, expect } from 'vitest'
+import { describe, it, beforeEach, vi, expect, afterEach } from 'vitest'
 import { startEventStream } from './eventStream'
 import { serverDown } from './actions'
 import config from './config'
@@ -32,7 +32,6 @@ describe('startEventStream', () => {
     localStorage.setItem('is-authenticated', 'true')
     localStorage.setItem('token', 'abc')
     config.devNewEventStream = true
-    // Mock console.log to suppress output during tests
     vi.spyOn(console, 'log').mockImplementation(() => {})
   })
 
@@ -47,5 +46,21 @@ describe('startEventStream', () => {
     expect(dispatch).toHaveBeenCalledWith(serverDown())
     vi.advanceTimersByTime(5000)
     expect(global.EventSource).toHaveBeenCalledTimes(2)
+  })
+
+  it('subscribes to jukebox state updates', async () => {
+    await startEventStream(dispatch)
+    expect(instance.listeners.jukeboxStateUpdated).toBeTypeOf('function')
+
+    dispatch.mockClear()
+    instance.listeners.jukeboxStateUpdated({
+      type: 'jukeboxStateUpdated',
+      data: JSON.stringify({ sessionId: 's1', currentIndex: 1, trackId: 't2' }),
+    })
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'jukeboxStateUpdated',
+      data: { sessionId: 's1', currentIndex: 1, trackId: 't2' },
+    })
   })
 })

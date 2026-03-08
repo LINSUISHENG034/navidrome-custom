@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"time"
 
 	"github.com/navidrome/navidrome/model"
 	. "github.com/onsi/ginkgo/v2"
@@ -133,5 +134,40 @@ var _ = Describe("PlaybackServer", func() {
 			got := ps.playbackDeviceContext(reqCtx)
 			Expect(got.Err()).ToNot(BeNil())
 		})
+	})
+
+	It("invokes state change callback after automatic track advance", func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		events := make(chan DeviceStatus, 1)
+		ps = &playbackServer{
+			ctx: &ctx,
+			onDeviceStateChange: func(_ *playbackDevice, status DeviceStatus) {
+				events <- status
+			},
+		}
+
+		oldTrack := &mockTrack{playing: true}
+		nextTrack := &mockTrack{}
+		previousNewTrack := newTrack
+		newTrack = func(_ context.Context, _ chan bool, _ string, _ model.MediaFile) (Track, error) {
+			return nextTrack, nil
+		}
+		defer func() { newTrack = previousNewTrack }()
+
+		pd := ps.newPlaybackDevice(ctx, "Speaker", "auto")
+		pd.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}, {ID: "2", Path: "/b.mp3"}})
+		pd.ActiveTrack = oldTrack
+
+		go pd.trackSwitcherGoroutine()
+		pd.PlaybackDone <- true
+
+		Eventually(events, time.Second).Should(Receive(Equal(DeviceStatus{
+			CurrentIndex: 1,
+			Playing:      true,
+			Gain:         DefaultGain,
+			Position:     0,
+		})))
 	})
 })
