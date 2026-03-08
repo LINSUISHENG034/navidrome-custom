@@ -49,6 +49,7 @@ import {
 } from './jukeboxLifecycle'
 import {
   computeQueueDiff,
+  resolvePlayIndex,
   syncJukeboxQueueIncremental,
   syncJukeboxSeek,
   syncJukeboxTrackChangeAfterQueueSync,
@@ -175,6 +176,27 @@ const shouldConsumePendingRemoteTrackChange = ({
   return false
 }
 
+const applyOptimisticUserSkip = ({
+  controlledPlayIndex,
+  pendingUserSkipRef,
+  remoteCurrentIndex,
+}) => {
+  const pending = pendingUserSkipRef.current
+  if (!pending) return controlledPlayIndex
+
+  if (remoteCurrentIndex === pending.index) {
+    pendingUserSkipRef.current = null
+    return controlledPlayIndex
+  }
+
+  if (Date.now() > pending.expiresAt) {
+    pendingUserSkipRef.current = null
+    return controlledPlayIndex
+  }
+
+  return pending.index
+}
+
 const resolvePlayerUiState = (playerState) => {
   const state = { player: playerState }
   const effectiveCurrentTrack = selectEffectiveCurrentTrack(state)
@@ -207,6 +229,7 @@ const Player = () => {
   const pendingQueueSyncRef = useRef(Promise.resolve())
   const lastStablePlayIndexRef = useRef(undefined)
   const pendingRemoteTrackChangeRef = useRef(null)
+  const pendingUserSkipRef = useRef(null)
   const [queueSyncPending, setQueueSyncPending] = useState(false)
 
   const handleAudioInstance = useCallback(
@@ -335,7 +358,7 @@ const Player = () => {
   )
 
   const { current, playIndex } = resolvePlayerUiState(playerState)
-  const controlledPlayIndex = resolveControlledJukeboxPlayIndex({
+  let controlledPlayIndex = resolveControlledJukeboxPlayIndex({
     jukeboxMode: playerState.jukeboxMode,
     queueSyncPending,
     remotePlayIndex: playIndex,
@@ -345,7 +368,18 @@ const Player = () => {
   if (!playerState.jukeboxMode) {
     lastStablePlayIndexRef.current = controlledPlayIndex
     pendingRemoteTrackChangeRef.current = null
+    pendingUserSkipRef.current = null
   } else {
+    controlledPlayIndex = applyOptimisticUserSkip({
+      controlledPlayIndex,
+      pendingUserSkipRef,
+      remoteCurrentIndex: playerState.jukeboxSession?.currentIndex,
+    })
+
+    if (queueSyncPending && pendingUserSkipRef.current) {
+      pendingUserSkipRef.current = null
+    }
+
     primePendingRemoteTrackChange({
       jukeboxMode: playerState.jukeboxMode,
       queueSyncPending,
@@ -519,7 +553,11 @@ const Player = () => {
         setStartTime(null)
       }
       if (playerState.jukeboxMode) {
-        const nextIndex = audioLists.findIndex((item) => item?.uuid === playId)
+        const nextIndex = resolvePlayIndex({
+          audioLists,
+          playId,
+          trackId: info?.trackId,
+        })
         if (
           shouldConsumePendingRemoteTrackChange({
             nextIndex,
@@ -527,6 +565,14 @@ const Player = () => {
           })
         ) {
           return
+        }
+
+        if (nextIndex >= 0) {
+          pendingUserSkipRef.current = {
+            index: nextIndex,
+            expiresAt: Date.now() + 5000,
+          }
+          lastStablePlayIndexRef.current = nextIndex
         }
 
         enqueueJukeboxCommand(() =>
@@ -733,6 +779,7 @@ const Player = () => {
 
 export {
   Player,
+  applyOptimisticUserSkip,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
   primePendingRemoteTrackChange,

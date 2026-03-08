@@ -38,10 +38,12 @@ import {
   syncJukeboxTrackChangeAfterQueueSync,
 } from './jukeboxSync'
 import {
+  applyOptimisticUserSkip,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
   resolveControlledJukeboxPlayIndex,
   resolvePlayerUiState,
+  shouldConsumePendingRemoteTrackChange,
   startJukeboxHeartbeatLoop,
   syncRemotePositionIfNeeded,
 } from './Player'
@@ -625,5 +627,113 @@ describe('queue highlight stabilization', () => {
     }
 
     expect(jukeboxClient.skip).not.toHaveBeenCalled()
+  })
+})
+
+describe('optimistic user skip', () => {
+  it('holds the user-selected index while remote state is stale', () => {
+    const pendingUserSkipRef = {
+      current: { index: 2, expiresAt: Date.now() + 5000 },
+    }
+
+    const controlledPlayIndex = resolveControlledJukeboxPlayIndex({
+      jukeboxMode: true,
+      queueSyncPending: false,
+      remotePlayIndex: 0,
+      lastStablePlayIndex: 2,
+    })
+
+    expect(
+      applyOptimisticUserSkip({
+        controlledPlayIndex,
+        pendingUserSkipRef,
+        remoteCurrentIndex: 0,
+      }),
+    ).toBe(2)
+    expect(pendingUserSkipRef.current).not.toBeNull()
+  })
+
+  it('clears the optimistic ref once the remote state confirms it', () => {
+    const pendingUserSkipRef = {
+      current: { index: 2, expiresAt: Date.now() + 5000 },
+    }
+
+    expect(
+      applyOptimisticUserSkip({
+        controlledPlayIndex: 2,
+        pendingUserSkipRef,
+        remoteCurrentIndex: 2,
+      }),
+    ).toBe(2)
+    expect(pendingUserSkipRef.current).toBeNull()
+  })
+
+  it('expires the optimistic ref after its TTL', () => {
+    vi.useFakeTimers()
+
+    const pendingUserSkipRef = {
+      current: { index: 2, expiresAt: Date.now() + 50 },
+    }
+
+    vi.advanceTimersByTime(100)
+
+    expect(
+      applyOptimisticUserSkip({
+        controlledPlayIndex: 0,
+        pendingUserSkipRef,
+        remoteCurrentIndex: 0,
+      }),
+    ).toBe(0)
+    expect(pendingUserSkipRef.current).toBeNull()
+
+    vi.useRealTimers()
+  })
+
+  it('covers user click to remote confirmation without reverting', () => {
+    const pendingUserSkipRef = { current: null }
+    const lastStablePlayIndexRef = { current: 0 }
+    const pendingRemoteTrackChangeRef = { current: null }
+    const nextIndex = 2
+
+    expect(
+      shouldConsumePendingRemoteTrackChange({
+        nextIndex,
+        pendingRemoteTrackChangeRef,
+      }),
+    ).toBe(false)
+
+    pendingUserSkipRef.current = { index: nextIndex, expiresAt: Date.now() + 5000 }
+    lastStablePlayIndexRef.current = nextIndex
+
+    const staleControlledPlayIndex = resolveControlledJukeboxPlayIndex({
+      jukeboxMode: true,
+      queueSyncPending: false,
+      remotePlayIndex: 0,
+      lastStablePlayIndex: lastStablePlayIndexRef.current,
+    })
+
+    expect(
+      applyOptimisticUserSkip({
+        controlledPlayIndex: staleControlledPlayIndex,
+        pendingUserSkipRef,
+        remoteCurrentIndex: 0,
+      }),
+    ).toBe(2)
+
+    const confirmedPlayIndex = resolveControlledJukeboxPlayIndex({
+      jukeboxMode: true,
+      queueSyncPending: false,
+      remotePlayIndex: 2,
+      lastStablePlayIndex: lastStablePlayIndexRef.current,
+    })
+
+    expect(
+      applyOptimisticUserSkip({
+        controlledPlayIndex: confirmedPlayIndex,
+        pendingUserSkipRef,
+        remoteCurrentIndex: 2,
+      }),
+    ).toBe(2)
+    expect(pendingUserSkipRef.current).toBeNull()
   })
 })

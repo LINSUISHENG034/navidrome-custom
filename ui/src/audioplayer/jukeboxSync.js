@@ -1,3 +1,5 @@
+const PLAYER_CALLBACK_ID_KEY = '__PLAYER_KEY__'
+
 const toTrackIds = (audioLists = []) =>
   audioLists.map((item) => item?.trackId).filter(Boolean)
 
@@ -16,8 +18,13 @@ const resolvePlayIndex = ({ audioLists = [], playId, trackId }) => {
   if (audioLists.length === 0) return 0
 
   if (playId) {
-    const byPlayId = audioLists.findIndex((item) => item?.uuid === playId)
-    if (byPlayId >= 0) return byPlayId
+    const byPlayerKey = audioLists.findIndex(
+      (item) => item?.[PLAYER_CALLBACK_ID_KEY] === playId,
+    )
+    if (byPlayerKey >= 0) return byPlayerKey
+
+    const byUuid = audioLists.findIndex((item) => item?.uuid === playId)
+    if (byUuid >= 0) return byUuid
   }
 
   if (trackId) {
@@ -124,6 +131,8 @@ export const syncJukeboxQueueIncremental = async (client, diff) => {
 /**
  * Sync track change: just skip to the right index (queue is already synced incrementally).
  */
+export { resolvePlayIndex }
+
 export const syncJukeboxTrackChange = async (
   client,
   { audioLists = [], playId, audioInfo = {} } = {},

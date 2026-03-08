@@ -143,6 +143,25 @@ describe('syncJukeboxQueueIncremental', () => {
 })
 
 describe('syncJukeboxTrackChange', () => {
+  it('resolves third-party player playId via __PLAYER_KEY__ before uuid', async () => {
+    const client = {
+      skip: vi.fn(() => Promise.resolve({})),
+    }
+    const audioLists = [
+      { __PLAYER_KEY__: 'p1', uuid: 'u1', trackId: 't1' },
+      { __PLAYER_KEY__: 'p2', uuid: 'u2', trackId: 't2' },
+      { __PLAYER_KEY__: 'p3', uuid: 'u3', trackId: 't3' },
+    ]
+
+    await syncJukeboxTrackChange(client, {
+      audioLists,
+      playId: 'p2',
+      audioInfo: { currentTime: 17 },
+    })
+
+    expect(client.skip).toHaveBeenCalledWith(1, 0)
+  })
+
   it('sends skip to correct index', async () => {
     const client = {
       skip: vi.fn(() => Promise.resolve({})),
