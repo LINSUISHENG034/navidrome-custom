@@ -1,4 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { useDispatch, useSelector } from 'react-redux'
 import { useMediaQuery } from '@material-ui/core'
 import { ThemeProvider } from '@material-ui/core/styles'
@@ -116,6 +123,12 @@ const syncRemotePositionIfNeeded = ({
 }
 
 
+/**
+ * Resolve the playIndex sent to ReactJkMusicPlayer.
+ * - local mode: use the reducer-managed playIndex directly
+ * - jukebox + queue sync pending: freeze the last known stable playIndex
+ * - jukebox + stable queue: use the latest authoritative remote playIndex
+ */
 const resolveControlledJukeboxPlayIndex = ({
   jukeboxMode,
   queueSyncPending,
@@ -285,15 +298,15 @@ const Player = () => {
     [gainInfo, isDesktop, playerTheme, translate, playerState.mode],
   )
 
-  const options = useMemo(() => {
-    const { current, playIndex } = resolvePlayerUiState(playerState)
-    const controlledPlayIndex = resolveControlledJukeboxPlayIndex({
-      jukeboxMode: playerState.jukeboxMode,
-      queueSyncPending,
-      remotePlayIndex: playIndex,
-      lastStablePlayIndex: lastStablePlayIndexRef.current,
-    })
+  const { current, playIndex } = resolvePlayerUiState(playerState)
+  const controlledPlayIndex = resolveControlledJukeboxPlayIndex({
+    jukeboxMode: playerState.jukeboxMode,
+    queueSyncPending,
+    remotePlayIndex: playIndex,
+    lastStablePlayIndex: lastStablePlayIndexRef.current,
+  })
 
+  useLayoutEffect(() => {
     if (playerState.jukeboxMode) {
       if (!queueSyncPending && controlledPlayIndex !== undefined) {
         if (controlledPlayIndex !== lastStablePlayIndexRef.current) {
@@ -301,10 +314,13 @@ const Player = () => {
           lastStablePlayIndexRef.current = controlledPlayIndex
         }
       }
-    } else {
-      lastStablePlayIndexRef.current = controlledPlayIndex
+      return
     }
 
+    lastStablePlayIndexRef.current = controlledPlayIndex
+  }, [playerState.jukeboxMode, queueSyncPending, controlledPlayIndex])
+
+  const options = useMemo(() => {
     return {
       ...defaultOptions,
       audioLists: snapshotQueue(playerState.queue),
@@ -317,7 +333,16 @@ const Player = () => {
       defaultVolume: isMobilePlayer ? 1 : playerState.volume,
       showMediaSession: !current.isRadio,
     }
-  }, [playerState, defaultOptions, isMobilePlayer, queueSyncPending])
+  }, [
+    playerState.queue,
+    playerState.clear,
+    playerState.volume,
+    defaultOptions,
+    isMobilePlayer,
+    controlledPlayIndex,
+    current.trackId,
+    current.isRadio,
+  ])
 
   const onAudioListsChange = useCallback(
     (_, audioLists, audioInfo) => {
@@ -333,7 +358,7 @@ const Player = () => {
           .finally(() => setQueueSyncPending(false))
       } else {
         pendingQueueSyncRef.current = Promise.resolve()
-        setQueueSyncPending(false)
+        setQueueSyncPending((pending) => (pending ? false : pending))
       }
       prevQueueRef.current = queueSnapshot
     },

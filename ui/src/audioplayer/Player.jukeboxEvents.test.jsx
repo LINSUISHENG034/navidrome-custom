@@ -436,6 +436,48 @@ describe('remote-state-first jukebox controls', () => {
     expect(jukeboxClient.play).not.toHaveBeenCalled()
   })
 
+
+
+  it('uses authoritative remote current index for PREV_SONG in jukebox mode', () => {
+    const handlers = keyHandlers(
+      { togglePlay: vi.fn(), volume: 0.5 },
+      {
+        jukeboxMode: true,
+        queue: [
+          { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+          { trackId: 't2', uuid: 'u2', song: { id: 't2' } },
+          { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
+        ],
+        current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+        jukeboxStatus: null,
+        jukeboxSession: { currentIndex: 2, trackId: 't3' },
+      },
+    )
+
+    handlers.PREV_SONG({ metaKey: false })
+    expect(jukeboxClient.skip).toHaveBeenCalledWith(1, 0)
+  })
+
+  it('uses authoritative remote current index for NEXT_SONG in jukebox mode', () => {
+    const handlers = keyHandlers(
+      { togglePlay: vi.fn(), volume: 0.5 },
+      {
+        jukeboxMode: true,
+        queue: [
+          { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+          { trackId: 't2', uuid: 'u2', song: { id: 't2' } },
+          { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
+        ],
+        current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+        jukeboxStatus: null,
+        jukeboxSession: { currentIndex: 1, trackId: 't2' },
+      },
+    )
+
+    handlers.NEXT_SONG({ metaKey: false })
+    expect(jukeboxClient.skip).toHaveBeenCalledWith(2, 0)
+  })
+
   it('uses remote session gain for volume changes', () => {
     const handlers = keyHandlers(
       { togglePlay: vi.fn(), volume: 0.5 },
@@ -536,6 +578,20 @@ describe('queue highlight stabilization', () => {
     markPendingRemoteTrackChange({ index: 2, ttlMs: 3000 })
     expect(shouldSuppressRemoteTrackEcho(2)).toBe(true)
     expect(shouldSuppressRemoteTrackEcho(2)).toBe(false)
+  })
+
+  it('stops suppressing track-change echo after TTL expires', () => {
+    vi.useFakeTimers()
+    markPendingRemoteTrackChange({ index: 2, ttlMs: 50 })
+    vi.advanceTimersByTime(100)
+    expect(shouldSuppressRemoteTrackEcho(2)).toBe(false)
+    vi.useRealTimers()
+  })
+
+  it('does not suppress track-change echo when index does not match', () => {
+    markPendingRemoteTrackChange({ index: 2, ttlMs: 3000 })
+    expect(shouldSuppressRemoteTrackEcho(5)).toBe(false)
+    expect(shouldSuppressRemoteTrackEcho(2)).toBe(true)
   })
 
   it('keeps the last stable playIndex while queue sync is pending', () => {
