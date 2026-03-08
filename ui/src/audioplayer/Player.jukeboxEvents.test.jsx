@@ -38,6 +38,7 @@ import {
 import {
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
+  resolvePlayerUiState,
   startJukeboxHeartbeatLoop,
   syncRemotePositionIfNeeded,
 } from './Player'
@@ -496,5 +497,27 @@ describe('jukebox session heartbeat lifecycle', () => {
     const second = getOrCreateJukeboxClientId()
     expect(first).toBe(second)
     expect(first).toBeTruthy()
+  })
+})
+
+
+describe('remote-state-first player selection', () => {
+  it('uses remote current track and index for jukebox queue highlighting', () => {
+    const remoteTrack = { trackId: 't2', uuid: 'u2', song: { id: 't2' } }
+    const state = {
+      jukeboxMode: true,
+      playIndex: undefined,
+      current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+      queue: [
+        { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+        remoteTrack,
+      ],
+      jukeboxSession: { currentIndex: 1, trackId: 't2' },
+      jukeboxStatus: null,
+    }
+
+    const resolved = resolvePlayerUiState(state)
+    expect(resolved.current).toBe(remoteTrack)
+    expect(resolved.playIndex).toBe(1)
   })
 })

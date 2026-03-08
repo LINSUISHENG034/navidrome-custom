@@ -48,6 +48,10 @@ import {
   syncJukeboxTrackChangeAfterQueueSync,
 } from './jukeboxSync'
 import { audioVolumeToUiVolume, clamp01 } from './volumeMapping'
+import {
+  selectEffectiveCurrentTrack,
+  selectEffectiveJukeboxCurrentIndex,
+} from '../selectors/playerSelectors'
 
 
 const snapshotQueue = (audioLists = []) =>
@@ -107,6 +111,24 @@ const syncRemotePositionIfNeeded = ({
   markPendingRemoteSeek({ position: nextPosition })
   audioInstance.currentTime = nextPosition
   return true
+}
+
+
+const resolvePlayerUiState = (playerState) => {
+  const state = { player: playerState }
+  const effectiveCurrentTrack = selectEffectiveCurrentTrack(state)
+  const effectiveCurrentIndex = selectEffectiveJukeboxCurrentIndex(state)
+
+  return {
+    current:
+      playerState.jukeboxMode && effectiveCurrentTrack
+        ? effectiveCurrentTrack
+        : playerState.current || {},
+    playIndex:
+      playerState.jukeboxMode && effectiveCurrentIndex >= 0
+        ? effectiveCurrentIndex
+        : playerState.playIndex,
+  }
 }
 
 const Player = () => {
@@ -249,12 +271,12 @@ const Player = () => {
   )
 
   const options = useMemo(() => {
-    const current = playerState.current || {}
+    const { current, playIndex } = resolvePlayerUiState(playerState)
     return {
       ...defaultOptions,
       audioLists: snapshotQueue(playerState.queue),
-      playIndex: playerState.playIndex,
-      autoPlay: playerState.clear || playerState.playIndex === 0,
+      playIndex,
+      autoPlay: playerState.clear || playIndex === 0,
       clearPriorAudioLists: playerState.clear,
       extendsContent: (
         <PlayerToolbar id={current.trackId} isRadio={current.isRadio} />
@@ -606,6 +628,7 @@ export {
   Player,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
+  resolvePlayerUiState,
   startJukeboxHeartbeatLoop,
   syncRemotePositionIfNeeded,
 }
