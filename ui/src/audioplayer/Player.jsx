@@ -56,6 +56,13 @@ import {
 } from './jukeboxSync'
 import { audioVolumeToUiVolume, clamp01 } from './volumeMapping'
 import {
+  attachJukeboxSession,
+  detachJukeboxSession,
+  getJukeboxSessionId,
+  getOrCreateJukeboxClientId,
+  refreshJukeboxSessionStatus,
+} from './jukeboxSession'
+import {
   selectEffectiveCurrentTrack,
   selectEffectiveJukeboxCurrentIndex,
 } from '../selectors/playerSelectors'
@@ -66,23 +73,6 @@ const snapshotQueue = (audioLists = []) =>
 
 
 const JUKEBOX_HEARTBEAT_INTERVAL_MS = 15000
-const JUKEBOX_SESSION_ID_PREFIX = 'jukebox-session:'
-const JUKEBOX_CLIENT_ID_KEY = 'jukebox-client-id'
-
-const getJukeboxSessionId = () => {
-  const username = localStorage.getItem('username')
-  return username ? `${JUKEBOX_SESSION_ID_PREFIX}${username}` : null
-}
-
-const getOrCreateJukeboxClientId = () => {
-  const existing = sessionStorage.getItem(JUKEBOX_CLIENT_ID_KEY)
-  if (existing) return existing
-  const next =
-    globalThis.crypto?.randomUUID?.() ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`
-  sessionStorage.setItem(JUKEBOX_CLIENT_ID_KEY, next)
-  return next
-}
 
 const startJukeboxHeartbeatLoop = ({
   jukeboxMode,
@@ -257,6 +247,7 @@ const Player = () => {
     (state) => state.settings.notifications || false,
   )
   const gainInfo = useSelector((state) => state.replayGain)
+  const streamReconnected = useSelector((state) => state.activity.streamReconnected)
   const [context, setContext] = useState(null)
   const [gainNode, setGainNode] = useState(null)
 
@@ -677,11 +668,14 @@ const Player = () => {
         })
         .catch(() => {})
 
-    jukeboxClient
-      .attachSession(sessionId, clientId)
+    attachJukeboxSession({
+      client: jukeboxClient,
+      sessionId,
+      clientId,
+      dispatch,
+    })
       .then((status) => {
-        if (cancelled) return
-        dispatch(updateJukeboxSessionStatus(status))
+        if (cancelled || !status) return
         cleanupHeartbeat = startJukeboxHeartbeatLoop({
           jukeboxMode: true,
           sessionId,
@@ -694,6 +688,11 @@ const Player = () => {
     return () => {
       cancelled = true
       cleanupHeartbeat()
+      detachJukeboxSession({
+        client: jukeboxClient,
+        sessionId,
+        clientId,
+      }).catch(() => {})
     }
   }, [playerState.jukeboxMode, dispatch])
 
@@ -712,19 +711,29 @@ const Player = () => {
   }, [playerState.jukeboxMode, dispatch])
 
   useEffect(() => {
+    if (!playerState.jukeboxMode || !streamReconnected) return
+    const sessionId = getJukeboxSessionId()
+    refreshJukeboxSessionStatus({
+      jukeboxMode: true,
+      client: jukeboxClient,
+      sessionId,
+      dispatch,
+    }).catch(() => {})
+  }, [playerState.jukeboxMode, streamReconnected, dispatch])
+
+  useEffect(() => {
     syncRemotePositionIfNeeded({
       jukeboxMode: playerState.jukeboxMode,
       audioInstance,
       session: playerState.jukeboxSession,
-      currentTrackId:
-        playerState.current?.trackId || playerState.current?.song?.id || null,
+      currentTrackId: current?.trackId || current?.song?.id || null,
     })
   }, [
     playerState.jukeboxMode,
     playerState.jukeboxSession?.position,
     playerState.jukeboxSession?.trackId,
-    playerState.current?.trackId,
-    playerState.current?.song?.id,
+    current?.trackId,
+    current?.song?.id,
     audioInstance,
   ])
 
@@ -780,8 +789,11 @@ const Player = () => {
 export {
   Player,
   applyOptimisticUserSkip,
+  attachJukeboxSession,
+  detachJukeboxSession,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
+  refreshJukeboxSessionStatus,
   primePendingRemoteTrackChange,
   resolveControlledJukeboxPlayIndex,
   resolvePlayerUiState,

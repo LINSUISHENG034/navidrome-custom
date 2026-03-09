@@ -15,6 +15,8 @@ vi.mock('./jukeboxClient', () => ({
     seek: vi.fn(() => Promise.resolve({})),
     attachSession: vi.fn(() => Promise.resolve({})),
     heartbeatSession: vi.fn(() => Promise.resolve({})),
+    sessionStatus: vi.fn(() => Promise.resolve({ sessionId: 's1' })),
+    detachSession: vi.fn(() => Promise.resolve({})),
   },
 }))
 
@@ -46,6 +48,8 @@ import {
   shouldConsumePendingRemoteTrackChange,
   startJukeboxHeartbeatLoop,
   syncRemotePositionIfNeeded,
+  refreshJukeboxSessionStatus,
+  detachJukeboxSession,
 } from './Player'
 import keyHandlers from './keyHandlers'
 
@@ -735,5 +739,39 @@ describe('optimistic user skip', () => {
       }),
     ).toBe(2)
     expect(pendingUserSkipRef.current).toBeNull()
+  })
+})
+
+
+describe('jukebox session authority refresh helpers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('refreshes session status after reconnect', async () => {
+    const dispatch = vi.fn()
+
+    await refreshJukeboxSessionStatus({
+      jukeboxMode: true,
+      sessionId: 's1',
+      client: jukeboxClient,
+      dispatch,
+    })
+
+    expect(jukeboxClient.sessionStatus).toHaveBeenCalledWith('s1')
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'jukeboxStateUpdated',
+      data: { sessionId: 's1' },
+    })
+  })
+
+  it('detaches the session on jukebox exit cleanup', async () => {
+    await detachJukeboxSession({
+      sessionId: 's1',
+      clientId: 'tab-1',
+      client: jukeboxClient,
+    })
+
+    expect(jukeboxClient.detachSession).toHaveBeenCalledWith('s1', 'tab-1')
   })
 })

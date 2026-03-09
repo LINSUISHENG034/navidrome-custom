@@ -20,6 +20,12 @@ import bluetoothClient from './bluetoothClient'
 import { suppressJukeboxMediaEvents } from './jukeboxLifecycle'
 import { clamp01 } from './volumeMapping'
 import { setJukeboxMode } from '../actions'
+import {
+  attachJukeboxSession,
+  detachJukeboxSession,
+  getJukeboxSessionId,
+  getOrCreateJukeboxClientId,
+} from './jukeboxSession'
 import { useNotify } from 'react-admin'
 
 const POLL_INTERVAL_MS = 10000
@@ -100,7 +106,15 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
           setDevices(json)
 
           if (isLocalDevice) {
-            // Switching back to local browser playback
+            const sessionId = getJukeboxSessionId()
+            const clientId = getOrCreateJukeboxClientId()
+            if (jukeboxMode) {
+              detachJukeboxSession({
+                client: jukeboxClient,
+                sessionId,
+                clientId,
+              }).catch(() => {})
+            }
             enqueueJukeboxCommand(() => jukeboxClient.stop()).catch(() => {})
             dispatch(setJukeboxMode(false))
             if (audioInstance) {
@@ -136,6 +150,16 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
               ).catch(() => {
                 notify('Failed to start playback on remote device', 'warning')
               })
+            }
+
+            if (jukeboxMode) {
+              attachJukeboxSession({
+                client: jukeboxClient,
+                sessionId: getJukeboxSessionId(),
+                clientId: getOrCreateJukeboxClientId(),
+                deviceName: device.deviceName,
+                dispatch,
+              }).catch(() => {})
             }
 
             dispatch(setJukeboxMode(true, device.name))

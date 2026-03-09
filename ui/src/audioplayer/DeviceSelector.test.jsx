@@ -29,6 +29,8 @@ vi.mock('./jukeboxClient', () => ({
     play: vi.fn(() => Promise.resolve({})),
     start: vi.fn(() => Promise.resolve({})),
     stop: vi.fn(() => Promise.resolve({})),
+    attachSession: vi.fn(() => Promise.resolve({ sessionId: 'jukebox-session:admin' })),
+    detachSession: vi.fn(() => Promise.resolve({})),
   },
 }))
 
@@ -45,6 +47,8 @@ const playerStateMock = {
   audioInstance: audioInstanceMock,
   queue: [],
   savedPlayIndex: 0,
+  jukeboxMode: false,
+  jukeboxDevice: null,
 }
 
 vi.mock('react-redux', () => ({
@@ -63,6 +67,10 @@ describe('<DeviceSelector />', () => {
     audioInstanceMock.volume = 1
     playerStateMock.queue = []
     playerStateMock.savedPlayIndex = 0
+    playerStateMock.jukeboxMode = false
+    playerStateMock.jukeboxDevice = null
+    localStorage.setItem('username', 'admin')
+    sessionStorage.clear()
 
     httpClient.mockImplementation((url, options) => {
       if (url === '/api/jukebox/devices') {
@@ -248,4 +256,82 @@ describe('<DeviceSelector />', () => {
       )
     })
   })
+
+  it('rebinds the current jukebox session when switching remote devices in jukebox mode', async () => {
+    playerStateMock.queue = [{ trackId: 't1' }]
+    playerStateMock.jukeboxMode = true
+    audioInstanceMock.paused = false
+
+    render(<DeviceSelector isDesktop buttonClass="" />)
+
+    const openButton = await screen.findByTestId('device-selector-button')
+    fireEvent.click(openButton)
+
+    const bluetoothDevice = await screen.findByText('Bluetooth 24:C4:06:FA:00:37')
+    fireEvent.click(bluetoothDevice)
+
+    await waitFor(() => {
+      expect(jukeboxClient.attachSession).toHaveBeenCalledWith(
+        'jukebox-session:admin',
+        expect.any(String),
+        'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+      )
+    })
+  })
+
+  it('detaches the current jukebox session when switching back to local playback', async () => {
+    playerStateMock.jukeboxMode = true
+    audioInstanceMock.paused = true
+
+    httpClient.mockImplementation((url, options) => {
+      if (url === '/api/jukebox/devices') {
+        return Promise.resolve({
+          json: [
+            { deviceName: 'auto', name: 'Local', isDefault: false },
+            {
+              deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+              name: 'Bluetooth 24:C4:06:FA:00:37',
+              isBluetooth: true,
+              connected: true,
+              isDefault: true,
+            },
+          ],
+        })
+      }
+      if (url === '/api/jukebox/devices/switch' && options?.method === 'POST') {
+        return Promise.resolve({
+          json: [
+            { deviceName: 'auto', name: 'Local', isDefault: true },
+            {
+              deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+              name: 'Bluetooth 24:C4:06:FA:00:37',
+              isBluetooth: true,
+              connected: true,
+              isDefault: false,
+            },
+          ],
+        })
+      }
+      if (url === '/api/bluetooth/devices') {
+        return Promise.resolve({ json: [] })
+      }
+      return Promise.resolve({ json: [] })
+    })
+
+    render(<DeviceSelector isDesktop buttonClass="" />)
+
+    const openButton = await screen.findByTestId('device-selector-button')
+    fireEvent.click(openButton)
+
+    const localDevice = await screen.findByText('Local')
+    fireEvent.click(localDevice)
+
+    await waitFor(() => {
+      expect(jukeboxClient.detachSession).toHaveBeenCalledWith(
+        'jukebox-session:admin',
+        expect.any(String),
+      )
+    })
+  })
+
 })
