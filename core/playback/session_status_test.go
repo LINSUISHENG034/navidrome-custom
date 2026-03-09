@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/navidrome/navidrome/core/playback/bluetooth"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	serverevents "github.com/navidrome/navidrome/server/events"
@@ -189,6 +190,51 @@ func TestPlaybackServerPublishJukeboxStateUpdatesTargetsMatchingDeviceSessions(t
 	}
 }
 
+func TestPlaybackServerPublishJukeboxStateUpdatesUsesMigratedSessionBinding(t *testing.T) {
+	ctx := context.Background()
+	broker := &fakeEventBroker{}
+	ps := &playbackServer{
+		ctx:            &ctx,
+		sessionManager: NewSessionManager(time.Minute),
+		eventBroker:    broker,
+		playbackDevices: []playbackDevice{
+			*NewPlaybackDevice(ctx, nil, "Speaker", "alsa_output.analog"),
+			*NewPlaybackDevice(ctx, nil, "BT", "pulse/bluez_output.AA_BB_CC.a2dp-sink"),
+		},
+	}
+	ps.playbackDevices[0].Default = true
+	ps.playbackDevices[0].PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
+	ps.playbackDevices[1].PlaybackQueue.Add(model.MediaFiles{{ID: "2", Path: "/b.mp3"}})
+
+	_, err := ps.AttachSession(ctx, AttachRequest{
+		SessionID:  "s1",
+		ClientID:   "tab-1",
+		User:       "admin",
+		DeviceName: "alsa_output.analog",
+	})
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	if err := ps.SwitchDevice(ctx, "pulse/bluez_output.AA_BB_CC.a2dp-sink"); err != nil {
+		t.Fatalf("switch: %v", err)
+	}
+	broker.sent = nil
+
+	ps.publishJukeboxStateUpdates(&ps.playbackDevices[1])
+
+	if len(broker.sent) != 1 {
+		t.Fatalf("expected 1 targeted event, got %d", len(broker.sent))
+	}
+	state, ok := broker.sent[0].event.(*serverevents.JukeboxStateUpdated)
+	if !ok {
+		t.Fatalf("unexpected event type: %T", broker.sent[0].event)
+	}
+	if state.SessionID != "s1" || state.DeviceName != "pulse/bluez_output.AA_BB_CC.a2dp-sink" {
+		t.Fatalf("unexpected migrated event payload: %#v", state)
+	}
+}
+
 func TestPlaybackServerReaperBroadcastsDetachOnExpiry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -221,5 +267,53 @@ func TestPlaybackServerReaperBroadcastsDetachOnExpiry(t *testing.T) {
 	state, ok := broker.sent[0].event.(*serverevents.JukeboxStateUpdated)
 	if !ok || state.Attached {
 		t.Fatalf("expected detach event with Attached=false, got %#v", broker.sent[0].event)
+	}
+}
+
+func TestPlaybackServerCheckBluetoothConnectionsPublishesPauseState(t *testing.T) {
+	ctx := context.Background()
+	broker := &fakeEventBroker{}
+	ps := &playbackServer{
+		ctx:            &ctx,
+		sessionManager: NewSessionManager(time.Minute),
+		eventBroker:    broker,
+	}
+	ps.playbackDevices = []playbackDevice{*ps.newPlaybackDevice(ctx, "BT", "pulse/bluez_output.AA_BB_CC.a2dp-sink")}
+	ps.playbackDevices[0].Default = true
+	ps.playbackDevices[0].PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
+	ps.playbackDevices[0].ActiveTrack = &mockTrack{playing: true, position: 12}
+
+	_, err := ps.AttachSession(ctx, AttachRequest{
+		SessionID:  "bt-session",
+		ClientID:   "tab-1",
+		User:       "admin",
+		DeviceName: "pulse/bluez_output.AA_BB_CC.a2dp-sink",
+	})
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	previousDiscover := discoverAllSinks
+	discoverAllSinks = func(context.Context) []bluetooth.AudioSink { return nil }
+	defer func() { discoverAllSinks = previousDiscover }()
+
+	ps.checkBluetoothConnections(ctx)
+
+	track, ok := ps.playbackDevices[0].ActiveTrack.(*mockTrack)
+	if !ok {
+		t.Fatalf("expected mockTrack, got %T", ps.playbackDevices[0].ActiveTrack)
+	}
+	if track.pauseCalls != 1 {
+		t.Fatalf("expected paused track, pauseCalls=%d", track.pauseCalls)
+	}
+	if len(broker.sent) != 1 {
+		t.Fatalf("expected 1 targeted event, got %d", len(broker.sent))
+	}
+	state, ok := broker.sent[0].event.(*serverevents.JukeboxStateUpdated)
+	if !ok {
+		t.Fatalf("unexpected event type: %T", broker.sent[0].event)
+	}
+	if state.Playing {
+		t.Fatalf("expected published paused state, got %#v", state)
 	}
 }

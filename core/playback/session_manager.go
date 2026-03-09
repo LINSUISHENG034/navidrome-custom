@@ -130,6 +130,26 @@ func (sm *SessionManager) FindByDevice(deviceName string) []Session {
 	return sessions
 }
 
+func (sm *SessionManager) RebindDevice(oldDeviceName, newDeviceName string) []Session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if oldDeviceName == "" || newDeviceName == "" || oldDeviceName == newDeviceName {
+		return nil
+	}
+
+	rebound := make([]Session, 0)
+	for id, session := range sm.sessions {
+		if session.DeviceName != oldDeviceName {
+			continue
+		}
+		session.DeviceName = newDeviceName
+		sm.sessions[id] = session
+		rebound = append(rebound, session)
+	}
+	return rebound
+}
+
 func (sm *SessionManager) ReapExpired() []Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()

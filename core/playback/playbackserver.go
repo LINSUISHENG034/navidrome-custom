@@ -52,6 +52,8 @@ type playbackServer struct {
 	playbackDevices     []playbackDevice
 }
 
+var discoverAllSinks = bluetooth.DiscoverAllSinks
+
 func (ps *playbackServer) newPlaybackDevice(ctx context.Context, name string, deviceName string) *playbackDevice {
 	device := NewPlaybackDevice(ctx, ps, name, deviceName)
 	device.onStateChange = func(status DeviceStatus) {
@@ -273,21 +275,29 @@ func (ps *playbackServer) monitorBluetoothConnections(ctx context.Context) {
 
 func (ps *playbackServer) checkBluetoothConnections(ctx context.Context) {
 	activeSinks := make(map[string]bool)
-	for _, sink := range bluetooth.DiscoverAllSinks(ctx) {
+	for _, sink := range discoverAllSinks(ctx) {
 		activeSinks[sink.MPVDeviceName()] = true
 	}
 
+	var disconnected []*playbackDevice
 	ps.mu.Lock()
-	defer ps.mu.Unlock()
 	for idx := range ps.playbackDevices {
 		d := &ps.playbackDevices[idx]
 		if !strings.HasPrefix(d.DeviceName, "pulse/bluez_") {
 			continue
 		}
 		if _, connected := activeSinks[d.DeviceName]; !connected && d.isPlaying() {
-			d.ActiveTrack.Pause()
-			log.Warn(ctx, "Bluetooth device disconnected, pausing playback", "device", d.Name)
+			disconnected = append(disconnected, d)
 		}
+	}
+	ps.mu.Unlock()
+
+	for _, device := range disconnected {
+		if _, err := device.Stop(ctx); err != nil {
+			log.Warn(ctx, "Bluetooth device disconnect pause failed", "device", device.Name, "err", err)
+			continue
+		}
+		log.Warn(ctx, "Bluetooth device disconnected, pausing playback", "device", device.Name)
 	}
 }
 
@@ -442,8 +452,6 @@ func (ps *playbackServer) ListDevices() []DeviceInfo {
 // resumes at the same position.
 func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) error {
 	ps.mu.Lock()
-	defer ps.mu.Unlock()
-
 	var newDev *playbackDevice
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].DeviceName == deviceName {
@@ -452,10 +460,10 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 		}
 	}
 	if newDev == nil {
+		ps.mu.Unlock()
 		return fmt.Errorf("device not found: %s", deviceName)
 	}
 
-	// Find the current default device and capture its playback state
 	var oldDev *playbackDevice
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].Default {
@@ -464,14 +472,15 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 		}
 	}
 
-	// Capture state before stopping
 	wasPlaying := oldDev != nil && oldDev.isPlaying()
 	var savedPosition int
 	var savedGain float32
 	var savedQueue model.MediaFiles
 	var savedIndex int
+	oldDeviceName := ""
 
 	if oldDev != nil && oldDev.DeviceName != deviceName {
+		oldDeviceName = oldDev.DeviceName
 		savedGain = oldDev.Gain
 		savedQueue = oldDev.PlaybackQueue.Get()
 		savedIndex = oldDev.PlaybackQueue.Index
@@ -483,22 +492,25 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 			oldDev.ActiveTrack = nil
 			log.Info(ctx, "Stopped playback on previous device", "device", oldDev.Name, "position", savedPosition)
 		}
+
+		oldDev.PlaybackQueue.Clear()
+		oldDev.queueVersion++
 	}
 
-	// Toggle default flags
 	for idx := range ps.playbackDevices {
 		ps.playbackDevices[idx].Default = (ps.playbackDevices[idx].DeviceName == deviceName)
 	}
 
-	// Migrate queue and state to the new device
 	if oldDev != nil && oldDev.DeviceName != deviceName && len(savedQueue) > 0 {
 		newDev.PlaybackQueue.Set(savedQueue)
 		newDev.PlaybackQueue.SetIndex(savedIndex)
 		newDev.Gain = savedGain
+		newDev.queueVersion++
 
 		if wasPlaying {
 			_, err := newDev.Start(ctx)
 			if err != nil {
+				ps.mu.Unlock()
 				log.Error(ctx, "Error starting playback on new device", err)
 				return err
 			}
@@ -515,7 +527,22 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 		}
 	}
 
+	var reboundSessions []Session
+	if ps.sessionManager != nil && oldDeviceName != "" {
+		reboundSessions = ps.sessionManager.RebindDevice(oldDeviceName, deviceName)
+	}
+
 	log.Info(ctx, "Switched default audio device", "device", deviceName)
+	ps.mu.Unlock()
+
+	for _, session := range reboundSessions {
+		if session.User == "" {
+			continue
+		}
+		status := ps.statusFromSession(session)
+		ps.getEventBroker().SendMessage(jukeboxTargetContext(session.User), NewJukeboxStateUpdatedEvent(status))
+	}
+
 	return nil
 }
 

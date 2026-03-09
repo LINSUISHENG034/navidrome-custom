@@ -98,7 +98,50 @@ var _ = Describe("PlaybackServer", func() {
 			Expect(ps.playbackDevices[0].Default).To(BeTrue())
 			Expect(ps.playbackDevices[1].PlaybackQueue.Size()).To(Equal(0))
 		})
-	})
+
+		It("rebinds attached sessions to the migrated device", func() {
+			ps.sessionManager = NewSessionManager(time.Minute)
+			mfs := model.MediaFiles{
+				{ID: "1", Path: "/music/song1.mp3"},
+				{ID: "2", Path: "/music/song2.mp3"},
+			}
+			ps.playbackDevices[0].PlaybackQueue.Add(mfs)
+			ps.playbackDevices[0].PlaybackQueue.SetIndex(1)
+			ps.playbackDevices[0].queueVersion = 4
+
+			_, err := ps.AttachSession(ctx, AttachRequest{
+				SessionID:  "session-1",
+				User:       "admin",
+				ClientID:   "tab-1",
+				DeviceName: "alsa_output.analog",
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			err = ps.SwitchDevice(ctx, "pulse/bluez_output.AA_BB_CC.a2dp-sink")
+			Expect(err).ToNot(HaveOccurred())
+
+			status, err := ps.SessionStatus(ctx, "session-1")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(status.DeviceName).To(Equal("pulse/bluez_output.AA_BB_CC.a2dp-sink"))
+			Expect(status.CurrentIndex).To(Equal(1))
+			Expect(status.TrackID).To(Equal("2"))
+		})
+
+		It("clears stale authority from the old device after migration", func() {
+			mfs := model.MediaFiles{
+				{ID: "1", Path: "/music/song1.mp3"},
+				{ID: "2", Path: "/music/song2.mp3"},
+			}
+			ps.playbackDevices[0].PlaybackQueue.Add(mfs)
+			ps.playbackDevices[0].PlaybackQueue.SetIndex(1)
+
+			err := ps.SwitchDevice(ctx, "pulse/bluez_output.AA_BB_CC.a2dp-sink")
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(ps.playbackDevices[0].PlaybackQueue.Size()).To(Equal(0))
+			Expect(ps.playbackDevices[0].PlaybackQueue.Index).To(Equal(-1))
+		})
+		})
 
 	Describe("getDefaultDevice", func() {
 		It("returns the default device", func() {
