@@ -52,7 +52,7 @@ describe('<AudioTitle />', () => {
     const audioInfo = { trackId: 'track-1', song: baseSong }
     renderWithStore(
       <AudioTitle audioInfo={audioInfo} gainInfo={{}} isMobile={false} />,
-      { player: { jukeboxMode: false, current: {}, queue: [], jukeboxSession: null } },
+      { player: { jukeboxMode: false, current: {}, queue: [], jukeboxRemote: null } },
     )
     const link = screen.getByRole('link')
     expect(link.getAttribute('href')).toBe('/playlist/playlist-1/show')
@@ -65,7 +65,7 @@ describe('<AudioTitle />', () => {
     }
     renderWithStore(
       <AudioTitle audioInfo={audioInfo} gainInfo={{}} isMobile={false} />,
-      { player: { jukeboxMode: false, current: {}, queue: [], jukeboxSession: null } },
+      { player: { jukeboxMode: false, current: {}, queue: [], jukeboxRemote: null } },
     )
     const link = screen.getByRole('link')
     expect(link.getAttribute('href')).toBe('/album/album-1/show')
@@ -87,7 +87,8 @@ describe('<AudioTitle />', () => {
             { trackId: 'track-local', song: { ...baseSong, title: 'Local Song' } },
             remoteTrack,
           ],
-          jukeboxSession: { currentIndex: 1, trackId: 'track-remote' },
+          jukeboxControl: { ownershipState: 'recovering' },
+          jukeboxRemote: { currentIndex: 1, trackId: 'track-remote' },
         },
       },
     )

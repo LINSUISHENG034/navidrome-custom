@@ -63,4 +63,31 @@ describe('startEventStream', () => {
       data: { sessionId: 's1', currentIndex: 1, trackId: 't2' },
     })
   })
+
+  it('preserves durable-session recovery metadata on jukebox events', async () => {
+    await startEventStream(dispatch)
+
+    dispatch.mockClear()
+    instance.listeners.jukeboxStateUpdated({
+      type: 'jukeboxStateUpdated',
+      data: JSON.stringify({
+        sessionId: 's1',
+        ownershipState: 'recovering',
+        staleSince: '2026-03-09T12:00:00Z',
+        currentIndex: 2,
+        trackId: 't3',
+      }),
+    })
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'jukeboxStateUpdated',
+      data: {
+        sessionId: 's1',
+        ownershipState: 'recovering',
+        staleSince: '2026-03-09T12:00:00Z',
+        currentIndex: 2,
+        trackId: 't3',
+      },
+    })
+  })
 })

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { addTracks, syncQueue } from '../actions/player'
+import { PLAYER_JUKEBOX_SESSION_STATUS } from '../actions'
 import { playerReducer } from './playerReducer'
 
 describe('playerReducer queue isolation', () => {
@@ -18,5 +19,33 @@ describe('playerReducer queue isolation', () => {
     expect(state.queue).toHaveLength(2)
     expect(next.queue).toHaveLength(3)
     expect(next.queue).not.toBe(state.queue)
+  })
+
+  it('preserves remote authority when a recovering control update omits playback fields', () => {
+    const active = playerReducer(undefined, {
+      type: PLAYER_JUKEBOX_SESSION_STATUS,
+      data: {
+        sessionId: 's1',
+        ownerClientId: 'tab-1',
+        ownershipState: 'attached',
+        currentIndex: 2,
+        trackId: 't3',
+        playing: true,
+      },
+    })
+
+    const recovering = playerReducer(active, {
+      type: PLAYER_JUKEBOX_SESSION_STATUS,
+      data: {
+        sessionId: 's1',
+        ownerClientId: 'tab-1',
+        ownershipState: 'recovering',
+      },
+    })
+
+    expect(recovering.jukeboxControl.ownershipState).toBe('recovering')
+    expect(recovering.jukeboxRemote.currentIndex).toBe(2)
+    expect(recovering.jukeboxRemote.trackId).toBe('t3')
+    expect(recovering.jukeboxRemote.playing).toBe(true)
   })
 })

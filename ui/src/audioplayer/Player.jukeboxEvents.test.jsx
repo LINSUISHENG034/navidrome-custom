@@ -53,6 +53,20 @@ import {
 } from './Player'
 import keyHandlers from './keyHandlers'
 
+const buildJukeboxState = (overrides = {}) => ({
+  jukeboxMode: true,
+  playIndex: undefined,
+  current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+  queue: [
+    { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+    { trackId: 't2', uuid: 'u2', song: { id: 't2' } },
+    { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
+  ],
+  jukeboxControl: { sessionId: 's1', ownershipState: 'attached' },
+  jukeboxRemote: { currentIndex: 1, trackId: 't2', playing: true, position: 41 },
+  ...overrides,
+})
+
 describe('Jukebox visibility guard logic', () => {
   let originalHidden
 
@@ -555,21 +569,30 @@ describe('jukebox session heartbeat lifecycle', () => {
 describe('remote-state-first player selection', () => {
   it('uses remote current track and index for jukebox queue highlighting', () => {
     const remoteTrack = { trackId: 't2', uuid: 'u2', song: { id: 't2' } }
-    const state = {
-      jukeboxMode: true,
-      playIndex: undefined,
-      current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
+    const state = buildJukeboxState({
       queue: [
         { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
         remoteTrack,
       ],
-      jukeboxSession: { currentIndex: 1, trackId: 't2' },
-      jukeboxStatus: null,
-    }
+      jukeboxControl: { sessionId: 's1', ownershipState: 'recovering' },
+      jukeboxRemote: { currentIndex: 1, trackId: 't2', playing: true, position: 41 },
+    })
 
     const resolved = resolvePlayerUiState(state)
     expect(resolved.current).toBe(remoteTrack)
     expect(resolved.playIndex).toBe(1)
+  })
+
+  it('keeps remote authority after a reconnect gap while control is recovering', () => {
+    const state = buildJukeboxState({
+      current: { trackId: 't2', uuid: 'u2', song: { id: 't2' } },
+      jukeboxControl: { sessionId: 's1', ownershipState: 'recovering' },
+      jukeboxRemote: { currentIndex: 2, trackId: 't3', playing: true, position: 3 },
+    })
+
+    const resolved = resolvePlayerUiState(state)
+    expect(resolved.current?.trackId).toBe('t3')
+    expect(resolved.playIndex).toBe(2)
   })
 })
 

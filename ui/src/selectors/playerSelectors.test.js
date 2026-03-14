@@ -13,7 +13,8 @@ describe('playerSelectors', () => {
         jukeboxMode: true,
         queue: [{ trackId: 't1' }, { trackId: 't3' }],
         current: { trackId: 't1' },
-        jukeboxSession: { currentIndex: 1, trackId: 't3', position: 41 },
+        jukeboxControl: { ownershipState: 'attached' },
+        jukeboxRemote: { currentIndex: 1, trackId: 't3', position: 41 },
       },
     }
 
@@ -27,7 +28,8 @@ describe('playerSelectors', () => {
         jukeboxMode: false,
         queue: [{ trackId: 't1' }, { trackId: 't3' }],
         current,
-        jukeboxSession: { currentIndex: 1, trackId: 't3', position: 41 },
+        jukeboxControl: { ownershipState: 'attached' },
+        jukeboxRemote: { currentIndex: 1, trackId: 't3', position: 41 },
       },
     }
 
@@ -40,7 +42,8 @@ describe('playerSelectors', () => {
         jukeboxMode: true,
         queue: [{ trackId: 't1' }, { trackId: 't3' }],
         current: { trackId: 't1' },
-        jukeboxSession: { currentIndex: 0, trackId: 't3', position: 41 },
+        jukeboxControl: { ownershipState: 'recovering' },
+        jukeboxRemote: { currentIndex: 0, trackId: 't3', position: 41 },
       },
     }
 
@@ -53,21 +56,23 @@ describe('playerSelectors', () => {
         jukeboxMode: true,
         queue: [],
         current: { trackId: 't1' },
-        jukeboxSession: { currentIndex: 1, trackId: 't3', position: 41 },
+        jukeboxControl: { ownershipState: 'recovering' },
+        jukeboxRemote: { currentIndex: 1, trackId: 't3', position: 41 },
       },
     }
 
     expect(selectEffectiveCurrentTrack(state)).toBeNull()
   })
 
-  it('returns current when jukeboxSession is null', () => {
+  it('returns current when jukeboxRemote is null', () => {
     const current = { trackId: 'local-track' }
     const state = {
       player: {
         jukeboxMode: true,
         queue: [{ trackId: 't1' }, { trackId: 't3' }],
         current,
-        jukeboxSession: null,
+        jukeboxControl: { ownershipState: 'recovering' },
+        jukeboxRemote: null,
       },
     }
 
@@ -81,19 +86,20 @@ describe('playerSelectors', () => {
         jukeboxMode: true,
         queue: [{ trackId: 't1' }],
         current,
-        jukeboxSession: { currentIndex: 9 },
+        jukeboxControl: { ownershipState: 'recovering' },
+        jukeboxRemote: { currentIndex: 9 },
       },
     }
 
     expect(selectEffectiveCurrentTrack(state)).toBe(current)
   })
 
-  it('prefers jukeboxSession playing/gain/position with fallback to jukeboxStatus', () => {
+  it('prefers jukeboxRemote playing/gain/position', () => {
     const state = {
       player: {
         jukeboxMode: true,
-        jukeboxStatus: { playing: false, gain: 0.4, position: 12 },
-        jukeboxSession: { playing: true, gain: 0.8, position: 41 },
+        jukeboxControl: { ownershipState: 'recovering' },
+        jukeboxRemote: { playing: true, gain: 0.8, position: 41 },
       },
     }
 
@@ -102,17 +108,17 @@ describe('playerSelectors', () => {
     expect(selectEffectiveJukeboxPosition(state)).toBe(41)
   })
 
-  it('falls back to jukeboxStatus when jukeboxSession is unavailable', () => {
+  it('returns defaults when jukeboxRemote is unavailable', () => {
     const state = {
       player: {
         jukeboxMode: true,
-        jukeboxStatus: { playing: false, gain: 0.4, position: 12 },
-        jukeboxSession: null,
+        jukeboxControl: { ownershipState: 'recovering' },
+        jukeboxRemote: null,
       },
     }
 
     expect(selectEffectiveJukeboxPlaying(state)).toBe(false)
-    expect(selectEffectiveJukeboxGain(state)).toBe(0.4)
-    expect(selectEffectiveJukeboxPosition(state)).toBe(12)
+    expect(selectEffectiveJukeboxGain(state)).toBe(0.5)
+    expect(selectEffectiveJukeboxPosition(state)).toBe(0)
   })
 })
