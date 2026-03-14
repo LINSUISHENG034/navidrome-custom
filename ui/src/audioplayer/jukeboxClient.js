@@ -1,8 +1,6 @@
 import httpClient from '../dataProvider/httpClient'
 
 const jukeboxClient = {
-  status: () => httpClient('/api/jukebox/status').then(({ json }) => json),
-
   sessionStatus: (sessionId) =>
     httpClient(`/api/jukebox/session/status?sessionId=${encodeURIComponent(sessionId)}`).then(
       ({ json }) => json,

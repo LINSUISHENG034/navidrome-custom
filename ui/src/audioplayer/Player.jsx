@@ -29,8 +29,6 @@ import {
   setVolume,
   syncQueue,
   setAudioInstance as setAudioInstanceAction,
-  updateJukeboxStatus,
-  updateJukeboxSessionStatus,
 } from '../actions'
 import PlayerToolbar from './PlayerToolbar'
 import { sendNotification } from '../utils'
@@ -57,10 +55,12 @@ import {
 import { audioVolumeToUiVolume, clamp01 } from './volumeMapping'
 import {
   attachJukeboxSession,
+  canControlJukebox,
   detachJukeboxSession,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
   refreshJukeboxSessionStatus,
+  runJukeboxHeartbeat,
 } from './jukeboxSession'
 import {
   selectEffectiveCurrentTrack,
@@ -353,6 +353,7 @@ const Player = () => {
   const effectiveRemoteSession = selectEffectiveJukeboxRemoteSession({
     player: playerState,
   })
+  const canControl = canControlJukebox(playerState)
   let controlledPlayIndex = resolveControlledJukeboxPlayIndex({
     jukeboxMode: playerState.jukeboxMode,
     queueSyncPending,
@@ -412,7 +413,7 @@ const Player = () => {
     (_, audioLists, audioInfo) => {
       const queueSnapshot = snapshotQueue(audioLists)
       dispatch(syncQueue(audioInfo, queueSnapshot))
-      if (playerState.jukeboxMode) {
+      if (canControl) {
         const diff = computeQueueDiff(prevQueueRef.current, queueSnapshot)
         setQueueSyncPending(true)
         pendingQueueSyncRef.current = enqueueJukeboxCommand(() =>
@@ -426,7 +427,7 @@ const Player = () => {
       }
       prevQueueRef.current = queueSnapshot
     },
-    [dispatch, playerState.jukeboxMode],
+    [canControl, dispatch],
   )
 
   const nextSong = useCallback(() => {
@@ -472,13 +473,13 @@ const Player = () => {
   const onAudioVolumeChange = useCallback(
     (volume) => {
       dispatch(setVolume(audioVolumeToUiVolume(volume)))
-      if (playerState.jukeboxMode) {
+      if (canControl) {
         enqueueJukeboxCommand(() =>
           jukeboxClient.volume(clamp01(volume)),
         ).catch(() => {})
       }
     },
-    [dispatch, playerState.jukeboxMode],
+    [canControl, dispatch],
   )
 
   const onAudioPlay = useCallback(
@@ -486,6 +487,7 @@ const Player = () => {
       if (playerState.jukeboxMode) {
         if (audioInstance) audioInstance.muted = true
         if (
+          canControl &&
           shouldForwardJukeboxMediaEvent({
             jukeboxMode: playerState.jukeboxMode,
             hidden: document.hidden,
@@ -531,6 +533,7 @@ const Player = () => {
     },
     [
       audioInstance,
+      canControl,
       context,
       dispatch,
       playerState.jukeboxMode,
@@ -547,7 +550,7 @@ const Player = () => {
       if (startTime !== null) {
         setStartTime(null)
       }
-      if (playerState.jukeboxMode) {
+      if (canControl) {
         const nextIndex = resolvePlayIndex({
           audioLists,
           playId,
@@ -583,13 +586,14 @@ const Player = () => {
         ).catch(() => {})
       }
     },
-    [playerState.jukeboxMode, scrobbled, startTime],
+    [canControl, scrobbled, startTime],
   )
 
   const onAudioPause = useCallback(
     (info) => {
       dispatch(currentPlaying(info))
       if (
+        canControl &&
         shouldForwardJukeboxMediaEvent({
           jukeboxMode: playerState.jukeboxMode,
           hidden: document.hidden,
@@ -598,19 +602,19 @@ const Player = () => {
         enqueueJukeboxCommand(() => jukeboxClient.pause()).catch(() => {})
       }
     },
-    [dispatch, playerState.jukeboxMode],
+    [canControl, dispatch, playerState.jukeboxMode],
   )
 
   const onAudioSeeked = useCallback(
     (info) => {
-      if (!playerState.jukeboxMode) return
+      if (!canControl) return
       if (shouldSuppressRemoteSeekEcho(info.currentTime)) return
 
       enqueueJukeboxCommand(() => syncJukeboxSeek(jukeboxClient, info)).catch(
         () => {},
       )
     },
-    [playerState.jukeboxMode],
+    [canControl],
   )
 
   const onAudioEnded = useCallback(
@@ -665,12 +669,13 @@ const Player = () => {
     let cleanupHeartbeat = () => {}
 
     const heartbeat = () =>
-      jukeboxClient
-        .heartbeatSession(sessionId, clientId)
-        .then((status) => {
-          if (!cancelled) dispatch(updateJukeboxSessionStatus(status))
-        })
-        .catch(() => {})
+      runJukeboxHeartbeat({
+        client: jukeboxClient,
+        sessionId,
+        clientId,
+        deviceName: effectiveRemoteSession?.deviceName || null,
+        dispatch: cancelled ? null : dispatch,
+      }).catch(() => {})
 
     attachJukeboxSession({
       client: jukeboxClient,
@@ -698,21 +703,7 @@ const Player = () => {
         clientId,
       }).catch(() => {})
     }
-  }, [playerState.jukeboxMode, dispatch])
-
-  // Jukebox status polling — poll every 2s when in Jukebox mode
-  useEffect(() => {
-    if (!playerState.jukeboxMode) return
-    const poll = () => {
-      jukeboxClient
-        .status()
-        .then((status) => dispatch(updateJukeboxStatus(status)))
-        .catch(() => {})
-    }
-    poll()
-    const interval = setInterval(poll, 2000)
-    return () => clearInterval(interval)
-  }, [playerState.jukeboxMode, dispatch])
+  }, [dispatch, effectiveRemoteSession?.deviceName, playerState.jukeboxMode])
 
   useEffect(() => {
     if (!playerState.jukeboxMode || !streamReconnected) return
@@ -794,6 +785,7 @@ export {
   Player,
   applyOptimisticUserSkip,
   attachJukeboxSession,
+  canControlJukebox,
   detachJukeboxSession,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
@@ -801,6 +793,7 @@ export {
   primePendingRemoteTrackChange,
   resolveControlledJukeboxPlayIndex,
   resolvePlayerUiState,
+  runJukeboxHeartbeat,
   startJukeboxHeartbeatLoop,
   shouldConsumePendingRemoteTrackChange,
   syncRemotePositionIfNeeded,

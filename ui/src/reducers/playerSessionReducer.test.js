@@ -28,6 +28,8 @@ describe('playerReducer jukebox session state', () => {
     expect(next.jukeboxControl).not.toHaveProperty('deviceName')
     expect(next.jukeboxRemote.currentIndex).toBe(2)
     expect(next.jukeboxRemote.trackId).toBe('t3')
+    expect(next).not.toHaveProperty('jukeboxSession')
+    expect(next).not.toHaveProperty('jukeboxStatus')
   })
 
   it('syncs volume from session gain in jukebox mode', () => {

@@ -41,10 +41,12 @@ import {
 } from './jukeboxSync'
 import {
   applyOptimisticUserSkip,
+  canControlJukebox,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
   resolveControlledJukeboxPlayIndex,
   resolvePlayerUiState,
+  runJukeboxHeartbeat,
   shouldConsumePendingRemoteTrackChange,
   startJukeboxHeartbeatLoop,
   syncRemotePositionIfNeeded,
@@ -514,6 +516,50 @@ describe('remote-state-first jukebox controls', () => {
     expect(jukeboxClient.volume).toHaveBeenCalledTimes(1)
     expect(jukeboxClient.volume.mock.calls[0][0]).toBeCloseTo(0.7)
   })
+
+  it('does not send remote key-handler commands while ownership is recovering', () => {
+    const state = buildJukeboxState({
+      jukeboxControl: { sessionId: 's1', ownershipState: 'recovering' },
+    })
+
+    expect(canControlJukebox(state)).toBe(false)
+
+    const handlers = keyHandlers(
+      { togglePlay: vi.fn(), volume: 0.5 },
+      state,
+    )
+
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    handlers.NEXT_SONG({ metaKey: false })
+    handlers.VOL_DOWN()
+
+    expect(jukeboxClient.play).not.toHaveBeenCalled()
+    expect(jukeboxClient.pause).not.toHaveBeenCalled()
+    expect(jukeboxClient.skip).not.toHaveBeenCalled()
+    expect(jukeboxClient.volume).not.toHaveBeenCalled()
+  })
+
+  it('does not send a stale rewind after control is taken over', async () => {
+    const dispatch = vi.fn()
+    jukeboxClient.heartbeatSession.mockRejectedValueOnce({ status: 403 })
+
+    await runJukeboxHeartbeat({
+      client: jukeboxClient,
+      sessionId: 's1',
+      clientId: 'tab-1',
+      dispatch,
+    })
+
+    const state = buildJukeboxState({
+      jukeboxControl: { sessionId: 's1', ownershipState: 'taken_over' },
+      jukeboxRemote: { currentIndex: 2, trackId: 't3', playing: true, position: 41 },
+    })
+    const handlers = keyHandlers({ togglePlay: vi.fn(), volume: 0.5 }, state)
+
+    handlers.PREV_SONG({ metaKey: false })
+
+    expect(jukeboxClient.skip).not.toHaveBeenCalled()
+  })
 })
 
 
@@ -563,6 +609,113 @@ describe('jukebox session heartbeat lifecycle', () => {
     expect(first).toBe(second)
     expect(first).toBeTruthy()
   })
+
+  it('moves control state to recovering on heartbeat transport failure', async () => {
+    const dispatch = vi.fn()
+    jukeboxClient.heartbeatSession.mockRejectedValueOnce(new Error('offline'))
+
+    await runJukeboxHeartbeat({
+      client: jukeboxClient,
+      sessionId: 's1',
+      clientId: 'tab-1',
+      dispatch,
+    })
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'jukeboxStateUpdated',
+      data: {
+        sessionId: 's1',
+        ownerClientId: 'tab-1',
+        ownershipState: 'recovering',
+        terminationReason: null,
+      },
+    })
+  })
+
+  it('transitions to taken_over on heartbeat ownership conflict', async () => {
+    const dispatch = vi.fn()
+    jukeboxClient.heartbeatSession.mockRejectedValueOnce({ status: 403 })
+
+    await runJukeboxHeartbeat({
+      client: jukeboxClient,
+      sessionId: 's1',
+      clientId: 'tab-1',
+      dispatch,
+    })
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'jukeboxStateUpdated',
+      data: {
+        sessionId: 's1',
+        ownerClientId: 'tab-1',
+        ownershipState: 'taken_over',
+        terminationReason: 'taken_over',
+      },
+    })
+  })
+
+  it('re-attaches on heartbeat 404 using the last known remote device', async () => {
+    const dispatch = vi.fn()
+    jukeboxClient.heartbeatSession.mockRejectedValueOnce({ status: 404 })
+    jukeboxClient.attachSession.mockResolvedValueOnce({
+      sessionId: 's1',
+      ownerClientId: 'tab-1',
+      ownershipState: 'attached',
+      deviceName: 'pulse/test',
+    })
+
+    await runJukeboxHeartbeat({
+      client: jukeboxClient,
+      sessionId: 's1',
+      clientId: 'tab-1',
+      deviceName: 'pulse/test',
+      dispatch,
+    })
+
+    expect(jukeboxClient.attachSession).toHaveBeenCalledWith(
+      's1',
+      'tab-1',
+      'pulse/test',
+    )
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'jukeboxStateUpdated',
+      data: {
+        sessionId: 's1',
+        ownerClientId: 'tab-1',
+        ownershipState: 'attached',
+        deviceName: 'pulse/test',
+      },
+    })
+  })
+
+  it('returns to attached when a heartbeat succeeds after recovery', async () => {
+    const dispatch = vi.fn()
+    jukeboxClient.heartbeatSession.mockResolvedValueOnce({
+      sessionId: 's1',
+      ownerClientId: 'tab-1',
+      ownershipState: 'attached',
+      currentIndex: 2,
+      trackId: 't3',
+    })
+
+    await runJukeboxHeartbeat({
+      client: jukeboxClient,
+      sessionId: 's1',
+      clientId: 'tab-1',
+      dispatch,
+    })
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'jukeboxStateUpdated',
+      data: {
+        sessionId: 's1',
+        ownerClientId: 'tab-1',
+        ownershipState: 'attached',
+        currentIndex: 2,
+        trackId: 't3',
+      },
+    })
+  })
 })
 
 
@@ -593,6 +746,19 @@ describe('remote-state-first player selection', () => {
     const resolved = resolvePlayerUiState(state)
     expect(resolved.current?.trackId).toBe('t3')
     expect(resolved.playIndex).toBe(2)
+  })
+
+  it('does not send next-song skip after remote advance during a reconnect gap', () => {
+    const state = buildJukeboxState({
+      current: { trackId: 't2', uuid: 'u2', song: { id: 't2' } },
+      jukeboxControl: { sessionId: 's1', ownershipState: 'recovering' },
+      jukeboxRemote: { currentIndex: 2, trackId: 't3', playing: true, position: 3 },
+    })
+    const handlers = keyHandlers({ togglePlay: vi.fn(), volume: 0.5 }, state)
+
+    handlers.NEXT_SONG({ metaKey: false })
+
+    expect(jukeboxClient.skip).not.toHaveBeenCalled()
   })
 })
 

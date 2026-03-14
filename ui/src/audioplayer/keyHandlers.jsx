@@ -1,4 +1,5 @@
 import jukeboxClient from './jukeboxClient'
+import { canControlJukebox } from './jukeboxSession'
 import { clamp01 } from './volumeMapping'
 import {
   selectEffectiveCurrentTrack,
@@ -23,6 +24,7 @@ const keyHandlers = (audioInstance, playerState) => {
   }
 
   const isJukebox = playerState.jukeboxMode
+  const canControl = canControlJukebox(playerState)
   const state = { player: playerState }
   const effectiveCurrentTrack = selectEffectiveCurrentTrack(state)
   const effectiveCurrentIndex = selectEffectiveJukeboxCurrentIndex(state)
@@ -33,6 +35,7 @@ const keyHandlers = (audioInstance, playerState) => {
     TOGGLE_PLAY: (e) => {
       e.preventDefault()
       if (isJukebox) {
+        if (!canControl) return
         if (effectiveJukeboxPlaying) {
           jukeboxClient.pause().catch(() => {})
         } else {
@@ -44,6 +47,7 @@ const keyHandlers = (audioInstance, playerState) => {
     },
     VOL_UP: () => {
       if (isJukebox) {
+        if (!canControl) return
         jukeboxClient.volume(clamp01(effectiveJukeboxGain + 0.1)).catch(() => {})
       } else {
         audioInstance.volume = Math.min(1, audioInstance.volume + 0.1)
@@ -51,6 +55,7 @@ const keyHandlers = (audioInstance, playerState) => {
     },
     VOL_DOWN: () => {
       if (isJukebox) {
+        if (!canControl) return
         jukeboxClient.volume(clamp01(effectiveJukeboxGain - 0.1)).catch(() => {})
       } else {
         audioInstance.volume = Math.max(0, audioInstance.volume - 0.1)
@@ -58,6 +63,7 @@ const keyHandlers = (audioInstance, playerState) => {
     },
     PREV_SONG: (e) => {
       if (isJukebox) {
+        if (!canControl) return
         if (effectiveCurrentIndex > 0) {
           jukeboxClient.skip(effectiveCurrentIndex - 1, 0).catch(() => {})
         }
@@ -70,6 +76,7 @@ const keyHandlers = (audioInstance, playerState) => {
     },
     NEXT_SONG: (e) => {
       if (isJukebox) {
+        if (!canControl) return
         if (
           effectiveCurrentIndex >= 0 &&
           effectiveCurrentIndex < playerState.queue.length - 1

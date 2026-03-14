@@ -74,6 +74,7 @@ describe('playerSelectors', () => {
         current,
         jukeboxControl: { ownershipState: 'recovering' },
         jukeboxRemote: null,
+        jukeboxSession: { currentIndex: 1, trackId: 't3' },
       },
     }
 
@@ -116,6 +117,7 @@ describe('playerSelectors', () => {
         jukeboxControl: { ownershipState: 'recovering' },
         jukeboxRemote: null,
         jukeboxStatus: { playing: true, gain: 0.9, position: 99 },
+        jukeboxSession: { playing: true, gain: 0.9, position: 99 },
       },
     }
 

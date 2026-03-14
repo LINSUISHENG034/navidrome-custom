@@ -18,6 +18,19 @@ const getOrCreateJukeboxClientId = () => {
   return next
 }
 
+const dispatchJukeboxSessionStatus = (dispatch, status) => {
+  if (dispatch) {
+    dispatch(updateJukeboxSessionStatus(status))
+  }
+  return status
+}
+
+const canControlJukebox = (playerState) =>
+  !!(
+    playerState?.jukeboxMode &&
+    playerState?.jukeboxControl?.ownershipState === 'attached'
+  )
+
 const attachJukeboxSession = async ({
   client,
   sessionId,
@@ -27,10 +40,7 @@ const attachJukeboxSession = async ({
 }) => {
   if (!client?.attachSession || !sessionId || !clientId) return null
   const status = await client.attachSession(sessionId, clientId, deviceName)
-  if (dispatch) {
-    dispatch(updateJukeboxSessionStatus(status))
-  }
-  return status
+  return dispatchJukeboxSessionStatus(dispatch, status)
 }
 
 const refreshJukeboxSessionStatus = async ({
@@ -41,10 +51,7 @@ const refreshJukeboxSessionStatus = async ({
 }) => {
   if (!jukeboxMode || !client?.sessionStatus || !sessionId) return null
   const status = await client.sessionStatus(sessionId)
-  if (dispatch) {
-    dispatch(updateJukeboxSessionStatus(status))
-  }
-  return status
+  return dispatchJukeboxSessionStatus(dispatch, status)
 }
 
 const detachJukeboxSession = async ({ client, sessionId, clientId }) => {
@@ -52,10 +59,61 @@ const detachJukeboxSession = async ({ client, sessionId, clientId }) => {
   return client.detachSession(sessionId, clientId)
 }
 
+const runJukeboxHeartbeat = async ({
+  client,
+  sessionId,
+  clientId,
+  deviceName = null,
+  dispatch,
+}) => {
+  if (!client?.heartbeatSession || !sessionId || !clientId) return null
+
+  try {
+    const status = await client.heartbeatSession(sessionId, clientId)
+    return dispatchJukeboxSessionStatus(dispatch, status)
+  } catch (err) {
+    if (err?.status === 404 && client?.attachSession) {
+      try {
+        const status = await client.attachSession(sessionId, clientId, deviceName)
+        return dispatchJukeboxSessionStatus(dispatch, status)
+      } catch (attachErr) {
+        err = attachErr
+      }
+    }
+
+    if (err?.status === 403) {
+      return dispatchJukeboxSessionStatus(dispatch, {
+        sessionId,
+        ownerClientId: clientId,
+        ownershipState: 'taken_over',
+        terminationReason: 'taken_over',
+      })
+    }
+
+    if (err?.status === 404) {
+      return dispatchJukeboxSessionStatus(dispatch, {
+        sessionId,
+        ownerClientId: clientId,
+        ownershipState: 'detached',
+        terminationReason: 'session_missing',
+      })
+    }
+
+    return dispatchJukeboxSessionStatus(dispatch, {
+      sessionId,
+      ownerClientId: clientId,
+      ownershipState: 'recovering',
+      terminationReason: null,
+    })
+  }
+}
+
 export {
   attachJukeboxSession,
+  canControlJukebox,
   detachJukeboxSession,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
   refreshJukeboxSessionStatus,
+  runJukeboxHeartbeat,
 }

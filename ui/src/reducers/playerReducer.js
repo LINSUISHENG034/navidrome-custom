@@ -11,7 +11,6 @@ import {
   PLAYER_SYNC_QUEUE,
   PLAYER_SET_MODE,
   PLAYER_SET_JUKEBOX_MODE,
-  PLAYER_JUKEBOX_STATUS,
   PLAYER_JUKEBOX_SESSION_STATUS,
   PLAYER_SET_AUDIO_INSTANCE,
 } from '../actions'
@@ -28,8 +27,6 @@ const initialState = {
   jukeboxDevice: null,
   jukeboxControl: null,
   jukeboxRemote: null,
-  jukeboxStatus: null,
-  jukeboxSession: null,
   audioInstance: null,
 }
 
@@ -229,23 +226,6 @@ const buildJukeboxRemoteState = (previousRemote, nextStatus) => ({
   deviceName: nextStatus.deviceName ?? previousRemote.deviceName ?? null,
 })
 
-const buildJukeboxSessionCompatibility = (control, remote) => ({
-  sessionId: control.sessionId,
-  ownerClientId: control.ownerClientId,
-  ownershipState: control.ownershipState,
-  terminationReason: control.terminationReason,
-  lastHeartbeat: control.lastHeartbeat,
-  staleSince: control.staleSince,
-  currentIndex: remote.currentIndex,
-  trackId: remote.trackId,
-  playing: remote.playing,
-  position: remote.position,
-  gain: remote.gain,
-  queueVersion: remote.queueVersion,
-  attached: remote.attached,
-  deviceName: remote.deviceName,
-})
-
 const reduceJukeboxSessionStatus = (previousState, payload) => {
   const previousControl = previousState.jukeboxControl || {}
   const previousRemote = previousState.jukeboxRemote || {}
@@ -257,8 +237,6 @@ const reduceJukeboxSessionStatus = (previousState, payload) => {
     ...previousState,
     jukeboxControl: nextControl,
     jukeboxRemote: nextRemote,
-    // Temporary compatibility mirror until the Player lifecycle refactor lands.
-    jukeboxSession: buildJukeboxSessionCompatibility(nextControl, nextRemote),
     volume:
       previousState.jukeboxMode && typeof nextStatus?.gain === 'number'
         ? audioVolumeToUiVolume(nextStatus.gain)
@@ -296,20 +274,6 @@ export const playerReducer = (previousState = initialState, payload) => {
           ? previousState.jukeboxControl
           : null,
         jukeboxRemote: payload.data.enabled ? previousState.jukeboxRemote : null,
-        jukeboxStatus: payload.data.enabled
-          ? previousState.jukeboxStatus
-          : null,
-        jukeboxSession: payload.data.enabled
-          ? previousState.jukeboxSession
-          : null,
-      }
-    case PLAYER_JUKEBOX_STATUS:
-      return {
-        ...previousState,
-        jukeboxStatus: payload.data,
-        volume: previousState.jukeboxMode
-          ? audioVolumeToUiVolume(payload.data.gain)
-          : previousState.volume,
       }
     case PLAYER_JUKEBOX_SESSION_STATUS:
       return reduceJukeboxSessionStatus(previousState, payload)

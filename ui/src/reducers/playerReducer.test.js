@@ -49,7 +49,7 @@ describe('playerReducer queue isolation', () => {
     expect(recovering.jukeboxRemote.playing).toBe(true)
   })
 
-  it('does not keep stale termination metadata in the compatibility mirror', () => {
+  it('clears stale termination metadata without keeping a legacy mirror', () => {
     const terminated = playerReducer(undefined, {
       type: PLAYER_JUKEBOX_SESSION_STATUS,
       data: {
@@ -74,6 +74,6 @@ describe('playerReducer queue isolation', () => {
     })
 
     expect(recovered.jukeboxControl.terminationReason).toBeNull()
-    expect(recovered.jukeboxSession.terminationReason ?? null).toBeNull()
+    expect(recovered).not.toHaveProperty('jukeboxSession')
   })
 })
