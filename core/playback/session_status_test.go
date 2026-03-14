@@ -128,22 +128,27 @@ func (f *fakeEventBroker) SendBroadcastMessage(ctx context.Context, event server
 
 func TestNewJukeboxStateUpdatedEvent(t *testing.T) {
 	status := SessionStatus{
-		SessionID:     "s1",
-		DeviceName:    "pulse/test",
-		OwnerClientID: "tab-1",
-		CurrentIndex:  2,
-		TrackID:       "track-3",
-		Playing:       true,
-		Position:      17,
-		Gain:          0.8,
-		Attached:      true,
-		QueueVersion:  9,
-		LastHeartbeat: time.Unix(123, 0).UTC(),
+		SessionID:         "s1",
+		DeviceName:        "pulse/test",
+		OwnerClientID:     "tab-1",
+		CurrentIndex:      2,
+		TrackID:           "track-3",
+		Playing:           true,
+		Position:          17,
+		Gain:              0.8,
+		Attached:          true,
+		OwnershipState:    SessionOwnershipRecovering,
+		TerminationReason: SessionTerminationStaleExpired,
+		QueueVersion:      9,
+		LastHeartbeat:     time.Unix(123, 0).UTC(),
 	}
 
 	evt := NewJukeboxStateUpdatedEvent(status)
 	if evt.SessionID != status.SessionID || evt.TrackID != status.TrackID || evt.QueueVersion != status.QueueVersion {
 		t.Fatalf("unexpected event payload: %#v", evt)
+	}
+	if evt.OwnershipState != SessionOwnershipRecovering || evt.TerminationReason != SessionTerminationStaleExpired {
+		t.Fatalf("expected durable-session metadata in event payload, got %#v", evt)
 	}
 }
 
@@ -235,14 +240,14 @@ func TestPlaybackServerPublishJukeboxStateUpdatesUsesMigratedSessionBinding(t *t
 	}
 }
 
-func TestPlaybackServerReaperBroadcastsDetachOnExpiry(t *testing.T) {
+func TestPlaybackServerReaperTransitionsHeartbeatLapseToRecovering(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	broker := &fakeEventBroker{}
 	ps := &playbackServer{
 		ctx:            &ctx,
-		sessionManager: NewSessionManager(50 * time.Millisecond),
+		sessionManager: NewSessionManager(50*time.Millisecond, 10*time.Minute),
 		eventBroker:    broker,
 		playbackDevices: []playbackDevice{
 			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
@@ -262,11 +267,57 @@ func TestPlaybackServerReaperBroadcastsDetachOnExpiry(t *testing.T) {
 	ps.reapExpiredSessions()
 
 	if len(broker.sent) != 1 {
-		t.Fatalf("expected 1 detach event, got %d", len(broker.sent))
+		t.Fatalf("expected 1 recovering event, got %d", len(broker.sent))
 	}
 	state, ok := broker.sent[0].event.(*serverevents.JukeboxStateUpdated)
-	if !ok || state.Attached {
-		t.Fatalf("expected detach event with Attached=false, got %#v", broker.sent[0].event)
+	if !ok {
+		t.Fatalf("unexpected event type: %T", broker.sent[0].event)
+	}
+	if !state.Attached || state.OwnershipState != SessionOwnershipRecovering {
+		t.Fatalf("expected attached recovering event, got %#v", state)
+	}
+}
+
+func TestPlaybackServerReaperBroadcastsDetachOnHardExpiry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	broker := &fakeEventBroker{}
+	ps := &playbackServer{
+		ctx:            &ctx,
+		sessionManager: NewSessionManager(50*time.Millisecond, 100*time.Millisecond),
+		eventBroker:    broker,
+		playbackDevices: []playbackDevice{
+			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+		},
+	}
+
+	now := time.Now()
+	ps.sessionManager.now = func() time.Time { return now }
+	ps.sessionManager.Attach(AttachRequest{
+		SessionID:  "s1",
+		ClientID:   "tab-1",
+		User:       "admin",
+		DeviceName: "pulse/test",
+	})
+
+	now = now.Add(80 * time.Millisecond)
+	ps.reapExpiredSessions()
+	now = now.Add(120 * time.Millisecond)
+	ps.reapExpiredSessions()
+
+	if len(broker.sent) != 2 {
+		t.Fatalf("expected recovering + hard-expiry events, got %d", len(broker.sent))
+	}
+	state, ok := broker.sent[1].event.(*serverevents.JukeboxStateUpdated)
+	if !ok {
+		t.Fatalf("unexpected event type: %T", broker.sent[1].event)
+	}
+	if state.Attached || state.OwnershipState != SessionOwnershipDetached {
+		t.Fatalf("expected detached terminal event, got %#v", state)
+	}
+	if state.TerminationReason != SessionTerminationStaleExpired {
+		t.Fatalf("expected stale_expired termination, got %#v", state)
 	}
 }
 

@@ -89,6 +89,9 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 				if got["attached"] != true {
 					t.Fatalf("expected attached=true, got %#v", got)
 				}
+				if got["ownershipState"] != playback.SessionOwnershipAttached {
+					t.Fatalf("expected ownershipState=attached, got %#v", got)
+				}
 			},
 		},
 		{

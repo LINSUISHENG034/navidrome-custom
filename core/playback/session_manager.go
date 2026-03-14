@@ -12,6 +12,17 @@ var (
 	defaultSessionTTL   = 45 * time.Second
 )
 
+const (
+	defaultSessionMaxStale = 10 * time.Minute
+
+	SessionOwnershipAttached   = "attached"
+	SessionOwnershipRecovering = "recovering"
+	SessionOwnershipDetached   = "detached"
+
+	SessionTerminationStaleExpired = "stale_expired"
+	SessionTerminationUserDetached = "user_detached"
+)
+
 type AttachRequest struct {
 	SessionID  string
 	User       string
@@ -20,37 +31,47 @@ type AttachRequest struct {
 }
 
 type Session struct {
-	SessionID     string    `json:"sessionId"`
-	User          string    `json:"user"`
-	OwnerClientID string    `json:"ownerClientId"`
-	DeviceName    string    `json:"deviceName"`
-	LastHeartbeat time.Time `json:"lastHeartbeat"`
+	SessionID      string     `json:"sessionId"`
+	User           string     `json:"user"`
+	OwnerClientID  string     `json:"ownerClientId"`
+	DeviceName     string     `json:"deviceName"`
+	LastHeartbeat  time.Time  `json:"lastHeartbeat"`
+	OwnershipState string     `json:"ownershipState"`
+	StaleSince     *time.Time `json:"staleSince,omitempty"`
 }
 
 type SessionStatus struct {
-	SessionID     string    `json:"sessionId"`
-	DeviceName    string    `json:"deviceName"`
-	OwnerClientID string    `json:"ownerClientId"`
-	CurrentIndex  int       `json:"currentIndex"`
-	TrackID       string    `json:"trackId"`
-	Playing       bool      `json:"playing"`
-	Position      int       `json:"position"`
-	Gain          float32   `json:"gain"`
-	Attached      bool      `json:"attached"`
-	QueueVersion  int       `json:"queueVersion"`
-	LastHeartbeat time.Time `json:"lastHeartbeat"`
+	SessionID         string    `json:"sessionId"`
+	DeviceName        string    `json:"deviceName"`
+	OwnerClientID     string    `json:"ownerClientId"`
+	CurrentIndex      int       `json:"currentIndex"`
+	TrackID           string    `json:"trackId"`
+	Playing           bool      `json:"playing"`
+	Position          int       `json:"position"`
+	Gain              float32   `json:"gain"`
+	Attached          bool      `json:"attached"`
+	OwnershipState    string    `json:"ownershipState"`
+	TerminationReason string    `json:"terminationReason,omitempty"`
+	QueueVersion      int       `json:"queueVersion"`
+	LastHeartbeat     time.Time `json:"lastHeartbeat"`
 }
 
 type SessionManager struct {
 	mu       sync.RWMutex
 	ttl      time.Duration
+	maxStale time.Duration
 	now      func() time.Time
 	sessions map[string]Session
 }
 
-func NewSessionManager(ttl time.Duration) *SessionManager {
+func NewSessionManager(ttl time.Duration, maxStale ...time.Duration) *SessionManager {
+	sessionMaxStale := defaultSessionMaxStale
+	if len(maxStale) > 0 {
+		sessionMaxStale = maxStale[0]
+	}
 	return &SessionManager{
 		ttl:      ttl,
+		maxStale: sessionMaxStale,
 		now:      time.Now,
 		sessions: make(map[string]Session),
 	}
@@ -61,11 +82,12 @@ func (sm *SessionManager) Attach(req AttachRequest) Session {
 	defer sm.mu.Unlock()
 
 	session := Session{
-		SessionID:     req.SessionID,
-		User:          req.User,
-		OwnerClientID: req.ClientID,
-		DeviceName:    req.DeviceName,
-		LastHeartbeat: sm.now().UTC(),
+		SessionID:      req.SessionID,
+		User:           req.User,
+		OwnerClientID:  req.ClientID,
+		DeviceName:     req.DeviceName,
+		LastHeartbeat:  sm.now().UTC(),
+		OwnershipState: SessionOwnershipAttached,
 	}
 	sm.sessions[req.SessionID] = session
 	return session
@@ -84,6 +106,8 @@ func (sm *SessionManager) Heartbeat(sessionID, clientID string) error {
 	}
 
 	session.LastHeartbeat = sm.now().UTC()
+	session.OwnershipState = SessionOwnershipAttached
+	session.StaleSince = nil
 	sm.sessions[sessionID] = session
 	return nil
 }
@@ -150,22 +174,34 @@ func (sm *SessionManager) RebindDevice(oldDeviceName, newDeviceName string) []Se
 	return rebound
 }
 
-func (sm *SessionManager) ReapExpired() []Session {
+func (sm *SessionManager) ReapExpired() (transitioned []Session, expired []Session) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	if sm.ttl <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	now := sm.now().UTC()
-	expired := make([]Session, 0)
 	for id, session := range sm.sessions {
-		if now.Sub(session.LastHeartbeat) <= sm.ttl {
+		if session.OwnershipState == "" {
+			session.OwnershipState = SessionOwnershipAttached
+		}
+
+		elapsed := now.Sub(session.LastHeartbeat)
+		if elapsed > sm.ttl && session.OwnershipState != SessionOwnershipRecovering {
+			session.OwnershipState = SessionOwnershipRecovering
+			staleAt := now
+			session.StaleSince = &staleAt
+			sm.sessions[id] = session
+			transitioned = append(transitioned, session)
 			continue
 		}
-		expired = append(expired, session)
-		delete(sm.sessions, id)
+
+		if session.OwnershipState == SessionOwnershipRecovering && session.StaleSince != nil && sm.maxStale > 0 && now.Sub(*session.StaleSince) > sm.maxStale {
+			delete(sm.sessions, id)
+			expired = append(expired, session)
+		}
 	}
-	return expired
+	return transitioned, expired
 }

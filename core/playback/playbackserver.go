@@ -89,12 +89,22 @@ func (ps *playbackServer) reapExpiredSessions() {
 	if ps.sessionManager == nil {
 		return
 	}
-	for _, session := range ps.sessionManager.ReapExpired() {
+	transitioned, expired := ps.sessionManager.ReapExpired()
+	for _, session := range transitioned {
+		if session.User == "" {
+			continue
+		}
+		status := ps.statusFromSession(session)
+		ps.getEventBroker().SendMessage(jukeboxTargetContext(session.User), NewJukeboxStateUpdatedEvent(status))
+	}
+	for _, session := range expired {
 		if session.User == "" {
 			continue
 		}
 		status := ps.statusFromSession(session)
 		status.Attached = false
+		status.OwnershipState = SessionOwnershipDetached
+		status.TerminationReason = SessionTerminationStaleExpired
 		ps.getEventBroker().SendMessage(jukeboxTargetContext(session.User), NewJukeboxStateUpdatedEvent(status))
 	}
 }
@@ -135,11 +145,15 @@ func (ps *playbackServer) getDeviceByName(deviceName string) *playbackDevice {
 
 func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 	status := SessionStatus{
-		SessionID:     session.SessionID,
-		DeviceName:    session.DeviceName,
-		OwnerClientID: session.OwnerClientID,
-		Attached:      true,
-		LastHeartbeat: session.LastHeartbeat,
+		SessionID:      session.SessionID,
+		DeviceName:     session.DeviceName,
+		OwnerClientID:  session.OwnerClientID,
+		Attached:       true,
+		OwnershipState: session.OwnershipState,
+		LastHeartbeat:  session.LastHeartbeat,
+	}
+	if status.OwnershipState == "" {
+		status.OwnershipState = SessionOwnershipAttached
 	}
 
 	device := ps.getDeviceByName(session.DeviceName)
@@ -190,6 +204,8 @@ func (ps *playbackServer) DetachSession(_ context.Context, sessionID, clientID s
 	}
 	status := ps.statusFromSession(session)
 	status.Attached = false
+	status.OwnershipState = SessionOwnershipDetached
+	status.TerminationReason = SessionTerminationUserDetached
 	return status, nil
 }
 
