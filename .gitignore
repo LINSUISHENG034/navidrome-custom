@@ -39,6 +39,7 @@ openspec/
 go.work*
 node_modules/
 docs/plans/
+fork/docs/
 CLAUDE.md
 
 .worktrees/
