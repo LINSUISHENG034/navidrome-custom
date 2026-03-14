@@ -1,4 +1,5 @@
 .DS_Store
+.worktrees
 ui/node_modules
 ui/build
 !ui/build/.gitkeep

@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import DeviceSelector from './DeviceSelector'
 import httpClient from '../dataProvider/httpClient'
 import jukeboxClient from './jukeboxClient'
+import { uiVolumeToRemoteGain } from './volumeProfiles'
 
 const notifyMock = vi.fn()
 
@@ -156,7 +157,11 @@ describe('<DeviceSelector />', () => {
       expect(audioInstanceMock.pause).not.toHaveBeenCalled()
       expect(jukeboxClient.set).toHaveBeenCalledWith(['t1'])
       expect(jukeboxClient.skip).toHaveBeenCalledWith(0, 42)
-      expect(jukeboxClient.volume).toHaveBeenCalledWith(0.36)
+      expect(jukeboxClient.volume).toHaveBeenCalledWith(
+        uiVolumeToRemoteGain(0.6, {
+          deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+        }),
+      )
       expect(jukeboxClient.play).toHaveBeenCalled()
       expect(jukeboxClient.volume.mock.invocationCallOrder[0]).toBeLessThan(
         jukeboxClient.play.mock.invocationCallOrder[0],

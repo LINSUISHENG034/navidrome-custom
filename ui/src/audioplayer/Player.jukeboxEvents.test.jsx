@@ -1,3 +1,5 @@
+/* global globalThis */
+
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
 vi.mock('navidrome-music-player', () => ({
@@ -54,6 +56,7 @@ import {
   detachJukeboxSession,
 } from './Player'
 import keyHandlers from './keyHandlers'
+import { remoteGainToUiVolume, uiVolumeToRemoteGain } from './volumeProfiles'
 
 const buildJukeboxState = (overrides = {}) => ({
   jukeboxMode: true,
@@ -515,6 +518,31 @@ describe('remote-state-first jukebox controls', () => {
     handlers.VOL_DOWN()
     expect(jukeboxClient.volume).toHaveBeenCalledTimes(1)
     expect(jukeboxClient.volume.mock.calls[0][0]).toBeCloseTo(0.7)
+  })
+
+  it('uses the Bluetooth profile for remote keyboard volume changes', () => {
+    const deviceName = 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink'
+    const handlers = keyHandlers(
+      { togglePlay: vi.fn(), volume: 0.5 },
+      {
+        jukeboxMode: true,
+        queue: [],
+        current: {},
+        jukeboxDevice: 'Bluetooth 24:C4:06:FA:00:37',
+        jukeboxControl: { ownershipState: 'attached' },
+        jukeboxRemote: { gain: 0.8, deviceName },
+      },
+    )
+
+    handlers.VOL_DOWN()
+    expect(jukeboxClient.volume).toHaveBeenCalledTimes(1)
+    expect(jukeboxClient.volume.mock.calls[0][0]).toBeCloseTo(
+      uiVolumeToRemoteGain(
+        remoteGainToUiVolume(0.8, { deviceName }) - 0.1,
+        { deviceName },
+      ),
+      5,
+    )
   })
 
   it('does not send remote key-handler commands while ownership is recovering', () => {

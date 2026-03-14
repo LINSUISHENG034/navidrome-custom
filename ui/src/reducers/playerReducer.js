@@ -16,6 +16,7 @@ import {
 } from '../actions'
 import config from '../config'
 import { audioVolumeToUiVolume } from '../audioplayer/volumeMapping'
+import { remoteGainToUiVolume } from '../audioplayer/volumeProfiles'
 
 const initialState = {
   queue: [],
@@ -239,7 +240,10 @@ const reduceJukeboxSessionStatus = (previousState, payload) => {
     jukeboxRemote: nextRemote,
     volume:
       previousState.jukeboxMode && typeof nextStatus?.gain === 'number'
-        ? audioVolumeToUiVolume(nextStatus.gain)
+        ? remoteGainToUiVolume(nextStatus.gain, {
+            deviceName: nextRemote.deviceName,
+            jukeboxDevice: previousState.jukeboxDevice,
+          })
         : previousState.volume,
   }
 }

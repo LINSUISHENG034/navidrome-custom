@@ -19,6 +19,7 @@ import { enqueueJukeboxCommand } from './jukeboxCommandQueue'
 import bluetoothClient from './bluetoothClient'
 import { suppressJukeboxMediaEvents } from './jukeboxLifecycle'
 import { clamp01 } from './volumeMapping'
+import { audioVolumeToRemoteGain } from './volumeProfiles'
 import { setJukeboxMode } from '../actions'
 import {
   attachJukeboxSession,
@@ -131,7 +132,10 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
               ? Math.floor(audioInstance.currentTime || 0)
               : 0
             const currentGain = audioInstance
-              ? clamp01(audioInstance.volume)
+              ? audioVolumeToRemoteGain(clamp01(audioInstance.volume), {
+                  deviceName: device.deviceName,
+                  jukeboxDevice: device.name,
+                })
               : 1
 
             // Mute browser audio — keeps element "playing" so UI stays correct

@@ -1,6 +1,6 @@
 import jukeboxClient from './jukeboxClient'
 import { canControlJukebox } from './jukeboxSession'
-import { clamp01 } from './volumeMapping'
+import { stepRemoteGainByUiDelta } from './volumeProfiles'
 import {
   selectEffectiveCurrentTrack,
   selectEffectiveJukeboxCurrentIndex,
@@ -48,7 +48,9 @@ const keyHandlers = (audioInstance, playerState) => {
     VOL_UP: () => {
       if (isJukebox) {
         if (!canControl) return
-        jukeboxClient.volume(clamp01(effectiveJukeboxGain + 0.1)).catch(() => {})
+        jukeboxClient
+          .volume(stepRemoteGainByUiDelta(effectiveJukeboxGain, 0.1, playerState))
+          .catch(() => {})
       } else {
         audioInstance.volume = Math.min(1, audioInstance.volume + 0.1)
       }
@@ -56,7 +58,9 @@ const keyHandlers = (audioInstance, playerState) => {
     VOL_DOWN: () => {
       if (isJukebox) {
         if (!canControl) return
-        jukeboxClient.volume(clamp01(effectiveJukeboxGain - 0.1)).catch(() => {})
+        jukeboxClient
+          .volume(stepRemoteGainByUiDelta(effectiveJukeboxGain, -0.1, playerState))
+          .catch(() => {})
       } else {
         audioInstance.volume = Math.max(0, audioInstance.volume - 0.1)
       }

@@ -52,7 +52,8 @@ import {
   syncJukeboxSeek,
   syncJukeboxTrackChangeAfterQueueSync,
 } from './jukeboxSync'
-import { audioVolumeToUiVolume, clamp01 } from './volumeMapping'
+import { audioVolumeToUiVolume } from './volumeMapping'
+import { audioVolumeToRemoteGain } from './volumeProfiles'
 import {
   attachJukeboxSession,
   canControlJukebox,
@@ -472,14 +473,15 @@ const Player = () => {
 
   const onAudioVolumeChange = useCallback(
     (volume) => {
-      dispatch(setVolume(audioVolumeToUiVolume(volume)))
+      const nextUiVolume = audioVolumeToUiVolume(volume)
+      dispatch(setVolume(nextUiVolume))
       if (canControl) {
         enqueueJukeboxCommand(() =>
-          jukeboxClient.volume(clamp01(volume)),
+          jukeboxClient.volume(audioVolumeToRemoteGain(volume, playerState)),
         ).catch(() => {})
       }
     },
-    [canControl, dispatch],
+    [canControl, dispatch, playerState],
   )
 
   const onAudioPlay = useCallback(

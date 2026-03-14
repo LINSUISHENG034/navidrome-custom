@@ -5,6 +5,7 @@ import {
   PLAYER_SET_JUKEBOX_MODE,
 } from '../actions'
 import { audioVolumeToUiVolume } from '../audioplayer/volumeMapping'
+import { remoteGainToUiVolume } from '../audioplayer/volumeProfiles'
 
 describe('playerReducer jukebox session state', () => {
   it('stores jukebox control and remote state separately', () => {
@@ -65,6 +66,29 @@ describe('playerReducer jukebox session state', () => {
     })
 
     expect(next.volume).toBe(0.33)
+  })
+
+  it('maps Bluetooth remote gain back to UI volume with the Bluetooth profile', () => {
+    const state = playerReducer(undefined, {
+      type: PLAYER_SET_JUKEBOX_MODE,
+      data: { enabled: true, device: 'Bluetooth 24:C4:06:FA:00:37' },
+    })
+
+    const next = playerReducer(state, {
+      type: PLAYER_JUKEBOX_SESSION_STATUS,
+      data: {
+        sessionId: 's1',
+        deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+        gain: 0.857917,
+      },
+    })
+
+    expect(next.volume).toBeCloseTo(
+      remoteGainToUiVolume(0.857917, {
+        deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+      }),
+      5,
+    )
   })
 
   it('clears jukebox control and remote state when jukebox mode is disabled', () => {
