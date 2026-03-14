@@ -65,6 +65,7 @@ import {
 import {
   selectEffectiveCurrentTrack,
   selectEffectiveJukeboxCurrentIndex,
+  selectEffectiveJukeboxRemoteSession,
 } from '../selectors/playerSelectors'
 
 
@@ -349,6 +350,9 @@ const Player = () => {
   )
 
   const { current, playIndex } = resolvePlayerUiState(playerState)
+  const effectiveRemoteSession = selectEffectiveJukeboxRemoteSession({
+    player: playerState,
+  })
   let controlledPlayIndex = resolveControlledJukeboxPlayIndex({
     jukeboxMode: playerState.jukeboxMode,
     queueSyncPending,
@@ -364,7 +368,7 @@ const Player = () => {
     controlledPlayIndex = applyOptimisticUserSkip({
       controlledPlayIndex,
       pendingUserSkipRef,
-      remoteCurrentIndex: playerState.jukeboxSession?.currentIndex,
+      remoteCurrentIndex: effectiveRemoteSession?.currentIndex,
     })
 
     if (queueSyncPending && pendingUserSkipRef.current) {
@@ -725,13 +729,13 @@ const Player = () => {
     syncRemotePositionIfNeeded({
       jukeboxMode: playerState.jukeboxMode,
       audioInstance,
-      session: playerState.jukeboxSession,
+      session: effectiveRemoteSession,
       currentTrackId: current?.trackId || current?.song?.id || null,
     })
   }, [
     playerState.jukeboxMode,
-    playerState.jukeboxSession?.position,
-    playerState.jukeboxSession?.trackId,
+    effectiveRemoteSession?.position,
+    effectiveRemoteSession?.trackId,
     current?.trackId,
     current?.song?.id,
     audioInstance,

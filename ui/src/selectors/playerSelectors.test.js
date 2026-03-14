@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   selectEffectiveCurrentTrack,
+  selectEffectiveJukeboxRemoteSession,
   selectEffectiveJukeboxGain,
   selectEffectiveJukeboxPlaying,
   selectEffectiveJukeboxPosition,
@@ -114,11 +115,25 @@ describe('playerSelectors', () => {
         jukeboxMode: true,
         jukeboxControl: { ownershipState: 'recovering' },
         jukeboxRemote: null,
+        jukeboxStatus: { playing: true, gain: 0.9, position: 99 },
       },
     }
 
     expect(selectEffectiveJukeboxPlaying(state)).toBe(false)
     expect(selectEffectiveJukeboxGain(state)).toBe(0.5)
     expect(selectEffectiveJukeboxPosition(state)).toBe(0)
+  })
+
+  it('returns the effective remote session object for Player hooks', () => {
+    const remote = { currentIndex: 2, trackId: 't3', position: 10 }
+    const state = {
+      player: {
+        jukeboxMode: true,
+        jukeboxControl: { ownershipState: 'recovering' },
+        jukeboxRemote: remote,
+      },
+    }
+
+    expect(selectEffectiveJukeboxRemoteSession(state)).toBe(remote)
   })
 })

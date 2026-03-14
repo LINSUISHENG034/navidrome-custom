@@ -48,4 +48,32 @@ describe('playerReducer queue isolation', () => {
     expect(recovering.jukeboxRemote.trackId).toBe('t3')
     expect(recovering.jukeboxRemote.playing).toBe(true)
   })
+
+  it('does not keep stale termination metadata in the compatibility mirror', () => {
+    const terminated = playerReducer(undefined, {
+      type: PLAYER_JUKEBOX_SESSION_STATUS,
+      data: {
+        sessionId: 's1',
+        ownerClientId: 'tab-1',
+        ownershipState: 'detached',
+        terminationReason: 'stale_expired',
+        currentIndex: 2,
+        trackId: 't3',
+      },
+    })
+
+    const recovered = playerReducer(terminated, {
+      type: PLAYER_JUKEBOX_SESSION_STATUS,
+      data: {
+        sessionId: 's1',
+        ownerClientId: 'tab-1',
+        ownershipState: 'attached',
+        currentIndex: 2,
+        trackId: 't3',
+      },
+    })
+
+    expect(recovered.jukeboxControl.terminationReason).toBeNull()
+    expect(recovered.jukeboxSession.terminationReason ?? null).toBeNull()
+  })
 })

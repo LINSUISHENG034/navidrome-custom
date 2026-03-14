@@ -1,13 +1,13 @@
 const selectPlayerState = (state) => state.player || {}
 
-const selectJukeboxAuthority = (player) =>
-  player.jukeboxRemote || player.jukeboxSession || null
+const selectEffectiveJukeboxRemoteSession = (state) =>
+  selectPlayerState(state).jukeboxRemote || null
 
 const selectEffectiveCurrentTrack = (state) => {
   const player = selectPlayerState(state)
-  const authority = selectJukeboxAuthority(player)
-  if (player.jukeboxMode && authority) {
-    const { currentIndex, trackId } = authority
+  const remote = selectEffectiveJukeboxRemoteSession(state)
+  if (player.jukeboxMode && remote) {
+    const { currentIndex, trackId } = remote
     if (
       Number.isInteger(currentIndex) &&
       player.queue?.[currentIndex] &&
@@ -23,25 +23,22 @@ const selectEffectiveCurrentTrack = (state) => {
 }
 
 const selectEffectiveJukeboxPlaying = (state) => {
-  const player = selectPlayerState(state)
-  return selectJukeboxAuthority(player)?.playing ?? player.jukeboxStatus?.playing ?? false
+  return selectEffectiveJukeboxRemoteSession(state)?.playing ?? false
 }
 
 const selectEffectiveJukeboxGain = (state) => {
-  const player = selectPlayerState(state)
-  return selectJukeboxAuthority(player)?.gain ?? player.jukeboxStatus?.gain ?? 0.5
+  return selectEffectiveJukeboxRemoteSession(state)?.gain ?? 0.5
 }
 
 const selectEffectiveJukeboxPosition = (state) => {
-  const player = selectPlayerState(state)
-  return selectJukeboxAuthority(player)?.position ?? player.jukeboxStatus?.position ?? 0
+  return selectEffectiveJukeboxRemoteSession(state)?.position ?? 0
 }
 
 const selectEffectiveJukeboxCurrentIndex = (state) => {
   const player = selectPlayerState(state)
-  const authority = selectJukeboxAuthority(player)
-  if (Number.isInteger(authority?.currentIndex)) {
-    return authority.currentIndex
+  const remote = selectEffectiveJukeboxRemoteSession(state)
+  if (Number.isInteger(remote?.currentIndex)) {
+    return remote.currentIndex
   }
   return player.queue.findIndex((item) => item.uuid === player.current?.uuid)
 }
@@ -52,4 +49,5 @@ export {
   selectEffectiveJukeboxGain,
   selectEffectiveJukeboxPlaying,
   selectEffectiveJukeboxPosition,
+  selectEffectiveJukeboxRemoteSession,
 }

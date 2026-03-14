@@ -446,8 +446,8 @@ describe('remote-state-first jukebox controls', () => {
         jukeboxMode: true,
         queue: [],
         current: {},
-        jukeboxStatus: { playing: false },
-        jukeboxSession: { playing: true },
+        jukeboxControl: { ownershipState: 'attached' },
+        jukeboxRemote: { playing: true },
       },
     )
 
@@ -469,8 +469,8 @@ describe('remote-state-first jukebox controls', () => {
           { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
         ],
         current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
-        jukeboxStatus: null,
-        jukeboxSession: { currentIndex: 2, trackId: 't3' },
+        jukeboxControl: { ownershipState: 'attached' },
+        jukeboxRemote: { currentIndex: 2, trackId: 't3' },
       },
     )
 
@@ -489,8 +489,8 @@ describe('remote-state-first jukebox controls', () => {
           { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
         ],
         current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
-        jukeboxStatus: null,
-        jukeboxSession: { currentIndex: 1, trackId: 't2' },
+        jukeboxControl: { ownershipState: 'attached' },
+        jukeboxRemote: { currentIndex: 1, trackId: 't2' },
       },
     )
 
@@ -505,8 +505,8 @@ describe('remote-state-first jukebox controls', () => {
         jukeboxMode: true,
         queue: [],
         current: {},
-        jukeboxStatus: { gain: 0.2 },
-        jukeboxSession: { gain: 0.8 },
+        jukeboxControl: { ownershipState: 'attached' },
+        jukeboxRemote: { gain: 0.8 },
       },
     )
 

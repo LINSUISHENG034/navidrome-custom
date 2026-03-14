@@ -202,47 +202,63 @@ const reduceMode = (state, { data: { mode } }) => {
   }
 }
 
+const buildJukeboxControlState = (previousControl, nextStatus) => ({
+  sessionId: nextStatus.sessionId ?? previousControl.sessionId ?? null,
+  ownerClientId:
+    nextStatus.ownerClientId ?? previousControl.ownerClientId ?? null,
+  ownershipState:
+    nextStatus.ownershipState ?? previousControl.ownershipState ?? 'attached',
+  terminationReason:
+    nextStatus.terminationReason !== undefined
+      ? nextStatus.terminationReason
+      : nextStatus.ownershipState === 'attached'
+        ? null
+        : previousControl.terminationReason ?? null,
+  lastHeartbeat: nextStatus.lastHeartbeat ?? previousControl.lastHeartbeat ?? null,
+  staleSince: nextStatus.staleSince ?? previousControl.staleSince ?? null,
+})
+
+const buildJukeboxRemoteState = (previousRemote, nextStatus) => ({
+  currentIndex: nextStatus.currentIndex ?? previousRemote.currentIndex ?? null,
+  trackId: nextStatus.trackId ?? previousRemote.trackId ?? null,
+  playing: nextStatus.playing ?? previousRemote.playing ?? false,
+  position: nextStatus.position ?? previousRemote.position ?? 0,
+  gain: nextStatus.gain ?? previousRemote.gain ?? 0.5,
+  queueVersion: nextStatus.queueVersion ?? previousRemote.queueVersion ?? null,
+  attached: nextStatus.attached ?? previousRemote.attached ?? false,
+  deviceName: nextStatus.deviceName ?? previousRemote.deviceName ?? null,
+})
+
+const buildJukeboxSessionCompatibility = (control, remote) => ({
+  sessionId: control.sessionId,
+  ownerClientId: control.ownerClientId,
+  ownershipState: control.ownershipState,
+  terminationReason: control.terminationReason,
+  lastHeartbeat: control.lastHeartbeat,
+  staleSince: control.staleSince,
+  currentIndex: remote.currentIndex,
+  trackId: remote.trackId,
+  playing: remote.playing,
+  position: remote.position,
+  gain: remote.gain,
+  queueVersion: remote.queueVersion,
+  attached: remote.attached,
+  deviceName: remote.deviceName,
+})
+
 const reduceJukeboxSessionStatus = (previousState, payload) => {
   const previousControl = previousState.jukeboxControl || {}
   const previousRemote = previousState.jukeboxRemote || {}
-  const previousSession = previousState.jukeboxSession || {}
   const nextStatus = payload.data || {}
+  const nextControl = buildJukeboxControlState(previousControl, nextStatus)
+  const nextRemote = buildJukeboxRemoteState(previousRemote, nextStatus)
 
   return {
     ...previousState,
-    jukeboxControl: {
-      sessionId: nextStatus.sessionId ?? previousControl.sessionId ?? null,
-      ownerClientId:
-        nextStatus.ownerClientId ?? previousControl.ownerClientId ?? null,
-      deviceName: nextStatus.deviceName ?? previousControl.deviceName ?? null,
-      ownershipState:
-        nextStatus.ownershipState ??
-        previousControl.ownershipState ??
-        'attached',
-      terminationReason:
-        nextStatus.terminationReason ?? previousControl.terminationReason ?? null,
-      lastHeartbeat:
-        nextStatus.lastHeartbeat ?? previousControl.lastHeartbeat ?? null,
-      staleSince: nextStatus.staleSince ?? previousControl.staleSince ?? null,
-      attached: nextStatus.attached ?? previousControl.attached ?? false,
-    },
-    jukeboxRemote: {
-      currentIndex:
-        nextStatus.currentIndex ?? previousRemote.currentIndex ?? null,
-      trackId: nextStatus.trackId ?? previousRemote.trackId ?? null,
-      playing: nextStatus.playing ?? previousRemote.playing ?? false,
-      position: nextStatus.position ?? previousRemote.position ?? 0,
-      gain: nextStatus.gain ?? previousRemote.gain ?? 0.5,
-      queueVersion:
-        nextStatus.queueVersion ?? previousRemote.queueVersion ?? null,
-      attached: nextStatus.attached ?? previousRemote.attached ?? false,
-      deviceName: nextStatus.deviceName ?? previousRemote.deviceName ?? null,
-    },
+    jukeboxControl: nextControl,
+    jukeboxRemote: nextRemote,
     // Temporary compatibility mirror until the Player lifecycle refactor lands.
-    jukeboxSession: {
-      ...previousSession,
-      ...nextStatus,
-    },
+    jukeboxSession: buildJukeboxSessionCompatibility(nextControl, nextRemote),
     volume:
       previousState.jukeboxMode && typeof nextStatus?.gain === 'number'
         ? audioVolumeToUiVolume(nextStatus.gain)

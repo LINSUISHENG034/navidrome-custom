@@ -24,6 +24,8 @@ describe('playerReducer jukebox session state', () => {
     expect(next.jukeboxControl.sessionId).toBe('s1')
     expect(next.jukeboxControl.ownerClientId).toBe('tab-1')
     expect(next.jukeboxControl.ownershipState).toBe('attached')
+    expect(next.jukeboxControl).not.toHaveProperty('attached')
+    expect(next.jukeboxControl).not.toHaveProperty('deviceName')
     expect(next.jukeboxRemote.currentIndex).toBe(2)
     expect(next.jukeboxRemote.trackId).toBe('t3')
   })
