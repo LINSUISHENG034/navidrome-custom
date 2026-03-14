@@ -287,6 +287,36 @@ func TestSessionManager_Tier2ExpiryDeletesAbandonedRecoveringSession(t *testing.
 	}
 }
 
+func TestSessionManager_HeartbeatRecoversRecoveringSession(t *testing.T) {
+	mgr := NewSessionManager(45*time.Second, 10*time.Minute)
+
+	now := time.Now()
+	mgr.now = func() time.Time { return now }
+	mgr.Attach(AttachRequest{SessionID: "s1", ClientID: "tab-1", User: "admin", DeviceName: "pulse/test"})
+
+	now = now.Add(2 * time.Minute)
+	transitioned, expired := mgr.ReapExpired()
+	if len(transitioned) != 1 || len(expired) != 0 {
+		t.Fatalf("expected tier 1 transition only, got transitioned=%d expired=%d", len(transitioned), len(expired))
+	}
+
+	now = now.Add(5 * time.Second)
+	if err := mgr.Heartbeat("s1", "tab-1"); err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+
+	session, ok := mgr.Get("s1")
+	if !ok {
+		t.Fatal("expected recovered session to remain present")
+	}
+	if session.OwnershipState != SessionOwnershipAttached {
+		t.Fatalf("expected attached ownership state after recovery, got %#v", session)
+	}
+	if session.StaleSince != nil {
+		t.Fatalf("expected staleSince cleared after recovery, got %#v", session)
+	}
+}
+
 func TestSessionManager_FindByDevice(t *testing.T) {
 	mgr := NewSessionManager(time.Minute)
 	mgr.Attach(AttachRequest{SessionID: "s1", ClientID: "tab-1", User: "admin", DeviceName: "pulse/test"})

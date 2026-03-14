@@ -127,6 +127,7 @@ func (f *fakeEventBroker) SendBroadcastMessage(ctx context.Context, event server
 }
 
 func TestNewJukeboxStateUpdatedEvent(t *testing.T) {
+	staleSince := time.Unix(120, 0).UTC()
 	status := SessionStatus{
 		SessionID:         "s1",
 		DeviceName:        "pulse/test",
@@ -141,6 +142,7 @@ func TestNewJukeboxStateUpdatedEvent(t *testing.T) {
 		TerminationReason: SessionTerminationStaleExpired,
 		QueueVersion:      9,
 		LastHeartbeat:     time.Unix(123, 0).UTC(),
+		StaleSince:        &staleSince,
 	}
 
 	evt := NewJukeboxStateUpdatedEvent(status)
@@ -149,6 +151,9 @@ func TestNewJukeboxStateUpdatedEvent(t *testing.T) {
 	}
 	if evt.OwnershipState != SessionOwnershipRecovering || evt.TerminationReason != SessionTerminationStaleExpired {
 		t.Fatalf("expected durable-session metadata in event payload, got %#v", evt)
+	}
+	if evt.StaleSince == nil || !evt.StaleSince.Equal(staleSince) {
+		t.Fatalf("expected staleSince in event payload, got %#v", evt)
 	}
 }
 
@@ -275,6 +280,48 @@ func TestPlaybackServerReaperTransitionsHeartbeatLapseToRecovering(t *testing.T)
 	}
 	if !state.Attached || state.OwnershipState != SessionOwnershipRecovering {
 		t.Fatalf("expected attached recovering event, got %#v", state)
+	}
+	if state.StaleSince == nil {
+		t.Fatalf("expected staleSince on recovering event, got %#v", state)
+	}
+}
+
+func TestPlaybackServerSessionStatusReturnsRecoveringSession(t *testing.T) {
+	ctx := context.Background()
+	ps := &playbackServer{
+		ctx:            &ctx,
+		sessionManager: NewSessionManager(50*time.Millisecond, 10*time.Minute),
+		playbackDevices: []playbackDevice{
+			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+		},
+	}
+
+	now := time.Now()
+	ps.sessionManager.now = func() time.Time { return now }
+	ps.playbackDevices[0].PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
+
+	_, err := ps.AttachSession(ctx, AttachRequest{
+		SessionID:  "s1",
+		ClientID:   "tab-1",
+		User:       "admin",
+		DeviceName: "pulse/test",
+	})
+	if err != nil {
+		t.Fatalf("attach session: %v", err)
+	}
+
+	now = now.Add(80 * time.Millisecond)
+	ps.reapExpiredSessions()
+
+	status, err := ps.SessionStatus(ctx, "s1")
+	if err != nil {
+		t.Fatalf("session status: %v", err)
+	}
+	if !status.Attached || status.OwnershipState != SessionOwnershipRecovering {
+		t.Fatalf("expected recovering attached session status, got %#v", status)
+	}
+	if status.StaleSince == nil {
+		t.Fatalf("expected staleSince in session status, got %#v", status)
 	}
 }
 

@@ -23,6 +23,7 @@ func NewJukeboxStateUpdatedEvent(status SessionStatus) *serverevents.JukeboxStat
 		TerminationReason: status.TerminationReason,
 		QueueVersion:      status.QueueVersion,
 		LastHeartbeat:     status.LastHeartbeat,
+		StaleSince:        status.StaleSince,
 	}
 }
 

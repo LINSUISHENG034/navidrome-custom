@@ -151,6 +151,7 @@ func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 		Attached:       true,
 		OwnershipState: session.OwnershipState,
 		LastHeartbeat:  session.LastHeartbeat,
+		StaleSince:     session.StaleSince,
 	}
 	if status.OwnershipState == "" {
 		status.OwnershipState = SessionOwnershipAttached
