@@ -2,15 +2,17 @@ import httpClient from '../dataProvider/httpClient'
 
 const jukeboxClient = {
   sessionStatus: (sessionId) =>
-    httpClient(`/api/jukebox/session/status?sessionId=${encodeURIComponent(sessionId)}`).then(
-      ({ json }) => json,
-    ),
+    httpClient(
+      `/api/jukebox/session/status?sessionId=${encodeURIComponent(sessionId)}`,
+    ).then(({ json }) => json),
 
   attachSession: (sessionId, clientId, deviceName = null) =>
     httpClient('/api/jukebox/session/attach', {
       method: 'POST',
       body: JSON.stringify(
-        deviceName ? { sessionId, clientId, deviceName } : { sessionId, clientId },
+        deviceName
+          ? { sessionId, clientId, deviceName }
+          : { sessionId, clientId },
       ),
     }).then(({ json }) => json),
 

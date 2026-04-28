@@ -49,7 +49,9 @@ const keyHandlers = (audioInstance, playerState) => {
       if (isJukebox) {
         if (!canControl) return
         jukeboxClient
-          .volume(stepRemoteGainByUiDelta(effectiveJukeboxGain, 0.1, playerState))
+          .volume(
+            stepRemoteGainByUiDelta(effectiveJukeboxGain, 0.1, playerState),
+          )
           .catch(() => {})
       } else {
         audioInstance.volume = Math.min(1, audioInstance.volume + 0.1)
@@ -59,7 +61,9 @@ const keyHandlers = (audioInstance, playerState) => {
       if (isJukebox) {
         if (!canControl) return
         jukeboxClient
-          .volume(stepRemoteGainByUiDelta(effectiveJukeboxGain, -0.1, playerState))
+          .volume(
+            stepRemoteGainByUiDelta(effectiveJukeboxGain, -0.1, playerState),
+          )
           .catch(() => {})
       } else {
         audioInstance.volume = Math.max(0, audioInstance.volume - 0.1)

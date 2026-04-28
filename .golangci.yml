@@ -40,6 +40,11 @@ linters:
       enable:
         - nilness
   exclusions:
+    rules:
+      - linters:
+          - gosec
+        path: _test\.go
+        text: "G703"
     generated: lax
     presets:
       - comments
@@ -50,6 +55,7 @@ linters:
       - third_party$
       - builtin$
       - examples$
+      - node_modules
 formatters:
   exclusions:
     generated: lax
@@ -57,3 +63,4 @@ formatters:
       - third_party$
       - builtin$
       - examples$
+      - node_modules

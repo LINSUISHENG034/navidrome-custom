@@ -57,7 +57,6 @@ describe('computeQueueDiff', () => {
     expect(diff.added).toEqual([])
     expect(diff.fullReplace).toBe(false)
   })
-
 })
 
 describe('syncJukeboxQueueIncremental', () => {

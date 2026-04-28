@@ -61,6 +61,8 @@ type Subsonic struct {
 	OpenSubsonicExtensions *OpenSubsonicExtensions `xml:"openSubsonicExtensions,omitempty"  json:"openSubsonicExtensions,omitempty"`
 	LyricsList             *LyricsList             `xml:"lyricsList,omitempty"              json:"lyricsList,omitempty"`
 	PlayQueueByIndex       *PlayQueueByIndex       `xml:"playQueueByIndex,omitempty" json:"playQueueByIndex,omitempty"`
+	TranscodeDecision      *TranscodeDecision      `xml:"transcodeDecision,omitempty"       json:"transcodeDecision,omitempty"`
+	SonicMatches           *Array[SonicMatch]      `xml:"sonicMatch,omitempty"              json:"sonicMatch,omitempty"`
 }
 
 const (
@@ -134,7 +136,7 @@ type Child struct {
 	Id                    string     `xml:"id,attr"                                 json:"id"`
 	Parent                string     `xml:"parent,attr,omitempty"                   json:"parent,omitempty"`
 	IsDir                 bool       `xml:"isDir,attr"                              json:"isDir"`
-	Title                 string     `xml:"title,attr,omitempty"                    json:"title,omitempty"`
+	Title                 string     `xml:"title,attr"                              json:"title"`
 	Name                  string     `xml:"name,attr,omitempty"                     json:"name,omitempty"`
 	Album                 string     `xml:"album,attr,omitempty"                    json:"album,omitempty"`
 	Artist                string     `xml:"artist,attr,omitempty"                   json:"artist,omitempty"`
@@ -249,7 +251,7 @@ type AlbumID3 struct {
 	ArtistId              string     `xml:"artistId,attr,omitempty"            json:"artistId,omitempty"`
 	CoverArt              string     `xml:"coverArt,attr,omitempty"            json:"coverArt,omitempty"`
 	SongCount             int32      `xml:"songCount,attr,omitempty"           json:"songCount,omitempty"`
-	Duration              int32      `xml:"duration,attr,omitempty"            json:"duration,omitempty"`
+	Duration              int32      `xml:"duration,attr"                      json:"duration"`
 	PlayCount             int64      `xml:"playCount,attr,omitempty"           json:"playCount,omitempty"`
 	Created               *time.Time `xml:"created,attr,omitempty"             json:"created,omitempty"`
 	Starred               *time.Time `xml:"starred,attr,omitempty"             json:"starred,omitempty"`
@@ -440,6 +442,11 @@ type TopSongs struct {
 	Song []Child `xml:"song,omitempty"         json:"song,omitempty"`
 }
 
+type SonicMatch struct {
+	Entry      Child   `xml:"entry"      json:"entry"`
+	Similarity float64 `xml:"similarity" json:"similarity"`
+}
+
 type PlayQueue struct {
 	Entry     []Child   `xml:"entry,omitempty"         json:"entry,omitempty"`
 	Current   string    `xml:"current,attr,omitempty"  json:"current,omitempty"`
@@ -508,10 +515,15 @@ type InternetRadioStations struct {
 }
 
 type Radio struct {
-	ID          string `xml:"id,attr"                    json:"id"`
-	Name        string `xml:"name,attr"                  json:"name"`
-	StreamUrl   string `xml:"streamUrl,attr"             json:"streamUrl"`
-	HomepageUrl string `xml:"homePageUrl,omitempty,attr" json:"homePageUrl,omitempty"`
+	ID                 string `xml:"id,attr"                    json:"id"`
+	Name               string `xml:"name,attr"                  json:"name"`
+	StreamUrl          string `xml:"streamUrl,attr"             json:"streamUrl"`
+	HomepageUrl        string `xml:"homePageUrl,omitempty,attr" json:"homePageUrl,omitempty"`
+	*OpenSubsonicRadio `xml:",omitempty" json:",omitempty"`
+}
+
+type OpenSubsonicRadio struct {
+	CoverArt string `xml:"coverArt,attr,omitempty"  json:"coverArt"`
 }
 
 type JukeboxStatus struct {
@@ -574,8 +586,9 @@ func (r ReplayGain) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 }
 
 type DiscTitle struct {
-	Disc  int32  `xml:"disc,attr" json:"disc"`
-	Title string `xml:"title,attr" json:"title"`
+	Disc     int32  `xml:"disc,attr"                json:"disc"`
+	Title    string `xml:"title,attr"               json:"title"`
+	CoverArt string `xml:"coverArt,attr,omitempty"  json:"coverArt,omitempty"`
 }
 
 type ItemDate struct {
@@ -616,4 +629,27 @@ func marshalJSONArray[T any](v []T) ([]byte, error) {
 		return json.Marshal([]T{})
 	}
 	return json.Marshal(v)
+}
+
+// TranscodeDecision represents the response for getTranscodeDecision (OpenSubsonic transcoding extension)
+type TranscodeDecision struct {
+	CanDirectPlay    bool           `xml:"canDirectPlay,attr"               json:"canDirectPlay"`
+	CanTranscode     bool           `xml:"canTranscode,attr"                json:"canTranscode"`
+	TranscodeReasons []string       `xml:"transcodeReason,omitempty"        json:"transcodeReason,omitempty"`
+	ErrorReason      string         `xml:"errorReason,attr,omitempty"       json:"errorReason,omitempty"`
+	TranscodeParams  string         `xml:"transcodeParams,attr,omitempty"   json:"transcodeParams,omitempty"`
+	SourceStream     *StreamDetails `xml:"sourceStream,omitempty"           json:"sourceStream,omitempty"`
+	TranscodeStream  *StreamDetails `xml:"transcodeStream,omitempty"        json:"transcodeStream,omitempty"`
+}
+
+// StreamDetails describes audio stream properties for transcoding decisions
+type StreamDetails struct {
+	Protocol        string `xml:"protocol,attr,omitempty"        json:"protocol,omitempty"`
+	Container       string `xml:"container,attr,omitempty"       json:"container,omitempty"`
+	Codec           string `xml:"codec,attr,omitempty"           json:"codec,omitempty"`
+	AudioChannels   int32  `xml:"audioChannels,attr,omitempty"   json:"audioChannels,omitempty"`
+	AudioBitrate    int32  `xml:"audioBitrate,attr,omitempty"     json:"audioBitrate,omitempty"`
+	AudioProfile    string `xml:"audioProfile,attr,omitempty"    json:"audioProfile,omitempty"`
+	AudioSamplerate int32  `xml:"audioSamplerate,attr,omitempty" json:"audioSamplerate,omitempty"`
+	AudioBitdepth   int32  `xml:"audioBitdepth,attr,omitempty"   json:"audioBitdepth,omitempty"`
 }

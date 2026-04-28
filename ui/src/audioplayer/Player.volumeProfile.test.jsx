@@ -60,10 +60,7 @@ vi.mock('react-hotkeys', () => ({
 }))
 
 vi.mock('navidrome-music-player', () => ({
-  default: function MockMusicPlayer({
-    onAudioVolumeChange,
-    getAudioInstance,
-  }) {
+  default: function MockMusicPlayer({ onAudioVolumeChange, getAudioInstance }) {
     React.useEffect(() => {
       getAudioInstance?.(null)
     }, [getAudioInstance])

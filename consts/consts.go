@@ -70,7 +70,6 @@ const (
 	PlaceholderArtistArt      = "artist-placeholder.webp"
 	PlaceholderAlbumArt       = "album-placeholder.webp"
 	PlaceholderAvatar         = "logo-192x192.png"
-	UICoverArtSize            = 300
 	DefaultUIVolume           = 100
 	DefaultUISearchDebounceMs = 200
 
@@ -83,6 +82,11 @@ const (
 	DefaultScannerExtractor = "taglib"
 	DefaultWatcherWait      = 5 * time.Second
 	Zwsp                    = string('\u200b')
+)
+
+const (
+	DefaultUICoverArtSize     = 300
+	DefaultMaxImageUploadSize = "10MB"
 )
 
 // Prometheus options
@@ -101,6 +105,13 @@ const (
 
 	DefaultCacheSize            = 100 * 1024 * 1024 // 100MB
 	DefaultCacheCleanUpInterval = 10 * time.Minute
+)
+
+// Entity types
+const (
+	EntityArtist   = "artist"
+	EntityPlaylist = "playlist"
+	EntityRadio    = "radio"
 )
 
 const (
@@ -154,6 +165,12 @@ var (
 			TargetFormat:   "aac",
 			DefaultBitRate: 256,
 			Command:        "ffmpeg -i %s -ss %t -map 0:a:0 -b:a %bk -v 0 -c:a aac -f adts -",
+		},
+		{
+			Name:           "flac audio",
+			TargetFormat:   "flac",
+			DefaultBitRate: 0,
+			Command:        "ffmpeg -i %s -ss %t -map 0:a:0 -v 0 -c:a flac -f flac -",
 		},
 	}
 )

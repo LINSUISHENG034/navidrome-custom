@@ -4,30 +4,31 @@ import (
 	"cmp"
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
+	"path"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/Masterminds/squirrel"
-	"github.com/maruel/natural"
 	"github.com/navidrome/navidrome/conf"
-	"github.com/navidrome/navidrome/core"
 	"github.com/navidrome/navidrome/core/external"
 	"github.com/navidrome/navidrome/core/ffmpeg"
+	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
+	"github.com/navidrome/navidrome/utils/natural"
 )
 
 type albumArtworkReader struct {
 	cacheKey
-	a          *artwork
-	provider   external.Provider
-	album      model.Album
-	updatedAt  *time.Time
-	imgFiles   []string
-	rootFolder string
+	a         *artwork
+	provider  external.Provider
+	album     model.Album
+	updatedAt *time.Time
+	imgFiles  []string // library-relative, forward-slash, no leading slash
+	lib       libraryView
 }
 
 func newAlbumArtworkReader(ctx context.Context, artwork *artwork, artID model.ArtworkID, provider external.Provider) (*albumArtworkReader, error) {
@@ -39,13 +40,17 @@ func newAlbumArtworkReader(ctx context.Context, artwork *artwork, artID model.Ar
 	if err != nil {
 		return nil, err
 	}
+	lib, err := loadLibraryView(ctx, artwork.ds, al.LibraryID)
+	if err != nil {
+		return nil, err
+	}
 	a := &albumArtworkReader{
-		a:          artwork,
-		provider:   provider,
-		album:      *al,
-		updatedAt:  imagesUpdateAt,
-		imgFiles:   imgFiles,
-		rootFolder: core.AbsolutePath(ctx, artwork.ds, al.LibraryID, ""),
+		a:         artwork,
+		provider:  provider,
+		album:     *al,
+		updatedAt: imagesUpdateAt,
+		imgFiles:  imgFiles,
+		lib:       lib,
 	}
 	a.cacheKey.artID = artID
 	if a.updatedAt != nil && a.updatedAt.After(al.UpdatedAt) {
@@ -57,10 +62,11 @@ func newAlbumArtworkReader(ctx context.Context, artwork *artwork, artID model.Ar
 }
 
 func (a *albumArtworkReader) Key() string {
-	var hash [16]byte
+	hashInput := conf.Server.CoverArtPriority
 	if conf.Server.EnableExternalServices {
-		hash = md5.Sum([]byte(conf.Server.Agents + conf.Server.CoverArtPriority))
+		hashInput = conf.Server.Agents + hashInput
 	}
+	hash := md5.Sum([]byte(hashInput))
 	return fmt.Sprintf(
 		"%s.%x.%t",
 		a.cacheKey.Key(),
@@ -69,7 +75,7 @@ func (a *albumArtworkReader) Key() string {
 	)
 }
 func (a *albumArtworkReader) LastUpdated() time.Time {
-	return a.album.UpdatedAt
+	return a.lastUpdate
 }
 
 func (a *albumArtworkReader) Reader(ctx context.Context) (io.ReadCloser, string, error) {
@@ -83,12 +89,15 @@ func (a *albumArtworkReader) fromCoverArtPriority(ctx context.Context, ffmpeg ff
 		pattern = strings.TrimSpace(pattern)
 		switch {
 		case pattern == "embedded":
-			embedArtPath := filepath.Join(a.rootFolder, a.album.EmbedArtPath)
-			ff = append(ff, fromTag(ctx, embedArtPath), fromFFmpegTag(ctx, ffmpeg, embedArtPath))
+			embedRel := a.album.EmbedArtPath
+			ff = append(ff,
+				fromTag(ctx, a.lib.FS, embedRel),
+				fromFFmpegTag(ctx, ffmpeg, a.lib.Abs(embedRel)),
+			)
 		case pattern == "external":
 			ff = append(ff, fromAlbumExternalSource(ctx, a.album, a.provider))
 		case len(a.imgFiles) > 0:
-			ff = append(ff, fromExternalFile(ctx, a.imgFiles, pattern))
+			ff = append(ff, fromExternalFile(ctx, a.lib.FS, a.imgFiles, pattern))
 		}
 	}
 	return ff
@@ -103,17 +112,39 @@ func loadAlbumFoldersPaths(ctx context.Context, ds model.DataStore, albums ...mo
 	if err != nil {
 		return nil, nil, nil, err
 	}
+
+	folderIDSet := make(map[string]bool, len(folderIDs))
+	for _, id := range folderIDs {
+		folderIDSet[id] = true
+	}
+
+	// For multi-disc albums (2+ folders), check if all folders share a common parent
+	// that is not already included. This finds cover art in the album root folder
+	// (e.g., "Artist/Album/cover.jpg" when tracks are in "Artist/Album/CD1/" and "Artist/Album/CD2/").
+	// We skip single-folder albums to avoid pulling images from the artist folder.
+	if commonParentID := commonParentFolder(folders, folderIDSet); commonParentID != "" {
+		parentFolder, err := ds.Folder(ctx).Get(commonParentID)
+		if errors.Is(err, model.ErrNotFound) {
+			log.Warn(ctx, "Parent folder not found for album cover art lookup", "parentID", commonParentID)
+		} else if err != nil {
+			return nil, nil, nil, err
+		}
+		if parentFolder != nil {
+			folders = append(folders, *parentFolder)
+		}
+	}
+
 	var paths []string
 	var imgFiles []string
 	var updatedAt time.Time
 	for _, f := range folders {
-		path := f.AbsolutePath()
-		paths = append(paths, path)
+		paths = append(paths, f.AbsolutePath())
 		if f.ImagesUpdatedAt.After(updatedAt) {
 			updatedAt = f.ImagesUpdatedAt
 		}
+		rel := strings.TrimPrefix(path.Join(f.Path, f.Name), "/")
 		for _, img := range f.ImageFiles {
-			imgFiles = append(imgFiles, filepath.Join(path, img))
+			imgFiles = append(imgFiles, path.Join(rel, img))
 		}
 	}
 
@@ -123,6 +154,24 @@ func loadAlbumFoldersPaths(ctx context.Context, ds model.DataStore, albums ...mo
 	slices.SortFunc(imgFiles, compareImageFiles)
 
 	return paths, imgFiles, &updatedAt, nil
+}
+
+// commonParentFolder returns the shared parent folder ID when all folders have the
+// same parent and that parent is not already in folderIDSet. Returns "" otherwise.
+func commonParentFolder(folders []model.Folder, folderIDSet map[string]bool) string {
+	if len(folders) < 2 {
+		return ""
+	}
+	parentID := folders[0].ParentID
+	if parentID == "" || folderIDSet[parentID] {
+		return ""
+	}
+	for _, f := range folders[1:] {
+		if f.ParentID != parentID {
+			return ""
+		}
+	}
+	return parentID
 }
 
 // compareImageFiles compares two image file paths for sorting.
@@ -136,8 +185,8 @@ func compareImageFiles(a, b string) int {
 	b = strings.ToLower(b)
 
 	// Extract base filenames without extensions
-	baseA := strings.TrimSuffix(filepath.Base(a), filepath.Ext(a))
-	baseB := strings.TrimSuffix(filepath.Base(b), filepath.Ext(b))
+	baseA := strings.TrimSuffix(path.Base(a), path.Ext(a))
+	baseB := strings.TrimSuffix(path.Base(b), path.Ext(b))
 
 	// Compare base names first, then full paths if equal
 	return cmp.Or(

@@ -4,6 +4,7 @@ import { useMediaQuery } from '@material-ui/core'
 import { Link } from 'react-router-dom'
 import clsx from 'clsx'
 import { QualityInfo } from '../common'
+import { decisionService } from '../transcode'
 import useStyle from './styles'
 import { useDrag } from 'react-dnd'
 import { DraggableTypes } from '../consts'
@@ -16,7 +17,8 @@ const AudioTitle = React.memo(({ audioInfo, gainInfo, isMobile }) => {
   const className = classes.audioTitle
   const isDesktop = useMediaQuery('(min-width:810px)')
 
-  const resolvedAudioInfo = jukeboxMode && effectiveCurrentTrack ? effectiveCurrentTrack : audioInfo
+  const resolvedAudioInfo =
+    jukeboxMode && effectiveCurrentTrack ? effectiveCurrentTrack : audioInfo
   const song = resolvedAudioInfo.song
   const [, dragSongRef] = useDrag(
     () => ({
@@ -40,6 +42,14 @@ const AudioTitle = React.memo(({ audioInfo, gainInfo, isMobile }) => {
     rgTrackPeak: song.rgTrackPeak,
   }
 
+  const decision = decisionService.getCachedDecision(audioInfo.trackId)
+  const transcodeProps = decision
+    ? {
+        transcodeStream: decision.transcodeStream || null,
+        isDirectPlay: decision.canDirectPlay,
+      }
+    : {}
+
   const subtitle = song.tags?.['subtitle']
   const title = song.title + (subtitle ? ` (${subtitle})` : '')
 
@@ -58,6 +68,7 @@ const AudioTitle = React.memo(({ audioInfo, gainInfo, isMobile }) => {
             record={qi}
             className={classes.qualityInfo}
             {...gainInfo}
+            {...transcodeProps}
           />
         )}
       </span>

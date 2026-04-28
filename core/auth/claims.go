@@ -21,6 +21,7 @@ type Claims struct {
 	ID      string // "id" - artwork/mediafile ID
 	Format  string // "f" - audio format
 	BitRate int    // "b" - audio bitrate
+	ShareID string // "sid" - share ID for share stream tokens
 }
 
 // ToMap converts Claims to a map[string]any for use with TokenAuth.Encode().
@@ -54,6 +55,9 @@ func (c Claims) ToMap() map[string]any {
 	if c.BitRate != 0 {
 		m["b"] = c.BitRate
 	}
+	if c.ShareID != "" {
+		m["sid"] = c.ShareID
+	}
 	return m
 }
 
@@ -86,9 +90,15 @@ func ClaimsFromToken(token jwt.Token) Claims {
 	if err := token.Get("f", &f); err == nil {
 		c.Format = f
 	}
-	var b int
-	if err := token.Get("b", &b); err == nil {
-		c.BitRate = b
+	if err := token.Get("b", &c.BitRate); err != nil {
+		var bf float64
+		if err := token.Get("b", &bf); err == nil {
+			c.BitRate = int(bf)
+		}
+	}
+	var sid string
+	if err := token.Get("sid", &sid); err == nil {
+		c.ShareID = sid
 	}
 	return c
 }

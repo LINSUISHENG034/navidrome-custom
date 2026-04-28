@@ -10,9 +10,11 @@ import (
 	"strings"
 
 	"github.com/Masterminds/squirrel"
+	"github.com/navidrome/navidrome/core/stream"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/utils/slice"
+	"github.com/navidrome/navidrome/utils/str"
 )
 
 type Archiver interface {
@@ -22,13 +24,13 @@ type Archiver interface {
 	ZipPlaylist(ctx context.Context, id string, format string, bitrate int, w io.Writer) error
 }
 
-func NewArchiver(ms MediaStreamer, ds model.DataStore, shares Share) Archiver {
+func NewArchiver(ms stream.MediaStreamer, ds model.DataStore, shares Share) Archiver {
 	return &archiver{ds: ds, ms: ms, shares: shares}
 }
 
 type archiver struct {
 	ds     model.DataStore
-	ms     MediaStreamer
+	ms     stream.MediaStreamer
 	shares Share
 }
 
@@ -86,7 +88,7 @@ func (a *archiver) albumFilename(mf model.MediaFile, format string, isMultiDisc 
 	if isMultiDisc {
 		file = fmt.Sprintf("Disc %02d/%s", mf.DiscNumber, file)
 	}
-	return fmt.Sprintf("%s/%s", sanitizeName(mf.Album), file)
+	return fmt.Sprintf("%s/%s", str.SanitizeFilename(mf.Album), file)
 }
 
 func (a *archiver) ZipShare(ctx context.Context, id string, out io.Writer) error {
@@ -125,7 +127,7 @@ func (a *archiver) zipMediaFiles(ctx context.Context, id, name string, format st
 
 	// Add M3U file if requested
 	if addM3U && len(zippedMfs) > 0 {
-		plsName := sanitizeName(name)
+		plsName := str.SanitizeFilename(name)
 		w, err := z.CreateHeader(&zip.FileHeader{
 			Name:     plsName + ".m3u",
 			Modified: mfs[0].UpdatedAt,
@@ -155,11 +157,7 @@ func (a *archiver) playlistFilename(mf model.MediaFile, format string, idx int) 
 	if format != "" && format != "raw" {
 		ext = format
 	}
-	return fmt.Sprintf("%02d - %s - %s.%s", idx+1, sanitizeName(mf.Artist), sanitizeName(mf.Title), ext)
-}
-
-func sanitizeName(target string) string {
-	return strings.ReplaceAll(target, "/", "_")
+	return fmt.Sprintf("%02d - %s - %s.%s", idx+1, str.SanitizeFilename(mf.Artist), str.SanitizeFilename(mf.Title), ext)
 }
 
 func (a *archiver) addFileToZip(ctx context.Context, z *zip.Writer, mf model.MediaFile, format string, bitrate int, filename string) error {
@@ -176,7 +174,7 @@ func (a *archiver) addFileToZip(ctx context.Context, z *zip.Writer, mf model.Med
 
 	var r io.ReadCloser
 	if format != "raw" && format != "" {
-		r, err = a.ms.DoStream(ctx, &mf, format, bitrate, 0)
+		r, err = a.ms.NewStream(ctx, &mf, stream.Request{Format: format, BitRate: bitrate})
 	} else {
 		r, err = os.Open(path)
 	}

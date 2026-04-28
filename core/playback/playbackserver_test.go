@@ -141,7 +141,7 @@ var _ = Describe("PlaybackServer", func() {
 			Expect(ps.playbackDevices[0].PlaybackQueue.Size()).To(Equal(0))
 			Expect(ps.playbackDevices[0].PlaybackQueue.Index).To(Equal(-1))
 		})
-		})
+	})
 
 	Describe("getDefaultDevice", func() {
 		It("returns the default device", func() {

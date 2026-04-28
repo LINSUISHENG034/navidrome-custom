@@ -3,6 +3,7 @@ package subsonic
 import (
 	"context"
 	"net/http/httptest"
+	"time"
 
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/navidrome/navidrome/conf"
@@ -103,27 +104,43 @@ var _ = Describe("helpers", func() {
 			Expect(buildDiscSubtitles(album)).To(BeNil())
 		})
 
-		It("should return the disc title for a single disc", func() {
+		It("should return the disc title with cover art for a single disc", func() {
+			updatedAt := time.Now().Truncate(time.Second)
 			album := model.Album{
+				ID:        "album1",
+				UpdatedAt: updatedAt,
 				Discs: map[int]string{
 					1: "Special Edition",
 				},
 			}
-			Expect(buildDiscSubtitles(album)).To(Equal([]responses.DiscTitle{{Disc: 1, Title: "Special Edition"}}))
+			result := buildDiscSubtitles(album)
+			Expect(result).To(HaveLen(1))
+			Expect(result[0].Disc).To(Equal(int32(1)))
+			Expect(result[0].Title).To(Equal("Special Edition"))
+			expectedArtID := model.NewArtworkID(model.KindDiscArtwork, "album1:1", &updatedAt)
+			Expect(result[0].CoverArt).To(Equal(expectedArtID.String()))
 		})
 
-		It("should return correct disc titles when album has discs with valid disc numbers", func() {
+		It("should return correct disc titles with cover art when album has multiple discs", func() {
+			updatedAt := time.Now().Truncate(time.Second)
 			album := model.Album{
+				ID:        "album1",
+				UpdatedAt: updatedAt,
 				Discs: map[int]string{
 					1: "Disc 1",
 					2: "Disc 2",
 				},
 			}
-			expected := []responses.DiscTitle{
-				{Disc: 1, Title: "Disc 1"},
-				{Disc: 2, Title: "Disc 2"},
-			}
-			Expect(buildDiscSubtitles(album)).To(Equal(expected))
+			result := buildDiscSubtitles(album)
+			Expect(result).To(HaveLen(2))
+			Expect(result[0].Disc).To(Equal(int32(1)))
+			Expect(result[0].Title).To(Equal("Disc 1"))
+			expectedArtID1 := model.NewArtworkID(model.KindDiscArtwork, "album1:1", &updatedAt)
+			Expect(result[0].CoverArt).To(Equal(expectedArtID1.String()))
+			Expect(result[1].Disc).To(Equal(int32(2)))
+			Expect(result[1].Title).To(Equal("Disc 2"))
+			expectedArtID2 := model.NewArtworkID(model.KindDiscArtwork, "album1:2", &updatedAt)
+			Expect(result[1].CoverArt).To(Equal(expectedArtID2.String()))
 		})
 	})
 
@@ -290,6 +307,14 @@ var _ = Describe("helpers", func() {
 				child := childFromMediaFile(ctx, mf)
 				Expect(child.Album).To(Equal("Test Album"))
 				Expect(child.Artist).To(Equal("Test Artist"))
+			})
+		})
+
+		Context("when MediaFile has an empty title", func() {
+			It("still includes the title field in the response", func() {
+				mf.Title = ""
+				child := childFromMediaFile(ctx, mf)
+				Expect(child.Title).To(Equal(""))
 			})
 		})
 	})
@@ -543,6 +568,38 @@ var _ = Describe("helpers", func() {
 				}
 				artist := toArtistID3(r, a)
 				Expect(artist.AverageRating).To(Equal(2.5))
+			})
+		})
+
+		Describe("buildAlbumID3 Created field", func() {
+			It("uses CreatedAt when set", func() {
+				t := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+				al := model.Album{ID: "a1", Name: "A", CreatedAt: t}
+				dir := buildAlbumID3(ctx, al)
+				Expect(dir.Created).ToNot(BeNil())
+				Expect(*dir.Created).To(Equal(t))
+			})
+
+			It("falls back to UpdatedAt when CreatedAt is zero", func() {
+				updated := time.Date(2019, 5, 6, 7, 8, 9, 0, time.UTC)
+				al := model.Album{ID: "a2", Name: "A", UpdatedAt: updated}
+				dir := buildAlbumID3(ctx, al)
+				Expect(dir.Created).ToNot(BeNil())
+				Expect(*dir.Created).To(Equal(updated))
+			})
+
+			It("falls back to ImportedAt when CreatedAt and UpdatedAt are zero", func() {
+				imported := time.Date(2021, 8, 9, 10, 11, 12, 0, time.UTC)
+				al := model.Album{ID: "a3", Name: "A", ImportedAt: imported}
+				dir := buildAlbumID3(ctx, al)
+				Expect(dir.Created).ToNot(BeNil())
+				Expect(*dir.Created).To(Equal(imported))
+			})
+
+			It("never leaves Created nil even when all timestamps are zero", func() {
+				al := model.Album{ID: "a4", Name: "A"}
+				dir := buildAlbumID3(ctx, al)
+				Expect(dir.Created).ToNot(BeNil())
 			})
 		})
 

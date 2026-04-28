@@ -30,7 +30,9 @@ vi.mock('./jukeboxClient', () => ({
     play: vi.fn(() => Promise.resolve({})),
     start: vi.fn(() => Promise.resolve({})),
     stop: vi.fn(() => Promise.resolve({})),
-    attachSession: vi.fn(() => Promise.resolve({ sessionId: 'jukebox-session:admin' })),
+    attachSession: vi.fn(() =>
+      Promise.resolve({ sessionId: 'jukebox-session:admin' }),
+    ),
     detachSession: vi.fn(() => Promise.resolve({})),
   },
 }))
@@ -272,7 +274,9 @@ describe('<DeviceSelector />', () => {
     const openButton = await screen.findByTestId('device-selector-button')
     fireEvent.click(openButton)
 
-    const bluetoothDevice = await screen.findByText('Bluetooth 24:C4:06:FA:00:37')
+    const bluetoothDevice = await screen.findByText(
+      'Bluetooth 24:C4:06:FA:00:37',
+    )
     fireEvent.click(bluetoothDevice)
 
     await waitFor(() => {
@@ -338,5 +342,4 @@ describe('<DeviceSelector />', () => {
       )
     })
   })
-
 })

@@ -7,7 +7,6 @@ vi.mock('navidrome-music-player', () => ({
 }))
 
 vi.mock('./jukeboxClient', () => ({
-
   default: {
     play: vi.fn(() => Promise.resolve({})),
     pause: vi.fn(() => Promise.resolve({})),
@@ -68,7 +67,12 @@ const buildJukeboxState = (overrides = {}) => ({
     { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
   ],
   jukeboxControl: { sessionId: 's1', ownershipState: 'attached' },
-  jukeboxRemote: { currentIndex: 1, trackId: 't2', playing: true, position: 41 },
+  jukeboxRemote: {
+    currentIndex: 1,
+    trackId: 't2',
+    playing: true,
+    position: 41,
+  },
   ...overrides,
 })
 
@@ -438,7 +442,6 @@ describe('remote-state control safety', () => {
   })
 })
 
-
 describe('remote-state-first jukebox controls', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -460,8 +463,6 @@ describe('remote-state-first jukebox controls', () => {
     expect(jukeboxClient.pause).toHaveBeenCalledTimes(1)
     expect(jukeboxClient.play).not.toHaveBeenCalled()
   })
-
-
 
   it('uses authoritative remote current index for PREV_SONG in jukebox mode', () => {
     const handlers = keyHandlers(
@@ -537,10 +538,9 @@ describe('remote-state-first jukebox controls', () => {
     handlers.VOL_DOWN()
     expect(jukeboxClient.volume).toHaveBeenCalledTimes(1)
     expect(jukeboxClient.volume.mock.calls[0][0]).toBeCloseTo(
-      uiVolumeToRemoteGain(
-        remoteGainToUiVolume(0.8, { deviceName }) - 0.1,
-        { deviceName },
-      ),
+      uiVolumeToRemoteGain(remoteGainToUiVolume(0.8, { deviceName }) - 0.1, {
+        deviceName,
+      }),
       5,
     )
   })
@@ -552,10 +552,7 @@ describe('remote-state-first jukebox controls', () => {
 
     expect(canControlJukebox(state)).toBe(false)
 
-    const handlers = keyHandlers(
-      { togglePlay: vi.fn(), volume: 0.5 },
-      state,
-    )
+    const handlers = keyHandlers({ togglePlay: vi.fn(), volume: 0.5 }, state)
 
     handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
     handlers.NEXT_SONG({ metaKey: false })
@@ -580,7 +577,12 @@ describe('remote-state-first jukebox controls', () => {
 
     const state = buildJukeboxState({
       jukeboxControl: { sessionId: 's1', ownershipState: 'taken_over' },
-      jukeboxRemote: { currentIndex: 2, trackId: 't3', playing: true, position: 41 },
+      jukeboxRemote: {
+        currentIndex: 2,
+        trackId: 't3',
+        playing: true,
+        position: 41,
+      },
     })
     const handlers = keyHandlers({ togglePlay: vi.fn(), volume: 0.5 }, state)
 
@@ -589,7 +591,6 @@ describe('remote-state-first jukebox controls', () => {
     expect(jukeboxClient.skip).not.toHaveBeenCalled()
   })
 })
-
 
 describe('jukebox session heartbeat lifecycle', () => {
   beforeEach(() => {
@@ -746,17 +747,18 @@ describe('jukebox session heartbeat lifecycle', () => {
   })
 })
 
-
 describe('remote-state-first player selection', () => {
   it('uses remote current track and index for jukebox queue highlighting', () => {
     const remoteTrack = { trackId: 't2', uuid: 'u2', song: { id: 't2' } }
     const state = buildJukeboxState({
-      queue: [
-        { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
-        remoteTrack,
-      ],
+      queue: [{ trackId: 't1', uuid: 'u1', song: { id: 't1' } }, remoteTrack],
       jukeboxControl: { sessionId: 's1', ownershipState: 'recovering' },
-      jukeboxRemote: { currentIndex: 1, trackId: 't2', playing: true, position: 41 },
+      jukeboxRemote: {
+        currentIndex: 1,
+        trackId: 't2',
+        playing: true,
+        position: 41,
+      },
     })
 
     const resolved = resolvePlayerUiState(state)
@@ -768,7 +770,12 @@ describe('remote-state-first player selection', () => {
     const state = buildJukeboxState({
       current: { trackId: 't2', uuid: 'u2', song: { id: 't2' } },
       jukeboxControl: { sessionId: 's1', ownershipState: 'recovering' },
-      jukeboxRemote: { currentIndex: 2, trackId: 't3', playing: true, position: 3 },
+      jukeboxRemote: {
+        currentIndex: 2,
+        trackId: 't3',
+        playing: true,
+        position: 3,
+      },
     })
 
     const resolved = resolvePlayerUiState(state)
@@ -780,7 +787,12 @@ describe('remote-state-first player selection', () => {
     const state = buildJukeboxState({
       current: { trackId: 't2', uuid: 'u2', song: { id: 't2' } },
       jukeboxControl: { sessionId: 's1', ownershipState: 'recovering' },
-      jukeboxRemote: { currentIndex: 2, trackId: 't3', playing: true, position: 3 },
+      jukeboxRemote: {
+        currentIndex: 2,
+        trackId: 't3',
+        playing: true,
+        position: 3,
+      },
     })
     const handlers = keyHandlers({ togglePlay: vi.fn(), volume: 0.5 }, state)
 
@@ -789,7 +801,6 @@ describe('remote-state-first player selection', () => {
     expect(jukeboxClient.skip).not.toHaveBeenCalled()
   })
 })
-
 
 describe('queue highlight stabilization', () => {
   beforeEach(() => {
@@ -923,7 +934,10 @@ describe('optimistic user skip', () => {
       }),
     ).toBe(false)
 
-    pendingUserSkipRef.current = { index: nextIndex, expiresAt: Date.now() + 5000 }
+    pendingUserSkipRef.current = {
+      index: nextIndex,
+      expiresAt: Date.now() + 5000,
+    }
     lastStablePlayIndexRef.current = nextIndex
 
     const staleControlledPlayIndex = resolveControlledJukeboxPlayIndex({
@@ -958,7 +972,6 @@ describe('optimistic user skip', () => {
     expect(pendingUserSkipRef.current).toBeNull()
   })
 })
-
 
 describe('jukebox session authority refresh helpers', () => {
   beforeEach(() => {

@@ -37,9 +37,11 @@ AGENTS.md
 *.ndp
 openspec/
 go.work*
+docker-compose.yml
 node_modules/
 docs/plans/
 fork/docs/
 CLAUDE.md
 
 .worktrees/
+.omx/

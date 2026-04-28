@@ -74,7 +74,11 @@ const runJukeboxHeartbeat = async ({
   } catch (err) {
     if (err?.status === 404 && client?.attachSession) {
       try {
-        const status = await client.attachSession(sessionId, clientId, deviceName)
+        const status = await client.attachSession(
+          sessionId,
+          clientId,
+          deviceName,
+        )
         return dispatchJukeboxSessionStatus(dispatch, status)
       } catch (attachErr) {
         err = attachErr

@@ -56,5 +56,8 @@ export const stepRemoteGainByUiDelta = (gain, delta, context = {}) => {
   if (getVolumeProfile(context) === DEFAULT_VOLUME_PROFILE) {
     return clamp01(gain + delta)
   }
-  return uiVolumeToRemoteGain(remoteGainToUiVolume(gain, context) + delta, context)
+  return uiVolumeToRemoteGain(
+    remoteGainToUiVolume(gain, context) + delta,
+    context,
+  )
 }

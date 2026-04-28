@@ -52,7 +52,14 @@ describe('<AudioTitle />', () => {
     const audioInfo = { trackId: 'track-1', song: baseSong }
     renderWithStore(
       <AudioTitle audioInfo={audioInfo} gainInfo={{}} isMobile={false} />,
-      { player: { jukeboxMode: false, current: {}, queue: [], jukeboxRemote: null } },
+      {
+        player: {
+          jukeboxMode: false,
+          current: {},
+          queue: [],
+          jukeboxRemote: null,
+        },
+      },
     )
     const link = screen.getByRole('link')
     expect(link.getAttribute('href')).toBe('/playlist/playlist-1/show')
@@ -65,14 +72,24 @@ describe('<AudioTitle />', () => {
     }
     renderWithStore(
       <AudioTitle audioInfo={audioInfo} gainInfo={{}} isMobile={false} />,
-      { player: { jukeboxMode: false, current: {}, queue: [], jukeboxRemote: null } },
+      {
+        player: {
+          jukeboxMode: false,
+          current: {},
+          queue: [],
+          jukeboxRemote: null,
+        },
+      },
     )
     const link = screen.getByRole('link')
     expect(link.getAttribute('href')).toBe('/album/album-1/show')
   })
 
   it('renders remote track title from jukebox session state in jukebox mode', () => {
-    const localAudioInfo = { trackId: 'track-local', song: { ...baseSong, title: 'Local Song' } }
+    const localAudioInfo = {
+      trackId: 'track-local',
+      song: { ...baseSong, title: 'Local Song' },
+    }
     const remoteTrack = {
       trackId: 'track-remote',
       song: { ...baseSong, title: 'Remote Song', playlistId: undefined },
@@ -84,7 +101,10 @@ describe('<AudioTitle />', () => {
           jukeboxMode: true,
           current: localAudioInfo,
           queue: [
-            { trackId: 'track-local', song: { ...baseSong, title: 'Local Song' } },
+            {
+              trackId: 'track-local',
+              song: { ...baseSong, title: 'Local Song' },
+            },
             remoteTrack,
           ],
           jukeboxControl: { ownershipState: 'recovering' },

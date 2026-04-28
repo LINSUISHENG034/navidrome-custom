@@ -7,6 +7,8 @@ export const PLAYER_PLAY_TRACKS = 'PLAYER_PLAY_TRACKS'
 export const PLAYER_CURRENT = 'PLAYER_CURRENT'
 export const PLAYER_SET_VOLUME = 'PLAYER_SET_VOLUME'
 export const PLAYER_SET_MODE = 'PLAYER_SET_MODE'
+export const TRANSCODING_SET_PROFILE = 'TRANSCODING_SET_PROFILE'
+export const PLAYER_REFRESH_QUEUE = 'PLAYER_REFRESH_QUEUE'
 export const PLAYER_SET_JUKEBOX_MODE = 'PLAYER_SET_JUKEBOX_MODE'
 export const PLAYER_JUKEBOX_SESSION_STATUS = 'jukeboxStateUpdated'
 export const PLAYER_SET_AUDIO_INSTANCE = 'PLAYER_SET_AUDIO_INSTANCE'
@@ -104,6 +106,16 @@ export const setVolume = (volume) => ({
 export const setPlayMode = (mode) => ({
   type: PLAYER_SET_MODE,
   data: { mode },
+})
+
+export const setTranscodingProfile = (profile) => ({
+  type: TRANSCODING_SET_PROFILE,
+  data: profile,
+})
+
+export const refreshQueue = (resolvedUrls) => ({
+  type: PLAYER_REFRESH_QUEUE,
+  data: resolvedUrls,
 })
 
 export const setJukeboxMode = (enabled, device = null) => ({

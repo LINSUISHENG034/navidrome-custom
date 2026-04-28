@@ -1,8 +1,3 @@
-//go:build unix
-
-// TODO Fix snapshot tests in Windows
-// Response Snapshot tests. Only run in Linux and macOS, as they fail in Windows
-// Probably because of EOL char differences
 package responses_test
 
 import (
@@ -288,7 +283,7 @@ var _ = Describe("Responses", func() {
 		Context("with data", func() {
 			BeforeEach(func() {
 				album := AlbumID3{
-					Id: "1", Name: "album", Artist: "artist", Genre: "rock",
+					Id: "1", Name: "album", Artist: "artist", Duration: 292, Genre: "rock",
 				}
 				album.OpenSubsonicAlbumID3 = &OpenSubsonicAlbumID3{
 					Genres:        []ItemGenre{{Name: "rock"}, {Name: "progressive"}},
@@ -1105,6 +1100,35 @@ var _ = Describe("Responses", func() {
 				}
 			})
 
+			It("should match .XML", func() {
+				Expect(xml.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+			It("should match .JSON", func() {
+				Expect(json.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+		})
+	})
+
+	Describe("SonicMatches", func() {
+		Context("without data", func() {
+			BeforeEach(func() {
+				response.SonicMatches = &Array[SonicMatch]{}
+			})
+			It("should match .XML", func() {
+				Expect(xml.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+			It("should match .JSON", func() {
+				Expect(json.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+		})
+
+		Context("with data", func() {
+			BeforeEach(func() {
+				response.SonicMatches = &Array[SonicMatch]{
+					{Entry: Child{Id: "1", Title: "Bohemian Rhapsody", IsDir: false}, Similarity: 0.95},
+					{Entry: Child{Id: "2", Title: "We Will Rock You", IsDir: false}, Similarity: 0.78},
+				}
+			})
 			It("should match .XML", func() {
 				Expect(xml.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
 			})
