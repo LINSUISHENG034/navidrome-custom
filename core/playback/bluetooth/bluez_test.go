@@ -1,6 +1,7 @@
 package bluetooth
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/godbus/dbus/v5"
@@ -76,5 +77,45 @@ func TestListDevicesParsesManagedObjects(t *testing.T) {
 	}
 	if devices[0].Name != "Speaker A" {
 		t.Fatalf("unexpected name: %s", devices[0].Name)
+	}
+}
+
+func TestFindDevicePathByMACInManaged(t *testing.T) {
+	managed := map[dbus.ObjectPath]map[string]map[string]dbus.Variant{
+		dbus.ObjectPath("/org/bluez/hci0/dev_24_C4_06_FA_00_37"): {
+			"org.bluez.Device1": {
+				"Address": dbus.MakeVariant("24:C4:06:FA:00:37"),
+			},
+		},
+	}
+
+	path, err := findDevicePathByMACInManaged(managed, "24_c4_06_fa_00_37")
+	if err != nil {
+		t.Fatalf("findDevicePathByMACInManaged returned error: %v", err)
+	}
+	if path != "/org/bluez/hci0/dev_24_C4_06_FA_00_37" {
+		t.Fatalf("unexpected path: %s", path)
+	}
+}
+
+func TestFindDevicePathByMACInManagedReturnsUnknownDeviceError(t *testing.T) {
+	_, err := findDevicePathByMACInManaged(map[dbus.ObjectPath]map[string]map[string]dbus.Variant{}, "24:C4:06:FA:00:37")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err.Error() != "bluetooth device not found: 24:C4:06:FA:00:37" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestIsUnavailableError(t *testing.T) {
+	if !IsUnavailableError(dbus.Error{Name: "org.freedesktop.DBus.Error.Disconnected"}) {
+		t.Fatal("expected disconnected D-Bus error to be unavailable")
+	}
+	if !IsUnavailableError(errors.New("dbus: connection closed by user")) {
+		t.Fatal("expected connection closed error to be unavailable")
+	}
+	if IsUnavailableError(errors.New("operation failed")) {
+		t.Fatal("did not expect generic error to be unavailable")
 	}
 }

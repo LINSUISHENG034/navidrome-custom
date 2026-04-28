@@ -18,21 +18,65 @@ type bluetoothManager interface {
 	Disconnect(ctx context.Context, mac string) error
 }
 
+type bluetoothManagerCloser interface {
+	Close() error
+}
+
 type bluetoothConnectRequest struct {
 	MAC string `json:"mac"`
 }
 
+type bluetoothActionWarning struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type bluetoothActionResponse struct {
+	Devices []bluetooth.BlueZDevice `json:"devices"`
+	Warning *bluetoothActionWarning `json:"warning,omitempty"`
+}
+
+var (
+	waitForBluetoothSinkReady = bluetooth.WaitForSinkReady
+	newBluetoothManager       = func() (bluetoothManager, error) {
+		return bluetooth.NewBlueZManager()
+	}
+)
+
 func (api *Router) getBluetoothManager() (bluetoothManager, error) {
+	api.bluetoothMu.Lock()
+	defer api.bluetoothMu.Unlock()
+
 	if api.bluetoothManager != nil {
 		return api.bluetoothManager, nil
 	}
 
-	manager, err := bluetooth.NewBlueZManager()
+	manager, err := newBluetoothManager()
 	if err != nil {
 		return nil, err
 	}
 	api.bluetoothManager = manager
 	return api.bluetoothManager, nil
+}
+
+func (api *Router) resetBluetoothManager(ctx context.Context, manager bluetoothManager, err error) {
+	if !bluetooth.IsUnavailableError(err) {
+		return
+	}
+
+	api.bluetoothMu.Lock()
+	defer api.bluetoothMu.Unlock()
+	if api.bluetoothManager != manager {
+		return
+	}
+
+	if closer, ok := api.bluetoothManager.(bluetoothManagerCloser); ok {
+		if closeErr := closer.Close(); closeErr != nil {
+			log.Warn(ctx, "Error closing bluetooth manager after D-Bus failure", "err", closeErr)
+		}
+	}
+	api.bluetoothManager = nil
+	log.Warn(ctx, "Reset bluetooth manager after D-Bus failure", "err", err)
 }
 
 func (api *Router) addBluetoothRoute(r chi.Router) {
@@ -53,6 +97,7 @@ func (api *Router) bluetoothDevices(w http.ResponseWriter, r *http.Request) {
 
 	devices, err := manager.ListDevices(r.Context())
 	if err != nil {
+		api.resetBluetoothManager(r.Context(), manager, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -65,6 +110,9 @@ func (api *Router) bluetoothDevices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *Router) bluetoothScan(w http.ResponseWriter, r *http.Request) {
+	api.bluetoothScanMu.Lock()
+	defer api.bluetoothScanMu.Unlock()
+
 	manager, err := api.getBluetoothManager()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -72,6 +120,7 @@ func (api *Router) bluetoothScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := manager.Scan(r.Context(), 10*time.Second); err != nil {
+		api.resetBluetoothManager(r.Context(), manager, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -80,18 +129,34 @@ func (api *Router) bluetoothScan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *Router) bluetoothConnect(w http.ResponseWriter, r *http.Request) {
-	api.bluetoothApplyAction(w, r, func(ctx context.Context, manager bluetoothManager, mac string) error {
-		return manager.Connect(ctx, mac)
+	api.bluetoothApplyAction(w, r, func(ctx context.Context, manager bluetoothManager, mac string) (*bluetoothActionWarning, error) {
+		if err := manager.Connect(ctx, mac); err != nil {
+			return nil, err
+		}
+
+		started := time.Now()
+		sink, ready := waitForBluetoothSinkReady(ctx, mac, 3*time.Second, 200*time.Millisecond)
+		if ready {
+			log.Debug(ctx, "Bluetooth audio sink ready after connect", "mac", bluetooth.NormalizeMAC(mac), "sink", sink.Name, "elapsed", time.Since(started))
+			return nil, nil
+		}
+
+		elapsed := time.Since(started)
+		log.Warn(ctx, "Bluetooth audio sink not ready after connect", "mac", bluetooth.NormalizeMAC(mac), "elapsed", elapsed)
+		return &bluetoothActionWarning{
+			Code:    "sink_not_ready",
+			Message: "Bluetooth device connected, but its audio output is still appearing.",
+		}, nil
 	})
 }
 
 func (api *Router) bluetoothDisconnect(w http.ResponseWriter, r *http.Request) {
-	api.bluetoothApplyAction(w, r, func(ctx context.Context, manager bluetoothManager, mac string) error {
-		return manager.Disconnect(ctx, mac)
+	api.bluetoothApplyAction(w, r, func(ctx context.Context, manager bluetoothManager, mac string) (*bluetoothActionWarning, error) {
+		return nil, manager.Disconnect(ctx, mac)
 	})
 }
 
-func (api *Router) bluetoothApplyAction(w http.ResponseWriter, r *http.Request, fn func(context.Context, bluetoothManager, string) error) {
+func (api *Router) bluetoothApplyAction(w http.ResponseWriter, r *http.Request, fn func(context.Context, bluetoothManager, string) (*bluetoothActionWarning, error)) {
 	manager, err := api.getBluetoothManager()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -108,7 +173,9 @@ func (api *Router) bluetoothApplyAction(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	if err := fn(r.Context(), manager, req.MAC); err != nil {
+	warning, err := fn(r.Context(), manager, req.MAC)
+	if err != nil {
+		api.resetBluetoothManager(r.Context(), manager, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -117,5 +184,16 @@ func (api *Router) bluetoothApplyAction(w http.ResponseWriter, r *http.Request, 
 		_ = api.playback.RefreshDevices(r.Context())
 	}
 
-	api.bluetoothDevices(w, r)
+	devices, err := manager.ListDevices(r.Context())
+	if err != nil {
+		api.resetBluetoothManager(r.Context(), manager, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(bluetoothActionResponse{Devices: devices, Warning: warning}); err != nil {
+		log.Error(r.Context(), "Error encoding bluetooth action response", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
