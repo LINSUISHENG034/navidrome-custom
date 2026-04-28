@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -42,6 +43,7 @@ type BlueZManager interface {
 type bluezManager struct {
 	conn        *dbus.Conn
 	adapterPath dbus.ObjectPath
+	scanMu      sync.Mutex
 }
 
 func NewBlueZManager() (BlueZManager, error) {
@@ -57,6 +59,13 @@ func NewBlueZManager() (BlueZManager, error) {
 	}
 
 	return &bluezManager{conn: conn, adapterPath: adapterPath}, nil
+}
+
+func (m *bluezManager) Close() error {
+	if m == nil || m.conn == nil {
+		return nil
+	}
+	return m.conn.Close()
 }
 
 func findAdapterPath(conn *dbus.Conn) (dbus.ObjectPath, error) {
@@ -190,6 +199,27 @@ func normalizeMAC(mac string) string {
 	return strings.ToUpper(mac)
 }
 
+func IsUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dbusErr dbus.Error
+	if errors.As(err, &dbusErr) {
+		switch dbusErr.Name {
+		case "org.freedesktop.DBus.Error.Disconnected",
+			"org.freedesktop.DBus.Error.NoServer",
+			"org.freedesktop.DBus.Error.ServiceUnknown",
+			"org.freedesktop.DBus.Error.NoReply":
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection closed") ||
+		strings.Contains(msg, "disconnected") ||
+		strings.Contains(msg, "serviceunknown") ||
+		strings.Contains(msg, "no such service")
+}
+
 func macFromPath(path dbus.ObjectPath) string {
 	raw := string(path)
 	idx := strings.LastIndex(raw, "/dev_")
@@ -201,6 +231,9 @@ func macFromPath(path dbus.ObjectPath) string {
 }
 
 func (m *bluezManager) Scan(ctx context.Context, timeout time.Duration) error {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
+
 	adapter := m.conn.Object(blueZServiceName, m.adapterPath)
 	if err := adapter.Call(blueZAdapterInterface+".StartDiscovery", 0).Err; err != nil {
 		return err
@@ -254,6 +287,15 @@ func (m *bluezManager) findDevicePathByMAC(mac string) (dbus.ObjectPath, error) 
 		return "", err
 	}
 
+	return findDevicePathByMACInManaged(managed, normalized)
+}
+
+func findDevicePathByMACInManaged(managed map[dbus.ObjectPath]map[string]map[string]dbus.Variant, mac string) (dbus.ObjectPath, error) {
+	normalized := normalizeMAC(mac)
+	if normalized == "" {
+		return "", errors.New("mac is required")
+	}
+
 	for path, ifaces := range managed {
 		props, ok := ifaces[blueZDeviceInterface]
 		if !ok {
@@ -264,7 +306,5 @@ func (m *bluezManager) findDevicePathByMAC(mac string) (dbus.ObjectPath, error) 
 		}
 	}
 
-	// Fall back to the canonical BlueZ device path shape.
-	devID := strings.ReplaceAll(normalized, ":", "_")
-	return dbus.ObjectPath(fmt.Sprintf("%s/dev_%s", m.adapterPath, devID)), nil
+	return "", fmt.Errorf("bluetooth device not found: %s", normalized)
 }

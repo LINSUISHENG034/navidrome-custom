@@ -6,6 +6,7 @@ import (
 	"html"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/deluan/rest"
@@ -48,6 +49,8 @@ type Router struct {
 	imgUpload        core.ImageUploadService
 	playback         playback.PlaybackServer
 	bluetoothManager bluetoothManager
+	bluetoothMu      sync.Mutex
+	bluetoothScanMu  sync.Mutex
 }
 
 func New(ds model.DataStore, share core.Share, playlists playlistsvc.Playlists, insights metrics.Insights, libraryService core.Library, userService core.User, maintenance core.Maintenance, pluginManager PluginManager, imgUpload core.ImageUploadService, playbackServer playback.PlaybackServer) *Router {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/navidrome/navidrome/conf"
+	"github.com/navidrome/navidrome/core/playback/bluetooth"
 	"github.com/navidrome/navidrome/model"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -38,6 +40,38 @@ var _ = Describe("PlaybackServer", func() {
 			Expect(devices[1].Name).To(Equal("BT Headphones"))
 			Expect(devices[1].IsDefault).To(BeFalse())
 			Expect(devices[1].IsBluetooth).To(BeTrue())
+		})
+
+		It("reuses one sink snapshot for bluetooth merge and status", func() {
+			previousAutoDiscover := conf.Server.Jukebox.AutoDiscoverBluetooth
+			previousDiscover := discoverAllSinks
+			defer func() {
+				conf.Server.Jukebox.AutoDiscoverBluetooth = previousAutoDiscover
+				discoverAllSinks = previousDiscover
+			}()
+
+			conf.Server.Jukebox.AutoDiscoverBluetooth = true
+			ps.playbackDevices = []playbackDevice{
+				*NewPlaybackDevice(ctx, nil, "Speaker", "alsa_output.analog"),
+			}
+			ps.playbackDevices[0].Default = true
+
+			calls := 0
+			discoverAllSinks = func(context.Context) []bluetooth.AudioSink {
+				calls++
+				return []bluetooth.AudioSink{
+					{Name: "bluez_output.24_C4_06_FA_00_37.a2dp-sink"},
+				}
+			}
+
+			devices := ps.ListDevices()
+
+			Expect(calls).To(Equal(1))
+			Expect(devices).To(HaveLen(2))
+			Expect(devices[1].Name).To(Equal("Bluetooth 24:C4:06:FA:00:37"))
+			Expect(devices[1].DeviceName).To(Equal("pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink"))
+			Expect(devices[1].IsBluetooth).To(BeTrue())
+			Expect(devices[1].Connected).To(BeTrue())
 		})
 	})
 

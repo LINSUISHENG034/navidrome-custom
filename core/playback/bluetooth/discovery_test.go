@@ -65,6 +65,26 @@ func TestAudioSink_FriendlyName(t *testing.T) {
 	}
 }
 
+func TestAudioSink_NormalizedMAC(t *testing.T) {
+	tests := []struct {
+		name     string
+		sink     AudioSink
+		expected string
+	}{
+		{"bluez_output with profile", AudioSink{Name: "bluez_output.24_C4_06_FA_00_37.a2dp-sink"}, "24:C4:06:FA:00:37"},
+		{"bluez_sink with profile", AudioSink{Name: "bluez_sink.aa_bb_cc_dd_ee_ff.a2dp-sink"}, "AA:BB:CC:DD:EE:FF"},
+		{"non-bluetooth sink", AudioSink{Name: "alsa_output.pci-0000_00_1f.3.analog-stereo"}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.sink.NormalizedMAC(); got != tt.expected {
+				t.Errorf("NormalizedMAC() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestAudioSink_ToDeviceDefinition(t *testing.T) {
 	sink := AudioSink{Name: "bluez_output.24_C4_06_FA_00_37.a2dp-sink"}
 	def := sink.ToDeviceDefinition()
@@ -138,6 +158,44 @@ func TestDiscoverAllSinks_ParsesCorrectly(t *testing.T) {
 	}
 	if !sinks[1].IsBluetooth() {
 		t.Error("sinks[1] should be bluetooth")
+	}
+}
+
+func TestDiscoverBluetoothSinks_FiltersProvidedSnapshot(t *testing.T) {
+	sinks := []AudioSink{
+		{Name: "alsa_output.pci-0000_00_1f.3.analog-stereo"},
+		{Name: "bluez_output.24_C4_06_FA_00_37.a2dp-sink"},
+		{Name: "bluez_sink.AA_BB_CC_DD_EE_FF.a2dp-sink"},
+	}
+
+	btSinks := DiscoverBluetoothSinks(nil, sinks)
+	if len(btSinks) != 2 {
+		t.Fatalf("DiscoverBluetoothSinks() returned %d sinks, want 2", len(btSinks))
+	}
+	if btSinks[0].Name != "bluez_output.24_C4_06_FA_00_37.a2dp-sink" {
+		t.Errorf("btSinks[0].Name = %q", btSinks[0].Name)
+	}
+	if btSinks[1].Name != "bluez_sink.AA_BB_CC_DD_EE_FF.a2dp-sink" {
+		t.Errorf("btSinks[1].Name = %q", btSinks[1].Name)
+	}
+}
+
+func TestFindBluetoothSinkByMAC(t *testing.T) {
+	sinks := []AudioSink{
+		{Name: "alsa_output.pci-0000_00_1f.3.analog-stereo"},
+		{Name: "bluez_output.24_C4_06_FA_00_37.a2dp-sink"},
+	}
+
+	sink, ok := FindBluetoothSinkByMAC(sinks, "24:c4:06:fa:00:37")
+	if !ok {
+		t.Fatal("expected matching sink")
+	}
+	if sink.Name != "bluez_output.24_C4_06_FA_00_37.a2dp-sink" {
+		t.Fatalf("unexpected sink: %#v", sink)
+	}
+
+	if _, ok := FindBluetoothSinkByMAC(sinks, "AA:BB:CC:DD:EE:FF"); ok {
+		t.Fatal("unexpected matching sink")
 	}
 }
 

@@ -52,7 +52,7 @@ type playbackServer struct {
 	playbackDevices     []playbackDevice
 }
 
-var discoverAllSinks = bluetooth.DiscoverAllSinks
+var discoverAllSinks = bluetooth.DiscoverSinks
 
 func (ps *playbackServer) newPlaybackDevice(ctx context.Context, name string, deviceName string) *playbackDevice {
 	device := NewPlaybackDevice(ctx, ps, name, deviceName)
@@ -399,7 +399,11 @@ func (ps *playbackServer) GetDeviceForUser(user string) (*playbackDevice, error)
 
 // mergeBluetoothDevices discovers Bluetooth sinks and appends any new ones to playbackDevices.
 func (ps *playbackServer) mergeBluetoothDevices(ctx context.Context) {
-	btSinks := bluetooth.DiscoverBluetoothSinks(ctx)
+	ps.mergeBluetoothDevicesFromSinks(ctx, discoverAllSinks(ctx))
+}
+
+func (ps *playbackServer) mergeBluetoothDevicesFromSinks(ctx context.Context, sinks []bluetooth.AudioSink) {
+	btSinks := bluetooth.DiscoverBluetoothSinks(ctx, sinks)
 	deviceCtx := ps.playbackDeviceContext(ctx)
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -431,17 +435,15 @@ func (ps *playbackServer) hasDevice(deviceName string) bool {
 
 // ListDevices returns info about all configured playback devices, including live connection status.
 func (ps *playbackServer) ListDevices() []DeviceInfo {
-	// Auto-discover and merge any new Bluetooth devices on each call
+	var sinkSnapshot []bluetooth.AudioSink
 	if conf.Server.Jukebox.AutoDiscoverBluetooth && ps.ctx != nil {
-		ps.mergeBluetoothDevices(*ps.ctx)
+		sinkSnapshot = discoverAllSinks(*ps.ctx)
+		ps.mergeBluetoothDevicesFromSinks(*ps.ctx, sinkSnapshot)
 	}
 
-	// Get current sinks to check BT connection status
 	activeSinks := make(map[string]bool)
-	if conf.Server.Jukebox.AutoDiscoverBluetooth && ps.ctx != nil {
-		for _, sink := range bluetooth.DiscoverAllSinks(*ps.ctx) {
-			activeSinks[sink.MPVDeviceName()] = true
-		}
+	for _, sink := range sinkSnapshot {
+		activeSinks[sink.MPVDeviceName()] = true
 	}
 
 	ps.mu.Lock()
