@@ -1,18 +1,19 @@
+ARG DOCKER_LIBRARY=docker.io/library
+
 FROM --platform=$BUILDPLATFORM ghcr.io/crazy-max/osxcross:14.5-debian AS osxcross
 
 ########################################################################################################################
 ### Build xx (original image: tonistiigi/xx)
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/alpine:3.20 AS xx-build
+FROM --platform=$BUILDPLATFORM ${DOCKER_LIBRARY}/alpine:3.20 AS xx-build
 
 # v1.9.0
 ENV XX_VERSION=a5592eab7a57895e8d385394ff12241bc65ecd50
 
-RUN apk add -U --no-cache git
-RUN git clone https://github.com/tonistiigi/xx && \
-    cd xx && \
-    git checkout ${XX_VERSION} && \
+ADD https://github.com/tonistiigi/xx/archive/${XX_VERSION}.tar.gz /tmp/xx.tar.gz
+RUN mkdir -p /tmp/xx && \
+    tar -xzf /tmp/xx.tar.gz -C /tmp/xx --strip-components=1 && \
     mkdir -p /out && \
-    cp src/xx-* /out/
+    cp /tmp/xx/src/xx-* /out/
 
 RUN cd /out && \
     ln -s xx-cc /out/xx-clang && \
@@ -26,7 +27,7 @@ COPY --from=xx-build /out/ /usr/bin/
 
 ########################################################################################################################
 ### Build Navidrome UI
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/node:lts-alpine AS ui
+FROM --platform=$BUILDPLATFORM ${DOCKER_LIBRARY}/node:lts-alpine AS ui
 WORKDIR /app
 
 # Install node dependencies
@@ -43,12 +44,15 @@ COPY --from=ui /build /build
 
 ########################################################################################################################
 ### Build Navidrome binary for Docker image (dynamic musl, enables native libwebp via dlopen)
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:1.26-alpine AS build-alpine
+FROM --platform=$BUILDPLATFORM ${DOCKER_LIBRARY}/golang:1.26-alpine AS build-alpine
 COPY --from=xx / /
 
 ARG TARGETPLATFORM
+ARG ALPINE_MIRROR=https://mirrors.aliyun.com/alpine
 
-RUN apk add --no-cache clang lld file git
+RUN alpine_version="v$(cut -d. -f1,2 /etc/alpine-release)" && \
+    printf "%s/%s/main\n%s/%s/community\n" "${ALPINE_MIRROR}" "${alpine_version}" "${ALPINE_MIRROR}" "${alpine_version}" > /etc/apk/repositories && \
+    apk add --no-cache clang lld file git
 RUN xx-apk add --no-cache gcc musl-dev zlib-dev
 RUN xx-verify --setup
 
@@ -82,7 +86,7 @@ EOT
 
 ########################################################################################################################
 ### Build Navidrome binary for standalone distribution (static glibc, cross-compiled)
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:1.26-trixie AS base
+FROM --platform=$BUILDPLATFORM ${DOCKER_LIBRARY}/golang:1.26-trixie AS base
 RUN apt-get update && apt-get install -y clang lld
 COPY --from=xx / /
 WORKDIR /workspace
@@ -139,13 +143,17 @@ COPY --from=build /out /
 
 ########################################################################################################################
 ### Build Final Image
-FROM public.ecr.aws/docker/library/alpine:3.20 AS final
+FROM ${DOCKER_LIBRARY}/alpine:3.20 AS final
 LABEL maintainer="deluan@navidrome.org"
 LABEL org.opencontainers.image.source="https://github.com/navidrome/navidrome"
 
+ARG ALPINE_MIRROR=https://mirrors.aliyun.com/alpine
+
 # Install runtime dependencies
 # - libwebp + symlinks: enables native WebP encoding via purego/dlopen
-RUN apk add -U --no-cache ffmpeg mpv sqlite pulseaudio-utils dbus libwebp libwebpdemux libwebpmux && \
+RUN alpine_version="v$(cut -d. -f1,2 /etc/alpine-release)" && \
+    printf "%s/%s/main\n%s/%s/community\n" "${ALPINE_MIRROR}" "${alpine_version}" "${ALPINE_MIRROR}" "${alpine_version}" > /etc/apk/repositories && \
+    apk add -U --no-cache ffmpeg mpv sqlite pulseaudio-utils dbus libwebp libwebpdemux libwebpmux && \
     for lib in libwebp libwebpdemux libwebpmux; do \
         target=$(ls /usr/lib/$lib.so.* 2>/dev/null | head -1) && \
         [ -n "$target" ] && ln -sf "$target" /usr/lib/$lib.so; \

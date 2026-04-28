@@ -9,10 +9,14 @@ cd "${REPO_ROOT}"
 GIT_TAG="${GIT_TAG:-v0.60.3-bt}"
 GIT_SHA="$(git rev-parse --short HEAD)"
 IMAGE="navidrome-bt:dev"
+ALPINE_MIRROR="${ALPINE_MIRROR:-https://mirrors.aliyun.com/alpine}"
+DOCKER_LIBRARY="${DOCKER_LIBRARY:-docker.io/library}"
 
 echo "==> Building image ${IMAGE} (${GIT_TAG} @ ${GIT_SHA})..."
 docker buildx build \
   --platform linux/amd64 \
+  --build-arg DOCKER_LIBRARY="${DOCKER_LIBRARY}" \
+  --build-arg ALPINE_MIRROR="${ALPINE_MIRROR}" \
   --build-arg GIT_TAG="${GIT_TAG}" \
   --build-arg GIT_SHA="${GIT_SHA}" \
   --tag "${IMAGE}" \

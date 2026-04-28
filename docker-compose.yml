@@ -26,3 +26,9 @@ services:
     group_add:
       - audio
     restart: unless-stopped
+    networks:
+      - 1panel-network
+
+networks:
+    1panel-network:
+        external: true
