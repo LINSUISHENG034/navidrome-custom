@@ -18,7 +18,7 @@ import (
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/server/subsonic/responses"
-	. "github.com/navidrome/navidrome/utils/gg"
+	"github.com/navidrome/navidrome/utils/gg"
 	"github.com/navidrome/navidrome/utils/number"
 	"github.com/navidrome/navidrome/utils/req"
 	"github.com/navidrome/navidrome/utils/slice"
@@ -217,7 +217,7 @@ func childFromMediaFile(ctx context.Context, mf model.MediaFile) responses.Child
 		child.Path = fakePath(mf)
 	}
 	child.DiscNumber = int32(mf.DiscNumber)
-	child.Created = P(mf.BirthTime)
+	child.Created = new(mf.BirthTime)
 	child.AlbumId = mf.AlbumID
 	child.ArtistId = mf.ArtistID
 	child.Type = "music"
@@ -251,7 +251,7 @@ func osChildFromMediaFile(ctx context.Context, mf model.MediaFile) *responses.Op
 	}
 	child.Comment = mf.Comment
 	child.SortName = sortName(mf.SortTitle, mf.OrderTitle)
-	child.BPM = int32(mf.BPM)
+	child.BPM = int32(gg.V(mf.BPM))
 	child.MediaType = responses.MediaTypeSong
 	child.MusicBrainzId = mf.MbzRecordingID
 	child.Isrc = mf.Tags.Values(model.TagISRC)
@@ -263,9 +263,10 @@ func osChildFromMediaFile(ctx context.Context, mf model.MediaFile) *responses.Op
 	}
 	child.ChannelCount = int32(mf.Channels)
 	child.SamplingRate = int32(mf.SampleRate)
-	child.BitDepth = int32(mf.BitDepth)
+	child.BitDepth = int32(gg.V(mf.BitDepth))
 	child.Genres = toItemGenres(mf.Genres)
 	child.Moods = mf.Tags.Values(model.TagMood)
+	child.Groupings = mf.Tags.Values(model.TagGrouping)
 	child.DisplayArtist = mf.Artist
 	child.Artists = artistRefs(mf.Participants[model.RoleArtist])
 	child.DisplayAlbumArtist = mf.AlbumArtist
@@ -345,7 +346,7 @@ func childFromAlbum(ctx context.Context, al model.Album) responses.Child {
 	child.Year = int32(cmp.Or(al.MaxOriginalYear, al.MaxYear))
 	child.Genre = al.Genre
 	child.CoverArt = al.CoverArtID().String()
-	child.Created = P(albumCreatedAt(al))
+	child.Created = new(albumCreatedAt(al))
 	child.Parent = al.AlbumArtistID
 	child.ArtistId = al.AlbumArtistID
 	child.Duration = int32(al.Duration)
@@ -375,6 +376,7 @@ func osChildFromAlbum(ctx context.Context, al model.Album) *responses.OpenSubson
 	child.MusicBrainzId = al.MbzAlbumID
 	child.Genres = toItemGenres(al.Genres)
 	child.Moods = al.Tags.Values(model.TagMood)
+	child.Groupings = al.Tags.Values(model.TagGrouping)
 	child.DisplayArtist = al.AlbumArtist
 	child.Artists = artistRefs(al.Participants[model.RoleAlbumArtist])
 	child.DisplayAlbumArtist = al.AlbumArtist
@@ -440,7 +442,7 @@ func buildAlbumID3(ctx context.Context, album model.Album) responses.AlbumID3 {
 	dir.PlayCount = album.PlayCount
 	dir.Year = int32(cmp.Or(album.MaxOriginalYear, album.MaxYear))
 	dir.Genre = album.Genre
-	dir.Created = P(albumCreatedAt(album))
+	dir.Created = albumCreatedAt(album)
 	if album.Starred {
 		dir.Starred = album.StarredAt
 	}
@@ -491,48 +493,6 @@ func mapExplicitStatus(explicitStatus string) string {
 		return "explicit"
 	}
 	return ""
-}
-
-func buildStructuredLyric(mf *model.MediaFile, lyrics model.Lyrics) responses.StructuredLyric {
-	lines := make([]responses.Line, len(lyrics.Line))
-
-	for i, line := range lyrics.Line {
-		lines[i] = responses.Line{
-			Start: line.Start,
-			Value: line.Value,
-		}
-	}
-
-	structured := responses.StructuredLyric{
-		DisplayArtist: lyrics.DisplayArtist,
-		DisplayTitle:  lyrics.DisplayTitle,
-		Lang:          lyrics.Lang,
-		Line:          lines,
-		Offset:        lyrics.Offset,
-		Synced:        lyrics.Synced,
-	}
-
-	if structured.DisplayArtist == "" {
-		structured.DisplayArtist = mf.Artist
-	}
-	if structured.DisplayTitle == "" {
-		structured.DisplayTitle = mf.Title
-	}
-
-	return structured
-}
-
-func buildLyricsList(mf *model.MediaFile, lyricsList model.LyricList) *responses.LyricsList {
-	lyricList := make(responses.StructuredLyrics, len(lyricsList))
-
-	for i, lyrics := range lyricsList {
-		lyricList[i] = buildStructuredLyric(mf, lyrics)
-	}
-
-	res := &responses.LyricsList{
-		StructuredLyrics: lyricList,
-	}
-	return res
 }
 
 // getUserAccessibleLibraries returns the list of libraries the current user has access to.

@@ -12,6 +12,7 @@ import (
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
+	"github.com/navidrome/navidrome/utils/gg"
 )
 
 const fallbackBitrate = 256 // kbps
@@ -58,18 +59,6 @@ func (s *deciderService) MakeDecision(ctx context.Context, mf *model.MediaFile, 
 	// Build source stream details (uses probe data if available)
 	decision.SourceStream = buildSourceStream(mf, probe)
 	src := &decision.SourceStream
-
-	// Check for server-side player transcoding override
-	if trc, ok := request.TranscodingFrom(ctx); ok && trc.TargetFormat != "" {
-		clientInfo = applyServerOverride(ctx, clientInfo, &trc)
-	} else if player, ok := request.PlayerFrom(ctx); ok && player.MaxBitRate > 0 {
-		if clientInfo.MaxAudioBitrate == 0 || player.MaxBitRate < clientInfo.MaxAudioBitrate {
-			modified := *clientInfo
-			modified.MaxAudioBitrate = player.MaxBitRate
-			clientInfo = &modified
-			log.Debug(ctx, "Applied player MaxBitRate cap", "playerMaxBitRate", player.MaxBitRate, "client", clientInfo.Name)
-		}
-	}
 
 	log.Trace(ctx, "Making transcode decision", "mediaID", mf.ID, "container", src.Container,
 		"codec", src.Codec, "bitrate", src.Bitrate, "channels", src.Channels,
@@ -154,7 +143,7 @@ func buildSourceStream(mf *model.MediaFile, probe *ffmpeg.AudioProbeResult) Deta
 		sd.Codec = mf.AudioCodec()
 		sd.Bitrate = mf.BitRate
 		sd.SampleRate = mf.SampleRate
-		sd.BitDepth = mf.BitDepth
+		sd.BitDepth = gg.V(mf.BitDepth)
 		sd.Channels = mf.Channels
 	}
 	sd.IsLossless = isLosslessFormat(sd.Codec)

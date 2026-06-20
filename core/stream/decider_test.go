@@ -12,6 +12,7 @@ import (
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/tests"
+	"github.com/navidrome/navidrome/utils/gg"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -23,7 +24,7 @@ func withProbe(mf *model.MediaFile) *model.MediaFile {
 		Codec:      mf.AudioCodec(),
 		BitRate:    mf.BitRate,
 		SampleRate: mf.SampleRate,
-		BitDepth:   mf.BitDepth,
+		BitDepth:   gg.V(mf.BitDepth),
 		Channels:   mf.Channels,
 	}
 	data, _ := json.Marshal(probe)
@@ -243,7 +244,7 @@ var _ = Describe("Decider", func() {
 
 		Context("Transcoding", func() {
 			It("selects transcoding when direct play isn't possible", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 256, // kbps
 					DirectPlayProfiles: []DirectPlayProfile{
@@ -278,7 +279,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("uses default bitrate when client doesn't specify", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, BitDepth: new(16)})
 				ci := &ClientInfo{
 					TranscodingProfiles: []Profile{
 						{Container: "mp3", Protocol: ProtocolHTTP},
@@ -331,7 +332,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("selects first valid transcoding profile in order", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 48000, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 48000, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					DirectPlayProfiles: []DirectPlayProfile{
@@ -351,7 +352,7 @@ var _ = Describe("Decider", func() {
 
 		Context("Lossless to lossless transcoding", func() {
 			It("allows lossless to lossless when samplerate needs downsampling", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 176400, BitDepth: 1})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 176400, BitDepth: new(1)})
 				ci := &ClientInfo{
 					MaxAudioBitrate: 1000,
 					DirectPlayProfiles: []DirectPlayProfile{
@@ -369,7 +370,7 @@ var _ = Describe("Decider", func() {
 
 			It("sets IsLossless=true on transcoded stream when target is lossless", func() {
 				// Transcoding to mp3 (lossy) should result in IsLossless=false.
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: 24})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: new(24)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -526,7 +527,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("rejects direct play due to samplerate limitation", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: 24})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: new(24)})
 				ci := &ClientInfo{
 					DirectPlayProfiles: []DirectPlayProfile{
 						{Containers: []string{"flac"}, Protocols: []string{ProtocolHTTP}},
@@ -573,7 +574,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("applies channel limitation to transcoded stream", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 48000, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 48000, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -596,7 +597,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("applies samplerate limitation to transcoded stream", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: 24})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: new(24)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -619,7 +620,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("applies bitdepth limitation to transcoded stream", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: 24})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: new(24)})
 				ci := &ClientInfo{
 					TranscodingProfiles: []Profile{
 						{Container: "flac", AudioCodec: "flac", Protocol: ProtocolHTTP},
@@ -642,7 +643,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("preserves source bit depth when no limitation applies", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 24})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(24)})
 				ci := &ClientInfo{
 					TranscodingProfiles: []Profile{
 						{Container: "flac", AudioCodec: "flac", Protocol: ProtocolHTTP},
@@ -656,7 +657,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("rejects transcoding profile when GreaterThanEqual cannot be satisfied", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -680,7 +681,7 @@ var _ = Describe("Decider", func() {
 
 		Context("DSD sample rate conversion", func() {
 			It("converts DSD sample rate to PCM-equivalent in decision", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: 1})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: new(1)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -700,7 +701,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("converts DSD sample rate for FLAC target without codec limit", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: 1})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: new(1)})
 				ci := &ClientInfo{
 					TranscodingProfiles: []Profile{
 						{Container: "flac", AudioCodec: "flac", Protocol: ProtocolHTTP},
@@ -719,7 +720,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("applies codec profile limit to DSD-converted FLAC sample rate", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: 1})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: new(1)})
 				ci := &ClientInfo{
 					TranscodingProfiles: []Profile{
 						{Container: "flac", AudioCodec: "flac", Protocol: ProtocolHTTP},
@@ -746,7 +747,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("applies audioBitdepth limitation to DSD-converted bit depth", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: 1})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: new(1)})
 				ci := &ClientInfo{
 					TranscodingProfiles: []Profile{
 						{Container: "flac", AudioCodec: "flac", Protocol: ProtocolHTTP},
@@ -775,7 +776,7 @@ var _ = Describe("Decider", func() {
 				// Regression test for #5336: ffmpeg's mp3 encoder rejects >2 channels.
 				// The decider must clamp to the codec's hard limit even when no
 				// transcoding profile MaxAudioChannels is configured.
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -791,7 +792,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("honors a stricter profile MaxAudioChannels over the codec clamp", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -806,7 +807,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("applies the codec clamp when the profile limit is looser", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -821,7 +822,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("passes channels through unchanged for codecs with no hard limit", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 6, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -840,7 +841,7 @@ var _ = Describe("Decider", func() {
 		Context("Probe-based lossless detection", func() {
 			It("uses probe codec name for lossless detection", func() {
 				// WavPack files: ffprobe reports codec as "wavpack", suffix is ".wv"
-				mf := &model.MediaFile{ID: "1", Suffix: "wv", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16}
+				mf := &model.MediaFile{ID: "1", Suffix: "wv", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)}
 				probe := ffmpeg.AudioProbeResult{
 					Codec: "wavpack", BitRate: 1000, SampleRate: 44100, BitDepth: 16, Channels: 2,
 				}
@@ -884,7 +885,7 @@ var _ = Describe("Decider", func() {
 
 		Context("Opus fixed sample rate", func() {
 			It("sets Opus output to 48000Hz regardless of input", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 128,
 					TranscodingProfiles: []Profile{
@@ -901,7 +902,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("sets Opus output to 48000Hz even for 96kHz input", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1500, Channels: 2, SampleRate: 96000, BitDepth: 24})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1500, Channels: 2, SampleRate: 96000, BitDepth: new(24)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 128,
 					TranscodingProfiles: []Profile{
@@ -917,7 +918,7 @@ var _ = Describe("Decider", func() {
 
 		Context("Container vs format separation", func() {
 			It("preserves mp4 container when falling back to aac format", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 256,
 					TranscodingProfiles: []Profile{
@@ -935,7 +936,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("uses container as format when container matches transcoding config", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 256,
 					TranscodingProfiles: []Profile{
@@ -952,7 +953,7 @@ var _ = Describe("Decider", func() {
 
 		Context("MP3 max sample rate", func() {
 			It("caps sample rate at 48000 for MP3", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1500, Channels: 2, SampleRate: 96000, BitDepth: 24})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1500, Channels: 2, SampleRate: 96000, BitDepth: new(24)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -966,7 +967,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("preserves sample rate at 44100 for MP3", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -982,7 +983,7 @@ var _ = Describe("Decider", func() {
 
 		Context("AAC max sample rate", func() {
 			It("caps sample rate at 96000 for AAC", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: 1})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "dsf", Codec: "DSD", BitRate: 5644, Channels: 2, SampleRate: 2822400, BitDepth: new(1)})
 				ci := &ClientInfo{
 					MaxTranscodingAudioBitrate: 320,
 					TranscodingProfiles: []Profile{
@@ -1025,7 +1026,7 @@ var _ = Describe("Decider", func() {
 
 		Context("Source stream details", func() {
 			It("populates source stream correctly with kbps bitrate", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: 24, Duration: 300.5, Size: 50000000})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 96000, BitDepth: new(24), Duration: 300.5, Size: 50000000})
 				ci := &ClientInfo{
 					DirectPlayProfiles: []DirectPlayProfile{
 						{Containers: []string{"flac"}, Protocols: []string{ProtocolHTTP}},
@@ -1042,8 +1043,8 @@ var _ = Describe("Decider", func() {
 			})
 		})
 
-		Context("Server-side player transcoding override", func() {
-			It("forces transcoding when override targets a different format", func() {
+		Context("Server-side context is ignored by MakeDecision", func() {
+			It("ignores transcoding override in context", func() {
 				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100})
 				ci := &ClientInfo{
 					Name: "TestClient",
@@ -1051,148 +1052,21 @@ var _ = Describe("Decider", func() {
 						{Containers: []string{"flac"}, Protocols: []string{ProtocolHTTP}},
 					},
 				}
-				// Set server override in context
 				overrideCtx := request.WithTranscoding(ctx, model.Transcoding{TargetFormat: "mp3", DefaultBitRate: 192})
-				overrideCtx = request.WithPlayer(overrideCtx, model.Player{MaxBitRate: 0})
-
 				decision, err := svc.MakeDecision(overrideCtx, mf, ci, TranscodeOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				Expect(decision.CanDirectPlay).To(BeFalse())
-				Expect(decision.CanTranscode).To(BeTrue())
-				Expect(decision.TargetFormat).To(Equal("mp3"))
-				Expect(decision.TargetBitrate).To(Equal(192))
-			})
-
-			It("allows direct play when source matches forced format and bitrate is within cap", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "mp3", Codec: "MP3", BitRate: 128, Channels: 2, SampleRate: 44100})
-				ci := &ClientInfo{
-					Name: "TestClient",
-					DirectPlayProfiles: []DirectPlayProfile{
-						{Containers: []string{"flac"}, Protocols: []string{ProtocolHTTP}},
-					},
-				}
-				overrideCtx := request.WithTranscoding(ctx, model.Transcoding{TargetFormat: "mp3", DefaultBitRate: 256})
-
-				decision, err := svc.MakeDecision(overrideCtx, mf, ci, TranscodeOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				Expect(decision.CanDirectPlay).To(BeTrue())
-				Expect(decision.CanTranscode).To(BeFalse())
-			})
-
-			It("transcodes when source bitrate exceeds the forced cap", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "mp3", Codec: "MP3", BitRate: 320, Channels: 2, SampleRate: 44100})
-				ci := &ClientInfo{
-					Name: "TestClient",
-				}
-				overrideCtx := request.WithTranscoding(ctx, model.Transcoding{TargetFormat: "mp3", DefaultBitRate: 192})
-
-				decision, err := svc.MakeDecision(overrideCtx, mf, ci, TranscodeOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				Expect(decision.CanDirectPlay).To(BeFalse())
-				Expect(decision.CanTranscode).To(BeTrue())
-				Expect(decision.TargetFormat).To(Equal("mp3"))
-				Expect(decision.TargetBitrate).To(Equal(192))
-			})
-
-			It("uses player MaxBitRate over transcoding DefaultBitRate", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100})
-				ci := &ClientInfo{
-					Name: "TestClient",
-				}
-				overrideCtx := request.WithTranscoding(ctx, model.Transcoding{TargetFormat: "mp3", DefaultBitRate: 192})
-				overrideCtx = request.WithPlayer(overrideCtx, model.Player{MaxBitRate: 320})
-
-				decision, err := svc.MakeDecision(overrideCtx, mf, ci, TranscodeOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				Expect(decision.CanTranscode).To(BeTrue())
-				Expect(decision.TargetFormat).To(Equal("mp3"))
-				Expect(decision.TargetBitrate).To(Equal(320))
-			})
-
-			It("applies no bitrate cap when both MaxBitRate and DefaultBitRate are 0", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100})
-				ci := &ClientInfo{
-					Name: "TestClient",
-				}
-				overrideCtx := request.WithTranscoding(ctx, model.Transcoding{TargetFormat: "mp3", DefaultBitRate: 0})
-				overrideCtx = request.WithPlayer(overrideCtx, model.Player{MaxBitRate: 0})
-
-				decision, err := svc.MakeDecision(overrideCtx, mf, ci, TranscodeOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				Expect(decision.CanTranscode).To(BeTrue())
-				Expect(decision.TargetFormat).To(Equal("mp3"))
-				// With no cap, lossless→lossy uses format default bitrate (160 for mp3 from mock)
-				Expect(decision.TargetBitrate).To(Equal(160))
-			})
-
-			It("does not apply override when no transcoding is in context", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100})
-				ci := &ClientInfo{
-					Name: "TestClient",
-					DirectPlayProfiles: []DirectPlayProfile{
-						{Containers: []string{"flac"}, Protocols: []string{ProtocolHTTP}},
-					},
-				}
-				// No override in context — client profiles used as-is
-				decision, err := svc.MakeDecision(ctx, mf, ci, TranscodeOptions{})
 				Expect(err).ToNot(HaveOccurred())
 				Expect(decision.CanDirectPlay).To(BeTrue())
 			})
 
-		})
-
-		Context("Player MaxBitRate cap", func() {
-			It("applies player MaxBitRate cap when client has no limit", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
+			It("ignores player MaxBitRate in context", func() {
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					Name: "TestClient",
 					DirectPlayProfiles: []DirectPlayProfile{
-						{Containers: []string{"flac", "mp3"}, AudioCodecs: []string{"flac", "mp3"}, Protocols: []string{ProtocolHTTP}},
-					},
-					TranscodingProfiles: []Profile{
-						{Container: "mp3", AudioCodec: "mp3", Protocol: ProtocolHTTP},
+						{Containers: []string{"flac"}, Protocols: []string{ProtocolHTTP}},
 					},
 				}
 				playerCtx := request.WithPlayer(ctx, model.Player{MaxBitRate: 320})
-
-				decision, err := svc.MakeDecision(playerCtx, mf, ci, TranscodeOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				// Source bitrate 1000 > player cap 320, so direct play is not possible
-				Expect(decision.CanDirectPlay).To(BeFalse())
-				Expect(decision.CanTranscode).To(BeTrue())
-				// Lossless→lossy should use MaxAudioBitrate (320) as target, not format default
-				Expect(decision.TargetBitrate).To(Equal(320))
-			})
-
-			It("uses client limit when it is more restrictive than player MaxBitRate", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
-				ci := &ClientInfo{
-					Name:                       "TestClient",
-					MaxAudioBitrate:            256,
-					MaxTranscodingAudioBitrate: 256,
-					TranscodingProfiles: []Profile{
-						{Container: "mp3", AudioCodec: "mp3", Protocol: ProtocolHTTP},
-					},
-				}
-				playerCtx := request.WithPlayer(ctx, model.Player{MaxBitRate: 500})
-
-				decision, err := svc.MakeDecision(playerCtx, mf, ci, TranscodeOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				Expect(decision.CanTranscode).To(BeTrue())
-				// Client limit 256 < player cap 500, so player cap doesn't apply; client limit wins
-				Expect(decision.TargetBitrate).To(Equal(256))
-			})
-
-			It("does not cap when player MaxBitRate is 0", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "mp3", Codec: "MP3", BitRate: 320, Channels: 2, SampleRate: 44100})
-				ci := &ClientInfo{
-					Name: "TestClient",
-					DirectPlayProfiles: []DirectPlayProfile{
-						{Containers: []string{"mp3"}, AudioCodecs: []string{"mp3"}, Protocols: []string{ProtocolHTTP}},
-					},
-				}
-				playerCtx := request.WithPlayer(ctx, model.Player{MaxBitRate: 0})
-
 				decision, err := svc.MakeDecision(playerCtx, mf, ci, TranscodeOptions{})
 				Expect(err).ToNot(HaveOccurred())
 				Expect(decision.CanDirectPlay).To(BeTrue())
@@ -1201,7 +1075,7 @@ var _ = Describe("Decider", func() {
 
 		Context("Format-aware default bitrate", func() {
 			It("uses opus default bitrate from DB", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 48000, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 48000, BitDepth: new(16)})
 				ci := &ClientInfo{
 					TranscodingProfiles: []Profile{
 						{Container: "opus", AudioCodec: "opus", Protocol: ProtocolHTTP},
@@ -1214,7 +1088,7 @@ var _ = Describe("Decider", func() {
 			})
 
 			It("uses aac default bitrate from DB", func() {
-				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: 16})
+				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2, SampleRate: 44100, BitDepth: new(16)})
 				ci := &ClientInfo{
 					TranscodingProfiles: []Profile{
 						{Container: "aac", AudioCodec: "aac", Protocol: ProtocolHTTP},

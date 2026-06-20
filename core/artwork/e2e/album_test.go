@@ -37,20 +37,20 @@ var _ = Describe("Album artwork resolution", func() {
 		})
 	})
 
-	// Bug 2 variant: cover.* basenames tie across album-root and per-disc folders;
-	// compareImageFiles' lexicographic full-path tiebreaker ranks disc-subfolder
-	// files first. Flip from PIt to It once it prefers shorter/parent paths.
+	// https://github.com/navidrome/navidrome/issues/5376
+	// cover.* basenames tie across album-root and per-disc folders;
+	// compareImageFiles must prefer shallower paths.
 	When("a multi-disc album has a cover.jpg at the album root and per-disc covers", func() {
 		// Artist/
 		// └── Album/
 		//     ├── CD1/
 		//     │   ├── 01 - Track.mp3
-		//     │   └── cover.jpg        ← currently wins (bug)
+		//     │   └── cover.jpg        ← should not win
 		//     ├── CD2/
 		//     │   ├── 01 - Track.mp3
 		//     │   └── cover.jpg
 		//     └── cover.jpg            ← should win (album-root fallback)
-		PIt("uses the album-root cover (currently picks a disc subfolder image — bug)", func() {
+		It("prefers the album-root cover over per-disc covers", func() {
 			conf.Server.CoverArtPriority = defaultCoverPriority
 			setLayout(fstest.MapFS{
 				"Artist/Album/CD1/01 - Track.mp3": trackFile(1, "Track CD1"),
@@ -68,21 +68,20 @@ var _ = Describe("Album artwork resolution", func() {
 		})
 	})
 
-	// Bug 2: folder.jpg basenames tie across album-root and per-disc folders;
-	// the lexicographic full-path tiebreaker in compareImageFiles ranks
-	// "Artist/Album/CD1/folder.jpg" ahead of "Artist/Album/folder.jpg".
-	// Flip from PIt to It once compareImageFiles prefers shorter/parent paths.
+	// https://github.com/navidrome/navidrome/issues/5376
+	// folder.jpg basenames tie across album-root and per-disc folders;
+	// compareImageFiles must prefer shallower paths.
 	When("a multi-disc album has folder.jpg at the album root AND in each disc subfolder", func() {
 		// Artist/
 		// └── Album/
 		//     ├── CD1/
 		//     │   ├── 01 - Track.mp3
-		//     │   └── folder.jpg       ← currently wins (bug)
+		//     │   └── folder.jpg       ← should not win
 		//     ├── CD2/
 		//     │   ├── 01 - Track.mp3
 		//     │   └── folder.jpg
 		//     └── folder.jpg           ← should win (album-root fallback)
-		PIt("uses the album-root folder.jpg (currently picks a disc subfolder image — bug)", func() {
+		It("prefers the album-root folder.jpg over per-disc folder.jpg", func() {
 			conf.Server.CoverArtPriority = defaultCoverPriority
 			setLayout(fstest.MapFS{
 				"Artist/Album/CD1/01 - Track.mp3": trackFile(1, "Track CD1"),
@@ -98,21 +97,45 @@ var _ = Describe("Album artwork resolution", func() {
 		})
 	})
 
-	// Bug 1: commonParentFolder's `len(folders) < 2` guard skips the parent-folder
-	// lookup whenever an album lives entirely under a single subfolder, so an
-	// album-root cover is never considered. Flip from PIt to It once the guard
-	// accepts single-folder albums whose parent isn't already in the folder set.
+	// https://github.com/navidrome/navidrome/issues/5376
+	// Single-subfolder albums must still consider the parent folder's images.
 	When("an album lives entirely under a single disc subfolder with cover.jpg at the parent", func() {
 		// Artist/
 		// └── Album/
 		//     ├── disc1/
 		//     │   └── 01 - Track.mp3
-		//     └── cover.jpg            ← should win (parent-folder fallback, currently ignored — bug)
-		PIt("uses the parent-folder cover (currently ignored — bug)", func() {
+		//     └── cover.jpg            ← should win (parent-folder fallback)
+		It("uses the parent-folder cover for single-disc-subfolder albums", func() {
 			conf.Server.CoverArtPriority = defaultCoverPriority
 			setLayout(fstest.MapFS{
 				"Artist/Album/disc1/01 - Track.mp3": trackFile(1, "Track"),
 				"Artist/Album/cover.jpg":            imageFile("album-root"),
+			})
+			scan()
+
+			al := firstAlbum()
+			Expect(readArtwork(al.CoverArtID())).To(Equal(imageBytes("album-root")))
+		})
+	})
+
+	// https://github.com/navidrome/navidrome/issues/5456
+	When("a top-level multi-disc album has cover.jpg at the album root and per-disc folder.jpg", func() {
+		// Album/                        (top-level folder, Path=".")
+		// ├── CD1/
+		// │   ├── 01 - Track.mp3
+		// │   └── folder.jpg
+		// ├── CD2/
+		// │   ├── 01 - Track.mp3
+		// │   └── folder.jpg
+		// └── cover.jpg                ← should win (album-root)
+		It("prefers the album-root cover.jpg", func() {
+			conf.Server.CoverArtPriority = defaultCoverPriority
+			setLayout(fstest.MapFS{
+				"Album/CD1/01 - Track.mp3": trackFile(1, "Track CD1"),
+				"Album/CD2/01 - Track.mp3": trackFile(1, "Track CD2"),
+				"Album/cover.jpg":          imageFile("album-root"),
+				"Album/CD1/folder.jpg":     imageFile("disc1"),
+				"Album/CD2/folder.jpg":     imageFile("disc2"),
 			})
 			scan()
 
@@ -331,6 +354,98 @@ var _ = Describe("Album artwork resolution", func() {
 
 			al := firstAlbum()
 			Expect(readArtwork(al.CoverArtID())).To(Equal(imageBytes("cover")))
+		})
+	})
+
+	// Regression introduced in v0.62.0 (#5451 + #5457): the parent-folder
+	// fallback can pick up images from the ARTIST folder, serving the artist
+	// thumbnail as album art for any album without its own image files.
+	When("an album has no images and the artist folder has folder.jpg", func() {
+		// Artist/
+		// ├── folder.jpg               ← artist thumbnail, must NOT become album art
+		// ├── Album A/
+		// │   └── 01 - Track.mp3       (no images)
+		// └── Album B/
+		//     ├── 01 - Track.mp3
+		//     └── cover.jpg
+		It("does not use the artist image as album art", func() {
+			conf.Server.CoverArtPriority = defaultCoverPriority
+			setLayout(fstest.MapFS{
+				"Artist/folder.jpg":             imageFile("artist-thumbnail"),
+				"Artist/Album A/01 - Track.mp3": trackFile(1, "Track A", map[string]any{"album": "Album A", "albumartist": "Artist"}),
+				"Artist/Album B/01 - Track.mp3": trackFile(1, "Track B", map[string]any{"album": "Album B", "albumartist": "Artist"}),
+				"Artist/Album B/cover.jpg":      imageFile("album-b"),
+			})
+			scan()
+
+			alA := albumByName("Album A")
+			_, err := readArtworkOrErr(alA.CoverArtID())
+			Expect(err).To(HaveOccurred(),
+				"Album A has no images of its own, so it must fall through to the placeholder "+
+					"instead of inheriting the artist folder's folder.jpg")
+
+			alB := albumByName("Album B")
+			Expect(readArtwork(alB.CoverArtID())).To(Equal(imageBytes("album-b")))
+		})
+	})
+
+	When("a single-disc album is spread across sibling folders under the artist folder", func() {
+		// Artist/
+		// ├── folder.jpg               ← artist thumbnail, must NOT become album art
+		// ├── Album A/
+		// │   └── 01 - Track.mp3       (album: "Album A")
+		// ├── Album A bonus/
+		// │   └── 02 - Track.mp3       (album: "Album A" — same album, second folder)
+		// └── Album B/
+		//     ├── 01 - Track.mp3
+		//     └── cover.jpg
+		It("does not use the artist image as album art for the spread album", func() {
+			conf.Server.CoverArtPriority = defaultCoverPriority
+			setLayout(fstest.MapFS{
+				"Artist/folder.jpg":                   imageFile("artist-thumbnail"),
+				"Artist/Album A/01 - Track.mp3":       trackFile(1, "Track A1", map[string]any{"album": "Album A", "albumartist": "Artist"}),
+				"Artist/Album A bonus/02 - Track.mp3": trackFile(2, "Track A2", map[string]any{"album": "Album A", "albumartist": "Artist"}),
+				"Artist/Album B/01 - Track.mp3":       trackFile(1, "Track B", map[string]any{"album": "Album B", "albumartist": "Artist"}),
+				"Artist/Album B/cover.jpg":            imageFile("album-b"),
+			})
+			scan()
+
+			alA := albumByName("Album A")
+			Expect(alA.FolderIDs).To(HaveLen(2),
+				"sanity check: scanner should treat the two sibling folders as one spread album")
+			_, err := readArtworkOrErr(alA.CoverArtID())
+			Expect(err).To(HaveOccurred(),
+				"the spread album has no images of its own, so it must fall through to the "+
+					"placeholder instead of inheriting the artist folder's folder.jpg")
+		})
+	})
+
+	When("a spread album has its own front.jpg but the artist folder has cover.jpg", func() {
+		// Artist/
+		// ├── cover.jpg                ← artist image; matches cover.* (first pattern),
+		// │                              must NOT shadow the album's own front.jpg
+		// ├── Album A/
+		// │   ├── 01 - Track.mp3       (album: "Album A")
+		// │   └── front.jpg            ← should win
+		// ├── Album A bonus/
+		// │   └── 02 - Track.mp3       (album: "Album A")
+		// └── Album B/
+		//     └── 01 - Track.mp3
+		It("prefers the album's own art over the artist image", func() {
+			conf.Server.CoverArtPriority = defaultCoverPriority
+			setLayout(fstest.MapFS{
+				"Artist/cover.jpg":                    imageFile("artist-image"),
+				"Artist/Album A/01 - Track.mp3":       trackFile(1, "Track A1", map[string]any{"album": "Album A", "albumartist": "Artist"}),
+				"Artist/Album A/front.jpg":            imageFile("album-a-front"),
+				"Artist/Album A bonus/02 - Track.mp3": trackFile(2, "Track A2", map[string]any{"album": "Album A", "albumartist": "Artist"}),
+				"Artist/Album B/01 - Track.mp3":       trackFile(1, "Track B", map[string]any{"album": "Album B", "albumartist": "Artist"}),
+			})
+			scan()
+
+			alA := albumByName("Album A")
+			Expect(alA.FolderIDs).To(HaveLen(2),
+				"sanity check: scanner should treat the two sibling folders as one spread album")
+			Expect(readArtwork(alA.CoverArtID())).To(Equal(imageBytes("album-a-front")))
 		})
 	})
 

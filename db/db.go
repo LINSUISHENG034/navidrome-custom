@@ -38,6 +38,8 @@ func Db() *sql.DB {
 		if Path == ":memory:" {
 			Path = "file::memory:?cache=shared&_foreign_keys=on"
 			conf.Server.DbPath = Path
+		} else {
+			conf.Server.DataFolder.MustPath()
 		}
 		log.Debug("Opening DataBase", "dbPath", Path, "driver", Driver)
 		db, err := sql.Open(Driver, Path)
@@ -49,7 +51,6 @@ func Db() *sql.DB {
 			_, err = db.Exec("PRAGMA optimize=0x10002")
 			if err != nil {
 				log.Error("Error applying PRAGMA optimize", err)
-				return nil
 			}
 		}
 		return db

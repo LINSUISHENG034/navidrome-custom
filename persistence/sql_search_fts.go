@@ -66,7 +66,7 @@ func normalizeForFTS(values ...string) string {
 		result = append(result, variant)
 	}
 	for _, v := range values {
-		for _, word := range strings.Fields(v) {
+		for word := range strings.FieldsSeq(v) {
 			transliterated := sanitize.Accents(word)
 			// Concatenated ASCII form: R.E.M. → REM, AC/DC → ACDC, St-Étienne → StEtienne.
 			add(word, fts5PunctStrip.ReplaceAllString(transliterated, ""))
@@ -279,16 +279,14 @@ type ftsSearch struct {
 }
 
 // ToSql returns a single-query fallback for the REST filter path (no two-phase split).
-func (s *ftsSearch) ToSql() (string, []interface{}, error) {
+func (s *ftsSearch) ToSql() (string, []any, error) {
 	sql := s.tableName + ".rowid IN (SELECT rowid FROM " + s.ftsTable + " WHERE " + s.ftsTable + " MATCH ?)"
-	return sql, []interface{}{s.matchExpr}, nil
+	return sql, []any{s.matchExpr}, nil
 }
 
-// execute runs a two-phase FTS5 search:
-//   - Phase 1: lightweight rowid query (main table + FTS + library filter) for ranking and pagination.
-//   - Phase 2: full SELECT with all JOINs, scoped to Phase 1's rowid set.
-//
-// Complex ORDER BY (function calls, aggregations) are dropped from Phase 1.
+// execute runs a two-phase FTS5 search (see executeTwoPhase): Phase 1 here contributes the
+// FTS MATCH join and BM25 rank ordering. Complex ORDER BY (function calls, aggregations) are
+// dropped from Phase 1.
 func (s *ftsSearch) execute(r sqlRepository, sq SelectBuilder, dest any, cfg searchConfig, options model.QueryOptions) error {
 	qualifiedOrderBys := []string{s.rankExpr}
 	for _, ob := range cfg.OrderBy {
@@ -297,45 +295,11 @@ func (s *ftsSearch) execute(r sqlRepository, sq SelectBuilder, dest any, cfg sea
 		}
 	}
 
-	// Phase 1: fresh query — must set LIMIT/OFFSET from options explicitly.
-	// Mirror applyOptions behavior: Max=0 means no limit, not LIMIT 0.
-	rowidQuery := Select(s.tableName+".rowid").
+	rowidCore := Select(s.tableName+".rowid").
 		From(s.tableName).
 		Join(s.ftsTable+" ON "+s.ftsTable+".rowid = "+s.tableName+".rowid AND "+s.ftsTable+" MATCH ?", s.matchExpr).
-		Where(Eq{s.tableName + ".missing": false}).
 		OrderBy(qualifiedOrderBys...)
-	if options.Max > 0 {
-		rowidQuery = rowidQuery.Limit(uint64(options.Max))
-	}
-	if options.Offset > 0 {
-		rowidQuery = rowidQuery.Offset(uint64(options.Offset))
-	}
-
-	// Library filter + musicFolderId must be applied here, before pagination.
-	if cfg.LibraryFilter != nil {
-		rowidQuery = cfg.LibraryFilter(rowidQuery)
-	} else {
-		rowidQuery = r.applyLibraryFilter(rowidQuery)
-	}
-	if options.Filters != nil {
-		rowidQuery = rowidQuery.Where(options.Filters)
-	}
-
-	rowidSQL, rowidArgs, err := rowidQuery.ToSql()
-	if err != nil {
-		return fmt.Errorf("building FTS rowid query: %w", err)
-	}
-
-	// Phase 2: strip LIMIT/OFFSET from sq (Phase 1 handled pagination),
-	// join on the ranked rowid set to hydrate with full columns.
-	sq = sq.RemoveLimit().RemoveOffset()
-	rankedSubquery := fmt.Sprintf(
-		"(SELECT rowid as _rid, row_number() OVER () AS _rn FROM (%s)) AS _ranked",
-		rowidSQL,
-	)
-	sq = sq.Join(rankedSubquery+" ON "+s.tableName+".rowid = _ranked._rid", rowidArgs...)
-	sq = sq.OrderBy("_ranked._rn")
-	return r.queryAll(sq, dest)
+	return r.executeTwoPhase(sq, dest, rowidCore, cfg, options)
 }
 
 // qualifyOrderBy prepends tableName to a simple column name. Returns empty string for
@@ -373,8 +337,8 @@ func ftsQueryDegraded(original, ftsQuery string) bool {
 	// Check if all effective FTS tokens are very short (≤2 chars).
 	// Short tokens with prefix matching are too broad when special chars were stripped.
 	// For quoted phrases, extract the content and check the tokens inside.
-	tokens := strings.Fields(ftsQuery)
-	for _, t := range tokens {
+	tokens := strings.FieldsSeq(ftsQuery)
+	for t := range tokens {
 		t = strings.TrimSuffix(t, "*")
 		// Skip internal phrase placeholders
 		if strings.HasPrefix(t, "\x00") {
@@ -390,7 +354,7 @@ func ftsQueryDegraded(original, ftsQuery string) bool {
 			// Extract content between quotes
 			inner := strings.Trim(t, `"`)
 			innerAlpha := fts5PunctStrip.ReplaceAllString(inner, " ")
-			for _, it := range strings.Fields(innerAlpha) {
+			for it := range strings.FieldsSeq(innerAlpha) {
 				if len(it) > 2 {
 					return false
 				}

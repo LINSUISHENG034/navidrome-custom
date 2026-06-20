@@ -3,7 +3,9 @@ package persistence
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -26,9 +28,10 @@ func (j smartPlaylistJoinType) has(other smartPlaylistJoinType) bool {
 }
 
 type smartPlaylistField struct {
-	expr     string
-	order    string
-	joinType smartPlaylistJoinType
+	expr        string
+	order       string
+	joinType    smartPlaylistJoinType
+	emptyValues []string // additional values that encode "missing" for string columns (e.g. '[]' for lyrics)
 }
 
 type smartPlaylistCriteria struct {
@@ -70,7 +73,7 @@ var smartPlaylistFields = map[string]smartPlaylistField{
 	"datemodified":         {expr: "media_file.updated_at"},
 	"discsubtitle":         {expr: "media_file.disc_subtitle"},
 	"comment":              {expr: "media_file.comment"},
-	"lyrics":               {expr: "media_file.lyrics"},
+	"lyrics":               {expr: "media_file.lyrics", emptyValues: []string{"[]"}},
 	"sorttitle":            {expr: "media_file.sort_title"},
 	"sortalbum":            {expr: "media_file.sort_album_name"},
 	"sortartist":           {expr: "media_file.sort_artist_name"},
@@ -111,9 +114,12 @@ var smartPlaylistFields = map[string]smartPlaylistField{
 	"mbz_recording_id":     {expr: "media_file.mbz_recording_id"},
 	"mbz_release_track_id": {expr: "media_file.mbz_release_track_id"},
 	"mbz_release_group_id": {expr: "media_file.mbz_release_group_id"},
+	"rgalbumgain":          {expr: "media_file.rg_album_gain"},
+	"rgalbumpeak":          {expr: "media_file.rg_album_peak"},
+	"rgtrackgain":          {expr: "media_file.rg_track_gain"},
+	"rgtrackpeak":          {expr: "media_file.rg_track_peak"},
 	"library_id":           {expr: "media_file.library_id"},
 	"random":               {order: "random()"},
-	"value":                {expr: "value"},
 }
 
 func (c smartPlaylistCriteria) Where() (squirrel.Sqlizer, error) {
@@ -134,7 +140,7 @@ func (c smartPlaylistCriteria) exprSQL(expr criteria.Expression) (squirrel.Sqliz
 			}
 			and = append(and, cond)
 		}
-		return and, nil
+		return mergeNegatedJsonConds(and), nil
 	case criteria.Any:
 		or := squirrel.Or{}
 		for _, child := range e {
@@ -144,7 +150,7 @@ func (c smartPlaylistCriteria) exprSQL(expr criteria.Expression) (squirrel.Sqliz
 			}
 			or = append(or, cond)
 		}
-		return or, nil
+		return mergeJsonConds(or), nil
 	case criteria.Is:
 		return mapExpr(e, func(fields map[string]any) squirrel.Sqlizer {
 			return squirrel.Eq(fields)
@@ -185,6 +191,10 @@ func (c smartPlaylistCriteria) exprSQL(expr criteria.Expression) (squirrel.Sqliz
 		return c.inList(e, false)
 	case criteria.NotInPlaylist:
 		return c.inList(e, true)
+	case criteria.IsMissing:
+		return missingExpr(e, true)
+	case criteria.IsPresent:
+		return missingExpr(e, false)
 	default:
 		return nil, fmt.Errorf("unknown criteria expression type %T", expr)
 	}
@@ -199,6 +209,54 @@ func isNotExpr(values map[string]any) (squirrel.Sqlizer, error) {
 		return nil, err
 	}
 	return squirrel.NotEq(fields), nil
+}
+
+func missingExpr(values map[string]any, checkAbsence bool) (squirrel.Sqlizer, error) {
+	field, value, info, ok := singleField(values)
+	if !ok {
+		if len(values) != 1 {
+			return nil, fmt.Errorf("invalid field in criteria: isMissing/isPresent requires exactly one field")
+		}
+		return nil, fmt.Errorf("invalid field in criteria: %s", field)
+	}
+	b, ok := value.(bool)
+	if !ok {
+		return nil, fmt.Errorf("invalid boolean value for 'missing' expression: %s: %v", field, value)
+	}
+	negate := checkAbsence == b
+
+	switch {
+	case info.IsTag || info.IsRole:
+		return jsonExpr(info, nil, negate), nil
+	case info.Nullable:
+		// Nullable column fields are stored in dedicated columns, not in the tags JSON, so
+		// "missing" maps to a column check rather than a json_tree lookup. Numeric/boolean
+		// columns (e.g. ReplayGain, BPM) encode absence as NULL only; string columns (e.g.
+		// mbz_* IDs, lyrics) additionally treat empty string — and any field-specific empty
+		// encodings (e.g. '[]' for lyrics) — as missing. The unified flow below handles both:
+		// numeric/boolean fields simply have no empties, so the loops are no-ops.
+		f, ok := smartPlaylistFields[info.Name()]
+		if !ok || f.expr == "" {
+			return nil, fmt.Errorf("invalid field in criteria: %s", field)
+		}
+		col := f.expr
+		var empties []string
+		if !info.Numeric && !info.Boolean {
+			empties = append([]string{""}, f.emptyValues...)
+		}
+		missing := squirrel.Or{squirrel.Eq{col: nil}}
+		present := squirrel.And{squirrel.NotEq{col: nil}}
+		for _, e := range empties {
+			missing = append(missing, squirrel.Eq{col: e})
+			present = append(present, squirrel.NotEq{col: e})
+		}
+		if negate {
+			return missing, nil
+		}
+		return present, nil
+	default:
+		return nil, fmt.Errorf("isMissing/isPresent operator is not supported for field: %s", field)
+	}
 }
 
 func mapExpr(values map[string]any, makeCond func(map[string]any) squirrel.Sqlizer, negateJSON bool) (squirrel.Sqlizer, error) {
@@ -314,9 +372,9 @@ func (c smartPlaylistCriteria) inList(values map[string]any, negate bool) (squir
 
 func jsonExpr(info criteria.FieldInfo, cond squirrel.Sqlizer, negate bool) squirrel.Sqlizer {
 	if info.IsRole {
-		return roleCond{role: info.Name, cond: cond, not: negate}
+		return roleCond{role: info.Name(), cond: cond, not: negate}
 	}
-	return tagCond{tag: info.Name, numeric: info.Numeric, cond: cond, not: negate}
+	return tagCond{tag: info.Name(), numeric: info.Numeric, cond: cond, not: negate}
 }
 
 type tagCond struct {
@@ -327,11 +385,18 @@ type tagCond struct {
 }
 
 func (e tagCond) ToSql() (string, []any, error) {
-	cond, args, err := e.cond.ToSql()
-	if e.numeric {
-		cond = strings.ReplaceAll(cond, "value", "CAST(value AS REAL)")
+	var cond string
+	var args []any
+	var err error
+	if e.cond != nil {
+		cond, args, err = e.cond.ToSql()
+		if e.numeric {
+			cond = strings.ReplaceAll(cond, "value", "CAST(value AS REAL)")
+		}
+		cond = fmt.Sprintf("exists (select 1 from json_tree(media_file.tags, '$.%s') where key='value' and %s)", e.tag, cond)
+	} else {
+		cond = fmt.Sprintf("exists (select 1 from json_tree(media_file.tags, '$.%s') where key='value')", e.tag)
 	}
-	cond = fmt.Sprintf("exists (select 1 from json_tree(media_file.tags, '$.%s') where key='value' and %s)", e.tag, cond)
 	if e.not {
 		cond = "not " + cond
 	}
@@ -345,12 +410,197 @@ type roleCond struct {
 }
 
 func (e roleCond) ToSql() (string, []any, error) {
-	cond, args, err := e.cond.ToSql()
-	cond = fmt.Sprintf("exists (select 1 from json_tree(media_file.participants, '$.%s') where key='name' and %s)", e.role, cond)
+	var cond string
+	var args []any
+	if e.cond != nil {
+		innerSQL, innerArgs, err := roleCondSQL(e.cond)
+		if err != nil {
+			return "", nil, err
+		}
+		cond = roleExistsSQL(innerSQL)
+		args = append([]any{e.role}, innerArgs...)
+	} else {
+		cond = "exists (select 1 from media_file_artists mfa where mfa.media_file_id = media_file.id and mfa.role = ?)"
+		args = []any{e.role}
+	}
 	if e.not {
 		cond = "not " + cond
 	}
-	return cond, args, err
+	return cond, args, nil
+}
+
+// roleCondSQL extracts SQL from a squirrel condition and rewrites the placeholder column name.
+func roleCondSQL(cond squirrel.Sqlizer) (string, []any, error) {
+	sql, args, err := cond.ToSql()
+	if err != nil {
+		return "", nil, err
+	}
+	return strings.ReplaceAll(sql, "value", "artist.name"), args, nil
+}
+
+// roleExistsSQL wraps a condition fragment in the standard role EXISTS subquery.
+func roleExistsSQL(innerCond string) string {
+	return fmt.Sprintf("exists (select 1 from media_file_artists mfa join artist on artist.id = mfa.artist_id "+
+		"where mfa.media_file_id = media_file.id and mfa.role = ? and %s)", innerCond)
+}
+
+// jsonCondBatchSize limits how many conditions are ORed inside a single EXISTS subquery
+// to stay within SQLite's expression tree depth limit (max 1000). The EXISTS wrapper
+// consumes ~4 levels; each ORed condition adds 1 level. Empirically, 496 is the maximum.
+const jsonCondBatchSize = 350
+
+// mergeJsonConds collapses multiple non-negated roleCond or tagCond entries for the same
+// field within an OR group into batched EXISTS subqueries with the conditions ORed inside.
+// This turns N separate correlated subqueries into ceil(N/batchSize), dramatically
+// improving performance for smart playlists with many patterns.
+func mergeJsonConds(or squirrel.Or) squirrel.Sqlizer {
+	if merged, ok := mergeSameFieldConds(or, false); ok {
+		return squirrel.Or(merged)
+	}
+	return or
+}
+
+// mergeNegatedJsonConds is the AND-group counterpart to mergeJsonConds, merging negated
+// conditions. By De Morgan, "NOT EXISTS(X) AND NOT EXISTS(Y)" == "NOT EXISTS(X OR Y)".
+func mergeNegatedJsonConds(and squirrel.And) squirrel.Sqlizer {
+	if merged, ok := mergeSameFieldConds(and, true); ok {
+		return squirrel.And(merged)
+	}
+	return and
+}
+
+// mergeSameFieldConds groups roleCond/tagCond entries that share a field and the requested
+// polarity, replacing each group of 2+ with batched roleCondGroup/tagCondGroup subqueries.
+// Returns the rewritten conditions and whether any merge happened.
+func mergeSameFieldConds(conds []squirrel.Sqlizer, negated bool) ([]squirrel.Sqlizer, bool) {
+	type condEntry struct {
+		index int
+		cond  squirrel.Sqlizer
+	}
+	type group struct {
+		entries []condEntry
+		isRole  bool
+		numeric bool
+		tag     string
+	}
+	groups := make(map[string]*group)
+	for i, s := range conds {
+		switch c := s.(type) {
+		case roleCond:
+			if c.not != negated || c.cond == nil {
+				continue
+			}
+			g, exists := groups["role:"+c.role]
+			if !exists {
+				g = &group{isRole: true}
+				groups["role:"+c.role] = g
+			}
+			g.entries = append(g.entries, condEntry{index: i, cond: c.cond})
+		case tagCond:
+			if c.not != negated || c.cond == nil {
+				continue
+			}
+			g, exists := groups["tag:"+c.tag]
+			if !exists {
+				g = &group{tag: c.tag, numeric: c.numeric}
+				groups["tag:"+c.tag] = g
+			}
+			g.entries = append(g.entries, condEntry{index: i, cond: c.cond})
+		}
+	}
+
+	remove := make(map[int]bool)
+	var additions []squirrel.Sqlizer
+	for _, key := range slices.Sorted(maps.Keys(groups)) {
+		g := groups[key]
+		if len(g.entries) < 2 {
+			continue
+		}
+		batchConds := make([]squirrel.Sqlizer, len(g.entries))
+		for i, e := range g.entries {
+			remove[e.index] = true
+			batchConds[i] = e.cond
+		}
+		if g.isRole {
+			role := key[len("role:"):]
+			for batch := range slices.Chunk(batchConds, jsonCondBatchSize) {
+				additions = append(additions, roleCondGroup{role: role, conds: batch, not: negated})
+			}
+		} else {
+			for batch := range slices.Chunk(batchConds, jsonCondBatchSize) {
+				additions = append(additions, tagCondGroup{tag: g.tag, numeric: g.numeric, conds: batch, not: negated})
+			}
+		}
+	}
+
+	if len(remove) == 0 {
+		return conds, false
+	}
+
+	result := make([]squirrel.Sqlizer, 0, len(conds)-len(remove)+len(additions))
+	for i, s := range conds {
+		if !remove[i] {
+			result = append(result, s)
+		}
+	}
+	return append(result, additions...), true
+}
+
+// roleCondGroup represents multiple role conditions for the same role, merged into a single
+// (optionally negated) EXISTS subquery for performance.
+type roleCondGroup struct {
+	role  string
+	conds []squirrel.Sqlizer
+	not   bool
+}
+
+func (g roleCondGroup) ToSql() (string, []any, error) {
+	innerParts := make([]string, 0, len(g.conds))
+	allArgs := []any{g.role}
+	for _, c := range g.conds {
+		part, args, err := roleCondSQL(c)
+		if err != nil {
+			return "", nil, err
+		}
+		innerParts = append(innerParts, part)
+		allArgs = append(allArgs, args...)
+	}
+	cond := roleExistsSQL("(" + strings.Join(innerParts, " OR ") + ")")
+	if g.not {
+		cond = "not " + cond
+	}
+	return cond, allArgs, nil
+}
+
+// tagCondGroup represents multiple tag conditions for the same tag, merged into a single
+// (optionally negated) EXISTS subquery for performance.
+type tagCondGroup struct {
+	tag     string
+	numeric bool
+	conds   []squirrel.Sqlizer
+	not     bool
+}
+
+func (g tagCondGroup) ToSql() (string, []any, error) {
+	innerParts := make([]string, 0, len(g.conds))
+	var allArgs []any
+	for _, c := range g.conds {
+		part, args, err := c.ToSql()
+		if err != nil {
+			return "", nil, err
+		}
+		if g.numeric {
+			part = strings.ReplaceAll(part, "value", "CAST(value AS REAL)")
+		}
+		innerParts = append(innerParts, part)
+		allArgs = append(allArgs, args...)
+	}
+	cond := fmt.Sprintf("exists (select 1 from json_tree(media_file.tags, '$.%s') where key='value' and (%s))",
+		g.tag, strings.Join(innerParts, " OR "))
+	if g.not {
+		cond = "not " + cond
+	}
+	return cond, allArgs, nil
 }
 
 func singleField(values map[string]any) (string, any, criteria.FieldInfo, bool) {
@@ -374,7 +624,7 @@ func sqlFields(values map[string]any) (map[string]any, error) {
 		if info.IsTag || info.IsRole {
 			return nil, fmt.Errorf("tag and role criteria must contain exactly one field: %s", field)
 		}
-		sqlField, ok := fieldExpr(info.Name)
+		sqlField, ok := fieldExpr(info.Name())
 		if !ok || sqlField == "" {
 			return nil, fmt.Errorf("invalid field in criteria: %s", field)
 		}
@@ -393,7 +643,7 @@ func fieldJoinType(name string) smartPlaylistJoinType {
 	if !ok {
 		return smartPlaylistJoinNone
 	}
-	field, ok := smartPlaylistFields[info.Name]
+	field, ok := smartPlaylistFields[info.Name()]
 	if !ok {
 		return smartPlaylistJoinNone
 	}
@@ -441,17 +691,17 @@ func sortExpr(sortField string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	if field, ok := smartPlaylistFields[info.Name]; ok && field.order != "" {
+	if field, ok := smartPlaylistFields[info.Name()]; ok && field.order != "" {
 		return field.order, true
 	}
 	var mapped string
 	switch {
 	case info.IsTag:
-		mapped = "COALESCE(json_extract(media_file.tags, '$." + info.Name + "[0].value'), '')"
+		mapped = "COALESCE(json_extract(media_file.tags, '$." + info.Name() + "[0].value'), '')"
 	case info.IsRole:
-		mapped = "COALESCE(json_extract(media_file.participants, '$." + info.Name + "[0].name'), '')"
+		mapped = "COALESCE(json_extract(media_file.participants, '$." + info.Name() + "[0].name'), '')"
 	default:
-		field, ok := smartPlaylistFields[info.Name]
+		field, ok := smartPlaylistFields[info.Name()]
 		if !ok || field.expr == "" {
 			return "", false
 		}
