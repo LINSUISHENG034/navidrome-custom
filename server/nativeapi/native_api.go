@@ -14,6 +14,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core"
+	"github.com/navidrome/navidrome/core/artwork"
+	"github.com/navidrome/navidrome/core/external"
 	"github.com/navidrome/navidrome/core/metrics"
 	"github.com/navidrome/navidrome/core/playback"
 	playlistsvc "github.com/navidrome/navidrome/core/playlists"
@@ -46,15 +48,16 @@ type Router struct {
 	users            core.User
 	maintenance      core.Maintenance
 	pluginManager    PluginManager
-	imgUpload        core.ImageUploadService
+	imgUpload        artwork.Uploader
+	provider         external.Provider
 	playback         playback.PlaybackServer
 	bluetoothManager bluetoothManager
 	bluetoothMu      sync.Mutex
 	bluetoothScanMu  sync.Mutex
 }
 
-func New(ds model.DataStore, share core.Share, playlists playlistsvc.Playlists, insights metrics.Insights, libraryService core.Library, userService core.User, maintenance core.Maintenance, pluginManager PluginManager, imgUpload core.ImageUploadService, playbackServer playback.PlaybackServer) *Router {
-	r := &Router{ds: ds, share: share, playlists: playlists, insights: insights, libs: libraryService, users: userService, maintenance: maintenance, pluginManager: pluginManager, imgUpload: imgUpload, playback: playbackServer}
+func New(ds model.DataStore, share core.Share, playlists playlistsvc.Playlists, insights metrics.Insights, libraryService core.Library, userService core.User, maintenance core.Maintenance, pluginManager PluginManager, imgUpload artwork.Uploader, provider external.Provider, playbackServer playback.PlaybackServer) *Router {
+	r := &Router{ds: ds, share: share, playlists: playlists, insights: insights, libs: libraryService, users: userService, maintenance: maintenance, pluginManager: pluginManager, imgUpload: imgUpload, provider: provider, playback: playbackServer}
 	r.Handler = r.routes()
 	return r
 }
@@ -78,7 +81,8 @@ func (api *Router) routes() http.Handler {
 		api.R(r, "/player", model.Player{}, true)
 		api.R(r, "/transcoding", model.Transcoding{}, conf.Server.EnableTranscodingConfig)
 		api.addRadioRoute(r)
-		api.R(r, "/tag", model.Tag{}, true)
+		api.R(r, "/tag", model.Tag{}, false)
+		api.R(r, "/scrobble", model.Scrobble{}, false)
 		if conf.Server.EnableSharing {
 			api.RX(r, "/share", api.share.NewRepository, true)
 		}
@@ -96,6 +100,7 @@ func (api *Router) routes() http.Handler {
 			api.addConfigRoute(r)
 			api.addUserLibraryRoute(r)
 			api.addPluginRoute(r)
+			api.addMetadataRoute(r)
 			api.RX(r, "/library", api.libs.NewRepository, true)
 			if conf.Server.Jukebox.Enabled {
 				api.addJukeboxDeviceRoute(r)

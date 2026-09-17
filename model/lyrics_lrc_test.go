@@ -147,6 +147,49 @@ var _ = Describe("parseLRC", func() {
 		}))
 	})
 
+	It("should skip unknown tag lines instead of merging them into the prior line", func() {
+		lyrics, err := parseLRC("xxx", "[00:01.00]<00:01.00>Some <00:01.50>lyrics\n[by: someone]\n[al: An album]\n[00:03.00]Next")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(lyrics.Synced).To(BeTrue())
+		Expect(lyrics.Line).To(HaveLen(2))
+
+		t1000, t1500, t3000 := int64(1000), int64(1500), int64(3000)
+		Expect(lyrics.Line[0].Value).To(Equal("Some lyrics"))
+		Expect(lyrics.Line[0].Cue).To(Equal([]Cue{
+			{Start: &t1000, End: &t1500, Value: "Some ", ByteStart: 0, ByteEnd: 4},
+			{Start: &t1500, End: &t3000, Value: "lyrics", ByteStart: 5, ByteEnd: 10},
+		}))
+		Expect(lyrics.Line[1].Value).To(Equal("Next"))
+	})
+
+	It("should attach [bg:] background vocals to the previous line as a bg agent layer", func() {
+		lyrics, err := parseLRC("xxx", "[00:52.00]<00:52.00>Main <00:52.50>line\n[bg: <00:53.00>Okay<00:53.50>]\n[00:55.00]Next")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(lyrics.Agents).To(Equal([]Agent{
+			{ID: "main", Role: "main"},
+			{ID: "__nd_bg__|main", Role: "bg"},
+		}))
+		Expect(lyrics.Line).To(HaveLen(2))
+
+		line := lyrics.Line[0]
+		Expect(line.Value).To(Equal("Main line Okay"))
+		Expect(line.Cue).To(Equal([]Cue{
+			{Start: new(int64(52000)), End: new(int64(52500)), Value: "Main ", ByteStart: 0, ByteEnd: 4, AgentID: "main"},
+			{Start: new(int64(52500)), End: new(int64(55000)), Value: "line", ByteStart: 5, ByteEnd: 8, AgentID: "main"},
+			{Start: new(int64(53000)), End: new(int64(53500)), Value: "Okay", ByteStart: 10, ByteEnd: 13, AgentID: "__nd_bg__|main"},
+		}))
+		Expect(lyrics.Line[1].Value).To(Equal("Next"))
+	})
+
+	It("should skip a [bg:] line that has no inline timing", func() {
+		lyrics, err := parseLRC("xxx", "[00:01.00]Hi\n[bg: untimed]\n[00:03.00]Next")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(lyrics.Agents).To(BeNil())
+		Expect(lyrics.Line).To(HaveLen(2))
+		Expect(lyrics.Line[0].Value).To(Equal("Hi"))
+		Expect(lyrics.Line[1].Value).To(Equal("Next"))
+	})
+
 	It("should handle mixed Enhanced and plain LRC lines", func() {
 		lyrics, err := parseLRC("xxx", "[00:01.00]<00:01.00>Some <00:01.50>lyrics\n[00:03.00]Plain line\n[00:05.00]<00:05.00>More <00:05.50>words")
 		Expect(err).ToNot(HaveOccurred())
@@ -185,6 +228,42 @@ var _ = Describe("parseLRC", func() {
 			{Start: &t900, Value: "love", ByteStart: 3, ByteEnd: 6},
 			{Start: &t1300, Value: " me ", ByteStart: 7, ByteEnd: 10},
 			{Start: &t1600, Value: "tonight", ByteStart: 11, ByteEnd: 17},
+		}))
+	})
+
+	It("should use a trailing Enhanced LRC marker as the end of the last word", func() {
+		lyrics, err := parseLRC("xxx", "[00:01.00]<00:01.00>Some <00:01.50>lyrics<00:02.00>\n[00:30.00]Instrumental over")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(lyrics.Line).To(HaveLen(2))
+
+		t1000, t1500, t2000 := int64(1000), int64(1500), int64(2000)
+		line := lyrics.Line[0]
+		Expect(line.Value).To(Equal("Some lyrics"))
+		Expect(line.End).To(Equal(&t2000))
+		Expect(line.Cue).To(Equal([]Cue{
+			{Start: &t1000, End: &t1500, Value: "Some ", ByteStart: 0, ByteEnd: 4},
+			{Start: &t1500, End: &t2000, Value: "lyrics", ByteStart: 5, ByteEnd: 10},
+		}))
+	})
+
+	It("should shift a trailing Enhanced LRC marker for repeated line occurrences", func() {
+		lyrics, err := parseLRC("xxx", "[00:10.00][00:30.00]<00:10.10>Hello <00:10.50>world<00:10.90>")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(lyrics.Line).To(HaveLen(2))
+
+		t10100, t10500, t10900 := int64(10100), int64(10500), int64(10900)
+		t30100, t30500, t30900 := int64(30100), int64(30500), int64(30900)
+
+		Expect(lyrics.Line[0].End).To(Equal(&t10900))
+		Expect(lyrics.Line[0].Cue).To(Equal([]Cue{
+			{Start: &t10100, End: &t10500, Value: "Hello ", ByteStart: 0, ByteEnd: 5},
+			{Start: &t10500, End: &t10900, Value: "world", ByteStart: 6, ByteEnd: 10},
+		}))
+
+		Expect(lyrics.Line[1].End).To(Equal(&t30900))
+		Expect(lyrics.Line[1].Cue).To(Equal([]Cue{
+			{Start: &t30100, End: &t30500, Value: "Hello ", ByteStart: 0, ByteEnd: 5},
+			{Start: &t30500, End: &t30900, Value: "world", ByteStart: 6, ByteEnd: 10},
 		}))
 	})
 

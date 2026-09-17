@@ -153,6 +153,7 @@ func (pd *Queue) Shuffle() {
 		currentPath = current.Path
 	}
 
+	//nolint:gosec // shuffle order is not a security decision
 	rand.Shuffle(len(pd.Items), func(i, j int) { pd.Items[i], pd.Items[j] = pd.Items[j], pd.Items[i] })
 
 	if currentIndex == -1 || currentPath == "" {
