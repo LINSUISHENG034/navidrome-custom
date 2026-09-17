@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 cd "${REPO_ROOT}"
 
-GIT_TAG="${GIT_TAG:-v0.60.3-bt}"
+GIT_TAG="${GIT_TAG:-v0.64.0-bt}"
 GIT_SHA="$(git rev-parse --short HEAD)"
 IMAGE="navidrome-bt:dev"
 ALPINE_MIRROR="${ALPINE_MIRROR:-https://mirrors.aliyun.com/alpine}"
