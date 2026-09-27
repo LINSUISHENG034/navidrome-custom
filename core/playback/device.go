@@ -24,7 +24,7 @@ type Track interface {
 
 type playbackDevice struct {
 	mu                   sync.Mutex // protects all mutable state
-	serviceCtx           context.Context
+	serviceCtx           context.Context //nolint:containedctx // playback service lifecycle ctx
 	ParentPlaybackServer PlaybackServer
 	Default              bool
 	User                 string

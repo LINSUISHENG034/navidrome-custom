@@ -14,6 +14,7 @@ import (
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/conf/mime"
 	"github.com/navidrome/navidrome/consts"
+	"github.com/navidrome/navidrome/core/quickconnect"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/utils/slice"
@@ -31,7 +32,7 @@ func IndexWithShare(ds model.DataStore, fs fs.FS, shareInfo *model.Share) http.H
 // Injects the config in the `index.html` template
 func serveIndex(ds model.DataStore, fs fs.FS, shareInfo *model.Share) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		c, err := ds.User(r.Context()).CountAll()
+		c, err := ds.User().CountAll(r.Context())
 		firstTime := c == 0 && err == nil
 
 		t, err := getIndexTemplate(r, fs)
@@ -80,6 +81,7 @@ func serveIndex(ds model.DataStore, fs fs.FS, shareInfo *model.Share) http.Handl
 			"enableInspect":              conf.Server.Inspect.Enabled,
 			"pluginsEnabled":             conf.Server.Plugins.Enabled,
 			"extAuthLogoutURL":           conf.Server.ExtAuth.LogoutURL,
+			"enableQuickConnect":        quickconnect.Enabled(),
 			"jukeboxEnabled":             conf.Server.Jukebox.Enabled,
 			"bluetoothManagementEnabled": conf.Server.Jukebox.BluetoothManagement,
 		}
