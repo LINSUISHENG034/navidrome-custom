@@ -27,8 +27,9 @@ echo "==> Stopping and removing existing containers..."
 docker compose down --remove-orphans
 # Also remove any standalone container with the same project name
 CONTAINER_NAME="${COMPOSE_PROJECT_NAME:-$(basename "$(pwd)")}"
-if docker ps -aq --filter "name=${CONTAINER_NAME}" | grep -q .; then
-  docker rm -f $(docker ps -aq --filter "name=${CONTAINER_NAME}") 2>/dev/null || true
+EXISTING_IDS="$(docker ps -aq --filter "name=${CONTAINER_NAME}")"
+if [ -n "${EXISTING_IDS}" ]; then
+  docker rm -f ${EXISTING_IDS} 2>/dev/null || true
 fi
 
 echo "==> Starting container..."
