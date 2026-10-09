@@ -366,6 +366,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.invoke("test", "bridge"), 1)
         self.assertIn("non-skipped unittest", self.err.getvalue())
 
+    def test_test_does_not_confuse_inner_skipped_suite_with_executed_outer_suite(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        self.commands.test_output = self.unittest_output() + self.commands.test_output
+        self.assertEqual(self.invoke("test", "bridge"), 0, self.err.getvalue())
+        self.assertEqual(json.loads(self.out.getvalue())["tests"], 1)
+
     def test_export_never_silently_drops_untracked_files(self):
         self.generated_checkout()
         self.commands.untracked = "tests/new_test.py\n"

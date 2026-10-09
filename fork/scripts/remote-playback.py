@@ -327,13 +327,15 @@ def test_checkout(run, checkout, project):
                project["runtime_image"], *project["test_command"][1:]]
     result = execute(run, command, checkout)
     output = result.stdout + result.stderr
-    counts = re.findall(r"^Ran (\d+) tests? in ", output, re.MULTILINE)
-    if not counts or int(counts[-1]) == 0:
+    runs = list(re.finditer(r"^Ran (\d+) tests? in ", output, re.MULTILINE))
+    if not runs or int(runs[-1].group(1)) == 0:
         raise RunnerError("runtime did not report nonzero unittest execution")
-    skipped = re.findall(r"^OK \([^\n)]*\bskipped=(\d+)[^\n)]*\)$", output, re.MULTILINE)
-    if skipped and int(skipped[-1]) >= int(counts[-1]):
+    count = int(runs[-1].group(1))
+    summary = output[runs[-1].end():]
+    skipped = re.findall(r"^OK \([^\n)]*\bskipped=(\d+)[^\n)]*\)$", summary, re.MULTILINE)
+    if skipped and int(skipped[-1]) >= count:
         raise RunnerError("runtime did not report non-skipped unittest execution")
-    return {"tests": int(counts[-1]), "output": output}
+    return {"tests": count, "output": output}
 
 
 def atomic_write(path, content):
