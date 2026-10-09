@@ -22,10 +22,10 @@ Blocked by: 01, 02, 03
 
 ## Implementation contract
 
-- 只新增 Bridge 管理面协调，不修改 Sendspin wire。`POST /api/output/prepare` 输入 `output_id`、调用方预先生成的唯一 `lease_id`、有界 `timeout_seconds`；成功返回 `status=ready`、同一 `lease_id`/`output_id` 和不透明 `output_epoch`。只有已配置输出可被选择，不接受任意 MAC/系统命令。
+- 只新增 Bridge 管理面协调，不修改 Sendspin wire。`POST /api/output/prepare` 输入 `output_id`、调用方预先生成的唯一 `lease_id`、有界 `timeout_seconds`，升级目标另带可选 `pcm_format={sample_rate,bit_depth,channels}`，表示协商的有符号整数 PCM；成功返回 `status=ready`、同一 `lease_id`/`output_id`、不透明 `output_epoch`，显式格式请求还须回显相同格式。只有已配置输出可被选择，不接受任意 MAC/系统命令。同一 nonce 不可改变格式；冷启动的已接受 MA 路径必须显式给出实际协商格式，无格式旧调用只保留已绑定输出的行为，不猜测格式后声称 cold-ready。
 - `POST /api/output/release` 输入同一 `output_id`/`lease_id` 与受限 reason；同时撤销 pending 或 ready lease。必须支持「取消先于 prepare 到达」的有界 tombstone，防止 HTTP 取消/重排后旧请求复活；旧 lease 的释放不影响 successor。
 - 两接口要求显式机器访问 token，使用 `X-Output-Preparation-Token` 和常量时间比较；功能默认关闭，未配置 token 不开放控制。不得把 token 写到 URL、日志或仓库。MA 接入 URL 不含用户信息/query/fragment，明文只允许 loopback，其他地址要求 HTTPS。
-- Physical output adapter 是外部测试 port；成功至少检查连接/profile/sink、当前 daemon/backend 绑定与 epoch，不能把现有 wake success 或 reroute boolean 当 Ready。真实声学完整性仍独立验证。
+- Physical output adapter 是外部测试 port；成功至少检查连接/profile/sink、当前 daemon/backend 绑定与 epoch，不能把现有 wake success 或 reroute boolean 当 Ready。升级目标的显式格式请求，即便已有 Pulse 绑定也须取得 SDK 对该格式的确认；准备与内容使用同一 worker/backend，不能用另一个 reservation 替代。SDK 保留正常 decoder/clock 路径，未 drain 的不同格式转换失败关闭，不重写调度。真实声学完整性仍独立验证。
 - MA 使用现有可取消 session task，在供流前等待；HTTP 中断/超时即用已知 lease_id 请求撤销，不依赖先收到 ready 回包。要审查所有 resume/seek/skip 入口，不能只补 new play；旧 queue/timeline 不复制。
 - configured deadline/暂停宽限期/取消记录上限与保留期来自现有配置层；测试用短的明确参数或可控时钟，不在代码中写死真实等待。
 - CLI runner 的公开命令与外部 git/docker 执行 port 为额外基础设施测试 seam；它的测试只用临时目录/外部执行替身，不调用会部署生产的旧脚本。
@@ -53,6 +53,19 @@ Blocked by: 01, 02, 03
 - 固定 Bridge runtime 内，用标准库 `unittest.FunctionTestCase` 直接执行 5 个未修改 upstream 模块中无 fixture、无参数的测试函数：`test_bridge_daemon_signature` 1 项、`test_ipc_integration` 12 项、`test_subprocess_ipc_ratelimit` 4 项、`test_subprocess_stderr_tail` 5 项、`test_status_store` 7 项（均位于 `tests/unit/services/ipc/`）。实际结果为 `Ran 29 tests / OK`（2.688 秒、无 skipped）；没有伪造 pytest 或插件。这是指定函数的直接执行，不是完整 pytest/daemon/client suite。
 - 容器使用清单锁定 digest、断网、只读源码、去 capabilities、禁止提权及容器内部临时目录；Python 3.13.15、sendspin 7.5.0、aiosendspin 6.1.1 已核对。被测试 replay 源码、索引和 applied provenance 前后不变；没有改写正在开发的 checkout。
 - 固定运行时没有 pytest 及其 async/timeout/xdist 插件，也没有 pre_commit/Ruff；依赖这些工具的完整上游测试及 lint 未执行，未安装宿主依赖或下载 hook 环境。这个基线仍不能证明真实 SDK 的冷输出准备；后续增量优先处理音乐供流前的 backend 建立与释放，不接入真实音箱或生产资源。
+
+### 2026-10-09 冷启动 tracer 与 SDK 能力缺口
+
+- 新增真实 daemon stdin 的冷启动回归，保留固定 sendspin 7.5.0/aiosendspin 6.1.1 的 daemon、client、handler 与 worker，仅替换外部 PortAudio/Pulse 端口，不预置 owned sink-input。实际 red 为 `Ran 1 test / FAILED (failures=1)`（2.108 秒）：owned streams 为 0、allocations/starts/closes 均为空、绑定回报 `ready=false`。这不是物理实验，也不是失败已修复的声明。
+- 固定 SDK 的音乐 worker 在首个 chunk 后才调用 `AudioPlayer.set_format`；公开 handler/worker 尚无 pre-content prepare-format 能力。独立 `AudioPlayer.set_format` 可创建另一个 daemon-owned 预检输出，但不能证明实际音乐 worker 已准备或无需重开 backend；不将这类 reservation 改名成 gate ready，也不向私有队列注入伪造音频。
+- 后续增量选择最小的 SDK 公开 Prepare 生命周期，使准备和首个音乐 chunk 使用同一 worker/backend；SDK 改动将有独立版本锁定与 canonical 差分，隔离 runner 只读加载经 provenance 校验的依赖源码。若所需改动演变为重写 worker/协议，应停止该方向并重估，不用预检替身绕过首段门槛。此项仍在实施，没有 green/真实冷就绪结论。
+
+### 2026-10-10 依赖源码隔离 runner 增量
+
+- 扩展既有 runner 的可选 `runtime_sources` 配置；依赖递归去重后只读挂载于 `/runtime-sources/<project>`，复用同一 provenance/pin/canonical tree/Git 配置与整树安全检查，不自动 fetch/apply/install。依赖只需源码目录，不要求测试目录；未配置时保留原测试行为。
+- 依赖额外拒绝普通和被忽略的未跟踪文件、缺失源码目录以及含 `:` 的 `source_path`，防止导入覆盖或拆出额外 `PYTHONPATH`；缺失、错误 revision/origin/provenance、非 canonical 索引/工作区、循环引用、逃逸与特殊文件均在 Docker 前失败。
+- `source_path="src:/unowned"` 的公开 CLI 回归实际 red 为 `AssertionError: 0 != 1`、`Ran 1 test / FAILED (failures=1)`（0.018 秒），只加依赖专用的 `:` 检查后 unchanged test green；普通和被忽略未跟踪文件的拒绝也有真实 red→green。协调者独立 suite 为 `Ran 51 tests / OK`（0.660 秒），独立审阅另跑 51 项（1.096 秒），增加 diamond 去重和 transitive cycle 的公开替身探针，未发现已确认缺陷；固定清单及旧补丁 checksum 校验仍通过。新增验证只使用临时目录及 Git/Docker 外部执行替身，不等于真实依赖 clone/apply/Docker replay。canonical 清单暂未登记 SDK 项目，实际 SDK 生命周期增量仍待完成。
+- 已拒绝的独立 reservation/handoff 试验及其 35 项 green 留在忽略工作区，不纳入 canonical，也不关闭冷启动缺口。该试验发现的原生身份问题另计：固定 libpulse 17.0 下，`PULSE_PROP_application.name` 会被 ALSA 的显式名称覆盖；`PULSE_PROP_OVERRIDE_application.name` 经隔离原生 Pulse 观察可保留配置身份。严格 PID/身份比较不放宽，后续同一 worker 路径仍须重新验证。
 
 **本票仍 claimed，以下不是已完成项：**
 

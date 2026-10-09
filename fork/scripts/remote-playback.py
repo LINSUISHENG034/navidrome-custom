@@ -43,6 +43,33 @@ def validate_repository(repository):
         raise RunnerError("repository must be a credential-free GitHub HTTPS URL")
 
 
+def runtime_source_keys(projects, key):
+    ordered = []
+    visiting = set()
+    visited = set()
+
+    def visit(current):
+        if current in visiting:
+            raise RunnerError("runtime_sources dependency cycle")
+        if current in visited:
+            return
+        visiting.add(current)
+        dependencies = projects[current].get("runtime_sources", [])
+        if (not isinstance(dependencies, list) or
+                any(not isinstance(dependency, str) or dependency not in projects or dependency == current
+                    for dependency in dependencies) or len(set(dependencies)) != len(dependencies)):
+            raise RunnerError(f"{current}: runtime_sources must name distinct other manifest projects")
+        for dependency in dependencies:
+            if dependency not in ordered:
+                ordered.append(dependency)
+            visit(dependency)
+        visiting.remove(current)
+        visited.add(current)
+
+    visit(key)
+    return ordered
+
+
 def load_manifest(root):
     manifest_path = confined_path(root, "fork/patches/remote-playback/manifest.json", "manifest")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -85,6 +112,8 @@ def load_manifest(root):
                 raise RunnerError(f"{key}: invalid patch sha256")
             if hashlib.sha256(path.read_bytes()).hexdigest() != patch["sha256"]:
                 raise RunnerError(f"{key}: patch checksum mismatch: {patch['file']}")
+    for key in projects:
+        runtime_source_keys(projects, key)
     return manifest
 
 
@@ -294,7 +323,9 @@ def validate_mount_tree(checkout, *, allow_internal_symlinks=True):
                 raise RunnerError("checkout contains socket/device/FIFO; refusing access")
 
 
-def test_checkout(run, checkout, project):
+def validate_test_source(run, checkout, project, *, runtime_source=False):
+    if runtime_source and ":" in project["source_path"]:
+        raise RunnerError("runtime source_path cannot contain PYTHONPATH separators")
     state = inspect_checkout(run, checkout, project)
     if state["head"] != project["revision"]:
         raise RunnerError("test requires pinned base revision")
@@ -305,25 +336,41 @@ def test_checkout(run, checkout, project):
                 provenance.get("applied_patches") != project["patches"]):
             raise RunnerError("test refuses dirty changes not produced by canonical apply")
         git(run, checkout, "diff", "--no-ext-diff", "--no-textconv", "--quiet")
-        if git(run, checkout, "ls-files", "--others", "--exclude-standard").strip():
+    if state["dirty"] or runtime_source:
+        exclusions = [] if runtime_source else ["--exclude-standard"]
+        if git(run, checkout, "ls-files", "--others", *exclusions).strip():
             raise RunnerError("test refuses untracked files; export/stage them first")
     source = confined_path(checkout, project["source_path"], "source_path")
+    if not source.is_dir():
+        raise RunnerError("source_path directory missing")
+    validate_mount_tree(checkout)
+    if "," in str(checkout):
+        raise RunnerError("checkout path cannot contain Docker mount separators")
+    return source
+
+
+def test_checkout(run, checkout, project, projects=None):
+    validate_test_source(run, checkout, project)
     tests = confined_path(checkout, "tests", "tests")
-    if not source.is_dir() or not tests.is_dir():
-        raise RunnerError("source_path or tests directory missing")
+    if not tests.is_dir():
+        raise RunnerError("tests directory missing")
     matches = list(tests.glob(project["test_command"][8]))
     if not matches:
         raise RunnerError("no matching tests; refusing zero-test success")
     for path in matches:
         confined_path(checkout, str(path.relative_to(checkout)), "test file")
-    validate_mount_tree(checkout)
-    if "," in str(checkout):
-        raise RunnerError("checkout path cannot contain Docker mount separators")
-    pythonpath = "/workspace" if project["source_path"] == "." else "/workspace/" + project["source_path"]
+    pythonpaths = ["/workspace" if project["source_path"] == "." else "/workspace/" + project["source_path"]]
+    mounts = ["--mount", f"type=bind,src={checkout},dst=/workspace,readonly"]
+    for key in runtime_source_keys(projects if projects is not None else {checkout.name: project}, checkout.name):
+        dependency = confined_path(checkout.parent, key, "runtime source checkout")
+        source = validate_test_source(run, dependency, projects[key], runtime_source=True)
+        destination = Path("/runtime-sources") / key
+        mounts.extend(["--mount", f"type=bind,src={dependency},dst={destination},readonly"])
+        pythonpaths.append(str(destination / source.relative_to(dependency)))
     command = ["docker", "run", "--rm", "--pull=never", "--network", "none", "--read-only",
                "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--tmpfs", "/tmp",
-               "--mount", f"type=bind,src={checkout},dst=/workspace,readonly", "--workdir", "/workspace",
-               "--env", f"PYTHONPATH={pythonpath}", "--entrypoint", project["test_command"][0],
+               *mounts, "--workdir", "/workspace",
+               "--env", f"PYTHONPATH={':'.join(pythonpaths)}", "--entrypoint", project["test_command"][0],
                project["runtime_image"], *project["test_command"][1:]]
     result = execute(run, command, checkout)
     output = result.stdout + result.stderr
@@ -433,7 +480,7 @@ def main(argv=None, *, repo_root=None, run=subprocess.run, stdout=None, stderr=N
             elif args.command == "apply":
                 result = apply_patches(run, checkout, project, root / "fork/patches/remote-playback")
             elif args.command == "test":
-                result = test_checkout(run, checkout, project)
+                result = test_checkout(run, checkout, project, projects)
             elif args.command == "export":
                 result = export_patch(
                     run, checkout, manifest, args.project, root / "fork/patches/remote-playback",

@@ -28,16 +28,18 @@ partialclonefilter = blob:none
 """
 
 
-def fixture_repository(checkout):
+def fixture_repository(checkout, repository="https://github.com/example/bridge.git"):
     metadata = checkout / ".git"
     metadata.mkdir(parents=True)
-    (metadata / "config").write_text(BASE_CONFIG, encoding="utf-8")
+    config = BASE_CONFIG.replace("https://github.com/example/bridge.git", repository)
+    (metadata / "config").write_text(config, encoding="utf-8")
 
 
 class FakeCommands:
     def __init__(self):
         self.calls = []
         self.responses = {}
+        self.checkouts = {}
         self.head = "1" * 40
         self.origin = "https://github.com/example/bridge.git"
         self.dirty = ""
@@ -51,6 +53,7 @@ class FakeCommands:
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
+        state = self.checkouts.get(Path(kwargs["cwd"]).name, {})
         if argv[0] == "git" and self.tamper_config:
             config = Path(kwargs["cwd"]) / ".git/config"
             config.write_text(BASE_CONFIG + self.tamper_config, encoding="utf-8")
@@ -66,19 +69,24 @@ class FakeCommands:
                 elif "rev-parse" in argv:
                     if "--show-toplevel" in argv:
                         checkout = Path(kwargs["cwd"])
-                        output = str(self.effective_worktree or checkout) + "\n" + str(checkout / ".git") + "\n"
+                        effective = state.get("effective_worktree", self.effective_worktree) or checkout
+                        output = str(effective) + "\n" + str(checkout / ".git") + "\n"
                     else:
-                        output = self.head + "\n"
+                        output = state.get("head", self.head) + "\n"
                 elif "remote" in argv:
-                    output = self.origin + "\n"
+                    output = state.get("origin", self.origin) + "\n"
                 elif "status" in argv:
-                    output = self.dirty
+                    output = state.get("dirty", self.dirty)
                 elif "write-tree" in argv:
-                    output = self.tree + "\n"
+                    output = state.get("tree", self.tree) + "\n"
+                elif "diff" in argv and "--quiet" in argv and state.get("unstaged"):
+                    return subprocess.CompletedProcess(argv, 1, "", "fixture unstaged changes")
                 elif "diff" in argv and "--quiet" not in argv:
                     output = self.diff
                 elif "ls-files" in argv:
-                    output = self.untracked
+                    output = state.get("untracked", self.untracked)
+                    if "--exclude-standard" not in argv:
+                        output += state.get("ignored", "")
                 elif "cat-file" in argv:
                     output = "commit\n"
             if argv[0] == "docker":
@@ -124,21 +132,38 @@ class RunnerTests(unittest.TestCase):
         return runner.main(list(args), repo_root=self.root, run=self.commands,
                            stdout=self.out, stderr=self.err)
 
-    def generated_checkout(self):
-        checkout = self.root / "tmp/remote-playback/src/bridge"
-        fixture_repository(checkout)
+    def generated_checkout(self, key="bridge"):
+        project = self.manifest["projects"][key]
+        checkout = self.root / "tmp/remote-playback/src" / key
+        fixture_repository(checkout, project["repository"])
         checkout.with_suffix(".json").write_text(json.dumps({
             "schema_version": 1,
-            "project": "bridge",
-            "repository": self.manifest["projects"]["bridge"]["repository"],
-            "revision": "1" * 40,
+            "project": key,
+            "repository": project["repository"],
+            "revision": project["revision"],
         }), encoding="utf-8")
+        if key != "bridge":
+            self.commands.checkouts[key] = {"head": project["revision"], "origin": project["repository"]}
         return checkout
 
-    def add_patch(self):
-        (self.patch_dir / "bridge.patch").write_bytes(b"abc")
-        self.manifest["projects"]["bridge"]["patches"] = [{
-            "file": "bridge.patch",
+    def add_runtime_source(self, key="sendspin", *, generated=True):
+        self.manifest["projects"][key] = dict(
+            self.manifest["projects"]["bridge"],
+            repository=f"https://github.com/example/{key}.git", revision="4" * 40,
+        )
+        self.manifest["projects"][key].pop("runtime_sources", None)
+        self.manifest["projects"]["bridge"]["runtime_sources"] = [key]
+        self.save_manifest()
+        if not generated:
+            return self.root / "tmp/remote-playback/src" / key
+        checkout = self.generated_checkout(key)
+        (checkout / "src").mkdir()
+        return checkout
+
+    def add_patch(self, key="bridge"):
+        (self.patch_dir / f"{key}.patch").write_bytes(b"abc")
+        self.manifest["projects"][key]["patches"] = [{
+            "file": f"{key}.patch",
             "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         }]
         self.save_manifest()
@@ -199,6 +224,25 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.invoke("validate"), 1)
         self.assertEqual(len(self.commands.calls), 0)
 
+    def test_validate_rejects_invalid_runtime_source_references_without_commands(self):
+        self.add_runtime_source()
+        cases = ["sendspin", None, {}, [1], ["sendspin", "sendspin"], ["bridge"], ["missing"], ["../sendspin"]]
+        for dependencies in cases:
+            with self.subTest(runtime_sources=dependencies):
+                self.manifest["projects"]["bridge"]["runtime_sources"] = dependencies
+                self.save_manifest()
+                self.assertEqual(self.invoke("validate"), 1)
+                self.assertIn("runtime_sources", self.err.getvalue())
+                self.assertEqual(len(self.commands.calls), 0)
+
+    def test_validate_rejects_runtime_source_cycles_without_commands(self):
+        self.add_runtime_source()
+        self.manifest["projects"]["sendspin"]["runtime_sources"] = ["bridge"]
+        self.save_manifest()
+        self.assertEqual(self.invoke("validate"), 1)
+        self.assertIn("runtime_sources", self.err.getvalue())
+        self.assertEqual(len(self.commands.calls), 0)
+
     def test_validate_never_uses_symlinked_workspace_or_patch_directories(self):
         (self.root / "data").mkdir()
         (self.root / "tmp").symlink_to(self.root / "data", target_is_directory=True)
@@ -257,6 +301,200 @@ class RunnerTests(unittest.TestCase):
         for forbidden in ["--privileged", "--device", "--publish", "-p", "--volume"]:
             self.assertNotIn(forbidden, command[:command.index("ghcr.io/example/bridge@sha256:" + "2" * 64)])
         self.assertEqual(json.loads(self.out.getvalue())["tests"], 1)
+
+    def test_test_mounts_owned_runtime_sources_readonly_without_dependency_tests(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        self.assertEqual(self.invoke("test", "bridge"), 0, self.err.getvalue())
+        docker = [argv for argv, _ in self.commands.calls if argv[0] == "docker"]
+        self.assertEqual(len(docker), 1)
+        command = docker[0]
+        mounts = [command[index + 1] for index, value in enumerate(command) if value == "--mount"]
+        self.assertEqual(mounts, [
+            f"type=bind,src={checkout},dst=/workspace,readonly",
+            f"type=bind,src={dependency},dst=/runtime-sources/sendspin,readonly",
+        ])
+        self.assertIn("PYTHONPATH=/workspace/src:/runtime-sources/sendspin/src", command)
+        self.assertFalse((dependency / "tests").exists())
+        self.assertFalse(any("clone" in argv or "apply" in argv or "checkout" in argv
+                             for argv, _ in self.commands.calls))
+
+    def test_test_mounts_transitive_runtime_sources_once_with_confined_pythonpaths(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        self.add_runtime_source()
+        codec = self.add_runtime_source("codec")
+        self.manifest["projects"]["sendspin"]["runtime_sources"] = ["codec"]
+        self.manifest["projects"]["codec"]["source_path"] = "."
+        for dependencies in (["sendspin"], ["sendspin", "codec"]):
+            with self.subTest(runtime_sources=dependencies):
+                self.manifest["projects"]["bridge"]["runtime_sources"] = dependencies
+                self.save_manifest()
+                self.commands.calls.clear()
+                self.assertEqual(self.invoke("test", "bridge"), 0, self.err.getvalue())
+                command = next(argv for argv, _ in self.commands.calls if argv[0] == "docker")
+                self.assertEqual(command.count("--mount"), 3)
+                self.assertIn(f"type=bind,src={codec},dst=/runtime-sources/codec,readonly", command)
+                self.assertIn("PYTHONPATH=/workspace/src:/runtime-sources/sendspin/src:/runtime-sources/codec", command)
+
+    def test_test_refuses_missing_runtime_source_without_fetch_or_docker(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source(generated=False)
+        self.assertEqual(self.invoke("test", "bridge"), 1)
+        self.assertIn("not runner-generated", self.err.getvalue())
+        self.assertFalse(dependency.exists())
+        self.assertFalse(any(argv[0] == "docker" or "clone" in argv or "checkout" in argv or "apply" in argv
+                             for argv, _ in self.commands.calls))
+
+    def test_test_refuses_runtime_sources_with_missing_or_mismatched_provenance(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        marker = dependency.with_suffix(".json")
+        valid = json.loads(marker.read_text())
+        cases = [None, dict(valid, project="bridge"), dict(valid, schema_version=2),
+                 dict(valid, revision="5" * 40), dict(valid, repository="https://github.com/example/other.git")]
+        for provenance in cases:
+            with self.subTest(provenance=provenance):
+                if provenance is None:
+                    marker.unlink()
+                else:
+                    marker.write_text(json.dumps(provenance), encoding="utf-8")
+                self.commands.calls.clear()
+                self.assertEqual(self.invoke("test", "bridge"), 1)
+                self.assertFalse(any(argv[0] == "docker" or options["cwd"] == str(dependency)
+                                     for argv, options in self.commands.calls))
+
+    def test_test_refuses_runtime_source_identity_origin_or_revision_mismatches(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        self.add_runtime_source()
+        valid = self.commands.checkouts["sendspin"]
+        cases = [("effective_worktree", self.root / "outside"),
+                 ("origin", "https://github.com/example/other.git"), ("head", "5" * 40)]
+        for field, value in cases:
+            with self.subTest(field=field):
+                self.commands.checkouts["sendspin"] = dict(valid, **{field: value})
+                self.commands.calls.clear()
+                self.assertEqual(self.invoke("test", "bridge"), 1)
+                self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
+
+    def test_test_refuses_runtime_source_unsafe_config_before_dependency_git_or_docker(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        (dependency / ".git/config.worktree").write_text('[include]\npath = ../outside\n', encoding="utf-8")
+        self.assertEqual(self.invoke("test", "bridge"), 1)
+        self.assertFalse(any(argv[0] == "docker" or options["cwd"] == str(dependency)
+                             for argv, options in self.commands.calls))
+
+    def test_test_accepts_runner_applied_runtime_source_staged_tree(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        self.add_patch("sendspin")
+        self.assertEqual(self.invoke("apply", "sendspin"), 0, self.err.getvalue())
+        self.commands.checkouts["sendspin"]["dirty"] = "M  src/worker.py\n"
+        self.commands.calls.clear()
+        self.assertEqual(self.invoke("test", "bridge"), 0, self.err.getvalue())
+        command = next(argv for argv, _ in self.commands.calls if argv[0] == "docker")
+        self.assertIn(f"type=bind,src={dependency},dst=/runtime-sources/sendspin,readonly", command)
+        self.assertFalse(any("apply" in argv or "clone" in argv or "checkout" in argv
+                             for argv, _ in self.commands.calls))
+
+    def test_test_refuses_changed_canonical_runtime_source_without_docker(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        self.add_runtime_source()
+        self.add_patch("sendspin")
+        self.assertEqual(self.invoke("apply", "sendspin"), 0, self.err.getvalue())
+        valid = dict(self.commands.checkouts["sendspin"], dirty="M  src/worker.py\n")
+        cases = [("unknown index", {"tree": "5" * 40}),
+                 ("unstaged", {"unstaged": True}), ("untracked", {"untracked": "src/extra.py\n"})]
+        for name, changes in cases:
+            with self.subTest(case=name):
+                self.commands.checkouts["sendspin"] = dict(valid, **changes)
+                self.commands.calls.clear()
+                self.assertEqual(self.invoke("test", "bridge"), 1)
+                self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
+
+    def test_test_refuses_escaping_runtime_source_path_before_any_command(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        self.add_runtime_source()
+        self.manifest["projects"]["sendspin"]["source_path"] = "../bridge/src"
+        self.save_manifest()
+        self.assertEqual(self.invoke("test", "bridge"), 1)
+        self.assertEqual(len(self.commands.calls), 0)
+
+    def test_test_refuses_runtime_source_pythonpath_separator_ambiguity_before_docker(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        source_path = "src:/unowned"
+        (dependency / source_path).mkdir(parents=True)
+        self.manifest["projects"]["sendspin"]["source_path"] = source_path
+        self.save_manifest()
+        self.assertEqual(self.invoke("test", "bridge"), 1)
+        self.assertIn("PYTHONPATH", self.err.getvalue())
+        self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
+
+    def test_test_refuses_symlinked_runtime_source_checkout_before_any_command(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        outside = self.root / "outside"
+        dependency.rename(outside)
+        dependency.symlink_to(outside, target_is_directory=True)
+        self.assertEqual(self.invoke("test", "bridge"), 1)
+        self.assertEqual(len(self.commands.calls), 0)
+
+    def test_test_validates_entire_runtime_source_mount_tree_before_docker(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        hidden = dependency / ".hidden"
+        hidden.mkdir()
+        unsafe = hidden / "control"
+        for kind in ("escaping symlink", "FIFO"):
+            with self.subTest(kind=kind):
+                if kind == "FIFO":
+                    os.mkfifo(unsafe)
+                else:
+                    unsafe.symlink_to(self.root, target_is_directory=True)
+                try:
+                    self.commands.calls.clear()
+                    self.assertEqual(self.invoke("test", "bridge"), 1)
+                    self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
+                finally:
+                    unsafe.unlink()
+
+    def test_test_refuses_missing_or_symlinked_runtime_source_directory(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        source = dependency / "src"
+        source.rmdir()
+        self.assertEqual(self.invoke("test", "bridge"), 1)
+        self.assertIn("source_path directory missing", self.err.getvalue())
+        self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
+        internal = dependency / "internal"
+        internal.mkdir()
+        source.symlink_to(internal, target_is_directory=True)
+        self.commands.calls.clear()
+        self.assertEqual(self.invoke("test", "bridge"), 1)
+        self.assertEqual(len(self.commands.calls), 0)
+
+    def test_test_refuses_ignored_untracked_runtime_source_files_before_docker(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        (dependency / "src/ignored.py").write_text("# untrusted ignored fixture", encoding="utf-8")
+        self.commands.checkouts["sendspin"]["ignored"] = "src/ignored.py\n"
+        self.assertEqual(self.invoke("test", "bridge"), 1)
+        self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
 
     def test_test_accepts_only_runner_applied_staged_tree(self):
         checkout = self.generated_checkout()
