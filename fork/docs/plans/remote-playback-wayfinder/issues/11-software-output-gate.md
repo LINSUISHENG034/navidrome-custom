@@ -47,6 +47,13 @@ Blocked by: 01, 02, 03
 - **检查与未执行项**：普通文件及应用后源码的 `git diff --check` 通过；canonical 目录的 attributes 仅豁免 `.patch` 的差分 context 空白标记（真实 red 为 artifact check 退出 2，配置后退出 0），不豁免源码。完整 pre-commit/hooks/lint 未执行：固定 MA runtime 有 pre_commit、无 Ruff，未创建或下载 hook 环境。未安装宿主库、构建/发布 patched 镜像或进行生产部署。
 - **回退范围**：准备功能默认关闭；本轮只提交 canonical 补丁、清单、runner 支持和计划进度。没有生产变更需要回退；保留已有开发源码与旧临时重放证据，不 reset/删除原工作区。
 
+### 2026-10-09 冷启动增量前的独立回归基线
+
+- 当前 canonical replay 的 Bridge 准备 suite 再次运行为 `Ran 27 tests / OK`（18.698 秒、无 skipped）；安全 runner 独立回归为 `Ran 35 tests / OK`（0.325 秒），清单及补丁 checksum 校验通过。这轮未重新运行 MA suite，不将上一检查点的 17 项改写为本轮结果。
+- 固定 Bridge runtime 内，用标准库 `unittest.FunctionTestCase` 直接执行 5 个未修改 upstream 模块中无 fixture、无参数的测试函数：`test_bridge_daemon_signature` 1 项、`test_ipc_integration` 12 项、`test_subprocess_ipc_ratelimit` 4 项、`test_subprocess_stderr_tail` 5 项、`test_status_store` 7 项（均位于 `tests/unit/services/ipc/`）。实际结果为 `Ran 29 tests / OK`（2.688 秒、无 skipped）；没有伪造 pytest 或插件。这是指定函数的直接执行，不是完整 pytest/daemon/client suite。
+- 容器使用清单锁定 digest、断网、只读源码、去 capabilities、禁止提权及容器内部临时目录；Python 3.13.15、sendspin 7.5.0、aiosendspin 6.1.1 已核对。被测试 replay 源码、索引和 applied provenance 前后不变；没有改写正在开发的 checkout。
+- 固定运行时没有 pytest 及其 async/timeout/xdist 插件，也没有 pre_commit/Ruff；依赖这些工具的完整上游测试及 lint 未执行，未安装宿主依赖或下载 hook 环境。这个基线仍不能证明真实 SDK 的冷输出准备；后续增量优先处理音乐供流前的 backend 建立与释放，不接入真实音箱或生产资源。
+
 **本票仍 claimed，以下不是已完成项：**
 
 1. 运行时物理失联需要可靠传回 MA，撤销/冻结权威 source 与 timeline；仅本地 daemon pause/release 不证明该闭环。
