@@ -14,7 +14,7 @@ Created: 2026-10-09
 - 优先服务当前单服务器、单蓝牙输出；稳定性、日常操作和维护成本优先于合并容器数量。
 - 原生 Navidrome 页面是加分项，不是第一阶段的前置条件。
 - 排除「静音浏览器仍实际播放、远端同时播放、两边共同推进曲目」的方案；任何保留页面的路线都必须是真正的远端控制模式。
-- 保留现有 MA + Bridge 作为生产和回滚基线；Go SDK 是有证据基础的候选，不预先承诺替换 MA，也不从零重写已有协议。
+- 将用户曾确认工作稳定的 MA + Bridge 链路保留为比较候选和恢复资产；实际运行状态以研究证据为准，未经恢复验证不称为正在服务或可直接回滚的生产基线。Go SDK 是有证据基础的候选，不预先承诺替换 MA，也不从零重写已有协议。
 - 首段音频完整是硬门槛。首次连接以 10 秒内可听为初始目标；15 秒未就绪应明确失败、撤销本次准备工作，不能由过期任务稍后自动恢复播放。指标待实测验证，不作为已达到的性能声明。
 - 用户同意在约定维护窗口短时独占音箱；**每次实际执行前仍须再次确认具体窗口和操作**。不得删除生产容器、改动生产数据库或音乐库。
 - 本轮只建立规划和开展只读研究，不操作蓝牙、不播放音频、不启动测试容器、不重启服务、不安装依赖、不实施产品代码。
@@ -36,6 +36,7 @@ Created: 2026-10-09
 - 研究证据位于 `research/`，从研究票链接；报告是事实资产，不另存一份决策。评论追加在票的 `Comments`。
 - 同一 charting 会话不解决 HITL 票；后续一次会话最多解决一张非 research 票。研究可并行，真实音箱实验因共享硬件必须串行并排他。
 - 研究资产使用 `research/<name>` 临时分支，在隔离 worktree 内生成。合入地图分支前校验范围；不把已有未跟踪文件顺带提交。
+- 规划检查点与研究整合使用 `plan/remote-playback-wayfinder`。仓库远程主线是 `master`，没有 `main`；备份目标只能是用户确认的 fork 同名规划分支，不合并主线、不发布 issue/PR、不套用 `git push origin main` 模板。研究分支不由子代理自行推送。
 - 研究仅记录脱敏的版本、能力、状态和来源。禁止保存凭据、完整环境变量、原始 MAC、私有地址、数据库、完整运行配置或原始敏感日志。
 
 ### 工作方法与已有证据
@@ -43,7 +44,7 @@ Created: 2026-10-09
 - 每次工作先读 Destination、术语表和目标票，再按需读取其 blocker 和已关闭票。
 - Research 票由调用 `mattpocock-skills:research` 的子代理处理；Prototype 票调用 `mattpocock-skills:prototype` 并与用户讨论具体产物；Grilling 票调用 `mattpocock-skills:grilling` 与 `mattpocock-skills:domain-modeling`。
 - 模块和 Interface 设计遵守 `codebase-design`：一个播放权威，输出准备/释放集中，调用端不学习蓝牙命令顺序；测试跨相同 Interface，真实硬件证据另计。
-- 已有历史资产：[Jukebox session 升级记录](../../todo/2026-03-06-jukebox-session-architecture-upgrade.md)、[原蓝牙优化计划](../2026-04-28-bluetooth-module-optimization.md)。它们是本地背景，不是当前状态证明；其静音浏览器保留方向不能作为本路线实现模板。这些既有资产当前未跟踪，不随本轮提交。
+- 已有历史资产仅作为本地路径参考：`fork/docs/todo/2026-03-06-jukebox-session-architecture-upgrade.md`、`fork/docs/plans/2026-04-28-bluetooth-module-optimization.md`。它们不是当前状态证明；其静音浏览器保留方向不能作为本路线实现模板。它们当前未跟踪、不随本轮提交，因此不生成在 GitHub 备份中无法访问的 Markdown 链接。
 - 已查到的候选和规范来源：[Go SDK](https://github.com/Sendspin/sendspin-go)、[Go server CLI](https://github.com/Sendspin/sendspin-go-server)、[Python SDK](https://github.com/Sendspin/aiosendspin)、[Bridge](https://github.com/trudenboy/sendspin-bt-bridge)、[规范 scope](https://github.com/Sendspin/spec/blob/main/SCOPE.md)。存在 SDK 不等于目标版本互通或应用层完整。
 
 ## Decisions so far
