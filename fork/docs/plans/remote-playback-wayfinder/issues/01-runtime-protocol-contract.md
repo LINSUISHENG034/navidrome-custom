@@ -3,7 +3,7 @@
 Type: research
 Label: wayfinder:research
 Mode: AFK
-Status: claimed
+Status: resolved
 Assignee: LINSUISHENG034
 Parent: ../map.md
 Blocked by: none
@@ -21,3 +21,12 @@ Research asset: ../research/runtime-protocol-contract.md
 - 允许只读宿主文件及脱敏的容器元数据；不执行容器内命令、抓取流量、读数据库、调用带凭据的应用接口、启动/重启服务或尝试握手。
 
 研究报告持有具体证据，票的 Answer 只记录候选决策及证据边界。不能把报告中的静态兼容判断写成已实测互通。
+
+## Answer
+
+详细事实、版本锁、wire 来源、未知与 stop gates 见命名研究资产：[实际部署与协议兼容候选：锁定证据](../research/runtime-protocol-contract.md)。
+
+- 保留已按 RepoDigest 锁定的 MA 2.10.4 + Bridge 2.75.0 artifact 作为历史 baseline/回滚比较候选；观测时两者均 exited，不能称当前活跃生产互通，不能未经批准恢复。Bridge 的 tag、OCI main/revision、source 依赖声明与 installed 包必须分开。
+- 第一 Go 候选限定为官方 CLI v0.1.1 → SDK v1.8.2 与旧 Bridge artifact/明确锁定的 2.75.0 source。旧明文首包存在静态交集，值得进入有限私用原型设计；目标互通和可听播放都未经实测。
+- 固定新 Bridge source + SDK 9.1.1 与 MA/官方 Python server 作为新协议参考比较；旧 Go + 新 Bridge 默认 Noise 路径暂不纳入第一轮直接接线，先过协议/安全设计 gate。不用当前上游差异否定旧 Bridge 目标。
+- installed 依赖、真实历史 boot/log、有效准入配置、队列/输出语义与完整标准符合性仍未知；日志过滤读取被工具隔离校验拒绝后未重做或代读。没有运行、播放、握手、编译测试或修改运行环境；完整 Sendspin 1.0 合规与基础私用原型不同，静态研究不能宣布投产。
