@@ -52,7 +52,7 @@ Created: 2026-10-09
 
 - [锁定实际部署与协议兼容候选](issues/01-runtime-protocol-contract.md)：锁定历史 MA/Bridge 镜像候选，首轮 Go 私用原型限定 CLI v0.1.1 + SDK v1.8.2 与旧 Bridge；静态首包交集不等于已实测互通。
 - [确定输出准备与释放的最小协调位置](issues/02-output-readiness-contract.md)：优先验证播放会话到输出 adapter 的 pre-stream 准备/释放契约；现有 wake success 不等于物理 ready，首段与取消闭环仍需原型。
-- [确定验收语义与验证止损预算](issues/03-acceptance-and-budget.md)：按用户最新技术委托进入 MA-first 隔离软件开发，停止/取消优先、默认暂停宽限期配置化；真实设备验收仍需维护窗口。
+- [确定验收语义与验证止损预算](issues/03-acceptance-and-budget.md)：按用户最新技术委托进入 MA-first 隔离软件开发；首期沿用暂停即 stop 保位、释放后重新准备的原生语义，物理宽限期留作后续选项；真实设备验收仍需维护窗口。
 
 ## Not yet specified
 

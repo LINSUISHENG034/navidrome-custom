@@ -1,0 +1,2 @@
+# Unified-diff context markers are data; check the applied source instead.
+*.patch -whitespace

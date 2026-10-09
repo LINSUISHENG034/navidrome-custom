@@ -35,3 +35,21 @@ Blocked by: 01, 02, 03
 - 2026-10-09：这是用户扩大执行范围后的受限 AFK 开发任务；不是从自动通知推导授权。先完成无硬件软件证据，真实窗口仍保留独立确认。
 - 2026-10-09 软件阶段 A：审阅并纳入已有安全 runner 与其标准库 CLI 测试，不另建 runner。新增「全部测试 skipped 不得成功」公开回归，真实 red 为 `Ran 1 test / FAILED (failures=1)`、`AssertionError: 0 != 1`；最小修复后单项 green，完整 runner suite 为 `Ran 34 tests / OK`（0.358 秒）。`validate` 返回锁定的 `bridge`、`ma`，`git diff --check` 通过。这里的 Git/Docker 执行 port 使用替身，尚不能证明真实 canonical replay、Bridge/MA 门控或声学效果；本票仍 claimed。
 - 2026-10-09 runner 后续回归：嵌套 unittest 输出的 skipped summary 不得与外层执行数量错配。真实 red 为 `AssertionError: 1 != 0`；只解析最后一次 `Ran` 之后的 summary 后，完整 suite `Ran 35 tests / OK`（0.536 秒），`git diff --check` 通过。阶段 A 的 `48182488` 已成功备份到 fork 同名开发分支。
+
+### 2026-10-09 隔离软件检查点：补丁与干净重放
+
+- **Canonical**：[锁定清单](../../../../patches/remote-playback/manifest.json)、[Bridge 补丁](../../../../patches/remote-playback/bridge-output-preparation.patch)、[MA 补丁](../../../../patches/remote-playback/ma-output-preparation.patch)。只跟踪差分，不跟踪整份 upstream checkout；SHA-256 的唯一登记处是清单。Bridge 差分涉及 17 个源码/测试文件，MA 涉及 5 个，不更改 Navidrome 浏览器、Go backend 或 MA queue/controller。
+- **Bridge**：opt-in、独立机器 token、配置输出 allowlist、nonce/epoch、取消先到 tombstone、超时/迟到清理及实际 daemon IPC 绑定路径。真实 red→green 补齐 application identity 与 StatusStore 发布；prepare/release/watcher 只处理本播放器的流。独立审阅又发现整链路 disconnect 会干扰同 sink 其他来源，新增公开 release 回归由 `disconnects=[True]`→`[]`，未知/错误的 Pulse 观察保留链路，且观察前后及 worker 内检查 successor epoch。该观察只覆盖本机 Pulse 当前流，不识别手机连接，也不提供与外部程序之间的跨后端原子互斥。
+- **MA**：在已有 cancellation-managed session task 中先 Prepare，再应用权威音量、创建流和读取音乐；未配置时保留既有行为。HTTP/JSON 中断撤销已知 nonce；Stop 幂等释放，pause-as-stop 后 resume 用新 nonce；切歌复用 nonce 但重新核验 ready；现有流 EOF 排空提交音频后释放，setup failure 不冒充自然结束。配置位于既有播放器 Config Entries，token 使用 SECURE_STRING，非 loopback URL 要求 HTTPS，deadline 为有界配置。
+- **真实软件结果**：runner 35/35；开发源码与干净重放源码均为 Bridge 27/27、MA 17/17。最后重放分别为 18.594 秒、4.412 秒，均 `OK`；这不是首音时间。MA 一个 setup-failure 用例故意触发并捕获 RuntimeError，日志 traceback 不代表测试失败。
+- **重放方式**：在新的隔离 roots 调用现有 runner 的公开 Interface，真实 Git clone/checkout/export/apply/write-tree 与固定 digest Docker test；仅 clone 的下载 transport 替换为本地受管 cache，并恢复 manifest 的 HTTPS origin。两份 cache 是浅历史 clone，但本次固定 revision 的对象完整；不宣称全历史或 GitHub 下载 transport 已被这轮 replay 验证。原开发工作区、索引及 Git 非 objects 元数据的前后 fingerprint/status 均未变化；applied provenance 由 runner 生成，未伪造。
+- **运行时**：固定镜像实际包版本匹配清单：Bridge Python 3.13.15、aiosendspin 6.1.1、sendspin 7.5.0；MA Python 3.14.7、aiosendspin 9.1.1。容器断网、只读、去 capabilities、禁止提权，只挂载临时源码，没有生产数据、host network、音频设备、D-Bus 或 Pulse socket。
+- **检查与未执行项**：普通文件及应用后源码的 `git diff --check` 通过；canonical 目录的 attributes 仅豁免 `.patch` 的差分 context 空白标记（真实 red 为 artifact check 退出 2，配置后退出 0），不豁免源码。完整 pre-commit/hooks/lint 未执行：固定 MA runtime 有 pre_commit、无 Ruff，未创建或下载 hook 环境。未安装宿主库、构建/发布 patched 镜像或进行生产部署。
+- **回退范围**：准备功能默认关闭；本轮只提交 canonical 补丁、清单、runner 支持和计划进度。没有生产变更需要回退；保留已有开发源码与旧临时重放证据，不 reset/删除原工作区。
+
+**本票仍 claimed，以下不是已完成项：**
+
+1. 运行时物理失联需要可靠传回 MA，撤销/冻结权威 source 与 timeline；仅本地 daemon pause/release 不证明该闭环。
+2. 真实 SDK 是否能在音乐供流前建立 owned backend 尚未证明；没有当前绑定证据继续 fail closed，不能把替身 ready 当 cold-ready。
+3. 完整 MA controller 的 queue/seek/resume、事件竞态及启动 timeout 仍需更广的整应用集成证据；不因公开 session 测试通过宣称全路径等价或多房间支持。
+4. 首段完整、10 秒可听、15 秒实机失败截止、占用与闲置提示音仍属于未来逐次确认窗口的 HITL 验收。软件检查点不关闭硬件票。

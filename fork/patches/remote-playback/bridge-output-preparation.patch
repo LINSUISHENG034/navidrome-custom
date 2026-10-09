@@ -1,0 +1,1880 @@
+diff --git a/src/sendspin_bridge/bluetooth/manager.py b/src/sendspin_bridge/bluetooth/manager.py
+index d0cc3a39fede7683ae6ec8133815718412c79b1a..c67d643a7876e3cbe64dda27213e0e82432b312d 100644
+--- a/src/sendspin_bridge/bluetooth/manager.py
++++ b/src/sendspin_bridge/bluetooth/manager.py
+@@ -699,6 +699,21 @@ class BluetoothManager:
+             logger=logger,
+         )
+ 
++    def connect_prepared_output(self) -> bool:
++        """A bounded intent-driven connect, without pairing/power/trust/recovery."""
++        if self.is_device_paired() is not True or self._reconnect_cancelled():
++            return False
++        if self.link_state() is not LinkState.CONNECTED:
++            result = get_bluez().connect(self.mac_address, self._bluez_adapter())
++            if result.outcome is not Outcome.OK:
++                return False
++        if self._reconnect_cancelled() or self.link_state() is not LinkState.CONNECTED:
++            return False
++        if _dbus_get_device_property(self._dbus_device_path, "ServicesResolved") is not True:
++            return False
++        self._apply_connected_state(True)
++        return self.configure_bluetooth_audio()
++
+     def connect_device(self) -> bool:
+         """Connect to the Bluetooth device"""
+         if self._reconnect_cancelled():
+diff --git a/src/sendspin_bridge/bluetooth/monitor.py b/src/sendspin_bridge/bluetooth/monitor.py
+index c2d1a252eb57e1e9b0c7fd74b4b250009a8c48f2..f24a752feff2268823d4ca3e282ef4ba9700e18f 100644
+--- a/src/sendspin_bridge/bluetooth/monitor.py
++++ b/src/sendspin_bridge/bluetooth/monitor.py
+@@ -62,6 +62,10 @@ def _log_reconnect_attempt(device_name: str, attempt: int) -> None:
+ 
+ async def _standby_sleep(mgr: BluetoothManager, seconds: float = 5) -> None:
+     """Sleep interruptibly — returns early when ``signal_standby_wake()`` fires."""
++    if mgr.host and getattr(mgr.host, "output_preparation_enabled", False):
++        connected = await asyncio.get_running_loop().run_in_executor(bt_executor(), mgr.is_device_connected)
++        if connected != mgr.host.get_status_value("bluetooth_connected"):
++            mgr.host.update_status({"bluetooth_connected": connected})
+     evt = mgr.standby_wake_event
+     if evt is None:
+         await asyncio.sleep(seconds)
+@@ -186,7 +190,8 @@ async def _monitor_polling(mgr: BluetoothManager) -> None:
+                 await asyncio.sleep(5)
+                 continue
+ 
+-            if mgr.host and mgr.host.get_status_value("bt_standby") and not mgr.host.get_status_value("bt_waking"):
++            if mgr.host and (getattr(mgr.host, "output_preparation_enabled", False)
++                            or (mgr.host.get_status_value("bt_standby") and not mgr.host.get_status_value("bt_waking"))):
+                 await _standby_sleep(mgr)
+                 continue
+ 
+@@ -415,10 +420,11 @@ async def _monitor_dbus(mgr: BluetoothManager, MessageBus, BusType) -> None:
+                         loop.call_soon_threadsafe(conn_evt.set)
+                         # Correct sink routing for other devices that may have been
+                         # disrupted by module-rescue-streams when this sink appeared.
+-                        loop.call_soon_threadsafe(
+-                            asyncio.ensure_future,
+-                            _correct_other_devices_routing(mgr),
+-                        )
++                        if not mgr.host or not getattr(mgr.host, "output_preparation_enabled", False):
++                            loop.call_soon_threadsafe(
++                                asyncio.ensure_future,
++                                _correct_other_devices_routing(mgr),
++                            )
+ 
+                 return on_props_changed
+ 
+@@ -488,7 +494,8 @@ async def _inner_dbus_monitor(
+             await asyncio.sleep(5)
+             continue
+ 
+-        if mgr.host and mgr.host.get_status_value("bt_standby") and not mgr.host.get_status_value("bt_waking"):
++        if mgr.host and (getattr(mgr.host, "output_preparation_enabled", False)
++                            or (mgr.host.get_status_value("bt_standby") and not mgr.host.get_status_value("bt_waking"))):
+             await _standby_sleep(mgr)
+             continue
+ 
+diff --git a/src/sendspin_bridge/bridge/client.py b/src/sendspin_bridge/bridge/client.py
+index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d278c340def 100644
+--- a/src/sendspin_bridge/bridge/client.py
++++ b/src/sendspin_bridge/bridge/client.py
+@@ -67,6 +67,7 @@ from sendspin_bridge.services.infrastructure.config_validation import (
+ )
+ from sendspin_bridge.services.infrastructure.port_bind_probe import DEFAULT_MAX_ATTEMPTS, find_available_bind_port
+ from sendspin_bridge.services.ipc.commands import (
++    BindOutput,
+     Command,
+     Reconnect,
+     SetMinBufferMs,
+@@ -210,6 +211,10 @@ _MA_RECONNECT_TIMEOUT_S = 15.0
+ 
+ _IPC_ALLOWED_KEYS = frozenset(
+     {
++        "output_binding_epoch",
++        "output_binding_sink",
++        "output_binding_pid",
++        "output_binding_ready",
+         "playing",
+         "connected",
+         "server_connected",
+@@ -453,6 +458,10 @@ class DeviceStatus:
+     supported_commands: list | None = None
+     group_volume: int | None = None
+     group_muted: bool | None = None
++    output_binding_epoch: str | None = None
++    output_binding_sink: str | None = None
++    output_binding_pid: int | None = None
++    output_binding_ready: bool = False
+     bt_standby: bool = False
+     bt_standby_since: str | None = None
+     bt_waking: bool = False
+@@ -596,6 +605,8 @@ class SendspinClient:
+     D-Bus callbacks all read/write status through this single gate.
+     """
+ 
++    output_preparation_enabled: bool = False
++
+     def __init__(
+         self,
+         player_name: str,
+@@ -618,7 +629,14 @@ class SendspinClient:
+         static_delay_source: str = "default",
+         static_delay_calibrated_at: str | None = None,
+         static_delay_codec: str | None = None,
++        output_preparation_config: dict | None = None,
+     ):
++        from sendspin_bridge.config import output_preparation_settings
++
++        self._output_config = output_preparation_settings(output_preparation_config or {})
++        self.output_preparation_enabled = self._output_config["OUTPUT_PREPARATION_ENABLED"] is True
++        self._output_epoch: str | None = None
++        self._output_lock = asyncio.Lock()
+         self.player_name = player_name
+         self.server_host = server_host
+         self.server_port = server_port
+@@ -628,8 +646,11 @@ class SendspinClient:
+         self.static_delay_ms = static_delay_ms  # per-device delay override (None = use env var)
+         self.preferred_format = preferred_format  # preferred audio format string (e.g. "flac:44100:16:2")
+         self._effective_bridge = effective_bridge  # bridge instance label for MA device info
++        if self.output_preparation_enabled:
++            idle_mode = "auto_disconnect"
++            idle_disconnect_minutes = self._output_config["OUTPUT_PREPARATION_PAUSE_GRACE_SECONDS"] / 60
+         self.idle_mode = idle_mode  # default | power_save | auto_disconnect | keep_alive
+-        self.keepalive_enabled = idle_mode == "keep_alive" or keepalive_enabled
++        self.keepalive_enabled = not self.output_preparation_enabled and (idle_mode == "keep_alive" or keepalive_enabled)
+         self.keepalive_interval = max(30, keepalive_interval)  # seconds between keepalive bursts
+         # v2.63.0-rc.2 — payload selector: "infrasound" (default) | "silence" | "none"
+         self.keep_alive_method = keep_alive_method if keep_alive_method in _KEEPALIVE_METHODS else "infrasound"
+@@ -798,6 +819,8 @@ class SendspinClient:
+                 details=event["details"] if isinstance(event["details"], dict) else None,
+             )
+         _state.notify_status_changed()
++        if self.output_preparation_enabled and updates.get("bluetooth_connected") is False and self._output_epoch:
++            schedule_on_bridge_loop(self._on_prepared_output_lost(self._output_epoch), description="prepared output lost")
+         # ── Idle disconnect timer ─────────────────────────────────────
+         # Daemon-reported playback flags always participate in idle timer
+         # management, regardless of SinkMonitor availability.  PipeWire's
+@@ -1070,6 +1093,115 @@ class SendspinClient:
+         if hasattr(task, "cancel"):
+             task.cancel()
+ 
++    @property
++    def _pulse_application_name(self) -> str:
++        return f"sendspin-{self.player_id}"
++
++    async def prepare(self, epoch: str):
++        """Prepare a configured output without a Sendspin stream-start event."""
++        from sendspin_bridge.bluetooth.adapter_session import LinkState
++        from sendspin_bridge.bridge.output_preparation import OutputBinding, PreparationError
++        from sendspin_bridge.services.audio.pulse import averify_output_binding
++
++        if not self.output_preparation_enabled or not self.bt_manager or not self.bt_management_enabled:
++            raise PreparationError("output_unavailable")
++        self._output_epoch = epoch
++        async with self._output_lock:
++            self._cancel_idle_timer()
++            self.bt_manager.allow_reconnect()
++            self._update_status({"bt_waking": True})
++
++            def connect():
++                operation = self.bt_manager.adapter_handle.try_lease(f"prepare {self.player_name}")
++                if operation is None:
++                    return False
++                try:
++                    return self.bt_manager.connect_prepared_output()
++                finally:
++                    operation.release()
++
++            operation = asyncio.get_running_loop().run_in_executor(bt_executor(), connect)
++            try:
++                connected = await asyncio.shield(operation)
++            except asyncio.CancelledError:
++                # Bluetooth work cannot be cancelled by cancelling its asyncio
++                # waiter. Keep the adapter lease/serialization until it exits.
++                await asyncio.shield(operation)
++                raise
++            if self._output_epoch != epoch:
++                raise PreparationError("superseded")
++            if not connected or not self.bluetooth_sink_name or not self.is_running():
++                raise PreparationError("output_unavailable")
++            proc = self._daemon_proc
++            sink = self.bluetooth_sink_name
++            while (self._output_epoch == epoch and proc is self._daemon_proc and self.is_running()
++                   and self.bt_management_enabled and not self.bt_manager.reconnect_cancelled()):
++                await self._send_subprocess_command(BindOutput(epoch=epoch, sink=sink))
++                await asyncio.sleep(self._output_config["OUTPUT_PREPARATION_POLL_SECONDS"])
++                profile, present, bound = await averify_output_binding(proc.pid, sink, self._pulse_application_name)
++                link = await asyncio.get_running_loop().run_in_executor(bt_executor(), self.bt_manager.link_state)
++                ack = (self.status.get("output_binding_epoch") == epoch
++                       and self.status.get("output_binding_pid") == proc.pid
++                       and self.status.get("output_binding_sink") == sink
++                       and self.status.get("output_binding_ready") is True)
++                binding = OutputBinding(epoch, link is LinkState.CONNECTED, profile, present, self.is_running(), bound and ack)
++                if binding.ready and self._output_epoch == epoch:
++                    self._update_status({"bt_standby": False, "bt_waking": False, "bluetooth_connected": True})
++                    self._start_idle_timer(self._output_config["OUTPUT_PREPARATION_PAUSE_GRACE_SECONDS"])
++                    return binding
++            raise PreparationError("cancelled")
++
++    async def _on_prepared_output_lost(self, epoch: str) -> None:
++        if self._output_epoch != epoch:
++            return
++        from sendspin_bridge.services.ipc.commands import Pause
++
++        try:
++            if self.is_running():
++                await self._send_subprocess_command(Pause())
++        finally:
++            await self.release(epoch)
++
++    async def validate_binding(self, epoch: str) -> bool:
++        from sendspin_bridge.bluetooth.adapter_session import LinkState
++        from sendspin_bridge.services.audio.pulse import averify_output_binding
++
++        if self._output_epoch != epoch or not self.is_running() or not self.bt_manager or not self.bt_management_enabled:
++            return False
++        proc = self._daemon_proc
++        profile, present, bound = await averify_output_binding(proc.pid, self.bluetooth_sink_name or "", self._pulse_application_name)
++        link = await asyncio.get_running_loop().run_in_executor(bt_executor(), self.bt_manager.link_state)
++        return (profile and present and bound and link is LinkState.CONNECTED and self._output_epoch == epoch
++                and proc is self._daemon_proc and self.status.get("output_binding_epoch") == epoch
++                and self.status.get("output_binding_pid") == proc.pid
++                and self.status.get("output_binding_ready") is True)
++
++    async def release(self, epoch: str) -> None:
++        """Park only this generation; never disconnect a successor's output."""
++        if self._output_epoch != epoch:
++            return
++        self._output_epoch = None
++        if self.bt_manager:
++            self.bt_manager.cancel_reconnect()
++        async with self._output_lock:
++            if self._output_epoch is not None:
++                return
++            from sendspin_bridge.services.audio.pulse import STANDBY_SINK_NAME, amove_pid_sink_inputs
++
++            self._update_status({"bt_standby": True, "bt_waking": False, "output_binding_ready": False,
++                                 "output_binding_epoch": None})
++            try:
++                if self.is_running():
++                    try:
++                        await self._send_subprocess_command(SetStandby(sink=STANDBY_SINK_NAME))
++                    except IPCError:
++                        pass
++                    await amove_pid_sink_inputs(self._daemon_proc.pid, STANDBY_SINK_NAME,
++                                               application_name=self._pulse_application_name)
++            finally:
++                if self._output_epoch is None:
++                    await self._disconnect_bt_for_standby()
++
+     async def _disconnect_bt_for_standby(self) -> bool:
+         """Drop the BT link for standby, off the loop and under a lease.
+ 
+@@ -1080,6 +1212,17 @@ class SendspinClient:
+         """
+         if not self.bt_manager:
+             return False
++        if self.output_preparation_enabled:
++            from sendspin_bridge.services.audio.pulse import acan_disconnect_output
++
++            if self._output_epoch is not None:
++                return False
++            proc = self._daemon_proc
++            unused_by_others = await acan_disconnect_output(
++                proc.pid if proc else None, self.bluetooth_sink_name or "", self._pulse_application_name
++            )
++            if not unused_by_others or self._output_epoch is not None:
++                return False
+         handle = getattr(self.bt_manager, "adapter_handle", None)
+         lease = handle.try_lease(f"standby {self.player_name}") if handle is not None else None
+         if lease is None:
+@@ -1087,8 +1230,17 @@ class SendspinClient:
+             return False
+         try:
+             loop = asyncio.get_running_loop()
+-            await loop.run_in_executor(bt_executor(), self.bt_manager.disconnect_device)
+-            return True
++            def disconnect():
++                if self.output_preparation_enabled and self._output_epoch is not None:
++                    return False
++                self.bt_manager.disconnect_device()
++                return True
++            operation = loop.run_in_executor(bt_executor(), disconnect)
++            try:
++                return await asyncio.shield(operation)
++            except asyncio.CancelledError:
++                await asyncio.shield(operation)
++                raise
+         except Exception as exc:
+             logger.warning("[%s] BT disconnect on standby failed: %s", self.player_name, exc)
+             return False
+@@ -1122,6 +1274,10 @@ class SendspinClient:
+         Phase 2 behavior: daemon stays alive on a PA null sink so the player
+         remains visible in MA.  When MA sends play, the bridge auto-reconnects BT.
+         """
++        if self.output_preparation_enabled:
++            if self._output_epoch is not None:
++                await self.release(self._output_epoch)
++            return
+         if self.status.get("bt_standby"):
+             return
+         self._update_status(
+@@ -1196,6 +1352,8 @@ class SendspinClient:
+         while ``bt_standby=True``.  The daemon is alive on the null sink;
+         audio streams there silently until BT reconnects and streams are moved.
+         """
++        if self.output_preparation_enabled:
++            return
+         if not self.status.get("bt_standby") or self.status.get("bt_waking"):
+             return
+         logger.info("[%s] Play detected during standby — auto-waking", self.player_name)
+@@ -1431,7 +1589,7 @@ class SendspinClient:
+                         # Don't restart if BT is disconnected — monitor_and_reconnect
+                         # will call start_sendspin() once BT reconnects.
+                         decision = self._supervisor.on_death(
+-                            bt_connected=self.bt_manager.connected if self.bt_manager else None
++                            bt_connected=True if self.output_preparation_enabled else (self.bt_manager.connected if self.bt_manager else None)
+                         )
+                         if isinstance(decision, Halted):
+                             await asyncio.sleep(decision.delay_s)
+@@ -1519,6 +1677,8 @@ class SendspinClient:
+     async def _start_sendspin_inner(self) -> None:
+         """Spawn daemon_process.py subprocess with PULSE_SINK in its environment."""
+         try:
++            if self.output_preparation_enabled and self.is_running():
++                return
+             # Pre-flight gate (#291): refuse to spawn when SENDSPIN_SERVER is
+             # malformed (scheme prefix, embedded port, slashes, whitespace).
+             # The web-UI form rejects these values up front and the migration
+@@ -1546,7 +1706,7 @@ class SendspinClient:
+             # Configure BT audio sink if not yet done (offloaded to executor
+             # because configure_bluetooth_audio is a blocking call that sleeps
+             # during sink discovery retries — up to ~18 s).
+-            if self.bt_manager and self.bt_manager.connected and not self.bluetooth_sink_name:
++            if not self.output_preparation_enabled and self.bt_manager and self.bt_manager.connected and not self.bluetooth_sink_name:
+                 loop = asyncio.get_running_loop()
+                 await loop.run_in_executor(None, self.bt_manager.configure_bluetooth_audio)
+ 
+@@ -1696,6 +1856,13 @@ class SendspinClient:
+                 loop = asyncio.get_running_loop()
+                 bt_product_name, bt_manufacturer = await loop.run_in_executor(None, _read_bt_identity, bt_dbus_path)
+ 
++            output_sink = self.bluetooth_sink_name
++            if self.output_preparation_enabled:
++                from sendspin_bridge.services.audio.pulse import STANDBY_SINK_NAME, aensure_null_sink
++
++                if not await aensure_null_sink():
++                    raise IPCError("Prepared output requires a fallback sink")
++                output_sink = STANDBY_SINK_NAME
+             params = json.dumps(
+                 with_protocol_version(
+                     {
+@@ -1706,7 +1873,8 @@ class SendspinClient:
+                         "static_delay_ms": static_delay_ms,
+                         "required_lead_time_ms": self.required_lead_time_ms,
+                         "min_buffer_ms": self.min_buffer_ms,
+-                        "bluetooth_sink_name": self.bluetooth_sink_name,
++                        "bluetooth_sink_name": output_sink,
++                        "output_preparation_enabled": self.output_preparation_enabled,
+                         "bluetooth_device_path": bt_dbus_path,
+                         "volume": self.status.get("volume", 100),
+                         "muted": bool(self.status.get("muted", False)),
+@@ -1723,9 +1891,9 @@ class SendspinClient:
+             # CRITICAL: Audio routing — PULSE_SINK determines which BT speaker this
+             # subprocess sends audio to. Wrong value = audio to wrong speaker or silence.
+             env = os.environ.copy()
+-            if self.bluetooth_sink_name:
+-                env["PULSE_SINK"] = self.bluetooth_sink_name
+-                logger.info("[%s] Subprocess PULSE_SINK=%s", self.player_name, self.bluetooth_sink_name)
++            if output_sink:
++                env["PULSE_SINK"] = output_sink
++                logger.info("[%s] Subprocess PULSE_SINK=%s", self.player_name, output_sink)
+             # Unique application.name so PA module-stream-restore does not confuse
+             # streams across subprocesses (all share the same python3 binary name).
+             env["PULSE_PROP_application.name"] = f"sendspin-{self.player_id}"
+@@ -2549,6 +2717,11 @@ class SendspinClient:
+         # Start Sendspin player: immediately if no BT device, deferred if BT configured
+         if not self.bt_management_enabled:
+             logger.info("[%s] BT management disabled — skipping sendspin startup", self.player_name)
++        elif self.output_preparation_enabled:
++            self._update_status({"bt_standby": True, "bt_waking": False})
++            if self.bt_manager:
++                self.bt_manager.cancel_reconnect()
++            await self.start_sendspin()
+         elif not self.bt_manager:
+             # No BT device configured — start on default audio immediately
+             await self.start_sendspin()
+@@ -2570,7 +2743,7 @@ class SendspinClient:
+                 """Connect Bluetooth in background without blocking"""
+                 logger.info("Bluetooth async task started, waiting 2 seconds...")
+                 await asyncio.sleep(2)  # Let sendspin start first
+-                if not self.bt_management_enabled:
++                if not self.bt_management_enabled or self.output_preparation_enabled:
+                     return
+                 logger.info("Connecting Bluetooth speaker...")
+                 try:
+@@ -2655,6 +2828,8 @@ class SendspinClient:
+             logger.info("Client shutting down...")
+         finally:
+             # Cleanup
++            if self.output_preparation_enabled and self._output_epoch:
++                await self.release(self._output_epoch)
+             for task in tasks:
+                 task.cancel()
+             await self.stop_sendspin()
+diff --git a/src/sendspin_bridge/bridge/orchestrator.py b/src/sendspin_bridge/bridge/orchestrator.py
+index b5d35dbd4600010bc9abe77a9b92494142bd638e..c07895e5dfe7e57b92aa4cb67fe213c9e05a2854 100644
+--- a/src/sendspin_bridge/bridge/orchestrator.py
++++ b/src/sendspin_bridge/bridge/orchestrator.py
+@@ -25,6 +25,7 @@ from sendspin_bridge.config import (
+     detect_ha_addon_channel,
+     ensure_bridge_name,
+     load_config,
++    output_preparation_settings,
+     resolve_base_listen_port,
+     resolve_web_port,
+ )
+@@ -386,7 +387,13 @@ class BridgeOrchestrator:
+             sys.exit(1)
+ 
+         # PulseAudio runtime hardening — before any subprocess is spawned
+-        _harden_pulseaudio(disable_rescue_streams=bool(config.get("DISABLE_PA_RESCUE_STREAMS", False)))
++        if config.get("OUTPUT_PREPARATION_ENABLED", False) is True:
++            # Shared Pulse belongs to the host, not to this output lease.
++            from sendspin_bridge.services.audio.pulse import ensure_null_sink
++
++            ensure_null_sink()
++        else:
++            _harden_pulseaudio(disable_rescue_streams=bool(config.get("DISABLE_PA_RESCUE_STREAMS", False)))
+ 
+         # Per-adapter Class of Device override — Samsung Q-series workaround
+         # (bluez/bluez#1025).  Applied whenever an adapter entry has a
+@@ -631,6 +638,7 @@ class BridgeOrchestrator:
+             enable_adapter_auto_recovery=bootstrap.enable_adapter_auto_recovery,
+             bluetooth_adapters=getattr(bootstrap, "bluetooth_adapters", []),
+             enable_rssi_badge=bootstrap.enable_rssi_badge,
++            output_preparation_config=output_preparation_settings(bootstrap.config),
+             base_listen_port=base_listen_port,
+             client_factory=client_factory,
+             bt_manager_factory=bt_manager_factory,
+diff --git a/src/sendspin_bridge/bridge/output_preparation.py b/src/sendspin_bridge/bridge/output_preparation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f38a7d9317700eb5e4a004122e0bc3503070d98
+--- /dev/null
++++ b/src/sendspin_bridge/bridge/output_preparation.py
+@@ -0,0 +1,182 @@
++"""Cancellable ownership of configured physical outputs, independent of music."""
++
++from __future__ import annotations
++
++import asyncio
++import math
++import secrets
++import time
++from dataclasses import dataclass
++from typing import Protocol
++
++__all__ = ["OutputBinding", "OutputPreparation", "PhysicalOutput", "PreparationError"]
++
++
++@dataclass(frozen=True)
++class OutputBinding:
++    epoch: str
++    connected: bool
++    profile_ready: bool
++    sink_ready: bool
++    daemon_ready: bool
++    backend_bound: bool
++
++    @property
++    def ready(self) -> bool:
++        return all((self.connected, self.profile_ready, self.sink_ready, self.daemon_ready, self.backend_bound))
++
++
++class PhysicalOutput(Protocol):
++    async def prepare(self, epoch: str) -> OutputBinding: ...
++    async def release(self, epoch: str) -> None: ...
++    async def validate_binding(self, epoch: str) -> bool: ...
++
++
++class PreparationError(Exception):
++    def __init__(self, code: str):
++        super().__init__(code)
++        self.code = code
++
++
++@dataclass
++class _Lease:
++    lease_id: str
++    epoch: str
++    output: PhysicalOutput
++    result: asyncio.Future
++    deadline: float
++    task: asyncio.Task | None = None
++    revoked: str | None = None
++
++
++class OutputPreparation:
++    """One current intent per output; callers never own Bluetooth operation leases.
++
++    Cancellation records reserve space while an intent is live. At capacity,
++    fail closed rather than forgetting a recent cancellation. The configured
++    TTL is the replay-protection horizon; callers must never reuse lease IDs.
++    All methods run on the bridge's existing asyncio loop.
++    """
++
++    def __init__(self, outputs, *, timeout_seconds, tombstone_ttl_seconds, tombstone_limit, clock=time.monotonic):
++        self._outputs = outputs
++        self._timeout_seconds = timeout_seconds
++        self._tombstone_ttl = tombstone_ttl_seconds
++        self._tombstone_limit = tombstone_limit
++        self._clock = clock
++        self._leases: dict[str, _Lease] = {}
++        self._tombstones: dict[tuple[str, str], float] = {}
++        self._tasks: set[asyncio.Task] = set()
++
++    def _track(self, coroutine):
++        task = asyncio.create_task(coroutine)
++        self._tasks.add(task)
++
++        def finished(task):
++            self._tasks.discard(task)
++            if not task.cancelled():
++                task.exception()
++        task.add_done_callback(finished)
++        return task
++
++    def _prune(self):
++        now = self._clock()
++        self._tombstones = {key: expires for key, expires in self._tombstones.items() if expires > now}
++
++    def _remember(self, output_id, lease_id):
++        self._prune()
++        key = (output_id, lease_id)
++        if key not in self._tombstones and len(self._tombstones) >= self._tombstone_limit:
++            raise PreparationError("tombstone_capacity")
++        self._tombstones[key] = self._clock() + self._tombstone_ttl
++
++    def _revoke(self, lease, code):
++        lease.revoked = code
++        if not lease.result.done():
++            lease.result.set_exception(PreparationError(code))
++        if lease.task is not None:
++            lease.task.cancel()
++
++    async def prepare(self, output_id: str, lease_id: str, timeout_seconds: float) -> dict:
++        if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
++            raise PreparationError("invalid_request")
++        if output_id not in self._outputs:
++            raise PreparationError("unknown_output")
++        self._prune()
++        if (output_id, lease_id) in self._tombstones:
++            raise PreparationError("cancelled")
++        lease = self._leases.get(output_id)
++        if lease is None or lease.lease_id != lease_id:
++            if len(self._tombstones) + len(self._leases) >= self._tombstone_limit:
++                raise PreparationError("tombstone_capacity")
++            if lease is not None:
++                self._remember(output_id, lease.lease_id)
++                self._revoke(lease, "superseded")
++            result = asyncio.get_running_loop().create_future()
++            result.add_done_callback(lambda done: None if done.cancelled() else done.exception())
++            lease = _Lease(
++                lease_id,
++                secrets.token_urlsafe(24),
++                self._outputs[output_id],
++                result,
++                self._clock() + min(timeout_seconds, self._timeout_seconds),
++            )
++            self._leases[output_id] = lease
++            lease.task = self._track(self._prepare(output_id, lease))
++        try:
++            if lease.result.done() and lease.result.exception() is None:
++                try:
++                    valid = await asyncio.wait_for(lease.output.validate_binding(lease.epoch), self._timeout_seconds)
++                except Exception:
++                    valid = False
++                if not valid or self._leases.get(output_id) is not lease:
++                    await self.release(output_id, lease_id, "output_unavailable")
++                    raise PreparationError("output_unavailable")
++            done, _ = await asyncio.wait({lease.result}, timeout=max(0, lease.deadline - self._clock()))
++            if not done:
++                await self.release(output_id, lease_id, "timeout")
++                raise PreparationError("timeout")
++            if lease.revoked or self._leases.get(output_id) is not lease:
++                raise PreparationError(lease.revoked or "superseded")
++            return dict(lease.result.result())
++        except asyncio.CancelledError:
++            await self.release(output_id, lease_id, "cancelled")
++            raise
++
++    async def _prepare(self, output_id, lease):
++        try:
++            binding = await lease.output.prepare(lease.epoch)
++            if lease.revoked or self._leases.get(output_id) is not lease:
++                return
++            if binding.epoch != lease.epoch or not binding.ready:
++                raise PreparationError("output_unavailable")
++            lease.result.set_result(
++                {"status": "ready", "output_id": output_id, "lease_id": lease.lease_id, "output_epoch": lease.epoch}
++            )
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            if self._leases.get(output_id) is lease:
++                code = exc.code if isinstance(exc, PreparationError) else "output_unavailable"
++                await self.release(output_id, lease.lease_id, code)
++
++    async def _cleanup(self, output_id, lease):
++        if output_id not in self._leases:
++            await lease.output.release(lease.epoch)
++
++    async def release(self, output_id: str, lease_id: str, reason: str) -> dict:
++        if output_id not in self._outputs and output_id not in self._leases:
++            raise PreparationError("unknown_output")
++        self._prune()
++        lease = self._leases.get(output_id)
++        current = lease is not None and lease.lease_id == lease_id
++        if not current and (output_id, lease_id) not in self._tombstones:
++            if len(self._tombstones) + len(self._leases) >= self._tombstone_limit:
++                raise PreparationError("tombstone_capacity")
++        self._remember(output_id, lease_id)
++        if current:
++            self._leases.pop(output_id)
++            code = reason if reason in ("timeout", "output_unavailable") else "cancelled"
++            self._revoke(lease, code)
++            self._track(self._cleanup(output_id, lease))
++        return {"status": "released", "output_id": output_id, "lease_id": lease_id}
+diff --git a/src/sendspin_bridge/config/__init__.py b/src/sendspin_bridge/config/__init__.py
+index a7fb34942d60db82775ccc4e99af79ba69262aea..401242defd3122c412e4fc0713bf3d4db5bf1371 100644
+--- a/src/sendspin_bridge/config/__init__.py
++++ b/src/sendspin_bridge/config/__init__.py
+@@ -80,6 +80,7 @@ __all__ = [
+     "load_config",
+     "migrate_config_payload",
+     "normalize_update_channel",
++    "output_preparation_settings",
+     "resolve_additional_web_port",
+     "resolve_base_listen_port",
+     "resolve_device_room_context",
+@@ -121,6 +122,13 @@ DEFAULT_CONFIG = {
+     "BT_MAX_RECONNECT_FAILS": 5,
+     "BT_CHURN_THRESHOLD": 0,
+     "BT_CHURN_WINDOW": 300.0,
++    "OUTPUT_PREPARATION_ENABLED": False,
++    "OUTPUT_PREPARATION_TOKEN": "",
++    "OUTPUT_PREPARATION_TIMEOUT_SECONDS": 15.0,
++    "OUTPUT_PREPARATION_PAUSE_GRACE_SECONDS": 120.0,
++    "OUTPUT_PREPARATION_TOMBSTONE_TTL_SECONDS": 300.0,
++    "OUTPUT_PREPARATION_TOMBSTONE_LIMIT": 1024,
++    "OUTPUT_PREPARATION_POLL_SECONDS": 0.1,
+     "AUTH_ENABLED": False,
+     "SESSION_TIMEOUT_HOURS": 24,
+     "BRUTE_FORCE_PROTECTION": True,
+@@ -194,6 +202,16 @@ DEFAULT_CONFIG = {
+     "AUTH_TOKENS": [],
+ }
+ 
++
++def output_preparation_settings(config: dict) -> dict:
++    """Physical lifecycle settings only; never forward management credentials."""
++    return {
++        key: config.get(key, value)
++        for key, value in DEFAULT_CONFIG.items()
++        if key.startswith("OUTPUT_PREPARATION_") and key != "OUTPUT_PREPARATION_TOKEN"
++    }
++
++
+ logger = logging.getLogger(__name__)
+ 
+ CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
+@@ -205,6 +223,7 @@ CONFIG_ALLOWED_KEYS = frozenset(DEFAULT_CONFIG)
+ RUNTIME_STATE_CONFIG_KEYS = frozenset(("LAST_VOLUMES", "LAST_SINKS"))
+ SENSITIVE_CONFIG_KEYS = frozenset(
+     (
++        "OUTPUT_PREPARATION_TOKEN",
+         "AUTH_PASSWORD_HASH",
+         "SECRET_KEY",
+         "MA_API_TOKEN",
+diff --git a/src/sendspin_bridge/config/schema.json b/src/sendspin_bridge/config/schema.json
+index dd2956adb38e0d6390dc94a371916833d795432c..d41ae967482a953bae67e3205b8359f82cacf726 100644
+--- a/src/sendspin_bridge/config/schema.json
++++ b/src/sendspin_bridge/config/schema.json
+@@ -5,6 +5,13 @@
+   "description": "Machine-readable schema for /config/config.json used by the Sendspin BT Bridge.",
+   "type": "object",
+   "properties": {
++    "OUTPUT_PREPARATION_ENABLED": {"type": "boolean", "default": false},
++    "OUTPUT_PREPARATION_TOKEN": {"type": "string", "default": "", "writeOnly": true},
++    "OUTPUT_PREPARATION_TIMEOUT_SECONDS": {"type": "number", "default": 15, "exclusiveMinimum": 0, "maximum": 120},
++    "OUTPUT_PREPARATION_PAUSE_GRACE_SECONDS": {"type": "number", "default": 120, "minimum": 0, "maximum": 86400},
++    "OUTPUT_PREPARATION_TOMBSTONE_TTL_SECONDS": {"type": "number", "default": 300, "exclusiveMinimum": 0, "maximum": 86400},
++    "OUTPUT_PREPARATION_TOMBSTONE_LIMIT": {"type": "integer", "default": 1024, "minimum": 1, "maximum": 100000},
++    "OUTPUT_PREPARATION_POLL_SECONDS": {"type": "number", "default": 0.1, "exclusiveMinimum": 0, "maximum": 5},
+     "CONFIG_SCHEMA_VERSION": {
+       "type": "integer",
+       "const": 5,
+diff --git a/src/sendspin_bridge/services/audio/pa_volume_controller.py b/src/sendspin_bridge/services/audio/pa_volume_controller.py
+index c1724101f02160bac3640612e111208d0944cf9c..2f12ada9afa2c0fd817d7e53e1c42b0df70ee071 100644
+--- a/src/sendspin_bridge/services/audio/pa_volume_controller.py
++++ b/src/sendspin_bridge/services/audio/pa_volume_controller.py
+@@ -69,6 +69,11 @@ class PulseVolumeController:
+         """
+         self._external_change_tap = tap
+ 
++    async def bind_sink(self, sink_name: str) -> None:
++        """Follow this daemon's current prepared output, preserving volume."""
++        self._sink_name = sink_name
++        await self.set_state(self._volume, muted=self._muted)
++
+     async def set_state(self, volume: int, *, muted: bool) -> None:
+         """Apply volume and mute state to the PA sink."""
+         vol = max(0, min(100, volume))
+diff --git a/src/sendspin_bridge/services/audio/pulse.py b/src/sendspin_bridge/services/audio/pulse.py
+index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..fdb5d650bcd3557d2d4a7d8faa4f2586959b403f 100644
+--- a/src/sendspin_bridge/services/audio/pulse.py
++++ b/src/sendspin_bridge/services/audio/pulse.py
+@@ -30,6 +30,7 @@ STANDBY_SINK_NAME = "sendspin_fallback"
+ __all__ = [
+     "STANDBY_SINK_NAME",
+     "_PULSECTL_AVAILABLE",
++    "acan_disconnect_output",
+     "acycle_card_profile",
+     "aensure_null_sink",
+     "alist_cards",
+@@ -37,6 +38,7 @@ __all__ = [
+     "areload_bluez5_discover_module",
+     "aset_card_profile",
+     "asuspend_sink",
++    "averify_output_binding",
+     "cycle_card_profile",
+     "ensure_null_sink",
+     "get_server_name",
+@@ -109,6 +111,58 @@ async def aread_sink_state(pulse, sink_name: str) -> tuple[int | None, bool | No
+ # ---------------------------------------------------------------------------
+ 
+ 
++def _owns_sink_input(stream, pid: int, application_name: str | None) -> bool:
++    properties = getattr(stream, "proplist", {}) or {}
++    return (str(properties.get("application.process.id", "")) == str(pid)
++            and (application_name is None or properties.get("application.name") == application_name))
++
++
++async def averify_output_binding(pid: int, sink_name: str, application_name: str) -> tuple[bool, bool, bool]:
++    """Fresh profile/sink/PID binding evidence, never a cached routing boolean.
++
++    No backend stream means no binding evidence. This deliberately fails closed
++    before the SDK opens its output; backend warmup is a separate capability.
++    """
++    if not _PULSECTL_AVAILABLE or not application_name:
++        return False, False, False
++    try:
++        async with asyncio.timeout(_TIMEOUT):
++            async with pulsectl_asyncio.PulseAsync(_CLIENT_NAME) as pulse:
++                sink = await _aget_sink(pulse, sink_name)
++                if sink is None:
++                    return False, False, False
++                cards = await pulse.card_list()
++                card = next((card for card in cards if card.index == sink.card), None)
++                profile = getattr(getattr(card, "profile_active", None), "name", "")
++                inputs = [stream for stream in await pulse.sink_input_list()
++                          if _owns_sink_input(stream, pid, application_name)]
++                bound = bool(inputs) and all(stream.sink == sink.index for stream in inputs)
++                return "a2dp" in profile.lower(), True, bound
++    except Exception:
++        return False, False, False
++
++
++async def acan_disconnect_output(pid: int | None, sink_name: str, application_name: str) -> bool:
++    """Allow disconnect only after observing no other application on this sink.
++
++    Missing identity, sink, or PulseAudio evidence leaves the link alone. This
++    observes local backend streams, not a speaker's connections to other hosts.
++    """
++    if not _PULSECTL_AVAILABLE or pid is None or not sink_name or not application_name:
++        return False
++    try:
++        async with asyncio.timeout(_TIMEOUT):
++            async with pulsectl_asyncio.PulseAsync(_CLIENT_NAME) as pulse:
++                sink = await _aget_sink(pulse, sink_name)
++                if sink is None:
++                    return False
++                inputs = await pulse.sink_input_list()
++                return all(_owns_sink_input(stream, pid, application_name)
++                           for stream in inputs if stream.sink == sink.index)
++    except Exception:
++        return False
++
++
+ async def alist_sinks() -> list[dict]:
+     """Return all PA sinks as dicts with name, description, volume (0-100), muted."""
+     if not _PULSECTL_AVAILABLE:
+@@ -284,7 +338,7 @@ async def amove_sink_input(sink_input_idx: int, sink_name: str) -> bool:
+         return _fallback_move_sink_input(sink_input_idx, sink_name)
+ 
+ 
+-async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
++async def amove_pid_sink_inputs(pid: int, sink_name: str, *, application_name: str | None = None) -> int:
+     """Normalize and move all sink-inputs belonging to *pid* to *sink_name*.
+ 
+     Returns the number of sink-inputs moved (0 means nothing to do or nothing found).
+@@ -297,8 +351,10 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
+     PID matching is essential: other applications sharing the Bluetooth sink retain
+     their independent stream volumes.
+     """
++    if application_name == "":
++        return 0
+     if not _PULSECTL_AVAILABLE:
+-        return _fallback_move_pid_sink_inputs(pid, sink_name)
++        return 0 if application_name is not None else _fallback_move_pid_sink_inputs(pid, sink_name)
+     try:
+         async with asyncio.timeout(_TIMEOUT):
+             async with pulsectl_asyncio.PulseAsync(_CLIENT_NAME) as pulse:
+@@ -310,8 +366,7 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
+                     return 0
+                 moved = 0
+                 for si in inputs:
+-                    props = getattr(si, "proplist", {}) or {}
+-                    if str(props.get("application.process.id", "")) == str(pid):
++                    if _owns_sink_input(si, pid, application_name):
+                         try:
+                             await pulse.volume_set_all_chans(si, 1.0)
+                             logger.debug("Normalized sink-input %d (pid=%d) volume to 100%%", si.index, pid)
+@@ -325,8 +380,8 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
+                             moved += 1
+                 return moved
+     except Exception as exc:
+-        logger.debug("amove_pid_sink_inputs(%d, %s) error: %s — falling back", pid, sink_name, exc)
+-        return _fallback_move_pid_sink_inputs(pid, sink_name)
++        logger.debug("amove_pid_sink_inputs(%d, %s) error: %s", pid, sink_name, exc)
++        return 0 if application_name is not None else _fallback_move_pid_sink_inputs(pid, sink_name)
+ 
+ 
+ async def alist_cards() -> list[dict]:
+diff --git a/src/sendspin_bridge/services/bluetooth/device_activation.py b/src/sendspin_bridge/services/bluetooth/device_activation.py
+index 1a34435001658bb14d3e490c16a20783ba5e2d3f..9528fb0f9bd8e3a4b4cd06dfdce9c4dae5fd58e8 100644
+--- a/src/sendspin_bridge/services/bluetooth/device_activation.py
++++ b/src/sendspin_bridge/services/bluetooth/device_activation.py
+@@ -417,6 +417,7 @@ class DeviceActivationContext:
+     # round-trip is never issued.  Default False so existing tests and
+     # any other callers that don't pass the flag stay quiet on RSSI.
+     enable_rssi_badge: bool = False
++    output_preparation_config: dict[str, Any] = field(default_factory=dict)
+     # ``BLUETOOTH_ADAPTERS`` config — used to look up per-adapter
+     # ``device_class`` for the BluetoothManager pre-pair hook. The hook
+     # fires a raw HCI Write_Class_Of_Device just before each outbound
+@@ -496,6 +497,7 @@ def activate_device(
+             "keep_alive_method": keep_alive_method,
+             "required_lead_time_ms": required_lead_time_ms,
+             "min_buffer_ms": min_buffer_ms,
++            "output_preparation_config": context.output_preparation_config,
+             "static_delay_source": str(device.get("static_delay_source") or "default"),
+             "static_delay_calibrated_at": device.get("static_delay_calibrated_at"),
+             "static_delay_codec": device.get("static_delay_codec"),
+diff --git a/src/sendspin_bridge/services/ipc/commands.py b/src/sendspin_bridge/services/ipc/commands.py
+index d3084baf7cc516919ddf9689a89dfd054fd52045..169d32fdc88080a6afd04824f35ef7055cc88e3d 100644
+--- a/src/sendspin_bridge/services/ipc/commands.py
++++ b/src/sendspin_bridge/services/ipc/commands.py
+@@ -23,6 +23,7 @@ from typing import Any
+ from sendspin_bridge.services.ipc.ipc_protocol import build_command_envelope
+ 
+ __all__ = [
++    "BindOutput",
+     "Command",
+     "CommandError",
+     "InvalidCommand",
+@@ -123,6 +124,12 @@ class Transport:
+     value: Any = None
+ 
+ 
++@dataclass(frozen=True)
++class BindOutput:
++    epoch: str
++    sink: str
++
++
+ @dataclass(frozen=True)
+ class SetStandby:
+     #: The sink to redirect to; ``None`` restores the device's own sink.
+@@ -142,6 +149,7 @@ Command = (
+     | SetMinBufferMs
+     | Transport
+     | SetStandby
++    | BindOutput
+ )
+ 
+ 
+@@ -200,6 +208,10 @@ def decode_command(message: Any) -> Command:
+         if not action:
+             raise InvalidCommand("transport requires 'action'")
+         return Transport(action=action, value=message.get("value"))
++    if name == "bind_output":
++        if any(not isinstance(message.get(key), str) or not message[key] for key in ("epoch", "sink")):
++            raise InvalidCommand("bind_output requires epoch and sink")
++        return BindOutput(epoch=message["epoch"], sink=message["sink"])
+     if name == "set_standby":
+         sink = message.get("sink")
+         return SetStandby(sink=str(sink) if sink else None)
+@@ -231,6 +243,8 @@ def encode_command(command: Command) -> dict:
+         return build_command_envelope("set_min_buffer_ms", value=command.value)
+     if isinstance(command, Transport):
+         return build_command_envelope("transport", action=command.action, value=command.value)
++    if isinstance(command, BindOutput):
++        return build_command_envelope("bind_output", epoch=command.epoch, sink=command.sink)
+     if isinstance(command, SetStandby):
+         return build_command_envelope("set_standby", sink=command.sink)
+ 
+diff --git a/src/sendspin_bridge/services/ipc/daemon_process.py b/src/sendspin_bridge/services/ipc/daemon_process.py
+index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0feb486871 100644
+--- a/src/sendspin_bridge/services/ipc/daemon_process.py
++++ b/src/sendspin_bridge/services/ipc/daemon_process.py
+@@ -448,7 +448,8 @@ async def _timing_telemetry_watcher(
+ 
+ 
+ async def _startup_sink_routing_watcher(
+-    status: StatusStore | dict, sink_name: str, stop_event: asyncio.Event, player_name: str
++    status: StatusStore | dict, sink_name: str, stop_event: asyncio.Event, player_name: str,
++    *, prepared_output: bool = False,
+ ) -> None:
+     """Correct PA sink routing whenever this daemon starts an audio stream.
+ 
+@@ -470,15 +471,29 @@ async def _startup_sink_routing_watcher(
+         is_streaming = bool(status.get("audio_streaming"))
+         if is_streaming and not was_streaming:
+             try:
+-                moved = await amove_pid_sink_inputs(os.getpid(), sink_name)
++                target = os.environ.get("PULSE_SINK", sink_name) if prepared_output else sink_name
++                moved = await amove_pid_sink_inputs(
++                    os.getpid(), target,
++                    application_name=os.environ.get("PULSE_PROP_application.name", "" if prepared_output else None),
++                )
+                 if moved:
+-                    _logger.info("[%s] Corrected %d sink-input(s) → %s", player_name, moved, sink_name)
++                    _logger.info("[%s] Corrected %d sink-input(s) → %s", player_name, moved, target)
+             except Exception as exc:
+                 _logger.debug("[%s] Sink routing correction failed: %s", player_name, exc)
+         was_streaming = is_streaming
+ 
+ 
+-async def _read_commands(daemon_ref: list, stop_event: asyncio.Event, *, bt_sink_name: str | None = None) -> None:
++async def _set_daemon_output(daemon, sink: str) -> None:
++    """Keep this daemon's stream target and existing volume controller together."""
++    os.environ["PULSE_SINK"] = sink
++    controller = getattr(getattr(daemon, "_args", None), "volume_controller", None)
++    if controller is not None:
++        await controller.bind_sink(sink)
++
++
++async def _read_commands(
++    daemon_ref: list, stop_event: asyncio.Event, *, bt_sink_name: str | None = None, prepared_output: bool = False
++) -> None:
+     """Read JSON commands from stdin and dispatch them."""
+     loop = asyncio.get_running_loop()
+     reader = asyncio.StreamReader()
+@@ -689,14 +704,35 @@ async def _read_commands(daemon_ref: list, stop_event: asyncio.Event, *, bt_sink
+             _background_tasks.add(_task)
+             _task.add_done_callback(_background_tasks.discard)
+             _task.add_done_callback(lambda t, _a=action: _log_background_task_result(t, f"transport {_a}"))
++        elif cmd.cmd == "bind_output":
++            daemon = daemon_ref[0] if daemon_ref else None
++            if daemon is None:
++                continue
++            from sendspin_bridge.services.audio.pulse import amove_pid_sink_inputs, averify_output_binding
++
++            sink = cmd.payload["sink"]
++            await _set_daemon_output(daemon, sink)
++            application_name = os.environ.get("PULSE_PROP_application.name", "")
++            await amove_pid_sink_inputs(os.getpid(), sink, application_name=application_name)
++            profile, present, bound = await averify_output_binding(os.getpid(), sink, application_name)
++            _patch_status(daemon._bridge_status, {"output_binding_epoch": cmd.payload["epoch"],
++                                                 "output_binding_sink": sink,
++                                                 "output_binding_pid": os.getpid(),
++                                                 "output_binding_ready": profile and present and bound})
++            daemon._notify()
+         elif cmd.cmd == "set_standby":
++            daemon = daemon_ref[0] if daemon_ref else None
++            if daemon is not None:
++                _patch_status(daemon._bridge_status, {"output_binding_epoch": None, "output_binding_ready": False})
++                daemon._notify()
+             sink = cmd.payload.get("sink")
+-            if sink:
+-                os.environ["PULSE_SINK"] = sink
+-                logger.info("PULSE_SINK redirected to %s (standby)", sink)
+-            elif "PULSE_SINK" in os.environ and bt_sink_name:
+-                os.environ["PULSE_SINK"] = bt_sink_name
+-                logger.info("PULSE_SINK restored to %s (wake)", bt_sink_name)
++            if sink or ("PULSE_SINK" in os.environ and bt_sink_name):
++                target = sink or bt_sink_name
++                if prepared_output:
++                    await _set_daemon_output(daemon, target)
++                else:
++                    os.environ["PULSE_SINK"] = target
++                logger.info("PULSE_SINK %s to %s", "redirected" if sink else "restored", target)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -916,7 +952,10 @@ async def _run(params: dict) -> None:
+ 
+         pa_volume_controller.set_external_change_tap(_mirror_external_volume_to_bridge)
+ 
+-    cmd_task = asyncio.create_task(_read_commands(daemon_ref, stop_event, bt_sink_name=bluetooth_sink_name))
++    prepared_output = params.get("output_preparation_enabled") is True
++    cmd_task = asyncio.create_task(_read_commands(
++        daemon_ref, stop_event, bt_sink_name=bluetooth_sink_name, prepared_output=prepared_output
++    ))
+     daemon_task = asyncio.create_task(daemon.run())
+     watcher_task = asyncio.create_task(_reanchor_watcher(status, _on_status_change, stop_event))
+     timing_task = asyncio.create_task(_timing_telemetry_watcher(daemon, status, _on_status_change, stop_event))
+@@ -926,7 +965,9 @@ async def _run(params: dict) -> None:
+     routing_task = None
+     if bluetooth_sink_name:
+         routing_task = asyncio.create_task(
+-            _startup_sink_routing_watcher(status, bluetooth_sink_name, stop_event, player_name)
++            _startup_sink_routing_watcher(
++                status, bluetooth_sink_name, stop_event, player_name, prepared_output=prepared_output
++            )
+         )
+ 
+     # Wait until stdin closes, a stop command arrives, or the daemon exits.
+diff --git a/src/sendspin_bridge/web/interface.py b/src/sendspin_bridge/web/interface.py
+index 0e3cf62f7e0eb2806caa972ac034c7e39a60c364..c2579d4cea98ffe8ad0b684fcdebecd4bfbc5572 100644
+--- a/src/sendspin_bridge/web/interface.py
++++ b/src/sendspin_bridge/web/interface.py
+@@ -28,6 +28,7 @@ from sendspin_bridge.config import (
+     resolve_web_port,
+ )
+ from sendspin_bridge.config.logging_setup import apply_log_level
++from sendspin_bridge.services.lifecycle.bridge_runtime_state import get_main_loop
+ from sendspin_bridge.web.request_identity import current_trust_policy, trust_policy_for_environ
+ 
+ # Configure logging
+@@ -124,6 +125,7 @@ from sendspin_bridge.web.routes.api_ha import ha_bp  # noqa: E402
+ from sendspin_bridge.web.routes.api_ma import ma_bp  # noqa: E402
+ from sendspin_bridge.web.routes.api_status import status_bp  # noqa: E402
+ from sendspin_bridge.web.routes.api_transport import transport_bp  # noqa: E402
++from sendspin_bridge.web.routes.api_output import create_output_blueprint  # noqa: E402
+ from sendspin_bridge.web.routes.auth import auth_bp  # noqa: E402
+ from sendspin_bridge.web.routes.views import views_bp  # noqa: E402
+ 
+@@ -134,6 +136,17 @@ app.register_blueprint(config_bp)
+ app.register_blueprint(ma_bp)
+ app.register_blueprint(status_bp)
+ app.register_blueprint(transport_bp)
++
++
++def _configured_outputs():
++    from sendspin_bridge.services.bluetooth.device_registry import get_device_registry_snapshot
++
++    return {client.player_id: client for client in get_device_registry_snapshot().active_clients
++            if getattr(client, "output_preparation_enabled", False) and client.bt_management_enabled}
++
++
++app.register_blueprint(create_output_blueprint(config_provider=load_config, outputs_provider=_configured_outputs,
++                                             loop_provider=get_main_loop))
+ app.register_blueprint(auth_bp)
+ app.register_blueprint(ha_bp)
+ 
+@@ -363,6 +376,10 @@ def _resolve_ingress_user() -> str:
+ @app.before_request
+ def _check_auth():
+     """Enforce authentication when AUTH_ENABLED is True."""
++    if request.blueprint == "output_preparation":
++        # This blueprint always checks its explicit machine token, including
++        # when UI auth is off or ingress considers the peer trusted.
++        return
+     session.permanent = True  # use configured PERMANENT_SESSION_LIFETIME
+     if not _auth_enabled:
+         return  # auth disabled — allow all
+diff --git a/src/sendspin_bridge/web/routes/api_config.py b/src/sendspin_bridge/web/routes/api_config.py
+index 54979092dc9ea67e71e19ca350782ed139617bdc..f7368585b8d5eeae65203a0282c4f7f213ac6b66 100644
+--- a/src/sendspin_bridge/web/routes/api_config.py
++++ b/src/sendspin_bridge/web/routes/api_config.py
+@@ -124,14 +124,8 @@ def _submit_loop_coroutine(loop, coro, *, description: str) -> bool:
+     return True
+ 
+ 
+-_DOWNLOAD_REDACTED_KEYS = (
+-    "AUTH_PASSWORD_HASH",
+-    "SECRET_KEY",
+-    "MA_API_TOKEN",
+-    "MA_ACCESS_TOKEN",
+-    "MA_REFRESH_TOKEN",
+-    "MA_TOKEN_INSTANCE_HOSTNAME",
+-    "MA_TOKEN_LABEL",
++_DOWNLOAD_REDACTED_KEYS = tuple(
++    sorted((SENSITIVE_CONFIG_KEYS - {"HA_INTEGRATION"}) | {"MA_TOKEN_INSTANCE_HOSTNAME", "MA_TOKEN_LABEL"})
+ )
+ _HA_ADDON_BASE_SLUG = "sendspin_bt_bridge"
+ 
+@@ -195,10 +189,8 @@ def _build_config_get_response():
+ 
+     # Never expose secrets to the browser — but indicate whether password is set
+     has_password = bool(config.get("AUTH_PASSWORD_HASH"))
+-    config.pop("AUTH_PASSWORD_HASH", None)
+-    config.pop("SECRET_KEY", None)
+-    config.pop("MA_ACCESS_TOKEN", None)
+-    config.pop("MA_REFRESH_TOKEN", None)
++    for key in SENSITIVE_CONFIG_KEYS - {"HA_INTEGRATION", "MA_API_TOKEN"}:
++        config.pop(key, None)
+     config.pop("MA_TOKEN_INSTANCE_HOSTNAME", None)
+     config.pop("MA_TOKEN_LABEL", None)
+     # HA_INTEGRATION carries an MQTT password — surface its presence
+diff --git a/src/sendspin_bridge/web/routes/api_output.py b/src/sendspin_bridge/web/routes/api_output.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c6ab9ddfe3e0be15aa5add5753c680b5fcf9ae1
+--- /dev/null
++++ b/src/sendspin_bridge/web/routes/api_output.py
+@@ -0,0 +1,94 @@
++"""Opt-in machine-only output preparation; independent of web/ingress login."""
++
++import asyncio
++import concurrent.futures
++import hmac
++import math
++
++from flask import Blueprint, jsonify, request
++
++from sendspin_bridge.bridge.output_preparation import OutputPreparation, PreparationError
++from sendspin_bridge.config import DEFAULT_CONFIG
++
++ERROR_STATUS = {
++    "invalid_request": 400,
++    "unknown_output": 404,
++    "cancelled": 409,
++    "superseded": 409,
++    "timeout": 504,
++    "output_unavailable": 503,
++    "tombstone_capacity": 503,
++}
++RELEASE_REASONS = frozenset(
++    {"stop", "pause", "idle", "ended", "cancelled", "timeout", "superseded", "disconnect", "shutdown", "error", "failed"}
++)
++
++
++def create_output_blueprint(*, config_provider, outputs_provider, loop_provider):
++    blueprint = Blueprint("output_preparation", __name__)
++    outputs = {}
++    preparation = None
++
++    @blueprint.before_request
++    def authenticate():
++        config = config_provider()
++        token = config.get("OUTPUT_PREPARATION_TOKEN", "")
++        if config.get("OUTPUT_PREPARATION_ENABLED", False) is not True or not isinstance(token, str) or not token:
++            return jsonify(status="error", error="disabled"), 404
++        supplied = request.headers.get("X-Output-Preparation-Token", "")
++        if not hmac.compare_digest(supplied.encode(), token.encode()):
++            return jsonify(status="error", error="unauthorized"), 401
++
++    async def dispatch(data, releasing, config):
++        nonlocal preparation
++        if preparation is None:
++            preparation = OutputPreparation(
++                outputs,
++                timeout_seconds=config["OUTPUT_PREPARATION_TIMEOUT_SECONDS"],
++                tombstone_ttl_seconds=config["OUTPUT_PREPARATION_TOMBSTONE_TTL_SECONDS"],
++                tombstone_limit=config["OUTPUT_PREPARATION_TOMBSTONE_LIMIT"],
++            )
++        outputs.clear()
++        outputs.update(outputs_provider())
++        if releasing:
++            return await preparation.release(data["output_id"], data["lease_id"], data["reason"])
++        return await preparation.prepare(data["output_id"], data["lease_id"], data["timeout_seconds"])
++
++    @blueprint.post("/api/output/prepare")
++    @blueprint.post("/api/output/release")
++    def output_request():
++        data = request.get_json(silent=True)
++        config = {**DEFAULT_CONFIG, **config_provider()}
++        releasing = request.path.endswith("/release")
++        if not isinstance(data, dict):
++            return jsonify(status="error", error="invalid_request"), 400
++        if any(not isinstance(data.get(key), str) or not 0 < len(data[key]) <= 128 for key in ("output_id", "lease_id")):
++            return jsonify(status="error", error="invalid_request"), 400
++        timeout = data.get("timeout_seconds")
++        if not releasing and (
++            type(timeout) not in (int, float)
++            or not math.isfinite(timeout)
++            or not 0 < timeout <= config["OUTPUT_PREPARATION_TIMEOUT_SECONDS"]
++        ):
++            return jsonify(status="error", error="invalid_request"), 400
++        if releasing and (not isinstance(data.get("reason"), str) or data["reason"] not in RELEASE_REASONS):
++            return jsonify(status="error", error="invalid_request"), 400
++        loop = loop_provider()
++        if loop is None or not loop.is_running():
++            return jsonify(status="error", error="output_unavailable"), 503
++        future = asyncio.run_coroutine_threadsafe(dispatch(data, releasing, config), loop)
++        try:
++            result = future.result(
++                timeout=config["OUTPUT_PREPARATION_TIMEOUT_SECONDS"] + config["OUTPUT_PREPARATION_POLL_SECONDS"]
++            )
++            return jsonify(result)
++        except PreparationError as exc:
++            return jsonify(status="error", error=exc.code), ERROR_STATUS.get(exc.code, 503)
++        except concurrent.futures.TimeoutError:
++            future.cancel()
++            return jsonify(status="error", error="timeout"), 504
++        except Exception:
++            future.cancel()
++            return jsonify(status="error", error="output_unavailable"), 503
++
++    return blueprint
+diff --git a/tests/test_output_preparation.py b/tests/test_output_preparation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d497af6906
+--- /dev/null
++++ b/tests/test_output_preparation.py
+@@ -0,0 +1,419 @@
++"""Output-use contracts at the public Prepare/Release seam."""
++
++import asyncio
++import json
++import unittest
++from contextlib import asynccontextmanager
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from sendspin_bridge.bridge.output_preparation import OutputBinding, OutputPreparation, PreparationError
++
++
++class PhysicalOutput:
++    def __init__(self):
++        self.prepares = []
++        self.releases = []
++        self.ready = asyncio.Event()
++        self.ready.set()
++
++    async def prepare(self, epoch):
++        self.prepares.append(epoch)
++        await self.ready.wait()
++        return OutputBinding(epoch, True, True, True, True, True)
++
++    async def release(self, epoch):
++        self.releases.append(epoch)
++
++    async def validate_binding(self, epoch):
++        return True
++
++
++class PulseOutput:
++    def __init__(self):
++        self.sink = SimpleNamespace(name="configured-sink", index=6, card=2)
++        self.standby = SimpleNamespace(name="sendspin_fallback", index=0, card=None)
++        self.card = SimpleNamespace(index=2, profile_active=SimpleNamespace(name="a2dp_sink"))
++        self.owned = SimpleNamespace(index=17, sink=0, proplist={"application.process.id": "314",
++                                                              "application.name": "sendspin-owned-player"})
++        self.unrelated = SimpleNamespace(index=18, sink=0, proplist={"application.process.id": "314",
++                                                                  "application.name": "unrelated-host-player"})
++        self.streams = [self.owned, self.unrelated]
++        self.moves = []
++        self.volumes = []
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, *args):
++        return False
++
++    async def sink_list(self):
++        return [self.sink, self.standby]
++
++    async def card_list(self):
++        return [self.card]
++
++    async def sink_input_list(self):
++        return self.streams
++
++    async def volume_set_all_chans(self, stream, value):
++        self.volumes.append(stream.index)
++
++    async def sink_input_move(self, stream, sink):
++        self.moves.append(stream.index)
++        stream.sink = sink.index
++
++    async def sink_mute(self, index, muted):
++        pass
++
++
++class DaemonProcess:
++    """External subprocess port: commands in, binding observations out."""
++
++    def __init__(self, pulse):
++        self.pid = 314
++        self.returncode = None
++        self.stdout = asyncio.StreamReader()
++        self.stderr = asyncio.StreamReader()
++        self.stdin = self
++        self.pulse = pulse
++        self.commands = []
++
++    def write(self, data):
++        from sendspin_bridge.services.ipc.ipc_protocol import build_status_envelope
++        command = json.loads(data)
++        self.commands.append(command)
++        if command["cmd"] == "bind_output":
++            self.pulse.owned.sink = self.pulse.sink.index
++            status = build_status_envelope({"output_binding_epoch": command["epoch"],
++                                            "output_binding_pid": self.pid,
++                                            "output_binding_sink": command["sink"],
++                                            "output_binding_ready": True})
++            self.stdout.feed_data((json.dumps(status) + "\n").encode())
++        elif command["cmd"] == "stop":
++            self.returncode = 0
++            self.stdout.feed_eof()
++            self.stderr.feed_eof()
++
++    async def drain(self):
++        pass
++
++    async def wait(self):
++        return self.returncode
++
++
++@asynccontextmanager
++async def physical_client():
++    from sendspin_bridge.bluetooth.adapter_session import LinkState
++    from sendspin_bridge.bridge.client import SendspinClient
++    from sendspin_bridge.services.audio import pulse
++
++    external = PulseOutput()
++    process = DaemonProcess(external)
++    operation = SimpleNamespace(release=lambda: None)
++    manager = SimpleNamespace(mac_address="AA:BB:CC:DD:EE:FF", check_bluetooth_available=lambda: True,
++                              adapter_handle=SimpleNamespace(try_lease=lambda reason: operation),
++                              allow_reconnect=lambda: None, cancel_reconnect=lambda: None,
++                              reconnect_cancelled=lambda: False, link_state=lambda: LinkState.CONNECTED,
++                              disconnects=[])
++    def disconnect():
++        manager.disconnects.append(True)
++        return True
++    manager.disconnect_device = disconnect
++    client = SendspinClient("configured-player", "auto", 8927, bt_manager=manager, listen_host="127.0.0.1",
++                            output_preparation_config={"OUTPUT_PREPARATION_ENABLED": True,
++                                                       "OUTPUT_PREPARATION_POLL_SECONDS": 0.001,
++                                                       "OUTPUT_PREPARATION_PAUSE_GRACE_SECONDS": 60})
++    manager.connect_prepared_output = lambda: setattr(client, "bluetooth_sink_name", "configured-sink") or True
++
++    async def spawn(*args, **kwargs):
++        external.owned.proplist["application.name"] = kwargs["env"]["PULSE_PROP_application.name"]
++        return process
++
++    with patch.object(pulse.pulsectl_asyncio, "PulseAsync", side_effect=lambda name: external), \
++            patch("asyncio.create_subprocess_exec", side_effect=spawn), \
++            patch("sendspin_bridge.bridge.client.find_available_bind_port", return_value=8928):
++        await client.start_sendspin()
++        try:
++            yield client, external, process
++        finally:
++            await client.stop_sendspin()
++
++
++def preparation_for(output, **settings):
++    config = {"timeout_seconds": 1, "tombstone_ttl_seconds": 60, "tombstone_limit": 8, **settings}
++    return OutputPreparation({"configured-player": output}, **config)
++
++
++class OutputPreparationTests(unittest.IsolatedAsyncioTestCase):
++    async def test_prepare_returns_a_verified_opaque_lease(self):
++        output = PhysicalOutput()
++        preparation = preparation_for(output)
++        result = await preparation.prepare("configured-player", "intent-1", 1)
++        self.assertEqual(result["status"], "ready")
++        self.assertEqual(result["lease_id"], "intent-1")
++        self.assertEqual(result["output_id"], "configured-player")
++        self.assertTrue(result["output_epoch"])
++        self.assertEqual(output.prepares, [result["output_epoch"]])
++
++    async def test_repeated_intent_reuses_the_verified_physical_client_binding(self):
++        async with physical_client() as (output, external, process):
++            preparation = preparation_for(output)
++            first = await preparation.prepare("configured-player", "intent", 1)
++            self.assertEqual(first["status"], "ready")
++            self.assertEqual(await preparation.prepare("configured-player", "intent", 1), first)
++            self.assertEqual([command["cmd"] for command in process.commands], ["bind_output"])
++
++    async def test_physical_release_never_moves_or_changes_unrelated_same_pid_streams(self):
++        async with physical_client() as (output, external, process):
++            await output.prepare("epoch")
++            external.unrelated.sink = external.sink.index
++            await output.release("epoch")
++            self.assertEqual(external.moves, [17])
++            self.assertEqual(external.volumes, [17])
++            self.assertEqual(external.unrelated.sink, 6)
++
++    async def test_physical_release_keeps_the_link_used_by_another_application(self):
++        async with physical_client() as (output, external, process):
++            await output.prepare("epoch")
++            external.unrelated.sink = external.sink.index
++            await output.release("epoch")
++            self.assertEqual(output.bt_manager.disconnects, [])
++            self.assertEqual(external.unrelated.sink, 6)
++            self.assertEqual(external.moves, [17])
++
++    async def test_physical_release_keeps_the_link_when_other_source_evidence_is_unknown(self):
++        for evidence in ("missing_sink", "backend_error", "unknown_source"):
++            with self.subTest(evidence=evidence):
++                async with physical_client() as (output, external, process):
++                    await output.prepare("epoch")
++                    if evidence == "missing_sink":
++                        external.sink.name = "unobserved-sink"
++                    elif evidence == "backend_error":
++                        async def unavailable():
++                            raise OSError("backend observation unavailable")
++                        external.sink_input_list = unavailable
++                    else:
++                        external.unrelated.sink = external.sink.index
++                        external.unrelated.proplist = {}
++                    await output.release("epoch")
++                    self.assertEqual(output.bt_manager.disconnects, [])
++
++    async def test_physical_release_disconnects_a_sink_observed_unused_by_other_sources(self):
++        async with physical_client() as (output, external, process):
++            await output.prepare("epoch")
++            await output.release("epoch")
++            self.assertEqual(output.bt_manager.disconnects, [True])
++            self.assertEqual(external.moves, [17])
++
++    async def test_old_release_does_not_disconnect_a_successor_during_source_observation(self):
++        async with physical_client() as (output, external, process):
++            await output.prepare("old-epoch")
++            observing = asyncio.Event()
++            continue_observation = asyncio.Event()
++            inputs = external.sink_input_list
++            observations = 0
++            async def observe():
++                nonlocal observations
++                observations += 1
++                if observations == 2:
++                    observing.set()
++                    await continue_observation.wait()
++                return await inputs()
++            external.sink_input_list = observe
++            release = asyncio.create_task(output.release("old-epoch"))
++            try:
++                await asyncio.wait_for(observing.wait(), timeout=1)
++                successor = asyncio.create_task(output.prepare("new-epoch"))
++                await asyncio.sleep(0)
++            finally:
++                continue_observation.set()
++            await release
++            binding = await successor
++            self.assertTrue(binding.ready)
++            self.assertEqual(binding.epoch, "new-epoch")
++            self.assertEqual(output.bt_manager.disconnects, [])
++
++    async def test_repeated_intent_joins_pending_work_and_reuses_ready_output(self):
++        output = PhysicalOutput()
++        output.ready.clear()
++        preparation = preparation_for(output)
++        first = asyncio.create_task(preparation.prepare("configured-player", "intent-1", 1))
++        second = asyncio.create_task(preparation.prepare("configured-player", "intent-1", 1))
++        await asyncio.sleep(0)
++        output.ready.set()
++        results = await asyncio.gather(first, second)
++        repeated = await preparation.prepare("configured-player", "intent-1", 1)
++        self.assertEqual(results[0], results[1])
++        self.assertEqual(repeated, results[0])
++        self.assertEqual(len(output.prepares), 1)
++
++    async def test_release_cancels_pending_and_prearrival_intent(self):
++        output = PhysicalOutput()
++        output.ready.clear()
++        preparation = preparation_for(output)
++        pending = asyncio.create_task(preparation.prepare("configured-player", "intent-1", 1))
++        await asyncio.sleep(0)
++        await preparation.release("configured-player", "intent-1", "stop")
++        with self.assertRaises(PreparationError) as error:
++            await pending
++        self.assertEqual(error.exception.code, "cancelled")
++        await preparation.release("configured-player", "intent-before-http", "stop")
++        output.ready.set()
++        with self.assertRaises(PreparationError) as error:
++            await preparation.prepare("configured-player", "intent-before-http", 1)
++        self.assertEqual(error.exception.code, "cancelled")
++        successor = await preparation.prepare("configured-player", "intent-2", 1)
++        releases = list(output.releases)
++        await preparation.release("configured-player", "intent-1", "stop")
++        self.assertEqual(output.releases, releases)
++        self.assertEqual(await preparation.prepare("configured-player", "intent-2", 1), successor)
++
++    async def test_new_intent_supersedes_late_ready_and_old_cleanup(self):
++        output = PhysicalOutput()
++        started = asyncio.Event()
++        finish_old = asyncio.Event()
++        async def prepare(epoch):
++            output.prepares.append(epoch)
++            if len(output.prepares) == 1:
++                started.set()
++                try:
++                    await finish_old.wait()
++                except asyncio.CancelledError:
++                    await finish_old.wait()
++            return OutputBinding(epoch, True, True, True, True, True)
++        output.prepare = prepare
++        preparation = preparation_for(output)
++        old = asyncio.create_task(preparation.prepare("configured-player", "old", 1))
++        await started.wait()
++        successor = await preparation.prepare("configured-player", "new", 1)
++        finish_old.set()
++        with self.assertRaises(PreparationError) as error:
++            await old
++        self.assertEqual(error.exception.code, "superseded")
++        await preparation.release("configured-player", "old", "stop")
++        self.assertEqual(output.releases, [])
++        self.assertEqual(await preparation.prepare("configured-player", "new", 1), successor)
++
++    async def test_deadline_rejects_output_and_cancels_known_intent(self):
++        output = PhysicalOutput()
++        output.ready.clear()
++        preparation = preparation_for(output, timeout_seconds=0.01)
++        with self.assertRaises(PreparationError) as error:
++            await asyncio.wait_for(preparation.prepare("configured-player", "deadline", 1), 0.2)
++        self.assertEqual(error.exception.code, "timeout")
++        output.ready.set()
++        with self.assertRaises(PreparationError):
++            await preparation.prepare("configured-player", "deadline", 1)
++
++    async def test_cancel_records_are_bounded_without_reviving_recent_intents(self):
++        now = [0.0]
++        output = PhysicalOutput()
++        preparation = preparation_for(output, tombstone_limit=1, clock=lambda: now[0])
++        await preparation.release("configured-player", "cancel-first", "stop")
++        with self.assertRaises(PreparationError) as error:
++            await preparation.release("configured-player", "cancel-over-capacity", "stop")
++        self.assertEqual(error.exception.code, "tombstone_capacity")
++        with self.assertRaises(PreparationError):
++            await preparation.prepare("configured-player", "cancel-first", 1)
++        now[0] = 61
++        await preparation.release("configured-player", "cancel-next", "stop")
++        with self.assertRaises(PreparationError):
++            await preparation.prepare("configured-player", "cancel-next", 1)
++
++    async def test_deadline_returns_before_uncancellable_cleanup_and_errors_release_output(self):
++        output = PhysicalOutput()
++        cleanup = asyncio.Event()
++        async def release(epoch):
++            output.releases.append(epoch)
++            await cleanup.wait()
++        output.release = release
++        output.ready.clear()
++        preparation = preparation_for(output, timeout_seconds=0.01)
++        try:
++            with self.assertRaises(PreparationError) as error:
++                await asyncio.wait_for(preparation.prepare("configured-player", "pending", 1), 0.1)
++            self.assertEqual(error.exception.code, "timeout")
++        finally:
++            cleanup.set()
++        await asyncio.sleep(0)
++
++    async def test_ready_lease_is_not_reused_after_output_disappears(self):
++        output = PhysicalOutput()
++        available = [True]
++        async def valid(epoch):
++            return available[0]
++        output.validate_binding = valid
++        preparation = preparation_for(output)
++        await preparation.prepare("configured-player", "intent-1", 1)
++        available[0] = False
++        with self.assertRaises(PreparationError) as error:
++            await preparation.prepare("configured-player", "intent-1", 1)
++        self.assertEqual(error.exception.code, "output_unavailable")
++
++    async def test_public_prepare_rejects_invalid_deadlines_before_touching_output(self):
++        output = PhysicalOutput()
++        preparation = preparation_for(output)
++        for timeout in (None, True, 0, -1, "1", float("nan"), float("inf")):
++            with self.subTest(timeout=timeout):
++                with self.assertRaises(PreparationError) as error:
++                    await preparation.prepare("configured-player", "intent", timeout)
++                self.assertEqual(error.exception.code, "invalid_request")
++        self.assertEqual(output.prepares, [])
++
++    async def test_release_wins_over_a_ready_response_still_in_flight(self):
++        output = PhysicalOutput()
++        preparation = preparation_for(output)
++        async def prepare(epoch):
++            asyncio.get_running_loop().call_soon(
++                asyncio.create_task, preparation.release("configured-player", "intent", "stop"))
++            return OutputBinding(epoch, True, True, True, True, True)
++        output.prepare = prepare
++        with self.assertRaises(PreparationError) as error:
++            await preparation.prepare("configured-player", "intent", 1)
++        self.assertEqual(error.exception.code, "cancelled")
++
++    async def test_prepare_never_moves_or_acknowledges_unrelated_same_pid_streams(self):
++        from sendspin_bridge.services.audio import pulse
++        external = PulseOutput()
++        output = PhysicalOutput()
++        async def prepare(epoch):
++            await pulse.amove_pid_sink_inputs(314, "configured-sink", application_name="sendspin-owned-player")
++            profile, present, bound = await pulse.averify_output_binding(314, "configured-sink", "sendspin-owned-player")
++            return OutputBinding(epoch, True, profile, present, True, bound)
++        output.prepare = prepare
++        preparation = preparation_for(output)
++        with patch.object(pulse.pulsectl_asyncio, "PulseAsync", side_effect=lambda name: external):
++            result = await preparation.prepare("configured-player", "intent-own", 1)
++            self.assertEqual(result["status"], "ready")
++            self.assertEqual(external.moves, [17])
++            self.assertEqual(external.volumes, [17])
++            external.streams = [external.unrelated]
++            external.unrelated.sink = 6
++            with self.assertRaises(PreparationError) as error:
++                await preparation.prepare("configured-player", "intent-no-own-backend", 1)
++            self.assertEqual(error.exception.code, "output_unavailable")
++            self.assertEqual(external.moves, [17])
++            self.assertEqual(external.volumes, [17])
++
++    async def test_incomplete_or_stale_physical_evidence_is_not_ready(self):
++        for evidence in ((False, True, True, True, True), (True, False, True, True, True),
++                         (True, True, False, True, True), (True, True, True, False, True),
++                         (True, True, True, True, False)):
++            with self.subTest(evidence=evidence):
++                output = PhysicalOutput()
++                async def prepare(epoch):
++                    return OutputBinding(epoch, *evidence)
++                output.prepare = prepare
++                preparation = preparation_for(output)
++                with self.assertRaises(PreparationError) as error:
++                    await preparation.prepare("configured-player", "intent-1", 1)
++                self.assertEqual(error.exception.code, "output_unavailable")
++        output = PhysicalOutput()
++        async def stale(epoch):
++            return OutputBinding("previous-daemon", True, True, True, True, True)
++        output.prepare = stale
++        preparation = preparation_for(output)
++        with self.assertRaises(PreparationError):
++            await preparation.prepare("configured-player", "intent-1", 1)
+diff --git a/tests/test_output_preparation_http.py b/tests/test_output_preparation_http.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..65d052830204a0c0fb32f0fdccf57c29014e8049
+--- /dev/null
++++ b/tests/test_output_preparation_http.py
+@@ -0,0 +1,227 @@
++"""Machine authentication at the real management HTTP entrance."""
++
++import asyncio
++import json
++import subprocess
++import sys
++import unittest
++
++from flask import Flask
++
++from sendspin_bridge.web.routes.api_output import create_output_blueprint
++from tests.test_output_preparation import PhysicalOutput
++
++
++class OutputHttpTests(unittest.IsolatedAsyncioTestCase):
++    def make_app(self, config, outputs=None):
++        app = Flask(__name__)
++        loop = asyncio.get_running_loop()
++        app.register_blueprint(create_output_blueprint(
++            config_provider=lambda: config, outputs_provider=lambda: outputs or {},
++            loop_provider=lambda: loop))
++        return app
++
++    async def test_http_prepare_and_release_use_the_known_nonce_contract(self):
++        output = PhysicalOutput()
++        app = self.make_app({"OUTPUT_PREPARATION_ENABLED": True,
++                             "OUTPUT_PREPARATION_TOKEN": "machine-secret"}, {"configured-player": output})
++        client = app.test_client()
++        headers = {"X-Output-Preparation-Token": "machine-secret"}
++        body = {"output_id": "configured-player", "lease_id": "intent-1", "timeout_seconds": 1}
++        response = await asyncio.to_thread(client.post, "/api/output/prepare", json=body, headers=headers)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(response.json["status"], "ready")
++        self.assertEqual(response.json["lease_id"], "intent-1")
++        self.assertTrue(response.json["output_epoch"])
++        response = await asyncio.to_thread(client.post, "/api/output/release",
++                                          json={"output_id": "configured-player", "lease_id": "intent-1", "reason": "stop"},
++                                          headers=headers)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(response.json, {"status": "released", "output_id": "configured-player", "lease_id": "intent-1"})
++        response = await asyncio.to_thread(client.post, "/api/output/prepare", json=body, headers=headers)
++        self.assertEqual(response.status_code, 409)
++        self.assertEqual(response.json["error"], "cancelled")
++
++    async def test_failed_release_cancels_a_prepare_that_has_not_arrived(self):
++        output = PhysicalOutput()
++        app = self.make_app({"OUTPUT_PREPARATION_ENABLED": True,
++                             "OUTPUT_PREPARATION_TOKEN": "machine-secret"}, {"configured-player": output})
++        client = app.test_client()
++        headers = {"X-Output-Preparation-Token": "machine-secret"}
++        response = await asyncio.to_thread(client.post, "/api/output/release",
++                                          json={"output_id": "configured-player", "lease_id": "failed-intent", "reason": "failed"},
++                                          headers=headers)
++        self.assertEqual(response.status_code, 200)
++        response = await asyncio.to_thread(client.post, "/api/output/prepare",
++                                          json={"output_id": "configured-player", "lease_id": "failed-intent", "timeout_seconds": 1},
++                                          headers=headers)
++        self.assertEqual(response.status_code, 409)
++        self.assertEqual(response.json["error"], "cancelled")
++        self.assertEqual(output.prepares, [])
++
++    async def test_http_rejects_unknown_output_and_unbounded_deadlines(self):
++        output = PhysicalOutput()
++        app = self.make_app({"OUTPUT_PREPARATION_ENABLED": True,
++                             "OUTPUT_PREPARATION_TOKEN": "machine-secret"}, {"configured-player": output})
++        headers = {"X-Output-Preparation-Token": "machine-secret"}
++        for timeout in (None, True, -1, 0, "1", float("inf"), float("nan"), 16):
++            response = await asyncio.to_thread(app.test_client().post, "/api/output/prepare",
++                                              json={"output_id": "configured-player", "lease_id": "intent", "timeout_seconds": timeout},
++                                              headers=headers)
++            self.assertEqual(response.status_code, 400, timeout)
++        response = await asyncio.to_thread(app.test_client().post, "/api/output/prepare",
++                                          json={"output_id": "AA:BB:CC:DD:EE:FF", "lease_id": "intent", "timeout_seconds": 1},
++                                          headers=headers)
++        self.assertEqual(response.status_code, 404)
++        self.assertEqual(output.prepares, [])
++
++    async def test_release_rejects_non_string_reason_as_a_client_error(self):
++        app = self.make_app({"OUTPUT_PREPARATION_ENABLED": True, "OUTPUT_PREPARATION_TOKEN": "machine-secret"})
++        response = app.test_client().post("/api/output/release",
++                                          json={"output_id": "configured-player", "lease_id": "intent", "reason": []},
++                                          headers={"X-Output-Preparation-Token": "machine-secret"})
++        self.assertEqual(response.status_code, 400)
++
++    async def test_registered_management_route_never_uses_web_or_ingress_auth(self):
++        # A fresh interpreter keeps the real application's import-time config
++        # and registered blueprints isolated from sibling pytest test files.
++        script = '''
++import json
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from unittest.mock import patch
++from sendspin_bridge.config import DEFAULT_CONFIG
++config = {**DEFAULT_CONFIG, "SECRET_KEY": "isolated-test-secret", "AUTH_ENABLED": True,
++          "OUTPUT_PREPARATION_ENABLED": True, "OUTPUT_PREPARATION_TOKEN": "machine-secret"}
++with patch("sendspin_bridge.config.load_config", side_effect=lambda: dict(config)):
++    from sendspin_bridge.web.interface import app
++    client = app.test_client()
++    with client.session_transaction() as session:
++        session["authenticated"] = True
++    response = client.post("/api/output/prepare", json={}, headers={"X-Ingress-Path": "/trusted"})
++    assert response.status_code == 401, response.status_code
++    response = client.post("/api/output/prepare", json={}, headers={"X-Output-Preparation-Token": "machine-secret"})
++    assert response.status_code == 400, response.status_code
++    response = client.get("/api/config")
++    assert response.status_code == 200, response.status_code
++    assert "machine-secret" not in response.get_data(as_text=True), "machine credential exposed by config GET"
++    with TemporaryDirectory() as directory:
++        config_file = Path(directory) / "config.json"
++        config_file.write_text(json.dumps(config))
++        with patch("sendspin_bridge.web.routes.api_config.CONFIG_FILE", config_file):
++            response = client.get("/api/config/download")
++            assert response.status_code == 200, response.status_code
++            assert "machine-secret" not in response.get_data(as_text=True), "machine credential exposed by config download"
++'''
++        result = await asyncio.to_thread(subprocess.run, [sys.executable, "-B", "-c", script],
++                                         capture_output=True, text=True, timeout=5)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    async def run_output_daemon(self, commands, *, streaming=False):
++        # Keep BridgeDaemon and stdin/stdout dispatch real; replace only the
++        # external SDK lifetime, audio device discovery, and PulseAudio ports.
++        script = r'''
++import asyncio
++import json
++import os
++import sys
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++from sendspin.daemon.daemon import SendspinDaemon
++from sendspin_bridge.services.audio import pulse
++from sendspin_bridge.services.ipc import daemon_process
++from tests.test_output_preparation import PulseOutput
++external = PulseOutput()
++for stream in external.streams:
++    stream.proplist["application.process.id"] = str(os.getpid())
++os.environ["PULSE_PROP_application.name"] = "sendspin-owned-player"
++device = SimpleNamespace(name="pulse", index=1, is_default=True)
++def sdk_init(self, args):
++    self._args = args
++    self._audio_handler = None
++    self._client = None
++async def sdk_run(self):
++    if json.loads(sys.argv[1]).get("fixture_streaming"):
++        self._handle_format_change("pcm", 44100, 16, 2)
++    await asyncio.Event().wait()
++with patch.object(SendspinDaemon, "__init__", sdk_init), \
++        patch.object(SendspinDaemon, "run", sdk_run), \
++        patch.object(SendspinDaemon, "_handle_format_change", lambda *args: None), \
++        patch("sendspin.audio_devices.query_devices", return_value=[device]), \
++        patch("sendspin.settings.get_client_settings", new=AsyncMock(return_value=SimpleNamespace(player_volume=100))), \
++        patch.object(pulse.pulsectl_asyncio, "PulseAsync", side_effect=lambda name: external):
++    daemon_process.main()
++print(json.dumps({"test_moves": external.moves, "unrelated_sink": external.unrelated.sink}))
++'''
++        params = {"player_name": "configured-player", "client_id": "owned-player", "listen_port": 8928,
++                  "bluetooth_sink_name": "sendspin_fallback", "output_preparation_enabled": True,
++                  "fixture_streaming": streaming}
++        def execute():
++            import os
++            import select
++            from time import monotonic, sleep
++            args = [sys.executable, "-B", "-c", script, json.dumps(params)]
++            with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                  stderr=subprocess.PIPE, text=True) as process:
++                content = "".join(json.dumps(command) + "\n" for command in commands)
++                prefix = ""
++                try:
++                    if streaming:
++                        process.stdin.write(content)
++                        process.stdin.flush()
++                        deadline = monotonic() + 10
++                        while '"output_binding_ready": true' not in prefix:
++                            readable, _, _ = select.select([process.stdout], [], [], max(0, deadline - monotonic()))
++                            if not readable:
++                                raise TimeoutError("daemon did not publish binding readiness")
++                            chunk = os.read(process.stdout.fileno(), 65536)
++                            if not chunk:
++                                raise AssertionError("daemon exited before binding readiness: " + prefix)
++                            prefix += chunk.decode()
++                        # After readiness, give the real 0.5-second watcher two
++                        # observations while stdin remains open.
++                        sleep(1.2)
++                        content = ""
++                    stdout, stderr = process.communicate(content + json.dumps({"cmd": "stop"}) + "\n", timeout=10)
++                except Exception:
++                    process.kill()
++                    process.communicate()
++                    raise
++                return subprocess.CompletedProcess(args, process.returncode, prefix + stdout, stderr)
++        result = await asyncio.to_thread(execute)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++        messages = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
++        return messages, result.stdout + result.stderr
++
++    async def test_daemon_stdin_binding_reports_ready_without_touching_unrelated_streams(self):
++        messages, diagnostics = await self.run_output_daemon([
++            {"cmd": "bind_output", "epoch": "intent-epoch", "sink": "configured-sink"}])
++        self.assertTrue(any(message.get("output_binding_ready") is True
++                            and message.get("output_binding_epoch") == "intent-epoch" for message in messages), diagnostics)
++        self.assertEqual(messages[-1], {"test_moves": [17], "unrelated_sink": 0})
++
++    async def test_daemon_standby_invalidates_the_published_binding(self):
++        messages, diagnostics = await self.run_output_daemon([
++            {"cmd": "bind_output", "epoch": "intent-epoch", "sink": "configured-sink"},
++            {"cmd": "set_standby", "sink": "sendspin_fallback"}])
++        statuses = [message for message in messages if message.get("type") == "status"]
++        self.assertIs(statuses[-1].get("output_binding_ready"), False, diagnostics)
++        self.assertIsNone(statuses[-1].get("output_binding_epoch"), diagnostics)
++
++    async def test_streaming_watcher_preserves_unrelated_same_pid_output(self):
++        messages, diagnostics = await self.run_output_daemon([
++            {"cmd": "bind_output", "epoch": "intent-epoch", "sink": "configured-sink"}], streaming=True)
++        self.assertTrue(any(message.get("audio_streaming") is True for message in messages), diagnostics)
++        self.assertEqual(messages[-1], {"test_moves": [17], "unrelated_sink": 0}, diagnostics)
++
++    async def test_disabled_or_missing_token_never_opens_management(self):
++        for config in ({}, {"OUTPUT_PREPARATION_ENABLED": True, "OUTPUT_PREPARATION_TOKEN": ""}):
++            app = self.make_app(config)
++            response = app.test_client().post("/api/output/prepare", json={})
++            self.assertEqual(response.status_code, 404)
++        app = self.make_app({"OUTPUT_PREPARATION_ENABLED": True, "OUTPUT_PREPARATION_TOKEN": "machine-secret"})
++        for headers in ({}, {"Authorization": "Bearer machine-secret"},
++                        {"X-Output-Preparation-Token": "incorrect"}):
++            response = app.test_client().post("/api/output/prepare", json={}, headers=headers)
++            self.assertEqual(response.status_code, 401)
++            self.assertEqual(response.json, {"status": "error", "error": "unauthorized"})

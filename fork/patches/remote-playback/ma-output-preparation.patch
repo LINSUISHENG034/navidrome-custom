@@ -1,0 +1,952 @@
+diff --git a/music_assistant/providers/sendspin/constants.py b/music_assistant/providers/sendspin/constants.py
+index c3cca4a9d20c7c868a76c76982d8e784783d0f4d..19a94ebe4fdf9e56cdc7ac920dc7a6e50ee7663a 100644
+--- a/music_assistant/providers/sendspin/constants.py
++++ b/music_assistant/providers/sendspin/constants.py
+@@ -13,6 +13,13 @@ CONF_ALLOW_LEGACY_CLIENTS = "allow_legacy_clients"
+ CONF_MIN_PIN_LENGTH = "min_pin_length"
+ DEFAULT_MIN_PIN_LENGTH = 4
+ 
++CONF_OUTPUT_PREPARATION_URL = "output_preparation_url"
++CONF_OUTPUT_PREPARATION_OUTPUT_ID = "output_preparation_output_id"
++CONF_OUTPUT_PREPARATION_TOKEN = "output_preparation_token"
++CONF_OUTPUT_PREPARATION_TIMEOUT = "output_preparation_timeout"
++MAX_OUTPUT_PREPARATION_TIMEOUT = 15.0
++DEFAULT_OUTPUT_PREPARATION_TIMEOUT = MAX_OUTPUT_PREPARATION_TIMEOUT
++
+ # Pairing method the setup flow lets the user pick between.
+ CONF_PAIRING_METHOD = "pairing_method"
+ CONF_PAIRING_TOKEN = "pairing_token"
+diff --git a/music_assistant/providers/sendspin/output_preparation.py b/music_assistant/providers/sendspin/output_preparation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..de4dc36c9ec4a7ef1db26d4df7e23bb3fea8cc09
+--- /dev/null
++++ b/music_assistant/providers/sendspin/output_preparation.py
+@@ -0,0 +1,166 @@
++"""Correlated output preparation before Sendspin content streaming."""
++
++from __future__ import annotations
++
++import asyncio
++from dataclasses import dataclass
++from ipaddress import ip_address
++from math import isfinite
++from typing import TYPE_CHECKING, Any
++from urllib.parse import urlsplit
++from uuid import uuid4
++
++from aiohttp import ClientError, ClientTimeout
++
++from .constants import MAX_OUTPUT_PREPARATION_TIMEOUT
++
++if TYPE_CHECKING:
++    from aiohttp import ClientSession
++
++
++class OutputPreparationError(RuntimeError):
++    """The configured output did not grant usable output authority."""
++
++
++@dataclass(frozen=True, slots=True)
++class OutputLease:
++    """Output usage owned by one caller-generated lease nonce."""
++
++    output_id: str
++    lease_id: str
++    output_epoch: str
++
++
++class OutputPreparationClient:
++    """Prepare a configured output through its authenticated management interface."""
++
++    def __init__(
++        self,
++        http_session: ClientSession,
++        url: str,
++        output_id: str,
++        token: str,
++        timeout_seconds: float,
++    ) -> None:
++        """Bind the client to one configured physical output."""
++        if (
++            not isinstance(output_id, str)
++            or not output_id.strip()
++            or not isinstance(token, str)
++            or not token.strip()
++            or any(ord(char) <= 32 or ord(char) == 127 for char in token)
++        ):
++            raise OutputPreparationError("Output preparation requires an output ID and machine token")
++        if (
++            isinstance(timeout_seconds, bool)
++            or not isinstance(timeout_seconds, (int, float))
++            or not isfinite(timeout_seconds)
++            or not 0 < timeout_seconds <= MAX_OUTPUT_PREPARATION_TIMEOUT
++        ):
++            raise OutputPreparationError("Output preparation requires a bounded positive deadline")
++        self._http_session = http_session
++        self._url = self._validate_url(url).rstrip("/")
++        self._output_id = output_id
++        self._token = token
++        self._timeout_seconds = timeout_seconds
++        self._release_tasks: set[asyncio.Task[None]] = set()
++
++    async def prepare(self, lease: OutputLease | None = None) -> OutputLease:
++        """Obtain or revalidate a correlated output lease before consuming content."""
++        if lease is None:
++            lease = OutputLease(self._output_id, uuid4().hex, "")
++        try:
++            payload = await self._request(
++                "prepare",
++                {
++                    "output_id": lease.output_id,
++                    "lease_id": lease.lease_id,
++                    "timeout_seconds": self._timeout_seconds,
++                },
++            )
++            if (
++                not isinstance(payload, dict)
++                or payload.get("status") != "ready"
++                or payload.get("output_id") != lease.output_id
++                or payload.get("lease_id") != lease.lease_id
++                or not isinstance(payload.get("output_epoch"), str)
++                or not payload["output_epoch"]
++            ):
++                raise OutputPreparationError("Output preparation returned an invalid readiness lease")
++            task = asyncio.current_task()
++            if task is not None and task.cancelling():
++                raise asyncio.CancelledError
++            return OutputLease(lease.output_id, lease.lease_id, payload["output_epoch"])
++        except asyncio.CancelledError:
++            self._schedule_release(lease, "cancelled")
++            raise
++        except TimeoutError:
++            self._schedule_release(lease, "timeout")
++            raise OutputPreparationError("Output preparation timed out") from None
++        except OutputPreparationError:
++            self._schedule_release(lease, "failed")
++            raise
++
++    async def release(self, lease: OutputLease, reason: str) -> None:
++        """Revoke this caller's pending or ready output lease."""
++        await self._request(
++            "release", {"output_id": lease.output_id, "lease_id": lease.lease_id, "reason": reason}
++        )
++
++    @staticmethod
++    def _validate_url(url: str) -> str:
++        if not isinstance(url, str) or any(ord(char) <= 32 or ord(char) == 127 for char in url):
++            raise OutputPreparationError("Invalid output preparation URL")
++        try:
++            parts = urlsplit(url)
++            hostname = parts.hostname
++            port = parts.port
++        except ValueError:
++            raise OutputPreparationError("Invalid output preparation URL") from None
++        if (
++            not hostname
++            or parts.username is not None
++            or parts.password is not None
++            or "?" in url
++            or "#" in url
++            or port == 0
++        ):
++            raise OutputPreparationError("Invalid output preparation URL")
++        loopback = hostname.lower() == "localhost"
++        if not loopback:
++            try:
++                loopback = ip_address(hostname).is_loopback
++            except ValueError:
++                loopback = False
++        if parts.scheme != "https" and not (parts.scheme == "http" and loopback):
++            raise OutputPreparationError("Output preparation requires HTTPS outside loopback")
++        return url
++
++    async def _request(self, action: str, payload: dict[str, Any]) -> Any:
++        try:
++            async with asyncio.timeout(self._timeout_seconds):
++                async with self._http_session.post(
++                    f"{self._url}/api/output/{action}",
++                    json=payload,
++                    headers={"X-Output-Preparation-Token": self._token},
++                    allow_redirects=False,
++                    timeout=ClientTimeout(total=self._timeout_seconds),
++                ) as response:
++                    if not 200 <= response.status < 300:
++                        raise OutputPreparationError("Output management request was rejected")
++                    if action == "prepare":
++                        return await response.json()
++                    return None
++        except (ClientError, ValueError):
++            raise OutputPreparationError("Output management request failed") from None
++
++    def _schedule_release(self, lease: OutputLease, reason: str) -> None:
++        task = asyncio.create_task(self.release(lease, reason))
++        self._release_tasks.add(task)
++
++        def done(completed: asyncio.Task[None]) -> None:
++            self._release_tasks.discard(completed)
++            if not completed.cancelled():
++                completed.exception()
++
++        task.add_done_callback(done)
+diff --git a/music_assistant/providers/sendspin/playback.py b/music_assistant/providers/sendspin/playback.py
+index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6de798e20 100644
+--- a/music_assistant/providers/sendspin/playback.py
++++ b/music_assistant/providers/sendspin/playback.py
+@@ -29,6 +29,17 @@ from music_assistant.providers.sendspin.bridge_role import (
+     BRIDGE_SAMPLE_RATE,
+     BridgePlayerRole,
+ )
++from music_assistant.providers.sendspin.constants import (
++    CONF_OUTPUT_PREPARATION_OUTPUT_ID,
++    CONF_OUTPUT_PREPARATION_TIMEOUT,
++    CONF_OUTPUT_PREPARATION_TOKEN,
++    CONF_OUTPUT_PREPARATION_URL,
++    DEFAULT_OUTPUT_PREPARATION_TIMEOUT,
++)
++from music_assistant.providers.sendspin.output_preparation import (
++    OutputLease,
++    OutputPreparationClient,
++)
+ 
+ if TYPE_CHECKING:
+     from music_assistant.helpers.dsp import ComplexFilter
+@@ -359,6 +370,8 @@ class SendspinPlaybackSession:
+         self._sendspin_pcm_format: SendspinAudioFormat = _DEFAULT_SENDSPIN_PCM_FORMAT
+         self._queue_id: str | None = None
+         self._queue_session_id: str | None = None
++        self._output_client: OutputPreparationClient | None = None
++        self._output_lease: OutputLease | None = None
+ 
+     def flow_track_anchor_us(self, track_start_offset_us: int) -> int | None:
+         """
+@@ -412,12 +425,13 @@ class SendspinPlaybackSession:
+             mishandle stream/clear.
+         """
+         task = self.playback_task
+-        if task is None:
+-            return
+-        if task.done():
++        if task is None or task.done():
++            if not keep_stream:
++                await self._release_output("stop")
+             if self.playback_task is task:
+                 self.playback_task = None
+             return
++        keep_output = keep_stream
+         provider = cast("SendspinProvider", self.player.provider)
+         if provider.server_api.allow_noncompliant_clients:
+             keep_stream = False
+@@ -431,6 +445,8 @@ class SendspinPlaybackSession:
+             await task
+         if self.playback_task is task:
+             self.playback_task = None
++        if not keep_output:
++            await self._release_output("stop")
+ 
+     async def start(self, media: PlayerMedia, restart: bool = False) -> None:
+         """Start background playback for `media`."""
+@@ -510,6 +526,14 @@ class SendspinPlaybackSession:
+ 
+     # -- Helpers ---------------------------------------------------------------
+ 
++    async def _release_output(self, reason: str) -> None:
++        client, lease = self._output_client, self._output_lease
++        self._output_client = None
++        self._output_lease = None
++        if client is not None and lease is not None:
++            with suppress(Exception):
++                await client.release(lease, reason)
++
+     def _attach_task_exception_logger(self, task: asyncio.Task[Any], name: str) -> None:
+         """Log unhandled exception from background task when it finishes."""
+ 
+@@ -736,7 +760,32 @@ class SendspinPlaybackSession:
+ 
+     # -- Playback pipeline -----------------------------------------------------
+ 
+-    async def _run_playback(self, media: PlayerMedia) -> None:  # noqa: PLR0915
++    async def _run_playback(self, media: PlayerMedia) -> None:
++        """Prepare output before streaming and revoke authority on failure."""
++        try:
++            if url := self.player.config.get_value(CONF_OUTPUT_PREPARATION_URL):
++                if self._output_client is None:
++                    self._output_client = OutputPreparationClient(
++                        self.player.mass.http_session,
++                        url,
++                        self.player.config.get_value(CONF_OUTPUT_PREPARATION_OUTPUT_ID),
++                        self.player.config.get_value(CONF_OUTPUT_PREPARATION_TOKEN),
++                        self.player.config.get_value(
++                            CONF_OUTPUT_PREPARATION_TIMEOUT, DEFAULT_OUTPUT_PREPARATION_TIMEOUT
++                        ),
++                    )
++                previous_lease, self._output_lease = self._output_lease, None
++                self._output_lease = await self._output_client.prepare(previous_lease)
++                if self.player.volume_level is not None:
++                    await self.player.volume_set(self.player.volume_level)
++                if self.player.volume_muted is not None:
++                    await self.player.volume_mute(self.player.volume_muted)
++            await self._stream_playback(media)
++        except Exception:
++            await self._release_output("failed")
++            raise
++
++    async def _stream_playback(self, media: PlayerMedia) -> None:  # noqa: PLR0915
+         """
+         Run the playback pipeline for a single media session.
+ 
+@@ -981,6 +1030,7 @@ class SendspinPlaybackSession:
+             # Only emit a group STOP when MA stream playback reached natural EOF.
+             # Skip this on cancellation/error paths to avoid stop-event races with transitions.
+             if producer_stopped_cleanly and not self._cancel_requested:
++                await self._release_output("ended")
+                 with suppress(Exception):
+                     await self.player.api.group.stop()
+ 
+diff --git a/music_assistant/providers/sendspin/player.py b/music_assistant/providers/sendspin/player.py
+index be02aebdca54c9fb79486942dae3ee42cf21eb01..a38d91f80c662d21a49447c4d00d01d85bfd75f4 100644
+--- a/music_assistant/providers/sendspin/player.py
++++ b/music_assistant/providers/sendspin/player.py
+@@ -90,6 +90,10 @@ from .constants import (
+     CONF_ACTION_MANAGEMENT_STATIC_PIN_ENABLE,
+     CONF_ACTION_UNPAIR,
+     CONF_CONNECT_METHOD,
++    CONF_OUTPUT_PREPARATION_OUTPUT_ID,
++    CONF_OUTPUT_PREPARATION_TIMEOUT,
++    CONF_OUTPUT_PREPARATION_TOKEN,
++    CONF_OUTPUT_PREPARATION_URL,
+     CONF_PAIRING_METHOD,
+     CONF_PAIRING_PIN,
+     CONF_PAIRING_TOKEN,
+@@ -99,7 +103,9 @@ from .constants import (
+     CONF_SOURCE_INPUT_ACTION,
+     CONNECT_METHOD_PAIR,
+     CONNECT_METHOD_UNPAIRED,
++    DEFAULT_OUTPUT_PREPARATION_TIMEOUT,
+     DEFAULT_SENDSPIN_STATIC_DELAY,
++    MAX_OUTPUT_PREPARATION_TIMEOUT,
+     PAIR_METHOD_DYNAMIC_PIN,
+     PAIR_METHOD_PIN,
+     PAIR_METHOD_STATIC_PIN,
+@@ -1664,6 +1670,43 @@ class SendspinPlayer(SendspinBasePlayer):
+         """Return all (provider/player specific) Config Entries for the player."""
+         entries: list[ConfigEntry] = []
+         entries.extend(await super().get_config_entries())
++        entries.extend(
++            [
++                ConfigEntry(
++                    key=CONF_OUTPUT_PREPARATION_URL,
++                    type=ConfigEntryType.STRING,
++                    title="Output preparation URL",
++                    description="Opt-in management URL for a standalone physical output. Leave blank "
++                    "to retain normal playback. HTTPS is required outside loopback.",
++                    required=False,
++                    default_value="",
++                    advanced=True,
++                ),
++                ConfigEntry(
++                    key=CONF_OUTPUT_PREPARATION_OUTPUT_ID,
++                    type=ConfigEntryType.STRING,
++                    title="Prepared output ID",
++                    description="The configured output ID accepted by the output manager.",
++                    required=False,
++                    advanced=True,
++                ),
++                ConfigEntry(
++                    key=CONF_OUTPUT_PREPARATION_TOKEN,
++                    type=ConfigEntryType.SECURE_STRING,
++                    title="Output preparation machine token",
++                    required=False,
++                    advanced=True,
++                ),
++                ConfigEntry(
++                    key=CONF_OUTPUT_PREPARATION_TIMEOUT,
++                    type=ConfigEntryType.FLOAT,
++                    title="Output preparation deadline (seconds)",
++                    range=(0.1, MAX_OUTPUT_PREPARATION_TIMEOUT),
++                    default_value=DEFAULT_OUTPUT_PREPARATION_TIMEOUT,
++                    advanced=True,
++                ),
++            ]
++        )
+         # Build dynamic format options from player's supported formats
+         player_role = self._player_role
+         if player_role is not None:
+diff --git a/tests/test_output_preparation_client.py b/tests/test_output_preparation_client.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e5c30a3d99aa5af272354df50361fd98a9b4b71
+--- /dev/null
++++ b/tests/test_output_preparation_client.py
+@@ -0,0 +1,573 @@
++"""Output preparation contract at the public HTTP client seam."""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import unittest
++from types import SimpleNamespace
++from typing import Any
++
++
++class HttpResponse:
++    """External HTTP response with a request-correlated ready payload."""
++
++    def __init__(
++        self,
++        payload: dict[str, Any],
++        gate: asyncio.Event | None = None,
++        status: int = 200,
++        cancel_on_ready: bool = False,
++        error: Exception | None = None,
++    ) -> None:
++        self.error = error
++        self.payload = payload
++        self.gate = gate
++        self.status = status
++        self.cancel_on_ready = cancel_on_ready
++
++    async def __aenter__(self) -> HttpResponse:
++        if self.gate is not None:
++            await self.gate.wait()
++        return self
++
++    async def __aexit__(self, *args: Any) -> None:
++        return None
++
++    async def json(self) -> dict[str, Any]:
++        if self.error is not None:
++            raise self.error
++        if self.cancel_on_ready:
++            task = asyncio.current_task()
++            assert task is not None
++            task.cancel()
++        return self.payload
++
++
++class HttpPort:
++    """Record requests made to the external output manager."""
++
++    def __init__(
++        self,
++        payload_updates: dict[str, Any] | None = None,
++        *,
++        gate: asyncio.Event | None = None,
++        status: int = 200,
++        cancel_on_ready: bool = False,
++        prepare_error: Exception | None = None,
++    ) -> None:
++        self.prepare_error = prepare_error
++        self.requests: list[tuple[str, dict[str, Any]]] = []
++        self.payload_updates = payload_updates or {}
++        self.gate = gate
++        self.status = status
++        self.cancel_on_ready = cancel_on_ready
++        self.prepare_started = asyncio.Event()
++
++    def post(self, url: str, **kwargs: Any) -> HttpResponse:
++        self.requests.append((url, kwargs))
++        body = kwargs["json"]
++        is_prepare = url.endswith("/prepare")
++        if is_prepare:
++            self.prepare_started.set()
++        return HttpResponse(
++            {
++                "status": "ready",
++                "output_id": body["output_id"],
++                "lease_id": body["lease_id"],
++                "output_epoch": "opaque-backend-generation",
++                **self.payload_updates,
++            },
++            self.gate if is_prepare else None,
++            self.status if is_prepare else 200,
++            self.cancel_on_ready if is_prepare else False,
++            self.prepare_error if is_prepare else None,
++        )
++
++
++class OutputPreparationClientTests(unittest.IsolatedAsyncioTestCase):
++    """Caller-owned nonces are correlated with output readiness."""
++
++    async def test_prepare_returns_only_the_requested_output_and_lease(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        http = HttpPort()
++        client = OutputPreparationClient(
++            http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++        )
++
++        lease = await client.prepare()
++
++        url, request = http.requests[0]
++        self.assertEqual(url, "https://output-manager.example/api/output/prepare")
++        self.assertEqual(request["json"]["output_id"], "configured-output")
++        self.assertEqual(request["json"]["lease_id"], lease.lease_id)
++        self.assertTrue(lease.lease_id)
++        self.assertEqual(request["json"]["timeout_seconds"], 0.1)
++        self.assertEqual(request["headers"], {"X-Output-Preparation-Token": "machine-secret"})
++        self.assertFalse(request["allow_redirects"])
++        self.assertEqual(lease.output_id, "configured-output")
++        self.assertEqual(lease.output_epoch, "opaque-backend-generation")
++
++    async def test_prepare_rejects_uncorrelated_or_nonready_response(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        for payload_updates in (
++            {"output_id": "other-output"},
++            {"lease_id": "stale-lease"},
++            {"status": "waking"},
++            {"output_epoch": ""},
++            {"output_epoch": 12},
++        ):
++            with self.subTest(payload_updates=payload_updates):
++                client = OutputPreparationClient(
++                    HttpPort(payload_updates),
++                    "https://output-manager.example",
++                    "configured-output",
++                    "machine-secret",
++                    0.1,
++                )
++                with self.assertRaises(RuntimeError):
++                    await client.prepare()
++
++    async def test_invalid_ready_revokes_the_nonce_even_without_a_ready_lease(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        http = HttpPort({"lease_id": "late-unrelated-lease"})
++        client = OutputPreparationClient(
++            http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++        )
++
++        with self.assertRaises(RuntimeError):
++            await client.prepare()
++        await asyncio.sleep(0)
++
++        prepare_request = http.requests[0][1]["json"]
++        self.assertEqual(len(http.requests), 2)
++        release_url, release_request = http.requests[1]
++        self.assertEqual(release_url, "https://output-manager.example/api/output/release")
++        self.assertEqual(
++            release_request["json"],
++            {
++                "output_id": "configured-output",
++                "lease_id": prepare_request["lease_id"],
++                "reason": "failed",
++            },
++        )
++        self.assertEqual(release_request["headers"], {"X-Output-Preparation-Token": "machine-secret"})
++        self.assertFalse(release_request["allow_redirects"])
++
++    async def test_http_interruption_or_invalid_json_revokes_known_nonce_without_secret(self) -> None:
++        from aiohttp import ClientConnectionError
++
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        for error in (ClientConnectionError("machine-secret"), ValueError("machine-secret")):
++            with self.subTest(error_type=type(error).__name__):
++                http = HttpPort(prepare_error=error)
++                client = OutputPreparationClient(
++                    http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++                )
++                with self.assertRaises(RuntimeError) as failure:
++                    await client.prepare()
++                self.assertNotIn("machine-secret", str(failure.exception))
++                await asyncio.sleep(0)
++                self.assertEqual(len(http.requests), 2)
++                self.assertEqual(http.requests[1][1]["json"]["reason"], "failed")
++                self.assertEqual(
++                    http.requests[1][1]["json"]["lease_id"],
++                    http.requests[0][1]["json"]["lease_id"],
++                )
++
++    async def test_prepare_deadline_revokes_pending_request(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        http = HttpPort(gate=asyncio.Event())
++        client = OutputPreparationClient(
++            http, "https://output-manager.example", "configured-output", "machine-secret", 0.01
++        )
++
++        with self.assertRaises(RuntimeError):
++            await asyncio.wait_for(client.prepare(), timeout=0.1)
++        await asyncio.sleep(0)
++
++        self.assertEqual(len(http.requests), 2)
++        self.assertEqual(http.requests[1][1]["json"]["reason"], "timeout")
++        self.assertEqual(
++            http.requests[0][1]["json"]["lease_id"], http.requests[1][1]["json"]["lease_id"]
++        )
++
++    async def test_incomplete_credentials_or_unbounded_deadline_fail_closed(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        for output_id, token, timeout in (
++            ("", "machine-secret", 0.1),
++            ("configured-output", "", 0.1),
++            ("configured-output", None, 0.1),
++            ("configured-output", "machine-secret\n", 0.1),
++            *(("configured-output", "machine-secret", timeout) for timeout in (
++                0, -1, float("nan"), float("inf"), 15.1, "15", True
++            )),
++        ):
++            with self.subTest(output_present=bool(output_id), timeout=timeout):
++                http = HttpPort()
++                with self.assertRaises(RuntimeError) as failure:
++                    OutputPreparationClient(
++                        http, "https://output-manager.example", output_id, token, timeout
++                    )
++                self.assertNotIn("machine-secret", str(failure.exception))
++                self.assertEqual(http.requests, [])
++
++    async def test_unsafe_management_urls_fail_closed_without_sending_secrets(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        for url in (
++            "http://output-manager.example",
++            "https://user:machine-secret@output-manager.example",
++            "https://output-manager.example?token=machine-secret",
++            "https://output-manager.example#machine-secret",
++            "ftp://output-manager.example",
++            "https://output-manager.example:bad-port",
++        ):
++            with self.subTest(url=url):
++                http = HttpPort()
++                with self.assertRaises(RuntimeError) as failure:
++                    OutputPreparationClient(http, url, "configured-output", "machine-secret", 0.1)
++                self.assertNotIn("machine-secret", str(failure.exception))
++                self.assertEqual(http.requests, [])
++
++    async def test_http_rejection_is_not_ready_and_revokes_its_nonce(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        for status in (302, 401, 503):
++            with self.subTest(status=status):
++                http = HttpPort(status=status)
++                client = OutputPreparationClient(
++                    http,
++                    "https://output-manager.example",
++                    "configured-output",
++                    "machine-secret",
++                    0.1,
++                )
++                with self.assertRaises(RuntimeError):
++                    await client.prepare()
++                await asyncio.sleep(0)
++                self.assertEqual(len(http.requests), 2)
++                self.assertEqual(http.requests[1][1]["json"]["reason"], "failed")
++
++    async def test_cancellation_wins_even_when_ready_is_already_returning(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        http = HttpPort(cancel_on_ready=True)
++        client = OutputPreparationClient(
++            http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++        )
++        granted: list[Any] = []
++
++        async def request() -> None:
++            granted.append(await client.prepare())
++
++        task = asyncio.create_task(request())
++        with self.assertRaises(asyncio.CancelledError):
++            await task
++        await asyncio.sleep(0)
++
++        self.assertEqual(granted, [])
++        self.assertEqual(len(http.requests), 2)
++        self.assertEqual(http.requests[1][1]["json"]["reason"], "cancelled")
++        self.assertEqual(
++            http.requests[0][1]["json"]["lease_id"], http.requests[1][1]["json"]["lease_id"]
++        )
++
++
++class MediaPorts:
++    """Observable music source, output and clock ports for a real session."""
++
++    def __init__(self) -> None:
++        self.events: list[str] = []
++        self.read_started = asyncio.Event()
++        self.committed = asyncio.Event()
++        self.eof = asyncio.Event()
++        self.drain_started = asyncio.Event()
++        self.drain_gate: asyncio.Event | None = None
++        self.stream_count = 0
++        self.start_error: Exception | None = None
++
++    def get_stream(self, *args: Any) -> Any:
++        self.events.append("read")
++        self.read_started.set()
++
++        async def source() -> Any:
++            yield b"\x00" * 3840
++            await self.eof.wait()
++
++        return source()
++
++    def start_stream(self, **kwargs: Any) -> Any:
++        if self.start_error is not None:
++            raise self.start_error
++        self.events.append("stream")
++        self.stream_count += 1
++        ports = self
++
++        class PushOutput:
++            is_stopped = False
++
++            def set_live_source(self, live: bool) -> None:
++                return None
++
++            def prepare_audio(self, *args: Any, **kwargs: Any) -> None:
++                return None
++
++            async def commit_audio(self) -> int:
++                ports.events.append("commit")
++                ports.committed.set()
++                return 1_000_000
++
++            async def sleep_to_limit_buffer(self, limit: int) -> None:
++                if limit == 0:
++                    ports.drain_started.set()
++                    if ports.drain_gate is not None:
++                        await ports.drain_gate.wait()
++
++            def now_us(self) -> int:
++                return 1_000_000
++
++            def clear(self) -> None:
++                ports.events.append("clear")
++
++            def stop(self, *, keep_stream: bool = False) -> None:
++                self.is_stopped = True
++                ports.events.append("stream-stop")
++
++        return PushOutput()
++
++    async def stop(self) -> None:
++        self.events.append("group-stop")
++
++
++class SessionPlayer:
++    """Player input with external HTTP and media ports, without a second queue."""
++
++    def __init__(self, http: HttpPort, ports: MediaPorts, *, enabled: bool = True) -> None:
++        self.player_id = "test-player"
++        self.logger = logging.getLogger("output-preparation-test")
++        self.values: dict[str, Any] = {
++            "output_preparation_url": "https://output-manager.example" if enabled else "",
++            "output_preparation_output_id": "configured-output",
++            "output_preparation_token": "machine-secret",
++            "output_preparation_timeout": 0.1,
++        }
++        self.config = SimpleNamespace(get_value=lambda key, default=None: self.values.get(key, default))
++        self.api = SimpleNamespace(
++            group=SimpleNamespace(
++                start_stream=ports.start_stream,
++                stop=ports.stop,
++                clients=[SimpleNamespace(client_id=self.player_id)],
++            )
++        )
++        self.provider = SimpleNamespace(
++            server_api=SimpleNamespace(
++                get_client=lambda player_id: None, allow_noncompliant_clients=False
++            )
++        )
++        self.mass = SimpleNamespace(
++            http_session=http,
++            config=SimpleNamespace(
++                get_player_dsp_config=lambda player_id: SimpleNamespace(enabled=False),
++                get_raw_player_config_value=lambda player_id, key, default: default,
++            ),
++            streams=SimpleNamespace(
++                get_stream=ports.get_stream,
++                audio=SimpleNamespace(
++                    get_player_output_plan=lambda *args, **kwargs: SimpleNamespace(filter_params=[])
++                ),
++            ),
++        )
++        self.volume_level = 42
++        self.volume_muted = False
++        self._metadata_role = None
++        self._extra_attributes: dict[str, Any] = {}
++        self.ports = ports
++
++    async def volume_set(self, volume: int) -> None:
++        self.ports.events.append(f"volume:{volume}")
++
++    async def volume_mute(self, muted: bool) -> None:
++        self.ports.events.append(f"mute:{muted}")
++
++    def update_state(self) -> None:
++        return None
++
++
++class OutputPreparationSessionTests(unittest.IsolatedAsyncioTestCase):
++    """Exercise the existing session's public start/cancel pre-stream seam."""
++
++    async def test_session_does_not_start_or_read_music_before_output_ready(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort(gate=asyncio.Event())
++        ports = MediaPorts()
++        session = SendspinPlaybackSession(SessionPlayer(http, ports))
++        media = PlayerMedia(uri="test://short-track")
++        await session.start(media)
++        try:
++            await asyncio.wait_for(http.prepare_started.wait(), timeout=1)
++            self.assertEqual(ports.events, [])
++            assert http.gate is not None
++            http.gate.set()
++            await asyncio.wait_for(ports.committed.wait(), timeout=1)
++            self.assertLess(ports.events.index("volume:42"), ports.events.index("read"))
++            self.assertLess(ports.events.index("read"), ports.events.index("commit"))
++        finally:
++            await session.cancel("stop command")
++
++    async def test_unconfigured_session_preserves_normal_streaming_without_management_http(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort()
++        ports = MediaPorts()
++        session = SendspinPlaybackSession(SessionPlayer(http, ports, enabled=False))
++        await session.start(PlayerMedia(uri="test://short-track"))
++        try:
++            await asyncio.wait_for(ports.committed.wait(), timeout=1)
++            self.assertEqual(http.requests, [])
++            self.assertNotIn("volume:42", ports.events)
++        finally:
++            await session.cancel("stop command")
++
++    async def test_pending_stop_revokes_nonce_without_reading_or_late_playback(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort(gate=asyncio.Event())
++        ports = MediaPorts()
++        session = SendspinPlaybackSession(SessionPlayer(http, ports))
++        await session.start(PlayerMedia(uri="test://short-track"))
++        await asyncio.wait_for(http.prepare_started.wait(), timeout=1)
++        await session.cancel("stop command")
++        assert http.gate is not None
++        http.gate.set()
++        await asyncio.sleep(0)
++
++        self.assertEqual(ports.events, [])
++        self.assertEqual(len(http.requests), 2)
++        self.assertEqual(http.requests[1][1]["json"]["reason"], "cancelled")
++        self.assertEqual(
++            http.requests[0][1]["json"]["lease_id"], http.requests[1][1]["json"]["lease_id"]
++        )
++
++    async def test_stop_releases_ready_output_even_when_called_repeatedly(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort()
++        ports = MediaPorts()
++        session = SendspinPlaybackSession(SessionPlayer(http, ports))
++        await session.start(PlayerMedia(uri="test://short-track"))
++        await asyncio.wait_for(ports.committed.wait(), timeout=1)
++
++        await session.cancel("stop command")
++        await session.cancel("stop command")
++
++        self.assertEqual(len(http.requests), 2)
++        self.assertEqual(http.requests[1][1]["json"], {
++            "output_id": "configured-output",
++            "lease_id": http.requests[0][1]["json"]["lease_id"],
++            "reason": "stop",
++        })
++
++    async def test_resume_after_pause_as_stop_prepares_new_lease_before_reading(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort()
++        ports = MediaPorts()
++        session = SendspinPlaybackSession(SessionPlayer(http, ports))
++        media = PlayerMedia(uri="test://short-track")
++        await session.start(media)
++        await asyncio.wait_for(ports.committed.wait(), timeout=1)
++        await session.cancel("pause via stop command")
++        http.gate = asyncio.Event()
++        http.prepare_started.clear()
++        ports.events.clear()
++        ports.committed.clear()
++        await session.start(media)
++        try:
++            await asyncio.wait_for(http.prepare_started.wait(), timeout=1)
++            self.assertEqual(ports.events, [])
++            self.assertEqual(len(http.requests), 3)
++            self.assertNotEqual(
++                http.requests[0][1]["json"]["lease_id"], http.requests[2][1]["json"]["lease_id"]
++            )
++            http.gate.set()
++            await asyncio.wait_for(ports.committed.wait(), timeout=1)
++        finally:
++            await session.cancel("stop command")
++
++    async def test_stream_setup_failure_releases_ready_lease_without_natural_eof(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort()
++        ports = MediaPorts()
++        ports.start_error = RuntimeError("transport unavailable")
++        session = SendspinPlaybackSession(SessionPlayer(http, ports))
++        await session.start(PlayerMedia(uri="test://short-track"))
++        try:
++            assert session.playback_task is not None
++            with self.assertRaisesRegex(RuntimeError, "transport unavailable"):
++                await asyncio.wait_for(session.playback_task, timeout=1)
++            self.assertNotIn("read", ports.events)
++            self.assertNotIn("group-stop", ports.events)
++            self.assertEqual(len(http.requests), 2)
++            self.assertEqual(http.requests[1][1]["json"]["reason"], "failed")
++        finally:
++            await session.cancel("stop command")
++
++    async def test_track_change_revalidates_and_reuses_lease_without_releasing_output(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort()
++        ports = MediaPorts()
++        session = SendspinPlaybackSession(SessionPlayer(http, ports))
++        await session.start(PlayerMedia(uri="test://first-track"))
++        try:
++            await asyncio.wait_for(ports.committed.wait(), timeout=1)
++            ports.committed.clear()
++            await session.start(PlayerMedia(uri="test://next-track"), restart=True)
++            await asyncio.wait_for(ports.committed.wait(), timeout=1)
++            self.assertEqual(ports.stream_count, 2)
++            self.assertEqual(len(http.requests), 2)
++            self.assertTrue(all(url.endswith("/prepare") for url, _ in http.requests))
++            self.assertEqual(
++                http.requests[0][1]["json"]["lease_id"],
++                http.requests[1][1]["json"]["lease_id"],
++            )
++        finally:
++            await session.cancel("stop command")
++
++    async def test_natural_eof_releases_output_only_after_committed_audio_drains(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort()
++        ports = MediaPorts()
++        ports.drain_gate = asyncio.Event()
++        session = SendspinPlaybackSession(SessionPlayer(http, ports))
++        await session.start(PlayerMedia(uri="test://short-track"))
++        try:
++            await asyncio.wait_for(ports.committed.wait(), timeout=1)
++            ports.eof.set()
++            await asyncio.wait_for(ports.drain_started.wait(), timeout=1)
++            self.assertEqual(len(http.requests), 1)
++            ports.drain_gate.set()
++            assert session.playback_task is not None
++            await asyncio.wait_for(session.playback_task, timeout=1)
++            self.assertEqual(len(http.requests), 2)
++            self.assertEqual(http.requests[1][1]["json"]["reason"], "ended")
++        finally:
++            await session.cancel("stop command")
