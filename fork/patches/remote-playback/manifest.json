@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "workspace": "tmp/remote-playback",
+  "projects": {
+    "bridge": {
+      "repository": "https://github.com/trudenboy/sendspin-bt-bridge.git",
+      "revision": "126e766d00876878aa67b5464d0f8f40e6b8c85d",
+      "reference": "v2.75.0",
+      "license": "MIT",
+      "source_path": "src",
+      "runtime_image": "ghcr.io/trudenboy/sendspin-bt-bridge@sha256:f024a481824283e1ae7aa7c8e308a3129e286d27bc8e38f85d199d9d182aabba",
+      "expected_packages": {
+        "aiosendspin": "6.1.1",
+        "sendspin": "7.5.0"
+      },
+      "test_command": ["python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_output_preparation*.py"],
+      "patches": []
+    },
+    "ma": {
+      "repository": "https://github.com/music-assistant/server.git",
+      "revision": "e30a4974ba951f38e21bea8d502af3b903df992c",
+      "reference": "2.10.4",
+      "license": "Apache-2.0",
+      "source_path": ".",
+      "runtime_image": "ghcr.io/music-assistant/server@sha256:37a9a2776e838a754c9f5b38c432567389952304e7cb8f6b44b6cd28043de6de",
+      "expected_packages": {
+        "aiosendspin": "9.1.1"
+      },
+      "test_command": ["python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_output_preparation*.py"],
+      "patches": []
+    }
+  },
+  "sandbox": {
+    "network": "none",
+    "read_only": true,
+    "pull_policy": "never"
+  }
+}
