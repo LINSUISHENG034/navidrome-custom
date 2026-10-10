@@ -95,7 +95,7 @@ def load_manifest(root):
         checkout = confined_path(workspace, f"src/{key}", "checkout")
         confined_path(checkout, project["source_path"], "source_path")
         command = project["test_command"]
-        if (not isinstance(command, list) or len(command) != 9 or
+        if command is not None and (not isinstance(command, list) or len(command) != 9 or
                 command[:7] != ["python3", "-B", "-m", "unittest", "discover", "-s", "tests"] or
                 command[7] != "-p" or not isinstance(command[8], str) or
                 not re.fullmatch(r"test_[A-Za-z0-9_*?-]+\.py", command[8])):
@@ -112,8 +112,14 @@ def load_manifest(root):
                 raise RunnerError(f"{key}: invalid patch sha256")
             if hashlib.sha256(path.read_bytes()).hexdigest() != patch["sha256"]:
                 raise RunnerError(f"{key}: patch checksum mismatch: {patch['file']}")
-    for key in projects:
-        runtime_source_keys(projects, key)
+    tested_sources = set()
+    for key, project in projects.items():
+        dependencies = runtime_source_keys(projects, key)
+        if project["test_command"] is not None:
+            tested_sources.update(dependencies)
+    if any(project["test_command"] is None and key not in tested_sources
+           for key, project in projects.items()):
+        raise RunnerError("source-only projects must be reachable via runtime_sources from a tested project")
     return manifest
 
 
@@ -350,6 +356,8 @@ def validate_test_source(run, checkout, project, *, runtime_source=False):
 
 
 def test_checkout(run, checkout, project, projects=None):
+    if project["test_command"] is None:
+        raise RunnerError("source-only project; test dependent project instead")
     validate_test_source(run, checkout, project)
     tests = confined_path(checkout, "tests", "tests")
     if not tests.is_dir():

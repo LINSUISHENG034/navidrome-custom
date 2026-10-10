@@ -243,6 +243,18 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("runtime_sources", self.err.getvalue())
         self.assertEqual(len(self.commands.calls), 0)
 
+    def test_validate_refuses_source_only_projects_without_reachability_from_tested_root(self):
+        self.add_runtime_source(generated=False)
+        command = self.manifest["projects"]["bridge"]["test_command"]
+        self.manifest["projects"]["sendspin"]["test_command"] = None
+        for dependencies, root_command in (([], command), (["sendspin"], None)):
+            with self.subTest(runtime_sources=dependencies, root_command=root_command):
+                self.manifest["projects"]["bridge"].update(runtime_sources=dependencies, test_command=root_command)
+                self.save_manifest()
+                self.assertEqual(self.invoke("validate"), 1)
+                self.assertIn("source-only", self.err.getvalue())
+                self.assertEqual(len(self.commands.calls), 0)
+
     def test_validate_never_uses_symlinked_workspace_or_patch_directories(self):
         (self.root / "data").mkdir()
         (self.root / "tmp").symlink_to(self.root / "data", target_is_directory=True)
@@ -320,6 +332,43 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(any("clone" in argv or "apply" in argv or "checkout" in argv
                              for argv, _ in self.commands.calls))
 
+    def test_test_mounts_source_only_runtime_source_with_null_command_without_dependency_tests(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        self.manifest["projects"]["sendspin"].update(test_command=None, source_path=".")
+        self.save_manifest()
+        self.assertEqual(self.invoke("test", "bridge"), 0, self.err.getvalue())
+        command = next(argv for argv, _ in self.commands.calls if argv[0] == "docker")
+        self.assertEqual(command.count("--mount"), 2)
+        self.assertIn(f"type=bind,src={dependency},dst=/runtime-sources/sendspin,readonly", command)
+        self.assertIn("PYTHONPATH=/workspace/src:/runtime-sources/sendspin", command)
+        self.assertFalse((dependency / "tests").exists())
+        self.assertEqual(json.loads(self.out.getvalue())["tests"], 1)
+
+    def test_test_refuses_standalone_source_only_project_before_docker(self):
+        self.add_runtime_source()
+        self.manifest["projects"]["sendspin"]["test_command"] = None
+        self.save_manifest()
+        self.assertEqual(self.invoke("test", "sendspin"), 1)
+        self.assertIn("source-only project", self.err.getvalue())
+        self.assertIn("test dependent project", self.err.getvalue())
+        self.assertEqual(self.out.getvalue(), "")
+        self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
+
+    def test_source_only_projects_preserve_status_fetch_apply_and_export_commands(self):
+        self.add_runtime_source()
+        self.manifest["projects"]["sendspin"]["test_command"] = None
+        self.add_patch("sendspin")
+        for command in ("status", "fetch", "apply"):
+            with self.subTest(command=command):
+                self.assertEqual(self.invoke(command, "sendspin"), 0, self.err.getvalue())
+        self.commands.checkouts["sendspin"]["dirty"] = "M  src/worker.py\n"
+        self.assertEqual(self.invoke("export", "sendspin", "--working-tree", "--patch", "sendspin.patch"), 0,
+                         self.err.getvalue())
+        self.assertIsNone(json.loads(self.manifest_path.read_text())["projects"]["sendspin"]["test_command"])
+        self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
+
     def test_test_mounts_transitive_runtime_sources_once_with_confined_pythonpaths(self):
         checkout = self.generated_checkout()
         self.fixture_sources(checkout)
@@ -337,6 +386,43 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(command.count("--mount"), 3)
                 self.assertIn(f"type=bind,src={codec},dst=/runtime-sources/codec,readonly", command)
                 self.assertIn("PYTHONPATH=/workspace/src:/runtime-sources/sendspin/src:/runtime-sources/codec", command)
+
+    def test_test_mounts_source_only_transitive_dependencies_once_from_tested_root(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        dependency = self.add_runtime_source()
+        codec = self.add_runtime_source("codec")
+        self.manifest["projects"]["bridge"]["runtime_sources"] = ["sendspin", "codec"]
+        self.manifest["projects"]["sendspin"].update(
+            test_command=None, source_path=".", runtime_sources=["codec"],
+        )
+        self.manifest["projects"]["codec"].update(test_command=None, source_path=".")
+        self.save_manifest()
+        self.assertEqual(self.invoke("validate"), 0, self.err.getvalue())
+        self.assertEqual(len(self.commands.calls), 0)
+        self.assertEqual(self.invoke("test", "bridge"), 0, self.err.getvalue())
+        command = next(argv for argv, _ in self.commands.calls if argv[0] == "docker")
+        self.assertEqual(command.count("--mount"), 3)
+        self.assertIn(f"type=bind,src={dependency},dst=/runtime-sources/sendspin,readonly", command)
+        self.assertIn(f"type=bind,src={codec},dst=/runtime-sources/codec,readonly", command)
+        self.assertIn("PYTHONPATH=/workspace/src:/runtime-sources/sendspin:/runtime-sources/codec", command)
+        self.assertFalse((dependency / "tests").exists())
+        self.assertFalse((codec / "tests").exists())
+
+    def test_source_only_runtime_sources_still_reject_untrusted_checkout_before_docker(self):
+        checkout = self.generated_checkout()
+        self.fixture_sources(checkout)
+        self.add_runtime_source()
+        self.manifest["projects"]["sendspin"]["test_command"] = None
+        self.save_manifest()
+        valid = self.commands.checkouts["sendspin"]
+        cases = [{"head": "5" * 40}, {"dirty": "M  src/worker.py\n"}, {"ignored": "src/ignored.py\n"}]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.commands.checkouts["sendspin"] = dict(valid, **changes)
+                self.commands.calls.clear()
+                self.assertEqual(self.invoke("test", "bridge"), 1)
+                self.assertFalse(any(argv[0] == "docker" for argv, _ in self.commands.calls))
 
     def test_test_refuses_missing_runtime_source_without_fetch_or_docker(self):
         checkout = self.generated_checkout()
