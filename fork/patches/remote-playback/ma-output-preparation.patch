@@ -18,10 +18,10 @@ index c3cca4a9d20c7c868a76c76982d8e784783d0f4d..19a94ebe4fdf9e56cdc7ac920dc7a6e5
  CONF_PAIRING_TOKEN = "pairing_token"
 diff --git a/music_assistant/providers/sendspin/output_preparation.py b/music_assistant/providers/sendspin/output_preparation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..de4dc36c9ec4a7ef1db26d4df7e23bb3fea8cc09
+index 0000000000000000000000000000000000000000..7e39df37656777ec4e5659efea8437b7d4f93c5e
 --- /dev/null
 +++ b/music_assistant/providers/sendspin/output_preparation.py
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,206 @@
 +"""Correlated output preparation before Sendspin content streaming."""
 +
 +from __future__ import annotations
@@ -53,6 +53,7 @@ index 0000000000000000000000000000000000000000..de4dc36c9ec4a7ef1db26d4df7e23bb3
 +    output_id: str
 +    lease_id: str
 +    output_epoch: str
++    pcm_format: tuple[int, int, int] | None = None
 +
 +
 +class OutputPreparationClient:
@@ -89,19 +90,35 @@ index 0000000000000000000000000000000000000000..de4dc36c9ec4a7ef1db26d4df7e23bb3
 +        self._timeout_seconds = timeout_seconds
 +        self._release_tasks: set[asyncio.Task[None]] = set()
 +
-+    async def prepare(self, lease: OutputLease | None = None) -> OutputLease:
-+        """Obtain or revalidate a correlated output lease before consuming content."""
-+        if lease is None:
-+            lease = OutputLease(self._output_id, uuid4().hex, "")
++    async def prepare(
++        self, lease: OutputLease | None = None, *, pcm_format: dict[str, int] | None = None
++    ) -> OutputLease:
++        """
++        Obtain or revalidate a correlated output lease before consuming content.
++
++        :param lease: Existing lease handed to this preparation; any failure revokes it.
++        :param pcm_format: Negotiated integer dimensions; omission preserves the lease format.
++        """
 +        try:
-+            payload = await self._request(
-+                "prepare",
-+                {
-+                    "output_id": lease.output_id,
-+                    "lease_id": lease.lease_id,
-+                    "timeout_seconds": self._timeout_seconds,
-+                },
++            normalized_format = (
++                self._normalize_pcm_format(pcm_format)
++                if pcm_format is not None
++                else lease.pcm_format if lease is not None else None
 +            )
++            if lease is not None and normalized_format != lease.pcm_format:
++                raise OutputPreparationError("Output lease PCM format cannot change")
++            if lease is None:
++                lease = OutputLease(self._output_id, uuid4().hex, "", normalized_format)
++            request: dict[str, Any] = {
++                "output_id": lease.output_id,
++                "lease_id": lease.lease_id,
++                "timeout_seconds": self._timeout_seconds,
++            }
++            if normalized_format is not None:
++                request["pcm_format"] = dict(
++                    zip(("sample_rate", "bit_depth", "channels"), normalized_format, strict=True)
++                )
++            payload = await self._request("prepare", request)
 +            if (
 +                not isinstance(payload, dict)
 +                or payload.get("status") != "ready"
@@ -111,10 +128,17 @@ index 0000000000000000000000000000000000000000..de4dc36c9ec4a7ef1db26d4df7e23bb3
 +                or not payload["output_epoch"]
 +            ):
 +                raise OutputPreparationError("Output preparation returned an invalid readiness lease")
++            if (
++                normalized_format is not None
++                and self._normalize_pcm_format(payload.get("pcm_format")) != normalized_format
++            ):
++                raise OutputPreparationError("Output preparation returned a mismatched PCM format")
 +            task = asyncio.current_task()
 +            if task is not None and task.cancelling():
 +                raise asyncio.CancelledError
-+            return OutputLease(lease.output_id, lease.lease_id, payload["output_epoch"])
++            return OutputLease(
++                lease.output_id, lease.lease_id, payload["output_epoch"], normalized_format
++            )
 +        except asyncio.CancelledError:
 +            self._schedule_release(lease, "cancelled")
 +            raise
@@ -130,6 +154,20 @@ index 0000000000000000000000000000000000000000..de4dc36c9ec4a7ef1db26d4df7e23bb3
 +        await self._request(
 +            "release", {"output_id": lease.output_id, "lease_id": lease.lease_id, "reason": reason}
 +        )
++
++    @staticmethod
++    def _normalize_pcm_format(pcm_format: Any) -> tuple[int, int, int]:
++        keys = ("sample_rate", "bit_depth", "channels")
++        if (
++            not isinstance(pcm_format, dict)
++            or set(pcm_format) != set(keys)
++            or any(type(pcm_format[key]) is not int for key in keys)
++            or pcm_format["sample_rate"] <= 0
++            or pcm_format["bit_depth"] not in (16, 24, 32)
++            or pcm_format["channels"] <= 0
++        ):
++            raise OutputPreparationError("Output preparation requires an integer PCM format")
++        return pcm_format["sample_rate"], pcm_format["bit_depth"], pcm_format["channels"]
 +
 +    @staticmethod
 +    def _validate_url(url: str) -> str:
@@ -178,7 +216,9 @@ index 0000000000000000000000000000000000000000..de4dc36c9ec4a7ef1db26d4df7e23bb3
 +        except (ClientError, ValueError):
 +            raise OutputPreparationError("Output management request failed") from None
 +
-+    def _schedule_release(self, lease: OutputLease, reason: str) -> None:
++    def _schedule_release(self, lease: OutputLease | None, reason: str) -> None:
++        if lease is None:
++            return
 +        task = asyncio.create_task(self.release(lease, reason))
 +        self._release_tasks.add(task)
 +
@@ -189,10 +229,10 @@ index 0000000000000000000000000000000000000000..de4dc36c9ec4a7ef1db26d4df7e23bb3
 +
 +        task.add_done_callback(done)
 diff --git a/music_assistant/providers/sendspin/playback.py b/music_assistant/providers/sendspin/playback.py
-index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6de798e20 100644
+index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e63813dd1 100644
 --- a/music_assistant/providers/sendspin/playback.py
 +++ b/music_assistant/providers/sendspin/playback.py
-@@ -29,6 +29,17 @@ from music_assistant.providers.sendspin.bridge_role import (
+@@ -29,6 +29,18 @@ from music_assistant.providers.sendspin.bridge_role import (
      BRIDGE_SAMPLE_RATE,
      BridgePlayerRole,
  )
@@ -206,11 +246,12 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6
 +from music_assistant.providers.sendspin.output_preparation import (
 +    OutputLease,
 +    OutputPreparationClient,
++    OutputPreparationError,
 +)
  
  if TYPE_CHECKING:
      from music_assistant.helpers.dsp import ComplexFilter
-@@ -359,6 +370,8 @@ class SendspinPlaybackSession:
+@@ -359,6 +371,8 @@ class SendspinPlaybackSession:
          self._sendspin_pcm_format: SendspinAudioFormat = _DEFAULT_SENDSPIN_PCM_FORMAT
          self._queue_id: str | None = None
          self._queue_session_id: str | None = None
@@ -219,7 +260,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6
  
      def flow_track_anchor_us(self, track_start_offset_us: int) -> int | None:
          """
-@@ -412,12 +425,13 @@ class SendspinPlaybackSession:
+@@ -412,12 +426,13 @@ class SendspinPlaybackSession:
              mishandle stream/clear.
          """
          task = self.playback_task
@@ -236,7 +277,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6
          provider = cast("SendspinProvider", self.player.provider)
          if provider.server_api.allow_noncompliant_clients:
              keep_stream = False
-@@ -431,6 +445,8 @@ class SendspinPlaybackSession:
+@@ -431,6 +446,8 @@ class SendspinPlaybackSession:
              await task
          if self.playback_task is task:
              self.playback_task = None
@@ -245,7 +286,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6
  
      async def start(self, media: PlayerMedia, restart: bool = False) -> None:
          """Start background playback for `media`."""
-@@ -510,6 +526,14 @@ class SendspinPlaybackSession:
+@@ -510,6 +527,14 @@ class SendspinPlaybackSession:
  
      # -- Helpers ---------------------------------------------------------------
  
@@ -260,7 +301,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6
      def _attach_task_exception_logger(self, task: asyncio.Task[Any], name: str) -> None:
          """Log unhandled exception from background task when it finishes."""
  
-@@ -736,7 +760,32 @@ class SendspinPlaybackSession:
+@@ -736,7 +761,57 @@ class SendspinPlaybackSession:
  
      # -- Playback pipeline -----------------------------------------------------
  
@@ -269,6 +310,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6
 +        """Prepare output before streaming and revoke authority on failure."""
 +        try:
 +            if url := self.player.config.get_value(CONF_OUTPUT_PREPARATION_URL):
++                pcm_format = self._get_output_preparation_pcm_format()
 +                if self._output_client is None:
 +                    self._output_client = OutputPreparationClient(
 +                        self.player.mass.http_session,
@@ -279,8 +321,12 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6
 +                            CONF_OUTPUT_PREPARATION_TIMEOUT, DEFAULT_OUTPUT_PREPARATION_TIMEOUT
 +                        ),
 +                    )
++                # Prepare owns revocation until readiness returns. The session must not
++                # retain a nonce that a failed or cancelled revalidation has revoked.
 +                previous_lease, self._output_lease = self._output_lease, None
-+                self._output_lease = await self._output_client.prepare(previous_lease)
++                self._output_lease = await self._output_client.prepare(
++                    previous_lease, pcm_format=pcm_format
++                )
 +                if self.player.volume_level is not None:
 +                    await self.player.volume_set(self.player.volume_level)
 +                if self.player.volume_muted is not None:
@@ -290,11 +336,31 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..cdce819c42ff112c39dba9df7f21e4a6
 +            await self._release_output("failed")
 +            raise
 +
++    def _get_output_preparation_pcm_format(self) -> dict[str, int]:
++        provider = cast("SendspinProvider", self.player.provider)
++        client = provider.server_api.get_client(self.player.player_id)
++        if client is not None:
++            for role in client.roles_by_family("player"):
++                if not isinstance(role, PlayerV1Role):
++                    continue
++                audio_format = role.preferred_format
++                if (
++                    audio_format is not None
++                    and audio_format.sample_type == "int"
++                    and role.preferred_codec in (SendspinAudioCodec.PCM, SendspinAudioCodec.FLAC)
++                ):
++                    return {
++                        "sample_rate": audio_format.sample_rate,
++                        "bit_depth": audio_format.bit_depth,
++                        "channels": audio_format.channels,
++                    }
++        raise OutputPreparationError("Negotiated integer PCM/FLAC output format is unavailable")
++
 +    async def _stream_playback(self, media: PlayerMedia) -> None:  # noqa: PLR0915
          """
          Run the playback pipeline for a single media session.
  
-@@ -981,6 +1030,7 @@ class SendspinPlaybackSession:
+@@ -981,6 +1056,7 @@ class SendspinPlaybackSession:
              # Only emit a group STOP when MA stream playback reached natural EOF.
              # Skip this on cancellation/error paths to avoid stop-event races with transitions.
              if producer_stopped_cleanly and not self._cancel_requested:
@@ -373,10 +439,10 @@ index be02aebdca54c9fb79486942dae3ee42cf21eb01..a38d91f80c662d21a49447c4d00d01d8
          if player_role is not None:
 diff --git a/tests/test_output_preparation_client.py b/tests/test_output_preparation_client.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3e5c30a3d99aa5af272354df50361fd98a9b4b71
+index 0000000000000000000000000000000000000000..9c792b28d8ce2a4c05b371ceea33f71abe379410
 --- /dev/null
 +++ b/tests/test_output_preparation_client.py
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,856 @@
 +"""Output preparation contract at the public HTTP client seam."""
 +
 +from __future__ import annotations
@@ -386,6 +452,10 @@ index 0000000000000000000000000000000000000000..3e5c30a3d99aa5af272354df50361fd9
 +import unittest
 +from types import SimpleNamespace
 +from typing import Any
++
++from aiosendspin.models.types import AudioCodec
++from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
++from aiosendspin.server.roles.player.v1 import PlayerV1Role
 +
 +
 +class HttpResponse:
@@ -455,6 +525,7 @@ index 0000000000000000000000000000000000000000..3e5c30a3d99aa5af272354df50361fd9
 +                "output_id": body["output_id"],
 +                "lease_id": body["lease_id"],
 +                "output_epoch": "opaque-backend-generation",
++                **({"pcm_format": body["pcm_format"]} if "pcm_format" in body else {}),
 +                **self.payload_updates,
 +            },
 +            self.gate if is_prepare else None,
@@ -487,6 +558,94 @@ index 0000000000000000000000000000000000000000..3e5c30a3d99aa5af272354df50361fd9
 +        self.assertFalse(request["allow_redirects"])
 +        self.assertEqual(lease.output_id, "configured-output")
 +        self.assertEqual(lease.output_epoch, "opaque-backend-generation")
++
++    async def test_prepare_carries_pcm_format_and_revalidates_the_same_lease(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        http = HttpPort()
++        client = OutputPreparationClient(
++            http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++        )
++        lease = await client.prepare(
++            pcm_format={"sample_rate": 48000, "bit_depth": 24, "channels": 2}
++        )
++        await client.prepare(lease)
++
++        for _, request in http.requests:
++            self.assertEqual(
++                request["json"]["pcm_format"],
++                {"sample_rate": 48000, "bit_depth": 24, "channels": 2},
++            )
++            self.assertEqual(request["json"]["lease_id"], lease.lease_id)
++
++    async def test_invalid_pcm_dimensions_fail_before_allocating_http_lease(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        for pcm_format in (
++            {"sample_rate": 0, "bit_depth": 16, "channels": 2},
++            {"sample_rate": 48000, "bit_depth": 8, "channels": 2},
++            {"sample_rate": 48000, "bit_depth": 16, "channels": 0},
++            {"sample_rate": 48000.0, "bit_depth": 16, "channels": 2},
++            {"sample_rate": 48000, "bit_depth": 16, "channels": True},
++            {"sample_rate": 48000, "bit_depth": 32, "channels": 2, "sample_type": "float"},
++        ):
++            with self.subTest(pcm_format=pcm_format):
++                http = HttpPort()
++                client = OutputPreparationClient(
++                    http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++                )
++                with self.assertRaises(RuntimeError):
++                    await client.prepare(pcm_format=pcm_format)
++                self.assertEqual(http.requests, [])
++
++    async def test_lease_pcm_format_cannot_change_before_revalidation_http(self) -> None:
++        """Failed revalidation releases its handed-off lease without another Prepare."""
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        for changed_dimensions in (
++            {"bit_depth": 16}, {"sample_rate": 44100}, {"channels": 1}
++        ):
++            with self.subTest(changed_dimensions=changed_dimensions):
++                http = HttpPort()
++                client = OutputPreparationClient(
++                    http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++                )
++                pcm_format = {"sample_rate": 48000, "bit_depth": 24, "channels": 2}
++                lease = await client.prepare(pcm_format=pcm_format)
++                pcm_format.update(changed_dimensions)
++                with self.assertRaises(RuntimeError):
++                    await client.prepare(lease, pcm_format=pcm_format)
++                await asyncio.sleep(0)
++                self.assertEqual(len(http.requests), 2)
++                self.assertTrue(http.requests[1][0].endswith("/release"))
++                self.assertEqual(http.requests[1][1]["json"]["lease_id"], lease.lease_id)
++                self.assertEqual(http.requests[1][1]["json"]["reason"], "failed")
++
++    async def test_ready_requires_exact_integer_pcm_echo_and_revokes_mismatch(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        for echo in (
++            None,
++            {"sample_rate": 48000, "bit_depth": 16, "channels": 2},
++            {"sample_rate": 48000.0, "bit_depth": 24, "channels": 2},
++            {"sample_rate": 48000, "bit_depth": 24, "channels": 2, "sample_type": "float"},
++        ):
++            with self.subTest(echo=echo):
++                http = HttpPort({"pcm_format": echo})
++                client = OutputPreparationClient(
++                    http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++                )
++                with self.assertRaises(RuntimeError):
++                    await client.prepare(
++                        pcm_format={"sample_rate": 48000, "bit_depth": 24, "channels": 2}
++                    )
++                await asyncio.sleep(0)
++                self.assertEqual(len(http.requests), 2)
++                self.assertEqual(http.requests[1][1]["json"]["reason"], "failed")
++                self.assertEqual(
++                    http.requests[0][1]["json"]["lease_id"],
++                    http.requests[1][1]["json"]["lease_id"],
++                )
 +
 +    async def test_prepare_rejects_uncorrelated_or_nonready_response(self) -> None:
 +        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
@@ -725,6 +884,25 @@ index 0000000000000000000000000000000000000000..3e5c30a3d99aa5af272354df50361fd9
 +        self.events.append("group-stop")
 +
 +
++class NegotiatedPlayerRole(PlayerV1Role):
++    """External Sendspin negotiation port, independent of MA's internal F32 pipeline."""
++
++    def __init__(self) -> None:
++        super().__init__(SimpleNamespace())
++        self.audio_format: SendspinAudioFormat | None = SendspinAudioFormat(
++            sample_rate=48000, bit_depth=16, channels=2, sample_type="int"
++        )
++        self.codec: AudioCodec | None = AudioCodec.PCM
++
++    @property
++    def preferred_format(self) -> SendspinAudioFormat | None:
++        return self.audio_format
++
++    @property
++    def preferred_codec(self) -> AudioCodec | None:
++        return self.codec
++
++
 +class SessionPlayer:
 +    """Player input with external HTTP and media ports, without a second queue."""
 +
@@ -745,9 +923,13 @@ index 0000000000000000000000000000000000000000..3e5c30a3d99aa5af272354df50361fd9
 +                clients=[SimpleNamespace(client_id=self.player_id)],
 +            )
 +        )
++        self.negotiated_role = NegotiatedPlayerRole()
 +        self.provider = SimpleNamespace(
 +            server_api=SimpleNamespace(
-+                get_client=lambda player_id: None, allow_noncompliant_clients=False
++                get_client=lambda player_id: SimpleNamespace(
++                    roles_by_family=lambda family: [self.negotiated_role]
++                ),
++                allow_noncompliant_clients=False,
 +            )
 +        )
 +        self.mass = SimpleNamespace(
@@ -781,6 +963,173 @@ index 0000000000000000000000000000000000000000..3e5c30a3d99aa5af272354df50361fd9
 +
 +class OutputPreparationSessionTests(unittest.IsolatedAsyncioTestCase):
 +    """Exercise the existing session's public start/cancel pre-stream seam."""
++
++    async def test_configured_session_rejects_float_or_unsupported_negotiation_before_http(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        for scenario in ("float", "missing-format", "missing-codec", "opus", "missing-client"):
++            with self.subTest(scenario=scenario):
++                http = HttpPort()
++                ports = MediaPorts()
++                player = SessionPlayer(http, ports)
++                if scenario == "float":
++                    player.negotiated_role.audio_format = SendspinAudioFormat(
++                        sample_rate=48000, bit_depth=32, channels=2, sample_type="float"
++                    )
++                elif scenario == "missing-format":
++                    player.negotiated_role.audio_format = None
++                elif scenario == "missing-codec":
++                    player.negotiated_role.codec = None
++                elif scenario == "opus":
++                    player.negotiated_role.codec = AudioCodec.OPUS
++                else:
++                    player.provider.server_api.get_client = lambda player_id: None
++                session = SendspinPlaybackSession(player)
++                await session.start(PlayerMedia(uri="test://short-track"))
++                try:
++                    assert session.playback_task is not None
++                    with self.assertRaises(RuntimeError):
++                        await asyncio.wait_for(session.playback_task, timeout=0.2)
++                    self.assertEqual(http.requests, [])
++                    self.assertEqual(ports.events, [])
++                finally:
++                    await session.cancel("stop command")
++
++    async def test_cancelled_revalidation_restarts_with_fresh_nonce_in_both_stream_modes(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        for keep_stream in (False, True):
++            with self.subTest(keep_stream=keep_stream):
++                http = HttpPort()
++                ports = MediaPorts()
++                session = SendspinPlaybackSession(SessionPlayer(http, ports))
++                await session.start(PlayerMedia(uri="test://first-track"))
++                try:
++                    await asyncio.wait_for(ports.committed.wait(), timeout=1)
++                    first_nonce = http.requests[0][1]["json"]["lease_id"]
++                    http.gate = asyncio.Event()
++                    http.prepare_started.clear()
++                    await session.start(PlayerMedia(uri="test://pending-track"), restart=True)
++                    await asyncio.wait_for(http.prepare_started.wait(), timeout=1)
++                    await session.cancel("cancel pending revalidation", keep_stream=keep_stream)
++                    await asyncio.sleep(0)
++                    self.assertEqual(len(http.requests), 3)
++                    self.assertEqual(http.requests[2][1]["json"], {
++                        "output_id": "configured-output",
++                        "lease_id": first_nonce,
++                        "reason": "cancelled",
++                    })
++                    http.gate = None
++                    ports.committed.clear()
++                    await session.start(PlayerMedia(uri="test://fresh-track"))
++                    await asyncio.wait_for(ports.committed.wait(), timeout=1)
++                    self.assertEqual(len(http.requests), 4)
++                    self.assertNotEqual(http.requests[3][1]["json"]["lease_id"], first_nonce)
++                    self.assertEqual(ports.events.count("read"), 2)
++                    self.assertEqual(ports.events.count("commit"), 2)
++                finally:
++                    await session.cancel("stop command")
++
++    async def test_failed_revalidation_revokes_the_owned_nonce_once(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        for scenario in ("wrong-pcm-echo", "http-rejection", "timeout"):
++            with self.subTest(scenario=scenario):
++                http = HttpPort()
++                ports = MediaPorts()
++                session = SendspinPlaybackSession(SessionPlayer(http, ports))
++                await session.start(PlayerMedia(uri="test://first-track"))
++                try:
++                    await asyncio.wait_for(ports.committed.wait(), timeout=1)
++                    first_nonce = http.requests[0][1]["json"]["lease_id"]
++                    if scenario == "wrong-pcm-echo":
++                        http.payload_updates = {
++                            "pcm_format": {"sample_rate": 48000, "bit_depth": 24, "channels": 2}
++                        }
++                    elif scenario == "http-rejection":
++                        http.status = 503
++                    else:
++                        http.gate = asyncio.Event()
++                    await session.start(PlayerMedia(uri="test://next-track"), restart=True)
++                    assert session.playback_task is not None
++                    with self.assertRaises(RuntimeError):
++                        await asyncio.wait_for(session.playback_task, timeout=1)
++                    await asyncio.sleep(0)
++                    self.assertEqual(len(http.requests), 3)
++                    self.assertTrue(http.requests[1][0].endswith("/prepare"))
++                    self.assertTrue(http.requests[2][0].endswith("/release"))
++                    self.assertEqual(http.requests[2][1]["json"]["lease_id"], first_nonce)
++                    self.assertEqual(ports.events.count("read"), 1)
++                    self.assertEqual(ports.events.count("commit"), 1)
++                finally:
++                    await session.cancel("stop command")
++
++    async def test_failed_negotiation_after_ready_releases_owned_lease_without_source_advance(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        for scenario in ("changed-format", "missing-format", "float"):
++            with self.subTest(scenario=scenario):
++                http = HttpPort()
++                ports = MediaPorts()
++                player = SessionPlayer(http, ports)
++                session = SendspinPlaybackSession(player)
++                await session.start(PlayerMedia(uri="test://first-track"))
++                try:
++                    await asyncio.wait_for(ports.committed.wait(), timeout=1)
++                    first_nonce = http.requests[0][1]["json"]["lease_id"]
++                    if scenario == "missing-format":
++                        player.negotiated_role.audio_format = None
++                    else:
++                        player.negotiated_role.audio_format = SendspinAudioFormat(
++                            sample_rate=48000,
++                            bit_depth=24 if scenario == "changed-format" else 32,
++                            channels=2,
++                            sample_type="int" if scenario == "changed-format" else "float",
++                        )
++                    await session.start(PlayerMedia(uri="test://next-track"), restart=True)
++                    assert session.playback_task is not None
++                    with self.assertRaises(RuntimeError):
++                        await asyncio.wait_for(session.playback_task, timeout=1)
++                    await session.cancel("stop command")
++                    self.assertEqual(ports.events.count("read"), 1)
++                    self.assertEqual(ports.events.count("commit"), 1)
++                    self.assertEqual(ports.stream_count, 1)
++                    self.assertEqual(len(http.requests), 2)
++                    self.assertTrue(http.requests[1][0].endswith("/release"))
++                    self.assertEqual(http.requests[1][1]["json"], {
++                        "output_id": "configured-output",
++                        "lease_id": first_nonce,
++                        "reason": "failed",
++                    })
++                finally:
++                    await session.cancel("stop command")
++
++    async def test_session_prepares_actual_negotiated_integer_pcm_not_internal_f32(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        http = HttpPort(gate=asyncio.Event())
++        ports = MediaPorts()
++        player = SessionPlayer(http, ports)
++        player.negotiated_role.audio_format = SendspinAudioFormat(
++            sample_rate=44100, bit_depth=24, channels=1, sample_type="int"
++        )
++        player.negotiated_role.codec = AudioCodec.FLAC
++        session = SendspinPlaybackSession(player)
++        await session.start(PlayerMedia(uri="test://short-track"))
++        try:
++            await asyncio.wait_for(http.prepare_started.wait(), timeout=1)
++            self.assertEqual(
++                http.requests[0][1]["json"]["pcm_format"],
++                {"sample_rate": 44100, "bit_depth": 24, "channels": 1},
++            )
++            self.assertEqual(ports.events, [])
++        finally:
++            await session.cancel("stop command")
 +
 +    async def test_session_does_not_start_or_read_music_before_output_ready(self) -> None:
 +        from music_assistant.models.player import PlayerMedia

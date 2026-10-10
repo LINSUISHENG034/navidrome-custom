@@ -96,9 +96,20 @@ Blocked by: 01, 02, 03
 - 架构评估收敛为现有 worker 的控制生命周期 Module：原 Prepare/Release Interface 不变，入队、desired epoch 撤销和晚到清理集中，不增加 backend/音频队列或重写 decoder/clock。计划仅在有效成功入队的 Prepare 后锁定受控模式，Release/取消不退回 legacy；从未 Prepare 的行为保留。标记范围为 worker 生命周期，断线后重建 worker 的重准备/供流安全仍无整链路结论。若局部改动扩成 worker/协议重写则停止重估。
 - 尚待真实 red→green：满队列下取消正在 native Prepare 的请求必须退休所有 allocation、阻止排队旧内容重开 backend；取消已入队 successor 必须清理旧资源且不影响更晚 successor。协调者已把既有 `SdkPreparationTests` class 单独交由 SDK 实现者完成，Bridge/MA 其余源码保持唯一写入者；完成后整体重跑、独立审阅、冻结再导出。SDK canonical patch 尚未登记，准备好的 runner-owned export checkout 保持干净。
 
+### 2026-10-10 同一 worker Prepare/Release canonical 检查点
+
+- **Canonical 已接入**：[SDK 补丁](../../../../patches/remote-playback/sendspin-output-preparation.patch)、更新后的 Bridge/MA 补丁及既有锁定清单。版本、镜像 digest 和 patch SHA-256 仍以清单为唯一来源。SDK 差分仅涉及 `audio.py`、`audio_connector.py`；Bridge 17 文件（16 个 Python 文件和 schema），MA 5 文件。没有修改 Navidrome Go/UI、复制队列或跟踪整份 upstream 源码。
+- **同一输出生命周期**：实际协商的有符号整数 PCM 经 MA→Bridge→typed IPC→SDK Prepare 传递；音乐与准备使用同一 worker/backend。显式 ready/lease 复验必须匹配本次有界 request ID 的新 SDK ACK，不接受旧缓存。配置默认关闭，未配置保留原行为；来源/时钟/native/Pulse 仍是外部测试 ports，不声称真实音箱就绪。
+- **SDK 完成的公开回归**：格式不匹配不重开 backend；native Release 失败回传并保留 handle/epoch 重试；worker 失败完成 pending 控制；无效/队列满请求不抢占 owner；有效 drain 失败持有清理权；满队列或已入队的取消退休全部输出、不由旧内容重开且不影响 successor。两项取消实际 red 为 `Ran 2 tests / FAILED (failures=2)`（1.306 秒），unchanged green 1.298 秒，另逐项 green 1.328/1.316 秒；保持同一 Prepare/Release Interface，不新增 backend、队列或重写 decoder/clock。
+- **独立审阅发现并修复额外退场缺口**：初次 SDK 23/23 独立通过（1.618 秒），但新故障端口观察到 prepared 格式替换吞掉旧 native close 错误，两个 handle 在 release/shutdown 后为 `[False, True]`。保留 `test_prepared_replacement_requires_native_retirement_and_retains_latest_cleanup_owner`，实际 red 为 `OSError not raised`、1 项失败（1.440 秒）；统一严格 native retirement，在改变格式/新 allocation 前确认旧 close，失败保留旧 format/handle 与最新清理权，unchanged green 1.257 秒。最终 SDK class 24/24（1.597 秒），独立复核 24/24（1.723 秒）及专门的 fail-closed/retry/stale-release/successor 场景通过；声明的 per-worker Prepare/Release 合同内未再发现已确认 false-ACK。
+- **真实干净重放**：在新的 `tmp/remote-playback/provenance-sdk-replay-20261010/` root 调用 runner 公开 fetch/apply/test，provenance 仅由真实 fetch 生成，SDK 依赖通过同一 provenance/pin/applied-tree 校验只读挂载。实际 Bridge `Ran 69 tests / OK`（44.643 秒，含 SDK 24 项）、MA `Ran 26 tests / OK`（2.744 秒），无 skipped；结果位于该 root 的 `bridge-test-result.json`、`ma-test-result.json`。开发快照此前为 Bridge 69/69（48.102 秒）、MA 26/26（2.807 秒），不把测试耗时当首音指标。仅 clone 下载 transport 替换为受管本地 cache，保留 no-hardlinks 并恢复 HTTPS origin，不宣称本轮验证了 GitHub 下载 transport。
+- **检查**：三个重放源码目录都用 `git diff --check <pinned-base>` 检查完整已暂存差分，而非空的 unstaged diff；容器 `compile()` 检查全部 23 个改动 Python 文件通过。SDK 的 `__init__`、audio、audio_connector、daemon 均从 `/runtime-sources/sendspin/` 导入，实际 sendspin 7.5.0/aiosendspin 6.1.1、MA aiosendspin 9.1.1 与清单一致。协调者最终 runner suite 57/57（0.796 秒）、canonical checksum/`validate`、仓库 `git diff --check` 通过。容器断网、固定 digest、只读、去 capabilities、禁止提权，无生产数据/host network/音频/D-Bus/Pulse 挂载，无 upstream host import。
+- **完整性偏差如实记录**：MA 的既有 helper 与 client 测试最初未暂存，首轮 tracked diff 缺失两文件，未将不完整补丁写回 canonical。一次诊断 `git status` 未禁 optional locks，刷新了原 MA Git 索引缓存；不能声称全会话 MA 元数据未变。经协调者明确授权，owner 仅暂存这两个既有已审查文件，源码/provenance 未变；重新建立基线后，三份原工作区的源码、provenance 与非 objects Git 元数据在最终捕获/重放/写回前后全部匹配。未恢复或伪造元数据，原 SDK 缺失的 provenance 仍缺失，不采用旧开发 checkout。
+- **未执行与结论边界**：upstream pre-commit/Ruff/mypy 等完整 lint 未运行，固定镜像缺工具/依赖；未安装宿主库、下载 hooks、构建/发布 patched 镜像或部署生产。controlled-mode 标记只在 worker 生命周期内保持，重建 worker 的 reconnect 需重新准备，未证明整链路安全；legacy worker-finally shutdown 在 native close 故障下不是已确认的资源退休保证。这些限制以及 MA 孤立 READY lease、失联反馈和完整 controller/WebSocket 集成仍保留，不关闭本票或硬件票。
+
 **本票仍 claimed，以下不是已完成项：**
 
 1. 运行时物理失联需要可靠传回 MA，撤销/冻结权威 source 与 timeline；仅本地 daemon pause/release 不证明该闭环。
-2. 真实 SDK 是否能在音乐供流前建立 owned backend 尚未证明；没有当前绑定证据继续 fail closed，不能把替身 ready 当 cold-ready。
+2. 真实 SDK 的同一 worker、pre-content Prepare 与退休已在隔离外部 ports 上证明；真实 native/Pulse/音箱绑定与声学效果仍未验收。重建 worker 后的重准备、native close 故障下的 legacy shutdown 及完整 reconnect 安全仍需证据，不能把替身 ready 当实机 cold-ready。
 3. 完整 MA controller 的 queue/seek/resume、事件竞态及启动 timeout 仍需更广的整应用集成证据；不因公开 session 测试通过宣称全路径等价或多房间支持。
 4. 首段完整、10 秒可听、15 秒实机失败截止、占用与闲置提示音仍属于未来逐次确认窗口的 HITL 验收。软件检查点不关闭硬件票。

@@ -76,7 +76,7 @@ index c2d1a252eb57e1e9b0c7fd74b4b250009a8c48f2..f24a752feff2268823d4ca3e282ef4ba
              continue
  
 diff --git a/src/sendspin_bridge/bridge/client.py b/src/sendspin_bridge/bridge/client.py
-index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d278c340def 100644
+index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb82c2f685 100644
 --- a/src/sendspin_bridge/bridge/client.py
 +++ b/src/sendspin_bridge/bridge/client.py
 @@ -67,6 +67,7 @@ from sendspin_bridge.services.infrastructure.config_validation import (
@@ -87,29 +87,31 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
      Command,
      Reconnect,
      SetMinBufferMs,
-@@ -210,6 +211,10 @@ _MA_RECONNECT_TIMEOUT_S = 15.0
+@@ -210,6 +211,11 @@ _MA_RECONNECT_TIMEOUT_S = 15.0
  
  _IPC_ALLOWED_KEYS = frozenset(
      {
 +        "output_binding_epoch",
++        "output_binding_request_id",
 +        "output_binding_sink",
 +        "output_binding_pid",
 +        "output_binding_ready",
          "playing",
          "connected",
          "server_connected",
-@@ -453,6 +458,10 @@ class DeviceStatus:
+@@ -453,6 +459,11 @@ class DeviceStatus:
      supported_commands: list | None = None
      group_volume: int | None = None
      group_muted: bool | None = None
 +    output_binding_epoch: str | None = None
++    output_binding_request_id: str | None = None
 +    output_binding_sink: str | None = None
 +    output_binding_pid: int | None = None
 +    output_binding_ready: bool = False
      bt_standby: bool = False
      bt_standby_since: str | None = None
      bt_waking: bool = False
-@@ -596,6 +605,8 @@ class SendspinClient:
+@@ -596,6 +607,8 @@ class SendspinClient:
      D-Bus callbacks all read/write status through this single gate.
      """
  
@@ -118,7 +120,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
      def __init__(
          self,
          player_name: str,
-@@ -618,7 +629,14 @@ class SendspinClient:
+@@ -618,7 +631,15 @@ class SendspinClient:
          static_delay_source: str = "default",
          static_delay_calibrated_at: str | None = None,
          static_delay_codec: str | None = None,
@@ -129,11 +131,12 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
 +        self._output_config = output_preparation_settings(output_preparation_config or {})
 +        self.output_preparation_enabled = self._output_config["OUTPUT_PREPARATION_ENABLED"] is True
 +        self._output_epoch: str | None = None
++        self._prepared_output_format = None
 +        self._output_lock = asyncio.Lock()
          self.player_name = player_name
          self.server_host = server_host
          self.server_port = server_port
-@@ -628,8 +646,11 @@ class SendspinClient:
+@@ -628,8 +649,11 @@ class SendspinClient:
          self.static_delay_ms = static_delay_ms  # per-device delay override (None = use env var)
          self.preferred_format = preferred_format  # preferred audio format string (e.g. "flac:44100:16:2")
          self._effective_bridge = effective_bridge  # bridge instance label for MA device info
@@ -146,7 +149,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
          self.keepalive_interval = max(30, keepalive_interval)  # seconds between keepalive bursts
          # v2.63.0-rc.2 — payload selector: "infrasound" (default) | "silence" | "none"
          self.keep_alive_method = keep_alive_method if keep_alive_method in _KEEPALIVE_METHODS else "infrasound"
-@@ -798,6 +819,8 @@ class SendspinClient:
+@@ -798,6 +822,8 @@ class SendspinClient:
                  details=event["details"] if isinstance(event["details"], dict) else None,
              )
          _state.notify_status_changed()
@@ -155,7 +158,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
          # ── Idle disconnect timer ─────────────────────────────────────
          # Daemon-reported playback flags always participate in idle timer
          # management, regardless of SinkMonitor availability.  PipeWire's
-@@ -1070,6 +1093,115 @@ class SendspinClient:
+@@ -1070,6 +1096,127 @@ class SendspinClient:
          if hasattr(task, "cancel"):
              task.cancel()
  
@@ -163,7 +166,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
 +    def _pulse_application_name(self) -> str:
 +        return f"sendspin-{self.player_id}"
 +
-+    async def prepare(self, epoch: str):
++    async def prepare(self, epoch: str, pcm_format=None):
 +        """Prepare a configured output without a Sendspin stream-start event."""
 +        from sendspin_bridge.bluetooth.adapter_session import LinkState
 +        from sendspin_bridge.bridge.output_preparation import OutputBinding, PreparationError
@@ -171,7 +174,11 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
 +
 +        if not self.output_preparation_enabled or not self.bt_manager or not self.bt_management_enabled:
 +            raise PreparationError("output_unavailable")
++        import secrets
++
 +        self._output_epoch = epoch
++        self._prepared_output_format = pcm_format
++        request_id = secrets.token_urlsafe(24) if pcm_format is not None else None
 +        async with self._output_lock:
 +            self._cancel_idle_timer()
 +            self.bt_manager.allow_reconnect()
@@ -202,14 +209,17 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
 +            sink = self.bluetooth_sink_name
 +            while (self._output_epoch == epoch and proc is self._daemon_proc and self.is_running()
 +                   and self.bt_management_enabled and not self.bt_manager.reconnect_cancelled()):
-+                await self._send_subprocess_command(BindOutput(epoch=epoch, sink=sink))
++                await self._send_subprocess_command(
++                    BindOutput(epoch=epoch, sink=sink, pcm_format=pcm_format, request_id=request_id)
++                )
 +                await asyncio.sleep(self._output_config["OUTPUT_PREPARATION_POLL_SECONDS"])
 +                profile, present, bound = await averify_output_binding(proc.pid, sink, self._pulse_application_name)
 +                link = await asyncio.get_running_loop().run_in_executor(bt_executor(), self.bt_manager.link_state)
 +                ack = (self.status.get("output_binding_epoch") == epoch
 +                       and self.status.get("output_binding_pid") == proc.pid
 +                       and self.status.get("output_binding_sink") == sink
-+                       and self.status.get("output_binding_ready") is True)
++                       and self.status.get("output_binding_ready") is True
++                       and (request_id is None or self.status.get("output_binding_request_id") == request_id))
 +                binding = OutputBinding(epoch, link is LinkState.CONNECTED, profile, present, self.is_running(), bound and ack)
 +                if binding.ready and self._output_epoch == epoch:
 +                    self._update_status({"bt_standby": False, "bt_waking": False, "bluetooth_connected": True})
@@ -234,8 +244,12 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
 +
 +        if self._output_epoch != epoch or not self.is_running() or not self.bt_manager or not self.bt_management_enabled:
 +            return False
++        if self._prepared_output_format is not None:
++            return (await self.prepare(epoch, pcm_format=self._prepared_output_format)).ready
 +        proc = self._daemon_proc
-+        profile, present, bound = await averify_output_binding(proc.pid, self.bluetooth_sink_name or "", self._pulse_application_name)
++        profile, present, bound = await averify_output_binding(
++            proc.pid, self.bluetooth_sink_name or "", self._pulse_application_name
++        )
 +        link = await asyncio.get_running_loop().run_in_executor(bt_executor(), self.bt_manager.link_state)
 +        return (profile and present and bound and link is LinkState.CONNECTED and self._output_epoch == epoch
 +                and proc is self._daemon_proc and self.status.get("output_binding_epoch") == epoch
@@ -262,8 +276,9 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
 +                        await self._send_subprocess_command(SetStandby(sink=STANDBY_SINK_NAME))
 +                    except IPCError:
 +                        pass
-+                    await amove_pid_sink_inputs(self._daemon_proc.pid, STANDBY_SINK_NAME,
-+                                               application_name=self._pulse_application_name)
++                    await amove_pid_sink_inputs(
++                        self._daemon_proc.pid, STANDBY_SINK_NAME, application_name=self._pulse_application_name
++                    )
 +            finally:
 +                if self._output_epoch is None:
 +                    await self._disconnect_bt_for_standby()
@@ -271,7 +286,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
      async def _disconnect_bt_for_standby(self) -> bool:
          """Drop the BT link for standby, off the loop and under a lease.
  
-@@ -1080,6 +1212,17 @@ class SendspinClient:
+@@ -1080,6 +1227,17 @@ class SendspinClient:
          """
          if not self.bt_manager:
              return False
@@ -289,17 +304,19 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
          handle = getattr(self.bt_manager, "adapter_handle", None)
          lease = handle.try_lease(f"standby {self.player_name}") if handle is not None else None
          if lease is None:
-@@ -1087,8 +1230,17 @@ class SendspinClient:
+@@ -1087,8 +1245,19 @@ class SendspinClient:
              return False
          try:
              loop = asyncio.get_running_loop()
 -            await loop.run_in_executor(bt_executor(), self.bt_manager.disconnect_device)
 -            return True
++
 +            def disconnect():
 +                if self.output_preparation_enabled and self._output_epoch is not None:
 +                    return False
 +                self.bt_manager.disconnect_device()
 +                return True
++
 +            operation = loop.run_in_executor(bt_executor(), disconnect)
 +            try:
 +                return await asyncio.shield(operation)
@@ -309,7 +326,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
          except Exception as exc:
              logger.warning("[%s] BT disconnect on standby failed: %s", self.player_name, exc)
              return False
-@@ -1122,6 +1274,10 @@ class SendspinClient:
+@@ -1122,6 +1291,10 @@ class SendspinClient:
          Phase 2 behavior: daemon stays alive on a PA null sink so the player
          remains visible in MA.  When MA sends play, the bridge auto-reconnects BT.
          """
@@ -320,7 +337,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
          if self.status.get("bt_standby"):
              return
          self._update_status(
-@@ -1196,6 +1352,8 @@ class SendspinClient:
+@@ -1196,6 +1369,8 @@ class SendspinClient:
          while ``bt_standby=True``.  The daemon is alive on the null sink;
          audio streams there silently until BT reconnects and streams are moved.
          """
@@ -329,7 +346,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
          if not self.status.get("bt_standby") or self.status.get("bt_waking"):
              return
          logger.info("[%s] Play detected during standby — auto-waking", self.player_name)
-@@ -1431,7 +1589,7 @@ class SendspinClient:
+@@ -1431,7 +1606,7 @@ class SendspinClient:
                          # Don't restart if BT is disconnected — monitor_and_reconnect
                          # will call start_sendspin() once BT reconnects.
                          decision = self._supervisor.on_death(
@@ -338,7 +355,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
                          )
                          if isinstance(decision, Halted):
                              await asyncio.sleep(decision.delay_s)
-@@ -1519,6 +1677,8 @@ class SendspinClient:
+@@ -1519,6 +1694,8 @@ class SendspinClient:
      async def _start_sendspin_inner(self) -> None:
          """Spawn daemon_process.py subprocess with PULSE_SINK in its environment."""
          try:
@@ -347,7 +364,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
              # Pre-flight gate (#291): refuse to spawn when SENDSPIN_SERVER is
              # malformed (scheme prefix, embedded port, slashes, whitespace).
              # The web-UI form rejects these values up front and the migration
-@@ -1546,7 +1706,7 @@ class SendspinClient:
+@@ -1546,7 +1723,7 @@ class SendspinClient:
              # Configure BT audio sink if not yet done (offloaded to executor
              # because configure_bluetooth_audio is a blocking call that sleeps
              # during sink discovery retries — up to ~18 s).
@@ -356,7 +373,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
                  loop = asyncio.get_running_loop()
                  await loop.run_in_executor(None, self.bt_manager.configure_bluetooth_audio)
  
-@@ -1696,6 +1856,13 @@ class SendspinClient:
+@@ -1696,6 +1873,13 @@ class SendspinClient:
                  loop = asyncio.get_running_loop()
                  bt_product_name, bt_manufacturer = await loop.run_in_executor(None, _read_bt_identity, bt_dbus_path)
  
@@ -370,7 +387,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
              params = json.dumps(
                  with_protocol_version(
                      {
-@@ -1706,7 +1873,8 @@ class SendspinClient:
+@@ -1706,7 +1890,8 @@ class SendspinClient:
                          "static_delay_ms": static_delay_ms,
                          "required_lead_time_ms": self.required_lead_time_ms,
                          "min_buffer_ms": self.min_buffer_ms,
@@ -380,7 +397,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
                          "bluetooth_device_path": bt_dbus_path,
                          "volume": self.status.get("volume", 100),
                          "muted": bool(self.status.get("muted", False)),
-@@ -1723,9 +1891,9 @@ class SendspinClient:
+@@ -1723,12 +1908,16 @@ class SendspinClient:
              # CRITICAL: Audio routing — PULSE_SINK determines which BT speaker this
              # subprocess sends audio to. Wrong value = audio to wrong speaker or silence.
              env = os.environ.copy()
@@ -393,7 +410,14 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
              # Unique application.name so PA module-stream-restore does not confuse
              # streams across subprocesses (all share the same python3 binary name).
              env["PULSE_PROP_application.name"] = f"sendspin-{self.player_id}"
-@@ -2549,6 +2717,11 @@ class SendspinClient:
++            if self.output_preparation_enabled:
++                # ALSA's Pulse plugin supplies an explicit context name; only
++                # libpulse's override property preserves our ownership identity.
++                env["PULSE_PROP_OVERRIDE_application.name"] = self._pulse_application_name
+ 
+             self._daemon_proc = await asyncio.create_subprocess_exec(
+                 sys.executable,
+@@ -2549,6 +2738,11 @@ class SendspinClient:
          # Start Sendspin player: immediately if no BT device, deferred if BT configured
          if not self.bt_management_enabled:
              logger.info("[%s] BT management disabled — skipping sendspin startup", self.player_name)
@@ -405,7 +429,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
          elif not self.bt_manager:
              # No BT device configured — start on default audio immediately
              await self.start_sendspin()
-@@ -2570,7 +2743,7 @@ class SendspinClient:
+@@ -2570,7 +2764,7 @@ class SendspinClient:
                  """Connect Bluetooth in background without blocking"""
                  logger.info("Bluetooth async task started, waiting 2 seconds...")
                  await asyncio.sleep(2)  # Let sendspin start first
@@ -414,7 +438,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..081c23e1ed3753b3ea04a3caf66b7d27
                      return
                  logger.info("Connecting Bluetooth speaker...")
                  try:
-@@ -2655,6 +2828,8 @@ class SendspinClient:
+@@ -2655,6 +2849,8 @@ class SendspinClient:
              logger.info("Client shutting down...")
          finally:
              # Cleanup
@@ -460,10 +484,10 @@ index b5d35dbd4600010bc9abe77a9b92494142bd638e..c07895e5dfe7e57b92aa4cb67fe213c9
              bt_manager_factory=bt_manager_factory,
 diff --git a/src/sendspin_bridge/bridge/output_preparation.py b/src/sendspin_bridge/bridge/output_preparation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..9f38a7d9317700eb5e4a004122e0bc3503070d98
+index 0000000000000000000000000000000000000000..c7f985bee1a46058135b8e6ba379bc7968ed58be
 --- /dev/null
 +++ b/src/sendspin_bridge/bridge/output_preparation.py
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,216 @@
 +"""Cancellable ownership of configured physical outputs, independent of music."""
 +
 +from __future__ import annotations
@@ -472,10 +496,35 @@ index 0000000000000000000000000000000000000000..9f38a7d9317700eb5e4a004122e0bc35
 +import math
 +import secrets
 +import time
-+from dataclasses import dataclass
++from dataclasses import asdict, dataclass
 +from typing import Protocol
 +
-+__all__ = ["OutputBinding", "OutputPreparation", "PhysicalOutput", "PreparationError"]
++__all__ = ["OutputBinding", "OutputFormat", "OutputPreparation", "PhysicalOutput", "PreparationError"]
++
++
++@dataclass(frozen=True)
++class OutputFormat:
++    """Decoded signed-integer PCM requested by one immutable output intent."""
++
++    sample_rate: int
++    bit_depth: int
++    channels: int
++
++    def __post_init__(self):
++        if (any(type(value) is not int for value in (self.sample_rate, self.bit_depth, self.channels))
++                or self.sample_rate <= 0 or self.bit_depth not in (16, 24, 32) or self.channels not in (1, 2)):
++            raise PreparationError("invalid_request")
++
++    @classmethod
++    def from_value(cls, value):
++        if value is None or isinstance(value, cls):
++            return value
++        if not isinstance(value, dict) or set(value) != {"sample_rate", "bit_depth", "channels"}:
++            raise PreparationError("invalid_request")
++        return cls(**value)
++
++    def as_dict(self):
++        return asdict(self)
 +
 +
 +@dataclass(frozen=True)
@@ -493,7 +542,7 @@ index 0000000000000000000000000000000000000000..9f38a7d9317700eb5e4a004122e0bc35
 +
 +
 +class PhysicalOutput(Protocol):
-+    async def prepare(self, epoch: str) -> OutputBinding: ...
++    async def prepare(self, epoch: str, pcm_format: OutputFormat | None = None) -> OutputBinding: ...
 +    async def release(self, epoch: str) -> None: ...
 +    async def validate_binding(self, epoch: str) -> bool: ...
 +
@@ -511,6 +560,7 @@ index 0000000000000000000000000000000000000000..9f38a7d9317700eb5e4a004122e0bc35
 +    output: PhysicalOutput
 +    result: asyncio.Future
 +    deadline: float
++    pcm_format: OutputFormat | None = None
 +    task: asyncio.Task | None = None
 +    revoked: str | None = None
 +
@@ -563,15 +613,18 @@ index 0000000000000000000000000000000000000000..9f38a7d9317700eb5e4a004122e0bc35
 +        if lease.task is not None:
 +            lease.task.cancel()
 +
-+    async def prepare(self, output_id: str, lease_id: str, timeout_seconds: float) -> dict:
++    async def prepare(self, output_id: str, lease_id: str, timeout_seconds: float, *, pcm_format=None) -> dict:
 +        if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
 +            raise PreparationError("invalid_request")
++        pcm_format = OutputFormat.from_value(pcm_format)
 +        if output_id not in self._outputs:
 +            raise PreparationError("unknown_output")
 +        self._prune()
 +        if (output_id, lease_id) in self._tombstones:
 +            raise PreparationError("cancelled")
 +        lease = self._leases.get(output_id)
++        if lease is not None and lease.lease_id == lease_id and lease.pcm_format != pcm_format:
++            raise PreparationError("intent_conflict")
 +        if lease is None or lease.lease_id != lease_id:
 +            if len(self._tombstones) + len(self._leases) >= self._tombstone_limit:
 +                raise PreparationError("tombstone_capacity")
@@ -586,6 +639,7 @@ index 0000000000000000000000000000000000000000..9f38a7d9317700eb5e4a004122e0bc35
 +                self._outputs[output_id],
 +                result,
 +                self._clock() + min(timeout_seconds, self._timeout_seconds),
++                pcm_format=pcm_format,
 +            )
 +            self._leases[output_id] = lease
 +            lease.task = self._track(self._prepare(output_id, lease))
@@ -604,14 +658,18 @@ index 0000000000000000000000000000000000000000..9f38a7d9317700eb5e4a004122e0bc35
 +                raise PreparationError("timeout")
 +            if lease.revoked or self._leases.get(output_id) is not lease:
 +                raise PreparationError(lease.revoked or "superseded")
-+            return dict(lease.result.result())
++            result = dict(lease.result.result())
++            if lease.pcm_format is not None:
++                result["pcm_format"] = lease.pcm_format.as_dict()
++            return result
 +        except asyncio.CancelledError:
 +            await self.release(output_id, lease_id, "cancelled")
 +            raise
 +
 +    async def _prepare(self, output_id, lease):
 +        try:
-+            binding = await lease.output.prepare(lease.epoch)
++            binding = (await lease.output.prepare(lease.epoch, pcm_format=lease.pcm_format)
++                       if lease.pcm_format is not None else await lease.output.prepare(lease.epoch))
 +            if lease.revoked or self._leases.get(output_id) is not lease:
 +                return
 +            if binding.epoch != lease.epoch or not binding.ready:
@@ -732,7 +790,7 @@ index c1724101f02160bac3640612e111208d0944cf9c..2f12ada9afa2c0fd817d7e53e1c42b0d
          """Apply volume and mute state to the PA sink."""
          vol = max(0, min(100, volume))
 diff --git a/src/sendspin_bridge/services/audio/pulse.py b/src/sendspin_bridge/services/audio/pulse.py
-index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..fdb5d650bcd3557d2d4a7d8faa4f2586959b403f 100644
+index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..781a298f60fc350472430bda0c203e162395adf7 100644
 --- a/src/sendspin_bridge/services/audio/pulse.py
 +++ b/src/sendspin_bridge/services/audio/pulse.py
 @@ -30,6 +30,7 @@ STANDBY_SINK_NAME = "sendspin_fallback"
@@ -751,7 +809,7 @@ index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..fdb5d650bcd3557d2d4a7d8faa4f2586
      "cycle_card_profile",
      "ensure_null_sink",
      "get_server_name",
-@@ -109,6 +111,58 @@ async def aread_sink_state(pulse, sink_name: str) -> tuple[int | None, bool | No
+@@ -109,6 +111,59 @@ async def aread_sink_state(pulse, sink_name: str) -> tuple[int | None, bool | No
  # ---------------------------------------------------------------------------
  
  
@@ -801,8 +859,9 @@ index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..fdb5d650bcd3557d2d4a7d8faa4f2586
 +                if sink is None:
 +                    return False
 +                inputs = await pulse.sink_input_list()
-+                return all(_owns_sink_input(stream, pid, application_name)
-+                           for stream in inputs if stream.sink == sink.index)
++                return all(
++                    _owns_sink_input(stream, pid, application_name) for stream in inputs if stream.sink == sink.index
++                )
 +    except Exception:
 +        return False
 +
@@ -810,7 +869,7 @@ index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..fdb5d650bcd3557d2d4a7d8faa4f2586
  async def alist_sinks() -> list[dict]:
      """Return all PA sinks as dicts with name, description, volume (0-100), muted."""
      if not _PULSECTL_AVAILABLE:
-@@ -284,7 +338,7 @@ async def amove_sink_input(sink_input_idx: int, sink_name: str) -> bool:
+@@ -284,7 +339,7 @@ async def amove_sink_input(sink_input_idx: int, sink_name: str) -> bool:
          return _fallback_move_sink_input(sink_input_idx, sink_name)
  
  
@@ -819,7 +878,7 @@ index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..fdb5d650bcd3557d2d4a7d8faa4f2586
      """Normalize and move all sink-inputs belonging to *pid* to *sink_name*.
  
      Returns the number of sink-inputs moved (0 means nothing to do or nothing found).
-@@ -297,8 +351,10 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
+@@ -297,8 +352,10 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
      PID matching is essential: other applications sharing the Bluetooth sink retain
      their independent stream volumes.
      """
@@ -831,7 +890,7 @@ index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..fdb5d650bcd3557d2d4a7d8faa4f2586
      try:
          async with asyncio.timeout(_TIMEOUT):
              async with pulsectl_asyncio.PulseAsync(_CLIENT_NAME) as pulse:
-@@ -310,8 +366,7 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
+@@ -310,8 +367,7 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
                      return 0
                  moved = 0
                  for si in inputs:
@@ -841,7 +900,7 @@ index 96aa91d76ab42d8ed570b6b6f947aa62f56828d4..fdb5d650bcd3557d2d4a7d8faa4f2586
                          try:
                              await pulse.volume_set_all_chans(si, 1.0)
                              logger.debug("Normalized sink-input %d (pid=%d) volume to 100%%", si.index, pid)
-@@ -325,8 +380,8 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
+@@ -325,8 +381,8 @@ async def amove_pid_sink_inputs(pid: int, sink_name: str) -> int:
                              moved += 1
                  return moved
      except Exception as exc:
@@ -873,7 +932,7 @@ index 1a34435001658bb14d3e490c16a20783ba5e2d3f..9528fb0f9bd8e3a4b4cd06dfdce9c4da
              "static_delay_calibrated_at": device.get("static_delay_calibrated_at"),
              "static_delay_codec": device.get("static_delay_codec"),
 diff --git a/src/sendspin_bridge/services/ipc/commands.py b/src/sendspin_bridge/services/ipc/commands.py
-index d3084baf7cc516919ddf9689a89dfd054fd52045..169d32fdc88080a6afd04824f35ef7055cc88e3d 100644
+index d3084baf7cc516919ddf9689a89dfd054fd52045..49281a060e85d1ab5f48d6875b8c1bbe6a2b5da9 100644
 --- a/src/sendspin_bridge/services/ipc/commands.py
 +++ b/src/sendspin_bridge/services/ipc/commands.py
 @@ -23,6 +23,7 @@ from typing import Any
@@ -884,7 +943,7 @@ index d3084baf7cc516919ddf9689a89dfd054fd52045..169d32fdc88080a6afd04824f35ef705
      "Command",
      "CommandError",
      "InvalidCommand",
-@@ -123,6 +124,12 @@ class Transport:
+@@ -123,6 +124,14 @@ class Transport:
      value: Any = None
  
  
@@ -892,12 +951,14 @@ index d3084baf7cc516919ddf9689a89dfd054fd52045..169d32fdc88080a6afd04824f35ef705
 +class BindOutput:
 +    epoch: str
 +    sink: str
++    pcm_format: Any = None
++    request_id: str | None = None
 +
 +
  @dataclass(frozen=True)
  class SetStandby:
      #: The sink to redirect to; ``None`` restores the device's own sink.
-@@ -142,6 +149,7 @@ Command = (
+@@ -142,6 +151,7 @@ Command = (
      | SetMinBufferMs
      | Transport
      | SetStandby
@@ -905,28 +966,42 @@ index d3084baf7cc516919ddf9689a89dfd054fd52045..169d32fdc88080a6afd04824f35ef705
  )
  
  
-@@ -200,6 +208,10 @@ def decode_command(message: Any) -> Command:
+@@ -200,6 +210,19 @@ def decode_command(message: Any) -> Command:
          if not action:
              raise InvalidCommand("transport requires 'action'")
          return Transport(action=action, value=message.get("value"))
 +    if name == "bind_output":
 +        if any(not isinstance(message.get(key), str) or not message[key] for key in ("epoch", "sink")):
 +            raise InvalidCommand("bind_output requires epoch and sink")
-+        return BindOutput(epoch=message["epoch"], sink=message["sink"])
++        from sendspin_bridge.bridge.output_preparation import OutputFormat, PreparationError
++
++        try:
++            pcm_format = OutputFormat.from_value(message.get("pcm_format"))
++        except PreparationError as exc:
++            raise InvalidCommand("bind_output requires integer PCM dimensions") from exc
++        request_id = message.get("request_id")
++        if request_id is not None and (not isinstance(request_id, str) or not 0 < len(request_id) <= 128):
++            raise InvalidCommand("bind_output requires a bounded request ID")
++        return BindOutput(epoch=message["epoch"], sink=message["sink"], pcm_format=pcm_format, request_id=request_id)
      if name == "set_standby":
          sink = message.get("sink")
          return SetStandby(sink=str(sink) if sink else None)
-@@ -231,6 +243,8 @@ def encode_command(command: Command) -> dict:
+@@ -231,6 +254,13 @@ def encode_command(command: Command) -> dict:
          return build_command_envelope("set_min_buffer_ms", value=command.value)
      if isinstance(command, Transport):
          return build_command_envelope("transport", action=command.action, value=command.value)
 +    if isinstance(command, BindOutput):
-+        return build_command_envelope("bind_output", epoch=command.epoch, sink=command.sink)
++        payload = {"epoch": command.epoch, "sink": command.sink}
++        if command.pcm_format is not None:
++            payload["pcm_format"] = command.pcm_format.as_dict()
++        if command.request_id is not None:
++            payload["request_id"] = command.request_id
++        return build_command_envelope("bind_output", **payload)
      if isinstance(command, SetStandby):
          return build_command_envelope("set_standby", sink=command.sink)
  
 diff --git a/src/sendspin_bridge/services/ipc/daemon_process.py b/src/sendspin_bridge/services/ipc/daemon_process.py
-index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0feb486871 100644
+index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b6df7a02e 100644
 --- a/src/sendspin_bridge/services/ipc/daemon_process.py
 +++ b/src/sendspin_bridge/services/ipc/daemon_process.py
 @@ -448,7 +448,8 @@ async def _timing_telemetry_watcher(
@@ -939,14 +1014,15 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0f
  ) -> None:
      """Correct PA sink routing whenever this daemon starts an audio stream.
  
-@@ -470,15 +471,29 @@ async def _startup_sink_routing_watcher(
+@@ -470,16 +471,75 @@ async def _startup_sink_routing_watcher(
          is_streaming = bool(status.get("audio_streaming"))
          if is_streaming and not was_streaming:
              try:
 -                moved = await amove_pid_sink_inputs(os.getpid(), sink_name)
 +                target = os.environ.get("PULSE_SINK", sink_name) if prepared_output else sink_name
 +                moved = await amove_pid_sink_inputs(
-+                    os.getpid(), target,
++                    os.getpid(),
++                    target,
 +                    application_name=os.environ.get("PULSE_PROP_application.name", "" if prepared_output else None),
 +                )
                  if moved:
@@ -958,6 +1034,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0f
  
  
 -async def _read_commands(daemon_ref: list, stop_event: asyncio.Event, *, bt_sink_name: str | None = None) -> None:
+-    """Read JSON commands from stdin and dispatch them."""
 +async def _set_daemon_output(daemon, sink: str) -> None:
 +    """Keep this daemon's stream target and existing volume controller together."""
 +    os.environ["PULSE_SINK"] = sink
@@ -966,13 +1043,58 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0f
 +        await controller.bind_sink(sink)
 +
 +
++async def _prepare_daemon_output(daemon, epoch: str, value) -> None:
++    """Prepare the exact SDK worker using the negotiated, decoded integer PCM."""
++    from aiosendspin.client import AudioFormat, PCMFormat
++    from aiosendspin.models.types import AudioCodec
++
++    from sendspin_bridge.bridge.output_preparation import OutputFormat, PreparationError
++    from sendspin_bridge.services.diagnostics.sendspin_compat import detect_supported_audio_formats_for_device
++
++    requested = OutputFormat.from_value(value)
++    if requested is None:
++        raise PreparationError("output_unavailable")
++    supported = detect_supported_audio_formats_for_device(daemon._args.audio_device)
++    if daemon._args.preferred_format is not None:
++        supported.append(daemon._args.preferred_format)
++    if not any((fmt.sample_rate, fmt.bit_depth, fmt.channels) ==
++               (requested.sample_rate, requested.bit_depth, requested.channels) for fmt in supported):
++        raise PreparationError("output_unavailable")
++    daemon._prepared_output_epoch = epoch
++    await daemon._audio_handler.prepare_output(
++        AudioFormat(AudioCodec.PCM, PCMFormat(**requested.as_dict())), epoch
++    )
++
++
 +async def _read_commands(
-+    daemon_ref: list, stop_event: asyncio.Event, *, bt_sink_name: str | None = None, prepared_output: bool = False
++    daemon_ref: list, stop_event: asyncio.Event, *, bt_sink_name: str | None = None, prepared_output: bool = False,
 +) -> None:
-     """Read JSON commands from stdin and dispatch them."""
++    """Read commands while owning the exact SDK prepared lifetime through teardown."""
++    try:
++        await _dispatch_commands(daemon_ref, stop_event, bt_sink_name=bt_sink_name, prepared_output=prepared_output)
++    finally:
++        daemon = daemon_ref[0] if daemon_ref else None
++        if prepared_output and daemon is not None:
++            await _release_daemon_output(daemon)
++
++
++async def _release_daemon_output(daemon) -> None:
++    release = getattr(getattr(daemon, "_audio_handler", None), "release_output", None)
++    if callable(release):
++        epochs = {getattr(daemon, "_prepared_output_epoch", None), daemon._bridge_status.get("output_binding_epoch")}
++        for epoch in epochs - {None}:
++            await release(epoch)
++    daemon._prepared_output_epoch = None
++
++
++async def _dispatch_commands(
++    daemon_ref: list, stop_event: asyncio.Event, *, bt_sink_name: str | None, prepared_output: bool,
++) -> None:
++    """Parse stdin and dispatch validated commands in their arrival order."""
      loop = asyncio.get_running_loop()
      reader = asyncio.StreamReader()
-@@ -689,14 +704,35 @@ async def _read_commands(daemon_ref: list, stop_event: asyncio.Event, *, bt_sink
+     protocol = asyncio.StreamReaderProtocol(reader)
+@@ -689,14 +749,53 @@ async def _read_commands(daemon_ref: list, stop_event: asyncio.Event, *, bt_sink
              _background_tasks.add(_task)
              _task.add_done_callback(_background_tasks.discard)
              _task.add_done_callback(lambda t, _a=action: _log_background_task_result(t, f"transport {_a}"))
@@ -987,14 +1109,32 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0f
 +            application_name = os.environ.get("PULSE_PROP_application.name", "")
 +            await amove_pid_sink_inputs(os.getpid(), sink, application_name=application_name)
 +            profile, present, bound = await averify_output_binding(os.getpid(), sink, application_name)
-+            _patch_status(daemon._bridge_status, {"output_binding_epoch": cmd.payload["epoch"],
-+                                                 "output_binding_sink": sink,
-+                                                 "output_binding_pid": os.getpid(),
-+                                                 "output_binding_ready": profile and present and bound})
++            if prepared_output and cmd.payload.get("pcm_format") is not None:
++                try:
++                    if not profile or not present:
++                        raise RuntimeError("Physical output is unavailable")
++                    await _prepare_daemon_output(daemon, cmd.payload["epoch"], cmd.payload["pcm_format"])
++                    await amove_pid_sink_inputs(os.getpid(), sink, application_name=application_name)
++                    profile, present, bound = await averify_output_binding(os.getpid(), sink, application_name)
++                except Exception as exc:
++                    bound = False
++                    logger.warning("Output preparation failed: %s", exc)
++            _patch_status(
++                daemon._bridge_status,
++                {
++                    "output_binding_epoch": cmd.payload["epoch"],
++                    "output_binding_request_id": cmd.payload.get("request_id"),
++                    "output_binding_sink": sink,
++                    "output_binding_pid": os.getpid(),
++                    "output_binding_ready": profile and present and bound,
++                },
++            )
 +            daemon._notify()
          elif cmd.cmd == "set_standby":
 +            daemon = daemon_ref[0] if daemon_ref else None
 +            if daemon is not None:
++                if prepared_output:
++                    await _release_daemon_output(daemon)
 +                _patch_status(daemon._bridge_status, {"output_binding_epoch": None, "output_binding_ready": False})
 +                daemon._notify()
              sink = cmd.payload.get("sink")
@@ -1014,7 +1154,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0f
  
  
  # ---------------------------------------------------------------------------
-@@ -916,7 +952,10 @@ async def _run(params: dict) -> None:
+@@ -916,7 +1015,10 @@ async def _run(params: dict) -> None:
  
          pa_volume_controller.set_external_change_tap(_mirror_external_volume_to_bridge)
  
@@ -1026,7 +1166,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0f
      daemon_task = asyncio.create_task(daemon.run())
      watcher_task = asyncio.create_task(_reanchor_watcher(status, _on_status_change, stop_event))
      timing_task = asyncio.create_task(_timing_telemetry_watcher(daemon, status, _on_status_change, stop_event))
-@@ -926,7 +965,9 @@ async def _run(params: dict) -> None:
+@@ -926,7 +1028,9 @@ async def _run(params: dict) -> None:
      routing_task = None
      if bluetooth_sink_name:
          routing_task = asyncio.create_task(
@@ -1038,7 +1178,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..0c41f70a1ef6826bc5eff3e94ce5ed0f
  
      # Wait until stdin closes, a stop command arrives, or the daemon exits.
 diff --git a/src/sendspin_bridge/web/interface.py b/src/sendspin_bridge/web/interface.py
-index 0e3cf62f7e0eb2806caa972ac034c7e39a60c364..c2579d4cea98ffe8ad0b684fcdebecd4bfbc5572 100644
+index 0e3cf62f7e0eb2806caa972ac034c7e39a60c364..84f60671c66ba1aa6bee9983de2fe7740ba0598a 100644
 --- a/src/sendspin_bridge/web/interface.py
 +++ b/src/sendspin_bridge/web/interface.py
 @@ -28,6 +28,7 @@ from sendspin_bridge.config import (
@@ -1049,15 +1189,15 @@ index 0e3cf62f7e0eb2806caa972ac034c7e39a60c364..c2579d4cea98ffe8ad0b684fcdebecd4
  from sendspin_bridge.web.request_identity import current_trust_policy, trust_policy_for_environ
  
  # Configure logging
-@@ -124,6 +125,7 @@ from sendspin_bridge.web.routes.api_ha import ha_bp  # noqa: E402
+@@ -122,6 +123,7 @@ from sendspin_bridge.web.routes.api_bt import bt_bp  # noqa: E402
+ from sendspin_bridge.web.routes.api_config import config_bp  # noqa: E402
+ from sendspin_bridge.web.routes.api_ha import ha_bp  # noqa: E402
  from sendspin_bridge.web.routes.api_ma import ma_bp  # noqa: E402
++from sendspin_bridge.web.routes.api_output import create_output_blueprint  # noqa: E402
  from sendspin_bridge.web.routes.api_status import status_bp  # noqa: E402
  from sendspin_bridge.web.routes.api_transport import transport_bp  # noqa: E402
-+from sendspin_bridge.web.routes.api_output import create_output_blueprint  # noqa: E402
  from sendspin_bridge.web.routes.auth import auth_bp  # noqa: E402
- from sendspin_bridge.web.routes.views import views_bp  # noqa: E402
- 
-@@ -134,6 +136,17 @@ app.register_blueprint(config_bp)
+@@ -134,6 +136,25 @@ app.register_blueprint(config_bp)
  app.register_blueprint(ma_bp)
  app.register_blueprint(status_bp)
  app.register_blueprint(transport_bp)
@@ -1066,16 +1206,24 @@ index 0e3cf62f7e0eb2806caa972ac034c7e39a60c364..c2579d4cea98ffe8ad0b684fcdebecd4
 +def _configured_outputs():
 +    from sendspin_bridge.services.bluetooth.device_registry import get_device_registry_snapshot
 +
-+    return {client.player_id: client for client in get_device_registry_snapshot().active_clients
-+            if getattr(client, "output_preparation_enabled", False) and client.bt_management_enabled}
++    return {
++        client.player_id: client
++        for client in get_device_registry_snapshot().active_clients
++        if getattr(client, "output_preparation_enabled", False) and client.bt_management_enabled
++    }
 +
 +
-+app.register_blueprint(create_output_blueprint(config_provider=load_config, outputs_provider=_configured_outputs,
-+                                             loop_provider=get_main_loop))
++app.register_blueprint(
++    create_output_blueprint(
++        config_provider=load_config,
++        outputs_provider=_configured_outputs,
++        loop_provider=get_main_loop,
++    )
++)
  app.register_blueprint(auth_bp)
  app.register_blueprint(ha_bp)
  
-@@ -363,6 +376,10 @@ def _resolve_ingress_user() -> str:
+@@ -363,6 +384,10 @@ def _resolve_ingress_user() -> str:
  @app.before_request
  def _check_auth():
      """Enforce authentication when AUTH_ENABLED is True."""
@@ -1122,10 +1270,10 @@ index 54979092dc9ea67e71e19ca350782ed139617bdc..f7368585b8d5eeae65203a0282c4f7f2
      # HA_INTEGRATION carries an MQTT password — surface its presence
 diff --git a/src/sendspin_bridge/web/routes/api_output.py b/src/sendspin_bridge/web/routes/api_output.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..6c6ab9ddfe3e0be15aa5add5753c680b5fcf9ae1
+index 0000000000000000000000000000000000000000..4f7f177f0f7fde7873c0ab160b93ac0bc19d2156
 --- /dev/null
 +++ b/src/sendspin_bridge/web/routes/api_output.py
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,96 @@
 +"""Opt-in machine-only output preparation; independent of web/ingress login."""
 +
 +import asyncio
@@ -1143,6 +1291,7 @@ index 0000000000000000000000000000000000000000..6c6ab9ddfe3e0be15aa5add5753c680b
 +    "unknown_output": 404,
 +    "cancelled": 409,
 +    "superseded": 409,
++    "intent_conflict": 409,
 +    "timeout": 504,
 +    "output_unavailable": 503,
 +    "tombstone_capacity": 503,
@@ -1180,7 +1329,8 @@ index 0000000000000000000000000000000000000000..6c6ab9ddfe3e0be15aa5add5753c680b
 +        outputs.update(outputs_provider())
 +        if releasing:
 +            return await preparation.release(data["output_id"], data["lease_id"], data["reason"])
-+        return await preparation.prepare(data["output_id"], data["lease_id"], data["timeout_seconds"])
++        return await preparation.prepare(data["output_id"], data["lease_id"], data["timeout_seconds"],
++                                         pcm_format=data.get("pcm_format"))
 +
 +    @blueprint.post("/api/output/prepare")
 +    @blueprint.post("/api/output/release")
@@ -1222,14 +1372,15 @@ index 0000000000000000000000000000000000000000..6c6ab9ddfe3e0be15aa5add5753c680b
 +    return blueprint
 diff --git a/tests/test_output_preparation.py b/tests/test_output_preparation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d497af6906
+index 0000000000000000000000000000000000000000..b241579034c589b0f3f56c7802f89bd0418557ba
 --- /dev/null
 +++ b/tests/test_output_preparation.py
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,628 @@
 +"""Output-use contracts at the public Prepare/Release seam."""
 +
 +import asyncio
 +import json
++import threading
 +import unittest
 +from contextlib import asynccontextmanager
 +from types import SimpleNamespace
@@ -1241,12 +1392,14 @@ index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d4
 +class PhysicalOutput:
 +    def __init__(self):
 +        self.prepares = []
++        self.formats = []
 +        self.releases = []
 +        self.ready = asyncio.Event()
 +        self.ready.set()
 +
-+    async def prepare(self, epoch):
++    async def prepare(self, epoch, pcm_format=None):
 +        self.prepares.append(epoch)
++        self.formats.append(pcm_format)
 +        await self.ready.wait()
 +        return OutputBinding(epoch, True, True, True, True, True)
 +
@@ -1307,14 +1460,20 @@ index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d4
 +        self.stdin = self
 +        self.pulse = pulse
 +        self.commands = []
++        self.hold_binding_acks = False
++        self.binding_requested = asyncio.Event()
 +
 +    def write(self, data):
 +        from sendspin_bridge.services.ipc.ipc_protocol import build_status_envelope
 +        command = json.loads(data)
 +        self.commands.append(command)
 +        if command["cmd"] == "bind_output":
++            self.binding_requested.set()
 +            self.pulse.owned.sink = self.pulse.sink.index
-+            status = build_status_envelope({"output_binding_epoch": command["epoch"],
++            if self.hold_binding_acks:
++                return
++            status = build_status_envelope({"output_binding_request_id": command.get("request_id"),
++                                            "output_binding_epoch": command["epoch"],
 +                                            "output_binding_pid": self.pid,
 +                                            "output_binding_sink": command["sink"],
 +                                            "output_binding_ready": True})
@@ -1332,7 +1491,7 @@ index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d4
 +
 +
 +@asynccontextmanager
-+async def physical_client():
++async def physical_client(*, native_identity=False):
 +    from sendspin_bridge.bluetooth.adapter_session import LinkState
 +    from sendspin_bridge.bridge.client import SendspinClient
 +    from sendspin_bridge.services.audio import pulse
@@ -1356,7 +1515,13 @@ index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d4
 +    manager.connect_prepared_output = lambda: setattr(client, "bluetooth_sink_name", "configured-sink") or True
 +
 +    async def spawn(*args, **kwargs):
-+        external.owned.proplist["application.name"] = kwargs["env"]["PULSE_PROP_application.name"]
++        # Native ALSA Pulse explicitly names its context; the fallback property
++        # does not win. This behavior was observed in the pinned runtime image.
++        if native_identity:
++            name = kwargs["env"].get("PULSE_PROP_OVERRIDE_application.name", "ALSA plug-in [python3.13]")
++        else:
++            name = kwargs["env"]["PULSE_PROP_application.name"]
++        external.owned.proplist["application.name"] = name
 +        return process
 +
 +    with patch.object(pulse.pulsectl_asyncio, "PulseAsync", side_effect=lambda name: external), \
@@ -1367,6 +1532,116 @@ index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d4
 +            yield client, external, process
 +        finally:
 +            await client.stop_sendspin()
++
++
++class SdkTransport:
++    """External transport listeners and deterministic clock, not a playback implementation."""
++
++    def __init__(self):
++        self.connected = False
++        self.callbacks = {name: [] for name in ("chunk", "start", "end", "clear")}
++        self.chunks_sent = 0
++        self.timestamp = 1_000_000
++
++    def _listen(self, name, callback):
++        self.callbacks[name].append(callback)
++        return lambda: self.callbacks[name].remove(callback)
++
++    def add_audio_chunk_listener(self, callback):
++        return self._listen("chunk", callback)
++
++    def add_stream_start_listener(self, callback):
++        return self._listen("start", callback)
++
++    def add_stream_end_listener(self, callback):
++        return self._listen("end", callback)
++
++    def add_stream_clear_listener(self, callback):
++        return self._listen("clear", callback)
++
++    def compute_play_time(self, timestamp):
++        return timestamp
++
++    def compute_server_time(self, timestamp):
++        return timestamp
++
++    def now_us(self):
++        return self.timestamp
++
++    def is_time_synchronized(self):
++        return True
++
++    def emit_start(self, audio_format):
++        from aiosendspin.models.core import StreamStartMessage, StreamStartPayload, StreamStartPlayer
++
++        pcm = audio_format.pcm_format
++        import base64
++
++        header = base64.b64encode(audio_format.codec_header).decode() if audio_format.codec_header else None
++        message = StreamStartMessage(StreamStartPayload(player=StreamStartPlayer(
++            codec=audio_format.codec, sample_rate=pcm.sample_rate, channels=pcm.channels, bit_depth=pcm.bit_depth,
++            codec_header=header,
++        )))
++        for callback in tuple(self.callbacks["start"]):
++            callback(message)
++
++    def emit_audio(self, payload, audio_format, timestamp=None):
++        self.chunks_sent += 1
++        for callback in tuple(self.callbacks["chunk"]):
++            callback(self.timestamp if timestamp is None else timestamp, payload, audio_format)
++
++    def emit_end(self):
++        for callback in tuple(self.callbacks["end"]):
++            callback(["player"])
++
++    def emit_clear(self):
++        for callback in tuple(self.callbacks["clear"]):
++            callback(["player"])
++
++
++class SdkBackendPort:
++    """PortAudio boundary with observable allocations, closes, and actual SDK samples."""
++
++    def __init__(self):
++        self.streams = []
++        self.started = threading.Event()
++        self.closed = threading.Event()
++        self.before_open = lambda: None
++        self.on_open = lambda stream: None
++        self.on_close = lambda stream: None
++
++    def open(self, **kwargs):
++        self.before_open()
++        port = self
++
++        class Stream:
++            latency = 0.1
++
++            def __init__(self):
++                self.closed = False
++                self.samples = []
++                self.settings = kwargs
++
++            def start(self):
++                width = int(kwargs["dtype"].removeprefix("int")) // 8
++                output = bytearray(16 * kwargs["channels"] * width)
++                kwargs["callback"](memoryview(output), 16,
++                                   SimpleNamespace(currentTime=0.9, outputBufferDacTime=1.0), False)
++                self.samples.append(bytes(output))
++                port.started.set()
++
++            def stop(self):
++                pass
++
++            def close(self):
++                self.closed = True
++                port.on_close(self)
++                port.closed.set()
++
++        stream = Stream()
++        self.streams.append(stream)
++        self.on_open(stream)
++        return stream
 +
 +
 +def preparation_for(output, **settings):
@@ -1384,6 +1659,90 @@ index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d4
 +        self.assertEqual(result["output_id"], "configured-player")
 +        self.assertTrue(result["output_epoch"])
 +        self.assertEqual(output.prepares, [result["output_epoch"]])
++
++    async def test_explicit_pcm_ready_echoes_the_exact_negotiated_format(self):
++        output = PhysicalOutput()
++        preparation = preparation_for(output)
++        requested = {"sample_rate": 48000, "bit_depth": 24, "channels": 2}
++        result = await preparation.prepare("configured-player", "explicit-intent", 1, pcm_format=requested)
++        self.assertEqual(result.get("pcm_format"), requested)
++
++    async def test_mutating_a_ready_reply_cannot_change_the_revalidated_pcm_contract(self):
++        output = PhysicalOutput()
++        preparation = preparation_for(output)
++        requested = {"sample_rate": 48000, "bit_depth": 24, "channels": 2}
++        first = await preparation.prepare("configured-player", "explicit-intent", 1, pcm_format=requested)
++        first["pcm_format"]["sample_rate"] = 44100
++        repeated = await preparation.prepare("configured-player", "explicit-intent", 1, pcm_format=requested)
++        self.assertEqual(repeated["pcm_format"], requested)
++        self.assertEqual(len(output.prepares), 1)
++
++    async def test_explicit_pcm_format_is_immutable_and_nonce_cannot_change_its_format(self):
++        output = PhysicalOutput()
++        output.ready.clear()
++        preparation = preparation_for(output)
++        requested = {"sample_rate": 48000, "bit_depth": 16, "channels": 2}
++        pending = asyncio.create_task(preparation.prepare("configured-player", "intent", 1, pcm_format=requested))
++        await asyncio.sleep(0)
++        requested["sample_rate"] = 44100
++        output.ready.set()
++        first = await pending
++        from dataclasses import asdict
++        self.assertEqual(asdict(output.formats[0]), {"sample_rate": 48000, "bit_depth": 16, "channels": 2})
++        self.assertEqual(await preparation.prepare("configured-player", "intent", 1,
++                         pcm_format={"sample_rate": 48000, "bit_depth": 16, "channels": 2}), first)
++        for changed in (requested, None):
++            with self.assertRaises(PreparationError) as error:
++                await preparation.prepare("configured-player", "intent", 1, pcm_format=changed)
++            self.assertEqual(error.exception.code, "intent_conflict")
++        self.assertEqual(len(output.prepares), 1)
++
++    async def test_explicit_pcm_public_prepare_reaches_the_daemon_binding_command(self):
++        async with physical_client() as (output, external, process):
++            requested = {"sample_rate": 48000, "bit_depth": 24, "channels": 2}
++            result = await preparation_for(output).prepare("configured-player", "explicit-intent", 1,
++                                                           pcm_format=requested)
++            self.assertEqual(result["pcm_format"], requested)
++            self.assertEqual(process.commands[0].get("pcm_format"), requested)
++
++    async def test_explicit_revalidation_cannot_reuse_a_cached_daemon_ack(self):
++        from sendspin_bridge.bridge.output_preparation import OutputFormat
++
++        async with physical_client() as (output, external, process):
++            pcm_format = OutputFormat(48000, 16, 2)
++            await output.prepare("epoch", pcm_format=pcm_format)
++            first_request = process.commands[0].get("request_id")
++            process.hold_binding_acks = True
++            process.binding_requested.clear()
++            pending = asyncio.create_task(output.prepare("epoch", pcm_format=pcm_format))
++            try:
++                await asyncio.wait_for(process.binding_requested.wait(), 0.2)
++                with self.assertRaises(TimeoutError):
++                    await asyncio.wait_for(asyncio.shield(pending), 0.03)
++                self.assertTrue(first_request)
++                self.assertNotEqual(process.commands[-1].get("request_id"), first_request)
++            finally:
++                pending.cancel()
++                try:
++                    await pending
++                except asyncio.CancelledError:
++                    pass
++
++    async def test_ready_lease_revalidation_requires_a_fresh_sdk_ack_before_returning_ready(self):
++        async with physical_client() as (output, external, process):
++            preparation = preparation_for(output, timeout_seconds=0.05)
++            requested = {"sample_rate": 48000, "bit_depth": 16, "channels": 2}
++            await preparation.prepare("configured-player", "intent", 0.05, pcm_format=requested)
++            process.hold_binding_acks = True
++            with self.assertRaises(PreparationError) as error:
++                await preparation.prepare("configured-player", "intent", 0.05, pcm_format=requested)
++            self.assertEqual(error.exception.code, "output_unavailable")
++
++    async def test_prepared_daemon_native_identity_is_verified_at_the_public_prepare_seam(self):
++        async with physical_client(native_identity=True) as (output, external, process):
++            result = await preparation_for(output, timeout_seconds=0.1).prepare("configured-player", "native-intent", 0.1)
++            self.assertEqual(result["status"], "ready")
++            self.assertEqual(external.unrelated.proplist["application.name"], "unrelated-host-player")
 +
 +    async def test_repeated_intent_reuses_the_verified_physical_client_binding(self):
 +        async with physical_client() as (output, external, process):
@@ -1647,10 +2006,10 @@ index 0000000000000000000000000000000000000000..adfc39f029d36eb2cb3e2a9f67ef44d4
 +            await preparation.prepare("configured-player", "intent-1", 1)
 diff --git a/tests/test_output_preparation_http.py b/tests/test_output_preparation_http.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..65d052830204a0c0fb32f0fdccf57c29014e8049
+index 0000000000000000000000000000000000000000..98c599ea3b6fc87233a12cb9c47f0af2c55c7d48
 --- /dev/null
 +++ b/tests/test_output_preparation_http.py
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,990 @@
 +"""Machine authentication at the real management HTTP entrance."""
 +
 +import asyncio
@@ -1694,6 +2053,25 @@ index 0000000000000000000000000000000000000000..65d052830204a0c0fb32f0fdccf57c29
 +        response = await asyncio.to_thread(client.post, "/api/output/prepare", json=body, headers=headers)
 +        self.assertEqual(response.status_code, 409)
 +        self.assertEqual(response.json["error"], "cancelled")
++
++    async def test_http_propagates_negotiated_pcm_and_rejects_changed_nonce_format(self):
++        from dataclasses import asdict
++
++        output = PhysicalOutput()
++        app = self.make_app({"OUTPUT_PREPARATION_ENABLED": True,
++                             "OUTPUT_PREPARATION_TOKEN": "machine-secret"}, {"configured-player": output})
++        headers = {"X-Output-Preparation-Token": "machine-secret"}
++        body = {"output_id": "configured-player", "lease_id": "intent", "timeout_seconds": 1,
++                "pcm_format": {"sample_rate": 48000, "bit_depth": 16, "channels": 2}}
++        response = await asyncio.to_thread(app.test_client().post, "/api/output/prepare", json=body, headers=headers)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(asdict(output.formats[0]), body["pcm_format"])
++        for changed in (None, {"sample_rate": 48000, "bit_depth": 24, "channels": 2}):
++            response = await asyncio.to_thread(app.test_client().post, "/api/output/prepare",
++                                              json={**body, "pcm_format": changed}, headers=headers)
++            self.assertEqual(response.status_code, 409)
++            self.assertEqual(response.json["error"], "intent_conflict")
++        self.assertEqual(len(output.prepares), 1)
 +
 +    async def test_failed_release_cancels_a_prepare_that_has_not_arrived(self):
 +        output = PhysicalOutput()
@@ -1846,6 +2224,233 @@ index 0000000000000000000000000000000000000000..65d052830204a0c0fb32f0fdccf57c29
 +        messages = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
 +        return messages, result.stdout + result.stderr
 +
++    async def run_cold_output_daemon(self, commands, *, content=False, enabled=True, backend_visible=True,
++                                     allocation_error=False):
++        # The pinned SDK handler/client/player remain real. Only the external
++        # PortAudio/PulseAudio ports are substituted; there is no owned stream
++        # until the SDK actually allocates its output backend.
++        script = r'''
++import asyncio
++import json
++import os
++import sys
++from types import SimpleNamespace
++from unittest.mock import patch
++import sounddevice
++from aiosendspin.client import AudioFormat, PCMFormat
++from aiosendspin.models.player import SupportedAudioFormat
++from aiosendspin.models.types import AudioCodec
++from sendspin.audio_devices import AudioDevice
++from sendspin.audio_connector import AudioStreamHandler
++from sendspin.daemon.daemon import DaemonArgs
++from sendspin_bridge.services.audio import pulse
++from sendspin_bridge.services.ipc import daemon_process
++from sendspin_bridge.services.ipc.bridge_daemon import BridgeDaemon
++from tests.test_output_preparation import PulseOutput, SdkBackendPort, SdkTransport
++fixture = json.loads(sys.argv[1])
++external = PulseOutput()
++external.streams = [external.unrelated]
++external.unrelated.proplist["application.process.id"] = str(os.getpid())
++os.environ["PULSE_PROP_application.name"] = "sendspin-owned-player"
++os.environ["PULSE_PROP_OVERRIDE_application.name"] = "sendspin-owned-player"
++os.environ["PULSE_SINK"] = "sendspin_fallback"
++backend = SdkBackendPort()
++def opened(stream):
++    stream.index = 100 + len(backend.streams)
++    stream.sink = 6 if os.environ["PULSE_SINK"] == "configured-sink" else 0
++    stream.proplist = {"application.process.id": str(os.getpid()),
++                      "application.name": os.environ["PULSE_PROP_OVERRIDE_application.name"]}
++    if fixture["backend_visible"]:
++        external.streams.append(stream)
++def closed(stream):
++    if stream in external.streams:
++        external.streams.remove(stream)
++def opening():
++    if fixture["allocation_error"]:
++        raise OSError("External audio backend unavailable")
++backend.on_open, backend.on_close, backend.before_open = opened, closed, opening
++async def main():
++    device = AudioDevice(index=1, name="pulse", output_channels=2, sample_rate=48000, is_default=True)
++    preferred = SupportedAudioFormat(codec=AudioCodec.PCM, sample_rate=48000, channels=2, bit_depth=16)
++    args = DaemonArgs(audio_device=device, client_id="owned-player", client_name="configured-player",
++                      settings=SimpleNamespace(player_volume=100, player_muted=False), preferred_format=preferred)
++    status, feed_task = {}, None
++    async def feed_content():
++        content_format = AudioFormat(AudioCodec.PCM, PCMFormat(sample_rate=48000, channels=2, bit_depth=16))
++        source = bytes(range(64)) * 1600
++        packets = [(source, 500000)]
++        if fixture["content"] == "flac":
++            from aiosendspin.server.roles.player.audio_transformers import FlacEncoder
++            encoder = FlacEncoder(sample_rate=48000, channels=2, bit_depth=16)
++            packets = encoder.process(source, daemon._client.timestamp, 500000) + encoder.flush()
++            content_format = AudioFormat(AudioCodec.FLAC, content_format.pcm_format, encoder.get_header())
++        daemon._client.emit_start(content_format)
++        timestamp = daemon._client.timestamp
++        for packet, duration in packets:
++            daemon._client.emit_audio(packet, content_format, timestamp)
++            timestamp += duration
++        if not await asyncio.to_thread(backend.started.wait, 2):
++            raise RuntimeError("Real content SDK output did not start")
++        print(json.dumps({"content_snapshot": True, "allocations": len(backend.streams),
++                          "closes": sum(stream.closed for stream in backend.streams),
++                          "owned_streams": len(external.streams) - 1,
++                          "output_samples": [sample.hex() for stream in backend.streams for sample in stream.samples]}), flush=True)
++    def notify():
++        nonlocal feed_task
++        daemon_process._emit_status(status)
++        if fixture["content"] and status.get("output_binding_ready") and feed_task is None:
++            feed_task = asyncio.create_task(feed_content())
++    daemon = BridgeDaemon(args, status, "configured-sink", on_status_change=notify)
++    handler = AudioStreamHandler(device, on_format_change=daemon._handle_format_change, on_event=daemon._on_stream_event)
++    daemon._audio_handler = handler
++    daemon._client = SdkTransport() if fixture["content"] else daemon._create_client()
++    handler.attach_client(daemon._client)
++    print(json.dumps({"cold_owned_streams": len(external.streams) - 1}), flush=True)
++    try:
++        await daemon_process._read_commands([daemon], asyncio.Event(), bt_sink_name="configured-sink",
++                                            prepared_output=fixture["enabled"])
++        if feed_task is not None:
++            await feed_task
++    finally:
++        await handler.shutdown()
++with patch.object(sounddevice, "RawOutputStream", side_effect=backend.open), \
++        patch.object(sounddevice, "check_output_settings", return_value=None), \
++        patch.object(pulse.pulsectl_asyncio, "PulseAsync", side_effect=lambda name: external):
++    asyncio.run(main())
++print(json.dumps({"allocations": [stream.settings["device"] for stream in backend.streams],
++                  "settings": [{key: stream.settings[key] for key in ("samplerate", "channels", "dtype")} for stream in backend.streams],
++                  "starts": [True for stream in backend.streams if stream.samples],
++                  "closes": [True for stream in backend.streams if stream.closed],
++                  "owned_streams": len(external.streams) - 1, "unrelated_sink": external.unrelated.sink}))
++'''
++        process = await asyncio.create_subprocess_exec(
++            sys.executable, "-B", "-c", script, json.dumps({"content": content, "enabled": enabled,
++                                                          "backend_visible": backend_visible,
++                                                          "allocation_error": allocation_error}),
++            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
++        prefix = b""
++        try:
++            process.stdin.write("".join(json.dumps(command) + "\n" for command in commands).encode())
++            await process.stdin.drain()
++            if content:
++                while b'"content_snapshot": true' not in prefix:
++                    line = await asyncio.wait_for(process.stdout.readline(), timeout=5)
++                    if not line:
++                        raise AssertionError("Cold daemon exited before content handoff: " + prefix.decode())
++                    prefix += line
++            process.stdin.write((json.dumps({"cmd": "stop"}) + "\n").encode())
++            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
++        except BaseException:
++            if process.returncode is None:
++                process.kill()
++            await process.communicate()
++            raise
++        diagnostics = (prefix + stdout + stderr).decode()
++        self.assertEqual(process.returncode, 0, diagnostics)
++        messages = [json.loads(line) for line in (prefix + stdout).decode().splitlines() if line.startswith("{")]
++        return messages, diagnostics
++
++    @staticmethod
++    def bind_request(epoch, bit_depth=16):
++        return {"cmd": "bind_output", "epoch": epoch, "sink": "configured-sink", "request_id": f"bind-{epoch}",
++                "pcm_format": {"sample_rate": 48000, "bit_depth": bit_depth, "channels": 2}}
++
++    async def test_cold_pinned_sdk_binding_allocates_owned_backend_without_music_or_wire_start(self):
++        messages, diagnostics = await self.run_cold_output_daemon([self.bind_request("cold-epoch", bit_depth=24)])
++        self.assertEqual(messages[0], {"cold_owned_streams": 0}, diagnostics)
++        self.assertTrue(any(message.get("output_binding_ready") is True
++                            and message.get("output_binding_epoch") == "cold-epoch" for message in messages), diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [1], diagnostics)
++        self.assertEqual(messages[-1]["settings"], [{"samplerate": 48000, "channels": 2, "dtype": "int24"}], diagnostics)
++        self.assertEqual(messages[-1]["starts"], [], diagnostics)
++        self.assertEqual(messages[-1]["unrelated_sink"], 0, diagnostics)
++
++    async def test_cold_sdk_binding_ack_echoes_the_current_request_after_native_confirmation(self):
++        request = self.bind_request("cold-epoch")
++        messages, diagnostics = await self.run_cold_output_daemon([request])
++        ready = [message for message in messages if message.get("output_binding_ready") is True]
++        self.assertEqual(len(ready), 1, diagnostics)
++        self.assertEqual(ready[0].get("output_binding_request_id"), request["request_id"], diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [1], diagnostics)
++        self.assertEqual(messages[-1]["starts"], [], diagnostics)
++        self.assertEqual(messages[-1]["closes"], [True], diagnostics)
++
++    async def test_explicit_cold_binding_and_first_content_use_one_worker_backend(self):
++        for codec in (True, "flac"):
++            with self.subTest(codec=codec):
++                messages, diagnostics = await self.run_cold_output_daemon([self.bind_request("cold-epoch")],
++                                                                         content=codec)
++                snapshot = next(message for message in messages if message.get("content_snapshot"))
++                self.assertEqual(snapshot["allocations"], 1, diagnostics)
++                self.assertEqual(snapshot["closes"], 0, diagnostics)
++                self.assertEqual(snapshot["owned_streams"], 1, diagnostics)
++                self.assertEqual(snapshot["output_samples"], [bytes(range(64)).hex()], diagnostics)
++                self.assertEqual(messages[-1]["closes"], [True], diagnostics)
++                self.assertEqual(messages[-1]["unrelated_sink"], 0, diagnostics)
++
++    async def test_explicit_cold_standby_releases_prepared_worker_before_successor_allocation(self):
++        messages, diagnostics = await self.run_cold_output_daemon([
++            self.bind_request("old-epoch"),
++            {"cmd": "set_standby", "sink": "sendspin_fallback"},
++            self.bind_request("new-epoch")])
++        statuses = [message for message in messages if message.get("type") == "status"]
++        self.assertEqual([status["output_binding_ready"] for status in statuses], [True, False, True], diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [1, 1], diagnostics)
++        self.assertEqual(messages[-1]["closes"], [True, True], diagnostics)
++        self.assertEqual(messages[-1]["owned_streams"], 0, diagnostics)
++
++    async def test_repeated_explicit_cold_bind_reuses_worker_without_fabricating_content_status(self):
++        messages, diagnostics = await self.run_cold_output_daemon([
++            self.bind_request(epoch) for epoch in ("old-epoch", "old-epoch", "new-epoch")])
++        self.assertEqual(messages[-1]["allocations"], [1], diagnostics)
++        self.assertEqual(messages[-1]["closes"], [True], diagnostics)
++        self.assertEqual(messages[-1]["owned_streams"], 0, diagnostics)
++        statuses = [message for message in messages if message.get("type") == "status"]
++        self.assertEqual(statuses[-1]["output_binding_epoch"], "new-epoch", diagnostics)
++        self.assertIs(statuses[-1]["output_binding_ready"], True, diagnostics)
++        self.assertTrue(all(not status.get("playing") and not status.get("audio_streaming")
++                            and not status.get("audio_format") for status in statuses), diagnostics)
++
++    async def test_legacy_no_format_cold_bind_never_claims_ready_or_guesses_pcm(self):
++        messages, diagnostics = await self.run_cold_output_daemon([
++            {"cmd": "bind_output", "epoch": "old-epoch", "sink": "configured-sink"},
++            {"cmd": "set_standby", "sink": "sendspin_fallback"},
++            {"cmd": "bind_output", "epoch": "new-epoch", "sink": "configured-sink"}])
++        statuses = [message for message in messages if message.get("type") == "status"]
++        self.assertEqual([status["output_binding_ready"] for status in statuses], [False, False, False], diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [], diagnostics)
++        self.assertEqual(messages[-1]["closes"], [], diagnostics)
++        self.assertEqual(messages[-1]["owned_streams"], 0, diagnostics)
++        self.assertEqual(messages[-1]["unrelated_sink"], 0, diagnostics)
++
++    async def test_disabled_explicit_cold_binding_never_allocates_a_worker_backend(self):
++        messages, diagnostics = await self.run_cold_output_daemon([
++            self.bind_request("cold-epoch")], enabled=False)
++        self.assertFalse(any(message.get("output_binding_ready") for message in messages), diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [], diagnostics)
++
++    async def test_successful_sdk_allocation_without_owned_pulse_evidence_is_not_ready(self):
++        messages, diagnostics = await self.run_cold_output_daemon([
++            self.bind_request("cold-epoch")], backend_visible=False)
++        self.assertFalse(any(message.get("output_binding_ready") for message in messages), diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [1], diagnostics)
++        self.assertEqual(messages[-1]["closes"], [True], diagnostics)
++
++    async def test_cold_backend_allocation_failure_is_not_ready_and_daemon_still_stops(self):
++        messages, diagnostics = await self.run_cold_output_daemon([
++            self.bind_request("cold-epoch")], allocation_error=True)
++        self.assertFalse(any(message.get("output_binding_ready") for message in messages), diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [], diagnostics)
++        self.assertEqual(messages[-1]["unrelated_sink"], 0, diagnostics)
++
++    async def test_invalid_explicit_pcm_command_never_allocates_or_claims_ready(self):
++        request = self.bind_request("invalid-epoch")
++        request["pcm_format"]["bit_depth"] = 8
++        messages, diagnostics = await self.run_cold_output_daemon([request])
++        self.assertFalse(any(message.get("output_binding_ready") for message in messages), diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [], diagnostics)
++        self.assertEqual(messages[-1]["unrelated_sink"], 0, diagnostics)
++
 +    async def test_daemon_stdin_binding_reports_ready_without_touching_unrelated_streams(self):
 +        messages, diagnostics = await self.run_output_daemon([
 +            {"cmd": "bind_output", "epoch": "intent-epoch", "sink": "configured-sink"}])
@@ -1878,3 +2483,520 @@ index 0000000000000000000000000000000000000000..65d052830204a0c0fb32f0fdccf57c29
 +            response = app.test_client().post("/api/output/prepare", json={}, headers=headers)
 +            self.assertEqual(response.status_code, 401)
 +            self.assertEqual(response.json, {"status": "error", "error": "unauthorized"})
++
++
++class SdkPreparationTests(unittest.IsolatedAsyncioTestCase):
++    async def asyncSetUp(self):
++        from unittest.mock import patch
++        from aiosendspin.client import AudioFormat, PCMFormat
++        from aiosendspin.models.types import AudioCodec
++        from sendspin.audio_connector import AudioStreamHandler
++        from sendspin.audio_devices import AudioDevice
++        from tests.test_output_preparation import SdkBackendPort, SdkTransport
++
++        self.transport = SdkTransport()
++        self.backend = SdkBackendPort()
++        self.formats = []
++        self.events = []
++        self.format = AudioFormat(AudioCodec.PCM, PCMFormat(sample_rate=48000, channels=2, bit_depth=16))
++        patcher = patch("sounddevice.RawOutputStream", side_effect=self.backend.open)
++        patcher.start()
++        self.addCleanup(patcher.stop)
++        settings = patch("sounddevice.check_output_settings", return_value=None)
++        settings.start()
++        self.addCleanup(settings.stop)
++        self.handler = AudioStreamHandler(
++            AudioDevice(index=1, name="pulse", output_channels=2, sample_rate=48000, is_default=True),
++            on_format_change=lambda *fmt: self.formats.append(fmt), on_event=self.events.append,
++        )
++        self.handler.attach_client(self.transport)
++
++    async def asyncTearDown(self):
++        await self.handler.shutdown()
++
++    async def _release_barrier(self):
++        async with asyncio.timeout(1):
++            while True:
++                try:
++                    await self.handler.release_output("not-owner")
++                    return
++                except RuntimeError as exc:
++                    if str(exc) != "Audio output control queue is full":
++                        raise
++                    await asyncio.sleep(0.001)
++
++    async def _assert_cancelled_output_retired_without_resurrection(self):
++        await self._release_barrier()
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertTrue(all(stream.closed for stream in self.backend.streams))
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        await self._release_barrier()
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertTrue(all(stream.closed for stream in self.backend.streams))
++        self.assertTrue(all(not stream.samples for stream in self.backend.streams))
++        await self.handler.prepare_output(self.format, "successor")
++        await self.handler.release_output("cancelled")
++        self.assertFalse(self.backend.streams[-1].closed)
++        await self.handler.release_output("successor")
++        self.assertTrue(all(stream.closed for stream in self.backend.streams))
++
++    async def test_cancelled_inflight_prepare_with_full_queue_retires_all_output_without_resurrection(self):
++        import threading
++
++        entered, finish = threading.Event(), threading.Event()
++
++        def delayed_open():
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External open was not released")
++
++        self.backend.before_open = delayed_open
++        pending = asyncio.create_task(self.handler.prepare_output(self.format, "cancelled"))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        for _ in range(600):
++            self.transport.emit_audio(b"", self.format)
++        try:
++            pending.cancel()
++            with self.assertRaises(asyncio.CancelledError):
++                await asyncio.wait_for(pending, 0.2)
++        finally:
++            finish.set()
++        await self._assert_cancelled_output_retired_without_resurrection()
++
++    async def test_cancelled_queued_successor_retires_admitted_output_and_preserves_later_owner(self):
++        import threading
++        from unittest.mock import patch
++
++        await self.handler.prepare_output(self.format, "original")
++        entered, finish = threading.Event(), threading.Event()
++
++        def failed_settings(**kwargs):
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External settings check was not released")
++            raise ValueError("External settings check failed")
++
++        with patch("sounddevice.check_output_settings", side_effect=failed_settings):
++            blocking = asyncio.create_task(self.handler.prepare_output(self.format, "blocking"))
++            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++            queued = asyncio.create_task(self.handler.prepare_output(self.format, "cancelled"))
++            await asyncio.sleep(0)
++            for _ in range(4):
++                self.transport.emit_audio(b"", self.format)
++            try:
++                queued.cancel()
++                with self.assertRaises(asyncio.CancelledError):
++                    await asyncio.wait_for(queued, 0.2)
++            finally:
++                finish.set()
++            with self.assertRaises(ValueError):
++                await asyncio.wait_for(blocking, 0.5)
++        await self._assert_cancelled_output_retired_without_resurrection()
++
++    async def test_prepared_pcm_cannot_be_replaced_by_mismatched_music_without_prepare(self):
++        from aiosendspin.client import AudioFormat, PCMFormat
++        from aiosendspin.models.types import AudioCodec
++
++        await self.handler.prepare_output(self.format, "epoch")
++        different = AudioFormat(AudioCodec.PCM, PCMFormat(sample_rate=48000, channels=2, bit_depth=24))
++        self.transport.emit_start(different)
++        self.transport.emit_audio(bytes(range(64)) * 1200, different)
++        await self.handler.prepare_output(self.format, "epoch")
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertFalse(self.backend.streams[0].closed)
++        self.assertEqual(self.backend.streams[0].samples, [])
++
++    async def test_prepared_replacement_requires_native_retirement_and_retains_latest_cleanup_owner(self):
++        from unittest.mock import DEFAULT, patch
++        from aiosendspin.client import AudioFormat, PCMFormat
++        from aiosendspin.models.types import AudioCodec
++
++        await self.handler.prepare_output(self.format, "original")
++        stream = self.backend.streams[0]
++        replacement = AudioFormat(AudioCodec.PCM, PCMFormat(sample_rate=44100, channels=2, bit_depth=16))
++        with patch.object(stream, "close", wraps=stream.close) as native_close:
++            native_close.__name__ = "close"
++            native_close.side_effect = [OSError("External replacement close failed"), DEFAULT]
++            with self.assertRaises(OSError):
++                await self.handler.prepare_output(replacement, "replacement")
++            self.assertEqual(len(self.backend.streams), 1)
++            self.assertFalse(stream.closed)
++            self.assertEqual(stream.settings["samplerate"], 48000)
++            await self.handler.release_output("original")
++            self.assertFalse(stream.closed)
++            await self.handler.release_output("replacement")
++            self.assertTrue(stream.closed)
++            self.assertEqual(native_close.call_count, 2)
++        await self.handler.prepare_output(replacement, "successor")
++        self.assertEqual(len(self.backend.streams), 2)
++        self.assertEqual(self.backend.streams[-1].settings["samplerate"], 44100)
++        await self.handler.release_output("replacement")
++        self.assertFalse(self.backend.streams[-1].closed)
++        await self.handler.release_output("successor")
++        self.assertTrue(all(output.closed for output in self.backend.streams))
++        self.assertEqual(self.transport.chunks_sent, 0)
++
++    async def test_release_reports_native_close_failure_and_retries_the_same_backend(self):
++        await self.handler.prepare_output(self.format, "epoch")
++        stream = self.backend.streams[0]
++        close = stream.close
++        attempts = []
++
++        def retryable_close():
++            attempts.append(True)
++            if len(attempts) == 1:
++                raise OSError("External native close failed")
++            close()
++
++        stream.close = retryable_close
++        with self.assertRaises(OSError):
++            await self.handler.release_output("epoch")
++        self.assertFalse(stream.closed)
++        await self.handler.release_output("epoch")
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(attempts), 2)
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertEqual(self.transport.chunks_sent, 0)
++
++    async def test_native_music_open_failure_completes_queued_prepare_and_bounded_shutdown(self):
++        import threading
++
++        entered, finish = threading.Event(), threading.Event()
++
++        def failed_open():
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External open was not released")
++            raise OSError("External music backend unavailable")
++
++        self.backend.before_open = failed_open
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        pending = asyncio.create_task(self.handler.prepare_output(self.format, "queued"))
++        await asyncio.sleep(0)
++        finish.set()
++        try:
++            with self.assertRaises(RuntimeError):
++                await asyncio.wait_for(asyncio.shield(pending), 0.5)
++            await asyncio.wait_for(self.handler.shutdown(), 0.5)
++            with self.assertRaises(RuntimeError):
++                await asyncio.wait_for(self.handler.prepare_output(self.format, "after-shutdown"), 0.5)
++        finally:
++            finish.set()
++            if not pending.done():
++                pending.cancel()
++                try:
++                    await pending
++                except asyncio.CancelledError:
++                    pass
++
++    async def test_invalid_float_successor_fails_before_admission_and_preserves_pending_owner(self):
++        import threading
++        from aiosendspin.client import AudioFormat
++        from aiosendspin.models.types import AudioCodec
++        from aiosendspin.server.audio import AudioFormat as ServerFormat
++
++        entered, finish = threading.Event(), threading.Event()
++
++        def delayed_open():
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External open was not released")
++
++        self.backend.before_open = delayed_open
++        original = asyncio.create_task(self.handler.prepare_output(self.format, "original"))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        invalid = AudioFormat(AudioCodec.PCM, ServerFormat(sample_rate=48000, channels=2, bit_depth=32,
++                                                         sample_type="float"))
++        try:
++            with self.assertRaises(ValueError):
++                await asyncio.wait_for(self.handler.prepare_output(invalid, "invalid"), 0.2)
++        finally:
++            finish.set()
++            await original
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertFalse(self.backend.streams[0].closed)
++        await self.handler.release_output("invalid")
++        self.assertFalse(self.backend.streams[0].closed)
++        await self.handler.release_output("original")
++        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_full_queue_rejection_preserves_last_accepted_preparation_owner(self):
++        import threading
++
++        entered, finish = threading.Event(), threading.Event()
++
++        def delayed_open():
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External open was not released")
++
++        self.backend.before_open = delayed_open
++        opening = asyncio.create_task(self.handler.prepare_output(self.format, "opening"))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        accepted = asyncio.create_task(self.handler.prepare_output(self.format, "accepted"))
++        await asyncio.sleep(0)
++        try:
++            for _ in range(600):
++                self.transport.emit_audio(b"", self.format)
++            with self.assertRaises(RuntimeError):
++                await self.handler.prepare_output(self.format, "rejected")
++        finally:
++            finish.set()
++        with self.assertRaises(RuntimeError):
++            await opening
++        await asyncio.wait_for(accepted, 0.5)
++        self.assertFalse(self.backend.streams[-1].closed)
++        await self.handler.release_output("rejected")
++        self.assertFalse(self.backend.streams[-1].closed)
++        await self.handler.release_output("accepted")
++        self.assertTrue(self.backend.streams[-1].closed)
++
++    async def test_valid_preparation_rejected_during_native_drain_still_owns_cleanup(self):
++        from aiosendspin.client import AudioFormat, PCMFormat
++        from aiosendspin.models.types import AudioCodec
++
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        transition = AudioFormat(AudioCodec.PCM, PCMFormat(sample_rate=48000, channels=2, bit_depth=24))
++        self.transport.emit_audio(bytes(range(64)) * 1200, transition)
++        requested = AudioFormat(AudioCodec.PCM, PCMFormat(sample_rate=48000, channels=2, bit_depth=32))
++        with self.assertRaises(RuntimeError):
++            await asyncio.wait_for(self.handler.prepare_output(requested, "latest"), 0.5)
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertFalse(self.backend.streams[0].closed)
++        await asyncio.wait_for(self.handler.release_output("latest"), 0.5)
++        self.assertTrue(self.backend.streams[0].closed)
++        self.assertEqual(len(self.backend.streams), 1)
++
++    async def test_matching_preparation_during_native_drain_preserves_music_and_one_backend(self):
++        from aiosendspin.client import AudioFormat, PCMFormat
++        from aiosendspin.models.types import AudioCodec
++
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        transition = AudioFormat(AudioCodec.PCM, PCMFormat(sample_rate=48000, channels=2, bit_depth=24))
++        self.transport.emit_audio(bytes(range(64)) * 1200, transition)
++        await asyncio.wait_for(self.handler.prepare_output(self.format, "latest"), 0.5)
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertFalse(self.backend.streams[0].closed)
++        self.assertEqual(self.backend.streams[0].samples, [bytes(range(64))])
++        await self.handler.release_output("latest")
++        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_disconnect_invalidates_prepared_backend_without_waiting_for_music_or_idle(self):
++        await self.handler.prepare_output(self.format, "epoch")
++        await asyncio.wait_for(self.handler.handle_disconnect(), 0.5)
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertTrue(self.backend.streams[0].closed)
++        self.assertEqual(self.transport.chunks_sent, 0)
++        with self.assertRaises(RuntimeError):
++            await self.handler.prepare_output(self.format, "disconnected")
++
++    async def test_public_prepare_allocates_exact_worker_backend_without_source_or_play_events(self):
++        await self.handler.prepare_output(self.format, "cold-epoch")
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertFalse(self.backend.streams[0].closed)
++        self.assertEqual(self.backend.streams[0].samples, [])
++        self.assertEqual(self.transport.chunks_sent, 0)
++        self.assertEqual(self.formats, [])
++        self.assertEqual(self.events, [])
++
++    async def test_real_pcm_start_and_first_samples_reuse_prepared_worker_backend(self):
++        await self.handler.prepare_output(self.format, "cold-epoch")
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertEqual(self.backend.streams[0].samples[0], bytes(range(64)))
++        self.assertEqual(self.formats, [("pcm", 48000, 16, 2)])
++        self.assertEqual(self.events, ["start"])
++
++    async def test_real_flac_start_and_decoded_first_samples_reuse_prepared_pcm_backend(self):
++        from aiosendspin.client import AudioFormat
++        from aiosendspin.models.types import AudioCodec
++        from aiosendspin.server.roles.player.audio_transformers import FlacEncoder
++
++        encoder = FlacEncoder(sample_rate=48000, channels=2, bit_depth=16)
++        packets = encoder.process(bytes(range(64)) * 1600, self.transport.timestamp, 500000)
++        packets.extend(encoder.flush())
++        encoded_format = AudioFormat(AudioCodec.FLAC, self.format.pcm_format, encoder.get_header())
++        await self.handler.prepare_output(self.format, "epoch")
++        self.transport.emit_start(encoded_format)
++        timestamp = self.transport.timestamp
++        for packet, duration in packets:
++            self.transport.emit_audio(packet, encoded_format, timestamp)
++            timestamp += duration
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertEqual(self.backend.streams[0].samples[0], bytes(range(64)))
++        self.assertEqual(self.formats, [("flac", 48000, 16, 2)])
++
++    async def test_default_without_prepare_closes_native_backend_on_stream_end(self):
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        self.transport.emit_end()
++        self.assertTrue(await asyncio.to_thread(self.backend.closed.wait, 1))
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_matching_active_prepare_ack_does_not_reopen_or_reset_source_callbacks(self):
++        await self.handler.prepare_output(self.format, "old")
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        await self.handler.prepare_output(self.format, "new")
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertEqual(self.backend.streams[0].samples, [bytes(range(64))])
++        self.assertEqual(self.formats, [("pcm", 48000, 16, 2)])
++        self.assertEqual(self.events, ["start"])
++        await self.handler.release_output("old")
++        self.assertFalse(self.backend.streams[0].closed)
++
++    async def test_undrained_format_mismatch_fails_without_reopening_and_latest_release_cleans_up(self):
++        from aiosendspin.client import AudioFormat, PCMFormat
++        from aiosendspin.models.types import AudioCodec
++
++        await self.handler.prepare_output(self.format, "old")
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        different = AudioFormat(AudioCodec.PCM, PCMFormat(sample_rate=48000, channels=2, bit_depth=24))
++        with self.assertRaises(RuntimeError):
++            await self.handler.prepare_output(different, "new")
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertFalse(self.backend.streams[0].closed)
++        self.assertEqual(self.backend.streams[0].samples, [bytes(range(64))])
++        await self.handler.release_output("new")
++        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_unsupported_native_settings_fail_before_allocation(self):
++        from unittest.mock import patch
++
++        with patch("sounddevice.check_output_settings", side_effect=ValueError("unsupported output")):
++            with self.assertRaises(ValueError):
++                await self.handler.prepare_output(self.format, "unsupported")
++        self.assertEqual(self.backend.streams, [])
++        await self.handler.prepare_output(self.format, "supported")
++        self.assertEqual(len(self.backend.streams), 1)
++
++    async def test_server_float_format_is_rejected_instead_of_treated_as_integer_pcm(self):
++        from aiosendspin.client import AudioFormat
++        from aiosendspin.models.types import AudioCodec
++        from aiosendspin.server.audio import AudioFormat as ServerFormat
++
++        incompatible = AudioFormat(AudioCodec.PCM, ServerFormat(sample_rate=48000, channels=2, bit_depth=32,
++                                                                sample_type="float"))
++        with self.assertRaises(ValueError):
++            await self.handler.prepare_output(incompatible, "float")
++        self.assertEqual(self.backend.streams, [])
++
++    async def test_prepared_lifetime_survives_start_clear_end_until_native_release_ack(self):
++        await self.handler.prepare_output(self.format, "epoch")
++        self.transport.emit_start(self.format)
++        self.transport.emit_clear()
++        self.transport.emit_end()
++        await self.handler.prepare_output(self.format, "epoch")  # Public control acknowledgment is the FIFO barrier.
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertFalse(self.backend.streams[0].closed)
++        await self.handler.release_output("epoch")
++        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_release_invalidates_pending_prepare_and_old_cleanup_cannot_close_successor(self):
++        import threading
++
++        entered, finish = threading.Event(), threading.Event()
++        def delayed_open():
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External open was not released")
++        self.backend.before_open = delayed_open
++        pending = asyncio.create_task(self.handler.prepare_output(self.format, "old"))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        closing = asyncio.create_task(self.handler.release_output("old"))
++        await asyncio.sleep(0)
++        successor = asyncio.create_task(self.handler.prepare_output(self.format, "new"))
++        await asyncio.sleep(0)
++        finish.set()
++        await closing
++        await successor
++        with self.assertRaises(RuntimeError):
++            await pending
++        self.assertEqual(len(self.backend.streams), 2)
++        self.assertTrue(self.backend.streams[0].closed)
++        self.assertFalse(self.backend.streams[1].closed)
++        await self.handler.release_output("old")
++        self.assertFalse(self.backend.streams[1].closed)
++        await self.handler.release_output("new")
++        self.assertTrue(self.backend.streams[1].closed)
++
++    async def test_cancelled_public_prepare_invalidates_late_native_allocation_without_waiting(self):
++        import threading
++
++        entered, finish = threading.Event(), threading.Event()
++        def delayed_open():
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External open was not released")
++        self.backend.before_open = delayed_open
++        pending = asyncio.create_task(self.handler.prepare_output(self.format, "cancelled"))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        try:
++            pending.cancel()
++            with self.assertRaises(asyncio.CancelledError):
++                await asyncio.wait_for(pending, 0.2)
++        finally:
++            finish.set()
++        await self.handler.release_output("not-owner")  # A public FIFO barrier, not a cleanup of the cancelled epoch.
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_full_control_queue_fails_closed_and_shutdown_completes_queued_prepare(self):
++        import threading
++
++        entered, finish = threading.Event(), threading.Event()
++        def delayed_open():
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External open was not released")
++        self.backend.before_open = delayed_open
++        opening = asyncio.create_task(self.handler.prepare_output(self.format, "opening"))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        queued = asyncio.create_task(self.handler.prepare_output(self.format, "queued"))
++        await asyncio.sleep(0)
++        for _ in range(600):
++            self.transport.emit_audio(b"", self.format)
++        with self.assertRaises(RuntimeError):
++            await self.handler.prepare_output(self.format, "rejected")
++        shutdown = asyncio.create_task(self.handler.shutdown())
++        await asyncio.sleep(0)
++        finish.set()
++        await shutdown
++        with self.assertRaises(RuntimeError):
++            await opening
++        with self.assertRaises((RuntimeError, asyncio.CancelledError)):
++            await asyncio.wait_for(queued, 0.2)
++        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_shutdown_invalidates_native_prepare_before_it_can_return_ready(self):
++        import threading
++
++        entered, finish = threading.Event(), threading.Event()
++        def delayed_open():
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External open was not released")
++        self.backend.before_open = delayed_open
++        pending = asyncio.create_task(self.handler.prepare_output(self.format, "stopped"))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        shutdown = asyncio.create_task(self.handler.shutdown())
++        await asyncio.sleep(0)
++        finish.set()
++        await shutdown
++        with self.assertRaises(RuntimeError):
++            await pending
++        self.assertTrue(self.backend.streams[0].closed)

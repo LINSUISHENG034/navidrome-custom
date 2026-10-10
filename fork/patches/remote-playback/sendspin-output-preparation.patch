@@ -1,0 +1,451 @@
+diff --git a/sendspin/audio.py b/sendspin/audio.py
+index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..126fb8c8fd678883ef4504b0d0853f3f29aa66f3 100644
+--- a/sendspin/audio.py
++++ b/sendspin/audio.py
+@@ -168,6 +168,8 @@ class AudioPlayer:
+         self._now_us = now_us or (lambda: int(time.monotonic() * 1_000_000))
+         self._is_clock_synced = is_clock_synced or (lambda: True)
+         self._format: PCMFormat | None = None
++        self._prepared_epoch: str | None = None
++        self._release_pending = False
+         self._queue: queue.Queue[_QueuedChunk] = queue.Queue()
+         self._stream: sounddevice.RawOutputStream | None = None
+         self._closed = False
+@@ -245,6 +247,55 @@ class AudioPlayer:
+         # Thread-safe flag for deferred operations (audio thread → main thread)
+         self._clear_requested: bool = False
+ 
++    @staticmethod
++    def validate_preparation_format(audio_format: AudioFormat) -> None:
++        """Validate integer PCM before admitting a new output lifetime."""
++        from aiosendspin.client import PCMFormat as ClientPCMFormat
++
++        pcm = getattr(audio_format, "pcm_format", None)
++        if not isinstance(pcm, ClientPCMFormat):
++            raise ValueError("Preparation requires decoded signed-integer client PCM")
++        if (
++            type(pcm.sample_rate) is not int
++            or pcm.sample_rate <= 0
++            or type(pcm.channels) is not int
++            or pcm.channels <= 0
++            or type(pcm.bit_depth) is not int
++            or pcm.bit_depth not in SOUNDDEVICE_DTYPE_MAP
++        ):
++            raise ValueError("Preparation requires a supported integer PCM format")
++
++    def prepare_output(self, audio_format: AudioFormat, device: AudioDevice, epoch: str) -> bool:
++        """Hold this exact backend; return whether its physical format changed."""
++        self.validate_preparation_format(audio_format)
++        if self._release_pending:
++            raise RuntimeError("The previous output release has not completed")
++        pcm = audio_format.pcm_format
++        self._prepared_epoch = epoch
++        changed = self._stream is None or self._format != pcm
++        if changed and not self.is_drained():
++            raise RuntimeError("Cannot reconfigure an undrained output")
++        sounddevice.check_output_settings(
++            device=device.device_id,
++            samplerate=pcm.sample_rate,
++            channels=pcm.channels,
++            dtype=SOUNDDEVICE_DTYPE_MAP[pcm.bit_depth],
++        )
++        if changed:
++            self.set_format(audio_format, device)
++        return changed
++
++    def validate_output_format(
++        self, audio_format: AudioFormat, *, require_prepared: bool = False
++    ) -> None:
++        """Reject content without its required prepared lifetime or matching format."""
++        if require_prepared and self._prepared_epoch is None:
++            raise RuntimeError("Audio output preparation is required")
++        if self._release_pending:
++            raise RuntimeError("The previous output release has not completed")
++        if self._prepared_epoch is not None and self._format != audio_format.pcm_format:
++            raise RuntimeError("Audio format does not match the prepared output")
++
+     def set_format(self, audio_format: AudioFormat, device: AudioDevice) -> None:
+         """Configure the audio output format.
+ 
+@@ -253,8 +304,14 @@ class AudioPlayer:
+             device: Audio device to use.
+         """
+         pcm_format = audio_format.pcm_format
++        if self._prepared_epoch is not None and self._stream is not None and self._format == pcm_format:
++            return
++        prepared = self._prepared_epoch is not None
++        if prepared:
++            self._release_pending = True
++        self._close_stream(wait=prepared)
++        self._release_pending = False
+         self._format = pcm_format
+-        self._close_stream()
+ 
+         # Reset state on format change
+         self._stream_started = False
+@@ -339,8 +396,26 @@ class AudioPlayer:
+         self._close_stream()
+         self._stream_executor.shutdown(wait=True)
+ 
+-    def close_stream(self) -> None:
+-        """Drop queued audio and fully close the stream to release the device.
++    def _retire_cancelled_preparation(self, epoch: str) -> bool:
++        """Retire an admitted control in worker order without opening a backend."""
++        if self._release_pending:
++            raise RuntimeError("The previous output release has not completed")
++        self._prepared_epoch = epoch
++        return self.release_output(epoch)
++
++    def release_output(self, epoch: str) -> bool:
++        """Force-close only the matching prepared lifetime and await native close."""
++        if self._prepared_epoch != epoch:
++            return False
++        self._release_pending = True
++        self.clear()
++        self._close_stream(wait=True)
++        self._prepared_epoch = None
++        self._release_pending = False
++        return True
++
++    def close_stream(self, *, wait: bool = False) -> None:
++        """Drop queued audio and close the stream unless an output lifetime holds it.
+ 
+         Unlike clear(), which only stops the stream (leaving the device FD open),
+         this fully closes the PortAudio stream. Call when the server signals
+@@ -350,7 +425,8 @@ class AudioPlayer:
+         if self._closed:
+             return
+         self.clear()
+-        self._close_stream()
++        if self._prepared_epoch is None:
++            self._close_stream(wait=wait)
+ 
+     def clear(self) -> None:
+         """Drop all queued audio chunks."""
+@@ -1291,20 +1367,37 @@ class AudioPlayer:
+                 self._queued_duration_us / 1_000_000,
+             )
+ 
+-    def _close_stream(self) -> None:
+-        """Close the audio output stream."""
++    def _close_stream(self, *, wait: bool = False) -> concurrent.futures.Future[None] | None:
++        """Close the output, retaining failed acknowledged closes for a retry."""
+         stream = self._stream
++        if stream is None:
++            return None
++        closing = self._stream_executor.submit(
++            self._call_stream, stream.stop, stream.close, raise_errors=wait
++        )
++        if wait:
++            try:
++                closing.result()
++            except Exception:
++                if stream.closed:
++                    self._stream = None
++                raise
+         self._stream = None
+-        if stream is not None:
+-            self._stream_executor.submit(self._call_stream, stream.stop, stream.close)
++        return closing
+ 
+     @staticmethod
+     def _call_stream(
+         *calls: Callable[[], object],
++        raise_errors: bool = False,
+     ) -> None:
+-        """Run stream operations with exception logging (runs in executor thread)."""
++        """Attempt all native operations, optionally propagating their first failure."""
++        error: Exception | None = None
+         for call in calls:
+             try:
+                 call()
+-            except Exception:
++            except Exception as exc:
+                 logger.exception("Stream operation %s failed", call.__name__)
++                if error is None:
++                    error = exc
++        if raise_errors and error is not None:
++            raise error
+diff --git a/sendspin/audio_connector.py b/sendspin/audio_connector.py
+index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd709ac1bd 100644
+--- a/sendspin/audio_connector.py
++++ b/sendspin/audio_connector.py
+@@ -8,6 +8,7 @@ import queue
+ import threading
+ import time
+ from collections.abc import Callable
++from concurrent.futures import Future
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, cast
+ 
+@@ -66,8 +67,18 @@ class _CloseStreamWorkItem:
+     """Close the audio stream and release the audio device on stream end."""
+ 
+ 
++@dataclass(slots=True)
++class _OutputWorkItem:
++    """Configure the worker's existing player and acknowledge native allocation."""
++
++    audio_format: AudioFormat | None
++    epoch: str
++    result: Future[None]
++
++
+ type _AudioWorkItem = (
+-    _ChunkWorkItem
++    _OutputWorkItem
++    | _ChunkWorkItem
+     | _ClearWorkItem
+     | _SetVolumeWorkItem
+     | _DelayChangeWorkItem
+@@ -94,6 +105,10 @@ class _AudioSyncWorker:
+ 
+         self._queue: queue.Queue[_AudioWorkItem] | None = None
+         self._thread: threading.Thread | None = None
++        self._output_epoch: str | None = None  # Written by event-loop callers; read by the worker.
++        self._output_lock = threading.Lock()
++        self._finished = False
++        self._output_controlled = False
+ 
+     def start(
+         self,
+@@ -108,7 +123,9 @@ class _AudioSyncWorker:
+ 
+         self._now_us = now_us
+         self._is_clock_synced = is_clock_synced
+-        self._queue = queue.Queue(maxsize=512)
++        with self._output_lock:
++            self._finished = False
++            self._queue = queue.Queue(maxsize=512)
+         self._thread = threading.Thread(
+             target=self._run,
+             args=(compute_play_time, compute_server_time),
+@@ -121,6 +138,83 @@ class _AudioSyncWorker:
+         """Whether the worker thread is currently alive."""
+         return self._thread is not None and self._thread.is_alive()
+ 
++    def _request_output(self, audio_format: AudioFormat | None, epoch: str) -> Future[None]:
++        if audio_format is not None:
++            AudioPlayer.validate_preparation_format(audio_format)
++        with self._output_lock:
++            queue_obj = self._queue
++            if queue_obj is None or self._finished or not self.is_running():
++                raise RuntimeError("Audio worker is not running")
++            result: Future[None] = Future()
++            try:
++                queue_obj.put_nowait(_OutputWorkItem(audio_format, epoch, result))
++            except queue.Full as exc:
++                raise RuntimeError("Audio output control queue is full") from exc
++            if audio_format is not None:
++                self._output_epoch = epoch
++                self._output_controlled = True
++            elif self._output_epoch == epoch:
++                self._output_epoch = None
++            return result
++
++    def _owns_output_epoch(self, epoch: str) -> bool:
++        with self._output_lock:
++            return not self._finished and self._output_epoch == epoch
++
++    def _revoke_output_epoch(self, epoch: str) -> None:
++        with self._output_lock:
++            if self._output_epoch == epoch:
++                self._output_epoch = None
++
++    def _validate_output_format(self, player: AudioPlayer, audio_format: AudioFormat) -> None:
++        with self._output_lock:
++            controlled = self._output_controlled
++        player.validate_output_format(audio_format, require_prepared=controlled)
++
++    async def prepare_output(self, audio_format: AudioFormat, epoch: str) -> None:
++        """Prepare the exact worker backend without submitting audio."""
++        try:
++            await asyncio.wrap_future(self._request_output(audio_format, epoch))
++        except asyncio.CancelledError:
++            self._revoke_output_epoch(epoch)
++            try:
++                self._request_output(None, epoch)
++            except RuntimeError:
++                logger.debug("Output cancellation control unavailable")
++            raise
++        if not self._owns_output_epoch(epoch):
++            raise RuntimeError("Output preparation superseded")
++
++    async def release_output(self, epoch: str) -> None:
++        """Acknowledge closing only the matching prepared output."""
++        await asyncio.wrap_future(self._request_output(None, epoch))
++
++    def _handle_output(self, item: _OutputWorkItem, player: AudioPlayer) -> bool:
++        if not item.result.set_running_or_notify_cancel():
++            try:
++                if item.audio_format is None:
++                    return player.release_output(item.epoch)
++                return player._retire_cancelled_preparation(item.epoch)
++            except Exception:
++                logger.exception("Cancelled output cleanup failed")
++                return False
++        try:
++            if item.audio_format is not None and not self._owns_output_epoch(item.epoch):
++                raise RuntimeError("Output preparation superseded")
++            changed = (
++                player.release_output(item.epoch)
++                if item.audio_format is None
++                else player.prepare_output(item.audio_format, self._audio_device, item.epoch)
++            )
++            if item.audio_format is not None and not self._owns_output_epoch(item.epoch):
++                player.release_output(item.epoch)
++                raise RuntimeError("Output preparation superseded")
++        except Exception as exc:
++            item.result.set_exception(exc)
++            return False
++        item.result.set_result(None)
++        return changed
++
+     def submit_chunk(
+         self, server_timestamp_us: int, audio_data: bytes | bytearray, fmt: AudioFormat
+     ) -> None:
+@@ -146,10 +240,12 @@ class _AudioSyncWorker:
+ 
+     async def stop(self) -> None:
+         """Stop worker thread and close queue resources."""
+-        queue_obj = self._queue
+-        thread = self._thread
+-        self._queue = None
+-        self._thread = None
++        with self._output_lock:
++            self._output_epoch = None
++            queue_obj = self._queue
++            thread = self._thread
++            self._queue = None
++            self._thread = None
+ 
+         if queue_obj is None:
+             return
+@@ -159,7 +255,9 @@ class _AudioSyncWorker:
+         except queue.Full:
+             while True:
+                 try:
+-                    queue_obj.get_nowait()
++                    discarded = queue_obj.get_nowait()
++                    if isinstance(discarded, _OutputWorkItem):
++                        discarded.result.cancel()
+                 except queue.Empty:
+                     break
+             try:
+@@ -190,12 +288,34 @@ class _AudioSyncWorker:
+         if queue_obj is None:
+             return
+ 
+-        player = AudioPlayer(
+-            compute_play_time,
+-            compute_server_time,
+-            now_us=self._now_us,
+-            is_clock_synced=self._is_clock_synced,
+-        )
++        player: AudioPlayer | None = None
++        try:
++            player = AudioPlayer(
++                compute_play_time,
++                compute_server_time,
++                now_us=self._now_us,
++                is_clock_synced=self._is_clock_synced,
++            )
++            self._run_audio(queue_obj, player)
++        except Exception:
++            logger.exception("Audio worker failed")
++        finally:
++            with self._output_lock:
++                self._finished = True
++                self._output_epoch = None
++                while True:
++                    try:
++                        pending = queue_obj.get_nowait()
++                    except queue.Empty:
++                        break
++                    if isinstance(pending, _OutputWorkItem):
++                        if pending.result.set_running_or_notify_cancel():
++                            pending.result.set_exception(RuntimeError("Audio worker stopped"))
++            if player is not None:
++                player.stop()
++
++    def _run_audio(self, queue_obj: queue.Queue[_AudioWorkItem], player: AudioPlayer) -> None:
++        """Run the existing decode and clock pipeline inside the worker lifetime."""
+         current_format: AudioFormat | None = None
+         flac_decoder: FlacDecoder | None = None
+         software_volume = self._initial_volume
+@@ -215,6 +335,11 @@ class _AudioSyncWorker:
+             if item_type is _StopWorkItem:
+                 break
+ 
++            if item_type is _OutputWorkItem:
++                if self._handle_output(cast(_OutputWorkItem, item), player):
++                    current_format = None
++                continue
++
+             if item_type is _ClearWorkItem:
+                 player.clear()
+                 continue
+@@ -238,6 +363,11 @@ class _AudioSyncWorker:
+ 
+             chunk_item = cast(_ChunkWorkItem, item)
+             fmt = chunk_item.fmt
++            try:
++                self._validate_output_format(player, fmt)
++            except RuntimeError:
++                logger.warning("Dropping audio that does not match a ready prepared output")
++                continue
+             if current_format != fmt:
+                 # Format changed: drain old-format audio before switching
+                 # to prevent pitch shift from old PCM played at new sample rate.
+@@ -254,8 +384,21 @@ class _AudioSyncWorker:
+                         continue
+ 
+                     drain_type = type(drain_item)
++                    if drain_type is _OutputWorkItem:
++                        control = cast(_OutputWorkItem, drain_item)
++                        changed = self._handle_output(control, player)
++                        if control.audio_format is None and changed:
++                            buffered_chunks.clear()
++                            close_requested = drained = True
++                            break
++                        try:
++                            self._validate_output_format(player, fmt)
++                        except RuntimeError:
++                            buffered_chunks.clear()
++                            close_requested = drained = True
++                            break
++                        continue
+                     if drain_type is _StopWorkItem:
+-                        player.stop()
+                         return
+                     if drain_type is _ClearWorkItem or drain_type is _CloseStreamWorkItem:
+                         if drain_type is _CloseStreamWorkItem:
+@@ -326,8 +469,6 @@ class _AudioSyncWorker:
+ 
+             player.submit(chunk_item.server_timestamp_us, payload)
+ 
+-        player.stop()
+-
+ 
+ class AudioStreamHandler:
+     """Manages audio playback state and stream lifecycle.
+@@ -499,6 +640,19 @@ class AudioStreamHandler:
+         if not self._audio_worker.is_running():
+             raise RuntimeError("Audio worker failed to start")
+ 
++    async def prepare_output(self, audio_format: AudioFormat, epoch: str) -> None:
++        """Await preparation of this handler's exact playback backend."""
++        worker = self._audio_worker
++        if worker is None:
++            raise RuntimeError("Audio worker is not attached")
++        await worker.prepare_output(audio_format, epoch)
++
++    async def release_output(self, epoch: str) -> None:
++        """Close the matching prepared native backend without detaching the client."""
++        worker = self._audio_worker
++        if worker is not None:
++            await worker.release_output(epoch)
++
+     def notify_delay_change(self, delta_us: int) -> None:
+         """Notify the audio worker that static delay changed."""
+         worker = self._audio_worker
