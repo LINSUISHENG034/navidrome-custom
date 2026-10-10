@@ -67,6 +67,12 @@ Blocked by: 01, 02, 03
 - `source_path="src:/unowned"` 的公开 CLI 回归实际 red 为 `AssertionError: 0 != 1`、`Ran 1 test / FAILED (failures=1)`（0.018 秒），只加依赖专用的 `:` 检查后 unchanged test green；普通和被忽略未跟踪文件的拒绝也有真实 red→green。协调者独立 suite 为 `Ran 51 tests / OK`（0.660 秒），独立审阅另跑 51 项（1.096 秒），增加 diamond 去重和 transitive cycle 的公开替身探针，未发现已确认缺陷；固定清单及旧补丁 checksum 校验仍通过。新增验证只使用临时目录及 Git/Docker 外部执行替身，不等于真实依赖 clone/apply/Docker replay。canonical 清单暂未登记 SDK 项目，实际 SDK 生命周期增量仍待完成。
 - 已拒绝的独立 reservation/handoff 试验及其 35 项 green 留在忽略工作区，不纳入 canonical，也不关闭冷启动缺口。该试验发现的原生身份问题另计：固定 libpulse 17.0 下，`PULSE_PROP_application.name` 会被 ALSA 的显式名称覆盖；`PULSE_PROP_OVERRIDE_application.name` 经隔离原生 Pulse 观察可保留配置身份。严格 PID/身份比较不放宽，后续同一 worker 路径仍须重新验证。
 
+### 2026-10-10 source-only 依赖检查点
+
+- 既有 runner 接受 `test_command: null` 的源码依赖，但要求它从至少一个有测试命令的项目经 `runtime_sources` 可达；直接 `test` 源码项目在 Docker 前拒绝，提示测试依赖它的项目。`status/fetch/apply/export` 保留原语义，依赖仍接受相同的 provenance/pin/canonical tree、安全路径及未跟踪文件检查。
+- 独立审阅实际运行完整 runner suite：`Ran 57 tests / OK`（0.839 秒，无 skipped），未发现已确认缺陷；本轮增加 6 个公开 CLI 回归。`validate` 与 `git diff --check` 通过。这里 Git/Docker 仍是外部执行替身，不能证明真实 SDK 导入或冷启动输出。
+- 已提交 `ea7bd14d` 并成功推送到 fork 的同名 `dev/remote-playback-output-gate` 分支。SDK 开发 checkout 没有 runner provenance，不补造标记；后续导出及重放使用 runner 新建的干净 checkout，不 reset/覆盖原开发源码。SDK canonical 差分及同一 worker 冷启动证据仍待接入。
+
 **本票仍 claimed，以下不是已完成项：**
 
 1. 运行时物理失联需要可靠传回 MA，撤销/冻结权威 source 与 timeline；仅本地 daemon pause/release 不证明该闭环。
