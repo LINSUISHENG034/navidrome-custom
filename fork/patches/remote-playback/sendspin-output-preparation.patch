@@ -167,7 +167,7 @@ index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..126fb8c8fd678883ef4504b0d0853f3f
 +        if raise_errors and error is not None:
 +            raise error
 diff --git a/sendspin/audio_connector.py b/sendspin/audio_connector.py
-index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd709ac1bd 100644
+index fd82602c886490d7fe35761d7564e5f87940e63c..d0c676f7bd85d41e10d95f8d60de431c2e12c7e2 100644
 --- a/sendspin/audio_connector.py
 +++ b/sendspin/audio_connector.py
 @@ -8,6 +8,7 @@ import queue
@@ -198,18 +198,26 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
      | _ClearWorkItem
      | _SetVolumeWorkItem
      | _DelayChangeWorkItem
-@@ -94,6 +105,10 @@ class _AudioSyncWorker:
+@@ -86,6 +97,7 @@ class _AudioSyncWorker:
+         use_software_volume: bool,
+         volume: int,
+         muted: bool,
++        output_controlled: bool = False,
+     ) -> None:
+         self._audio_device = audio_device
+         self._use_software_volume = use_software_volume
+@@ -94,6 +106,10 @@ class _AudioSyncWorker:
  
          self._queue: queue.Queue[_AudioWorkItem] | None = None
          self._thread: threading.Thread | None = None
 +        self._output_epoch: str | None = None  # Written by event-loop callers; read by the worker.
 +        self._output_lock = threading.Lock()
 +        self._finished = False
-+        self._output_controlled = False
++        self._output_controlled = output_controlled
  
      def start(
          self,
-@@ -108,7 +123,9 @@ class _AudioSyncWorker:
+@@ -108,7 +124,9 @@ class _AudioSyncWorker:
  
          self._now_us = now_us
          self._is_clock_synced = is_clock_synced
@@ -220,10 +228,16 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
          self._thread = threading.Thread(
              target=self._run,
              args=(compute_play_time, compute_server_time),
-@@ -121,6 +138,83 @@ class _AudioSyncWorker:
+@@ -121,6 +139,89 @@ class _AudioSyncWorker:
          """Whether the worker thread is currently alive."""
          return self._thread is not None and self._thread.is_alive()
  
++    @property
++    def output_controlled(self) -> bool:
++        """Whether an admitted preparation requires control across worker lifetimes."""
++        with self._output_lock:
++            return self._output_controlled
++
 +    def _request_output(self, audio_format: AudioFormat | None, epoch: str) -> Future[None]:
 +        if audio_format is not None:
 +            AudioPlayer.validate_preparation_format(audio_format)
@@ -304,7 +318,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
      def submit_chunk(
          self, server_timestamp_us: int, audio_data: bytes | bytearray, fmt: AudioFormat
      ) -> None:
-@@ -146,10 +240,12 @@ class _AudioSyncWorker:
+@@ -146,10 +247,12 @@ class _AudioSyncWorker:
  
      async def stop(self) -> None:
          """Stop worker thread and close queue resources."""
@@ -321,7 +335,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
  
          if queue_obj is None:
              return
-@@ -159,7 +255,9 @@ class _AudioSyncWorker:
+@@ -159,7 +262,9 @@ class _AudioSyncWorker:
          except queue.Full:
              while True:
                  try:
@@ -332,7 +346,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
                  except queue.Empty:
                      break
              try:
-@@ -190,12 +288,34 @@ class _AudioSyncWorker:
+@@ -190,12 +295,34 @@ class _AudioSyncWorker:
          if queue_obj is None:
              return
  
@@ -373,7 +387,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
          current_format: AudioFormat | None = None
          flac_decoder: FlacDecoder | None = None
          software_volume = self._initial_volume
-@@ -215,6 +335,11 @@ class _AudioSyncWorker:
+@@ -215,6 +342,11 @@ class _AudioSyncWorker:
              if item_type is _StopWorkItem:
                  break
  
@@ -385,7 +399,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
              if item_type is _ClearWorkItem:
                  player.clear()
                  continue
-@@ -238,6 +363,11 @@ class _AudioSyncWorker:
+@@ -238,6 +370,11 @@ class _AudioSyncWorker:
  
              chunk_item = cast(_ChunkWorkItem, item)
              fmt = chunk_item.fmt
@@ -397,7 +411,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
              if current_format != fmt:
                  # Format changed: drain old-format audio before switching
                  # to prevent pitch shift from old PCM played at new sample rate.
-@@ -254,8 +384,21 @@ class _AudioSyncWorker:
+@@ -254,8 +391,21 @@ class _AudioSyncWorker:
                          continue
  
                      drain_type = type(drain_item)
@@ -420,7 +434,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
                          return
                      if drain_type is _ClearWorkItem or drain_type is _CloseStreamWorkItem:
                          if drain_type is _CloseStreamWorkItem:
-@@ -326,8 +469,6 @@ class _AudioSyncWorker:
+@@ -326,8 +476,6 @@ class _AudioSyncWorker:
  
              player.submit(chunk_item.server_timestamp_us, payload)
  
@@ -429,7 +443,32 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
  
  class AudioStreamHandler:
      """Manages audio playback state and stream lifecycle.
-@@ -499,6 +640,19 @@ class AudioStreamHandler:
+@@ -376,6 +524,7 @@ class AudioStreamHandler:
+         self.audio_player: AudioPlayer | None = None
+ 
+         self._audio_worker: _AudioSyncWorker | None = None
++        self._output_controlled = False
+         self._client_unsubscribers: list[Callable[[], None]] = []
+ 
+         self._volume_controller: VolumeController | None = volume_controller
+@@ -482,12 +631,15 @@ class AudioStreamHandler:
+ 
+     def _start_audio_worker(self, client: SendspinClient) -> None:
+         """Start sync worker once during attach and fail fast if unavailable."""
+-        if self._audio_worker is None:
++        if self._audio_worker is None or not self._audio_worker.is_running():
++            if self._audio_worker is not None:
++                self._output_controlled |= self._audio_worker.output_controlled
+             self._audio_worker = _AudioSyncWorker(
+                 audio_device=self._audio_device,
+                 use_software_volume=not self.uses_external_volume_controller,
+                 volume=self._volume,
+                 muted=self._muted,
++                output_controlled=self._output_controlled,
+             )
+ 
+         self._audio_worker.start(
+@@ -499,6 +651,19 @@ class AudioStreamHandler:
          if not self._audio_worker.is_running():
              raise RuntimeError("Audio worker failed to start")
  
@@ -449,3 +488,48 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..035d74365a8a8cac87a93c302b57f8bd
      def notify_delay_change(self, delta_us: int) -> None:
          """Notify the audio worker that static delay changed."""
          worker = self._audio_worker
+@@ -542,7 +707,6 @@ class AudioStreamHandler:
+             return
+         assert self._client is not None, "Received stream start but client is not attached"
+         if self._audio_worker is None or not self._audio_worker.is_running():
+-            self._audio_worker = None
+             self._start_audio_worker(self._client)
+ 
+         self._clear_audio_worker()
+@@ -584,6 +748,7 @@ class AudioStreamHandler:
+ 
+         if self._audio_worker is not None:
+             await self._audio_worker.stop()
++            self._output_controlled |= self._audio_worker.output_controlled
+             self._audio_worker = None
+ 
+         self._current_format = None
+diff --git a/tests/test_audio_connector.py b/tests/test_audio_connector.py
+index 055c67baab093a278fb08d06b195257f8d464c8d..6a23a8653c2c0f3777a1b71fd08de8864a73edb8 100644
+--- a/tests/test_audio_connector.py
++++ b/tests/test_audio_connector.py
+@@ -18,11 +18,13 @@ class _FakeWorker:
+         use_software_volume: bool,
+         volume: int,
+         muted: bool,
++        output_controlled: bool = False,
+     ) -> None:
+         self.audio_device = audio_device
+         self.use_software_volume = use_software_volume
+         self.volume = volume
+         self.muted = muted
++        self._output_controlled = output_controlled
+         self.running = False
+         self.cleared = False
+         self.stream_closed = False
+@@ -42,6 +44,10 @@ class _FakeWorker:
+         self.now_us = now_us
+         self.is_clock_synced = is_clock_synced
+ 
++    @property
++    def output_controlled(self) -> bool:
++        return self._output_controlled
++
+     def is_running(self) -> bool:
+         return self.running
+ 

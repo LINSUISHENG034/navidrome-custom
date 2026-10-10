@@ -2006,10 +2006,10 @@ index 0000000000000000000000000000000000000000..b241579034c589b0f3f56c7802f89bd0
 +            await preparation.prepare("configured-player", "intent-1", 1)
 diff --git a/tests/test_output_preparation_http.py b/tests/test_output_preparation_http.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..98c599ea3b6fc87233a12cb9c47f0af2c55c7d48
+index 0000000000000000000000000000000000000000..8a395dfaa1c08873cf3e3448fd8a3aa8d37b7600
 --- /dev/null
 +++ b/tests/test_output_preparation_http.py
-@@ -0,0 +1,990 @@
+@@ -0,0 +1,1071 @@
 +"""Machine authentication at the real management HTTP entrance."""
 +
 +import asyncio
@@ -2786,6 +2786,87 @@ index 0000000000000000000000000000000000000000..98c599ea3b6fc87233a12cb9c47f0af2
 +        self.assertEqual(self.backend.streams[0].samples, [bytes(range(64))])
 +        await self.handler.release_output("latest")
 +        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_invalid_virgin_prepare_does_not_gate_legacy_playback_after_reconnect(self):
++        from aiosendspin.client import AudioFormat
++        from aiosendspin.models.types import AudioCodec
++        from aiosendspin.server.audio import AudioFormat as ServerFormat
++
++        invalid = AudioFormat(AudioCodec.PCM, ServerFormat(sample_rate=48000, channels=2, bit_depth=32,
++                                                         sample_type="float"))
++        with self.assertRaises(ValueError):
++            await self.handler.prepare_output(invalid, "invalid")
++        self.assertEqual(self.backend.streams, [])
++        await self.handler.handle_disconnect()
++        self.handler.attach_client(self.transport)
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertEqual(self.backend.streams[0].samples, [bytes(range(64))])
++        self.transport.emit_end()
++        self.assertTrue(await asyncio.to_thread(self.backend.closed.wait, 1))
++        self.assertTrue(self.backend.streams[0].closed)
++
++    async def test_crashed_worker_recovery_preserves_gate_for_stream_start_and_reattach(self):
++        for recovery in ("stream_start", "reattach"):
++            with self.subTest(recovery=recovery):
++                self.backend.closed.clear()
++                self.backend.started.clear()
++                await self.handler.prepare_output(self.format, "before-crash")
++                allocations = len(self.backend.streams)
++                self.transport.timestamp = None  # External clock failure in the real submit path.
++                self.transport.emit_audio(bytes(range(64)) * 800, self.format, timestamp=1_000_000)
++                self.assertTrue(await asyncio.to_thread(self.backend.closed.wait, 1))
++                self.assertTrue(self.backend.streams[-1].closed)
++                with self.assertRaises(RuntimeError):
++                    await self.handler.release_output("before-crash")
++                self.transport.timestamp = 1_000_000
++                async with asyncio.timeout(1):
++                    while True:
++                        if recovery == "reattach":
++                            self.handler.attach_client(self.transport)
++                        else:
++                            self.transport.emit_start(self.format)
++                        try:
++                            await self._release_barrier()
++                            break
++                        except RuntimeError as exc:
++                            if str(exc) != "Audio worker is not running":
++                                raise
++                            await asyncio.sleep(0.001)
++                self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++                await self._release_barrier()
++                self.assertEqual(len(self.backend.streams), allocations)
++                self.assertFalse(self.backend.started.is_set())
++                await self.handler.prepare_output(self.format, "after-crash")
++                await self.handler.release_output("before-crash")
++                self.assertFalse(self.backend.streams[-1].closed)
++                self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++                self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++                self.assertEqual(len(self.backend.streams), allocations + 1)
++                self.assertEqual(self.backend.streams[-1].samples, [bytes(range(64))])
++                await self.handler.handle_disconnect()
++                self.handler.attach_client(self.transport)
++
++    async def test_disconnect_rebuilt_worker_requires_fresh_prepare_before_accepting_music(self):
++        await self.handler.prepare_output(self.format, "old")
++        await asyncio.wait_for(self.handler.handle_disconnect(), 0.5)
++        self.assertTrue(self.backend.streams[0].closed)
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        await self._release_barrier()
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertFalse(self.backend.started.is_set())
++        await self.handler.prepare_output(self.format, "new")
++        self.assertEqual(len(self.backend.streams), 2)
++        await self.handler.release_output("old")
++        self.assertFalse(self.backend.streams[-1].closed)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        self.assertTrue(await asyncio.to_thread(self.backend.started.wait, 1))
++        self.assertEqual(self.backend.streams[-1].samples, [bytes(range(64))])
++        await self.handler.release_output("new")
++        self.assertTrue(all(stream.closed for stream in self.backend.streams))
 +
 +    async def test_disconnect_invalidates_prepared_backend_without_waiting_for_music_or_idle(self):
 +        await self.handler.prepare_output(self.format, "epoch")

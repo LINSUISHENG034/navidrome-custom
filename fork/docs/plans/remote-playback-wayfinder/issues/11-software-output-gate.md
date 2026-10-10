@@ -110,6 +110,17 @@ Blocked by: 01, 02, 03
 **本票仍 claimed，以下不是已完成项：**
 
 1. 运行时物理失联需要可靠传回 MA，撤销/冻结权威 source 与 timeline；仅本地 daemon pause/release 不证明该闭环。
-2. 真实 SDK 的同一 worker、pre-content Prepare 与退休已在隔离外部 ports 上证明；真实 native/Pulse/音箱绑定与声学效果仍未验收。重建 worker 后的重准备、native close 故障下的 legacy shutdown 及完整 reconnect 安全仍需证据，不能把替身 ready 当实机 cold-ready。
+2. 真实 SDK 的同一 worker、pre-content Prepare 与显式 Release 退休已在隔离外部 ports 上证明；同一 handler 的受控约束跨 worker 重建回归已补齐，见下方检查点。真实 native/Pulse/音箱绑定与声学效果仍未验收；native close 故障下的 legacy shutdown 已复现返回成功但 backend 未关闭，join-timeout 后的退休所有权及完整 daemon/WebSocket reconnect 安全仍待修补和证据，不能把替身 ready 当实机 cold-ready。
 3. 完整 MA controller 的 queue/seek/resume、事件竞态及启动 timeout 仍需更广的整应用集成证据；不因公开 session 测试通过宣称全路径等价或多房间支持。
 4. 首段完整、10 秒可听、15 秒实机失败截止、占用与闲置提示音仍属于未来逐次确认窗口的 HITL 验收。软件检查点不关闭硬件票。
+
+### 2026-10-10 同一 handler 的受控约束跨 worker 重建检查点
+
+- **真实缺陷与 red→green**：有效 Prepare 后断线，旧 worker 被丢弃，新 worker 默认回到 legacy，未重新 Prepare 的内容实际分配了第二个 backend。新增公开回归的真实 red 为 `Ran 1 test in 1.693s / FAILED (failures=1)`、`AssertionError: 2 != 1`；最小修复后该项与 legacy 播放保护 `Ran 2 tests in 1.385s / OK`。
+- **有界实现**：handler 在丢弃或替换 worker 前继承其实际 admitted 的受控事实，通过加锁的只读 handoff property 读取；新 worker 继承约束，不继承旧 epoch 或 prepared backend。标记在有效 Prepare 成功入队后设置，不以调用意图或最终成功判断；invalid/full-queue 拒绝不抢 owner。未使用 Prepare 的 handler 保留 legacy 行为，不改变 decoder、clock、音频队列或 Sendspin wire。
+- **公开保护回归**：断线后未经新 Prepare 不重新分配，fresh Prepare 后真实首批 samples 恢复，旧 epoch Release 不关闭 successor；通过外部 clock 故障使真实 worker 崩溃，分别验证 stream-start 和 reattach 恢复；virgin float Prepare 拒绝后重连仍能 legacy 播放并在 stream-end 关闭。这两项额外保护在修复上直接 green，不伪称额外 red；virgin full-queue legacy 暂无直接新用例，入队失败无状态变更仍由实现和既有 accepted-owner 回归约束。
+- **冻结验收**：最终重新执行真实 `SdkPreparationTests` 为 `Ran 27 tests in 1.667s / OK`；固定镜像无 pytest/pytest-asyncio，未安装。用标准库 fixture adapter 执行原 `test_audio.py` 两个与 `test_audio_connector.py` 五个原函数和原断言，7/7 PASS、exit 0、无 stderr；不是 pytest 或完整 upstream suite。SDK 原测试仅适配 FakeWorker 的新增可选参数和只读 property，既有行为断言未改，生产没有 mock 兼容分支。SDK suite 的 clock TypeError、native OSError、queue-full/drop warnings 属于报告过的预期故障注入，不把有 traceback 等同于测试失败。
+- **独立审阅与 canonical 已验收**：独立 SDK suite `Ran 27 tests in 1.716s / OK`、无 skipped，三个冻结指纹前后匹配；声明的受控重建范围内未发现阻塞。新 `tmp/remote-playback/provenance-sdk-reconnect-export-20261010/` root 经公开 fetch/apply 恢复旧 canonical，仅复制冻结的 SDK connector、原测试 fixture 和 Bridge HTTP 测试后公开 export；`audio.py` 未改，不采用或伪造原 SDK 缺失的 provenance。全新 `provenance-sdk-reconnect-replay-20261010/` root 真实 fetch/apply/test 得到 Bridge `Ran 72 tests in 46.371s / OK`（含 SDK 27 项）、MA `Ran 26 tests in 3.049s / OK`，均无 skipped；结果保留在该 root 的两个 `*-test-result.json`。仅 clone transport 使用受管本地 Git cache、保留 no-hardlinks 并恢复 HTTPS origin，不宣称验证 GitHub 下载；测试耗时不是首音指标。旧 69/26 证据未覆盖。
+- **完整性与检查**：SDK 完整差分现为 3 文件（含既有测试 fixture），Bridge 17 文件、MA 5 文件；三个 replay checkout 的 `git diff --check <pinned-base>` 通过。固定 digest、断网、只读、去 capabilities、禁止提权的容器中实际 24 个改动 Python 文件 `compile()` 全通过；依赖版本匹配清单，SDK audio/connector/daemon 实际均从 `/runtime-sources/sendspin/` 导入，冻结指纹匹配。MA patch 字节和完整 project 配置未变，三份新候选与 canonical 旧基线在写回前校验；审阅和干净重放通过后只写回 SDK/Bridge patch 及清单；最终协调者 `validate`、runner suite 57/57（0.781 秒）、仓库 `git diff --check` 通过。完整 inventory 与两个 `*-runtime-probe.json` 留在新 replay root，版本与 patch SHA-256 仍以 canonical 清单为唯一登记处。
+- **已复现而未修的 shutdown 缺陷**：真实 handler/worker 的 native close failure probe 返回 `shutdown_returned_success=true`、`native_stream_closed=false`、`allocations=1`；legacy finally teardown 记录 OSError 后仍丢失未退休 backend，不能宣称资源已释放。本阶段仅交付同一 handler 的受控约束持续，不把它扩大为 native 故障退休、有界 join 后所有权、新 daemon 或完整 WebSocket reconnect 安全。
+- **范围边界**：upstream pre-commit/Ruff/mypy 等完整 lint 未执行；无宿主安装、生产操作、patched 镜像构建/发布或真实音箱实验。运行时输出失联回传 MA 并冻结权威 source/timeline、完整 controller 集成与硬件/声学验收仍未完成，本票仍 claimed。
