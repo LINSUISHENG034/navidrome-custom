@@ -73,6 +73,13 @@ Blocked by: 01, 02, 03
 - 独立审阅实际运行完整 runner suite：`Ran 57 tests / OK`（0.839 秒，无 skipped），未发现已确认缺陷；本轮增加 6 个公开 CLI 回归。`validate` 与 `git diff --check` 通过。这里 Git/Docker 仍是外部执行替身，不能证明真实 SDK 导入或冷启动输出。
 - 已提交 `ea7bd14d` 并成功推送到 fork 的同名 `dev/remote-playback-output-gate` 分支。SDK 开发 checkout 没有 runner provenance，不补造标记；后续导出及重放使用 runner 新建的干净 checkout，不 reset/覆盖原开发源码。SDK canonical 差分及同一 worker 冷启动证据仍待接入。
 
+### 2026-10-10 锁定源码依赖的真实 runner 基线
+
+- 清单登记 `sendspin` 7.5.0 的精确 revision（以清单为唯一锁定来源），Bridge 经 `runtime_sources` 依赖它；SDK 使用 `test_command: null`，本检查点尚未加入 SDK 生命周期补丁，不把依赖登记当作 cold-ready。
+- 在新的 `tmp/remote-playback/provenance-sdk-baseline-20261010/` 隔离 root 使用 runner 的公开 fetch/apply/test；provenance 由真实 runner fetch 生成，不采用缺失标记的原开发 SDK checkout。仅 Git clone transport 替换为受管本地 cache，保留 no-hardlinks 并恢复 HTTPS origin；其他 Git 与容器操作真实执行。
+- 旧 canonical 补丁加未修改锁定 SDK 的实际结果：Bridge `Ran 27 tests / OK`（19.663 秒），MA `Ran 17 tests / OK`（5.501 秒）。MA 预期的模拟 transport unavailable traceback 属于通过的故障测试。本轮没有真实音箱或声学指标证据。
+- 容器确认 `sendspin.__file__=/runtime-sources/sendspin/sendspin/__init__.py`、daemon 同样来自该只读挂载，而非镜像安装副本；实际包 metadata 为 sendspin 7.5.0/aiosendspin 6.1.1，MA 为 aiosendspin 9.1.1。容器固定 digest、断网、只读、去 capabilities、禁止提权，无宿主音频/D-Bus/Pulse/生产数据挂载。协调者再跑 runner suite 为 `Ran 57 tests / OK`（0.850 秒）。
+
 **本票仍 claimed，以下不是已完成项：**
 
 1. 运行时物理失联需要可靠传回 MA，撤销/冻结权威 source 与 timeline；仅本地 daemon pause/release 不证明该闭环。

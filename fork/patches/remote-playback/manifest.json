@@ -8,6 +8,9 @@
       "reference": "v2.75.0",
       "license": "MIT",
       "source_path": "src",
+      "runtime_sources": [
+        "sendspin"
+      ],
       "runtime_image": "ghcr.io/trudenboy/sendspin-bt-bridge@sha256:f024a481824283e1ae7aa7c8e308a3129e286d27bc8e38f85d199d9d182aabba",
       "expected_packages": {
         "aiosendspin": "6.1.1",
@@ -58,6 +61,20 @@
           "sha256": "8c84c5ea1eb428bf3da1d03c030cba0ddc27de39051b47c6a6448770c264b74f"
         }
       ]
+    },
+    "sendspin": {
+      "repository": "https://github.com/Sendspin-Protocol/sendspin.git",
+      "revision": "22b9ff308afedd86e51ea1b88ededa574c9244e5",
+      "reference": "7.5.0",
+      "license": "Apache-2.0",
+      "source_path": ".",
+      "runtime_image": "ghcr.io/trudenboy/sendspin-bt-bridge@sha256:f024a481824283e1ae7aa7c8e308a3129e286d27bc8e38f85d199d9d182aabba",
+      "expected_packages": {
+        "aiosendspin": "6.1.1",
+        "sendspin": "7.5.0"
+      },
+      "test_command": null,
+      "patches": []
     }
   },
   "sandbox": {
