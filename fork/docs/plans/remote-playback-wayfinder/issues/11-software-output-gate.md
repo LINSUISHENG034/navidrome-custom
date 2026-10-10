@@ -80,6 +80,14 @@ Blocked by: 01, 02, 03
 - 旧 canonical 补丁加未修改锁定 SDK 的实际结果：Bridge `Ran 27 tests / OK`（19.663 秒），MA `Ran 17 tests / OK`（5.501 秒）。MA 预期的模拟 transport unavailable traceback 属于通过的故障测试。本轮没有真实音箱或声学指标证据。
 - 容器确认 `sendspin.__file__=/runtime-sources/sendspin/sendspin/__init__.py`、daemon 同样来自该只读挂载，而非镜像安装副本；实际包 metadata 为 sendspin 7.5.0/aiosendspin 6.1.1，MA 为 aiosendspin 9.1.1。容器固定 digest、断网、只读、去 capabilities、禁止提权，无宿主音频/D-Bus/Pulse/生产数据挂载。协调者再跑 runner suite 为 `Ran 57 tests / OK`（0.850 秒）。
 
+### 2026-10-10 同一 worker 增量实施中（未导出验收）
+
+- Bridge 开发源码补齐显式 PCM ready 回显、manager→client→typed IPC 的格式转发、standby 等待 SDK 释放，以及返回 JSON 不能修改缓存 lease 格式。四个公开回归实际 red 分别为缺少格式回显、`output_unavailable`、standby 后 backend 未重建、回显被改为 44100 而期望 48000；各自最小修复后 green。
+- 开发完整 suite 曾为 Bridge `Ran 55 tests / OK`（42.865 秒）、MA `Ran 26 tests / OK`（2.822 秒），但随后共享 Bridge 源码出现另一旧任务的 request-ID/ACK 并发改动，因此 **55 项通过不验证当前源码**。协调者明确 Bridge/MA 与 SDK 的唯一写入者；合并当前工作、冻结及重新完整测试前禁止 canonical 导出。未 reset/覆盖既有工作。
+- SDK 新保留回归 `test_prepared_pcm_cannot_be_replaced_by_mismatched_music_without_prepare` 的真实 red：准备 16-bit PCM 后送入合法 24-bit 音乐，再以公开 Prepare 作 FIFO barrier，`Ran 1 test / FAILED (errors=1)`（1.495 秒），报 `Cannot reconfigure an undrained output`。在原 drain 前拒绝不匹配内容的最小保护后，SDK class `Ran 14 tests / OK`（1.519 秒）；纠正开发者此前手工误报的 15 项计数。未重写 decoder、clock 或 wire。
+- 保留的 native-close/retry 回归目前真实 red：`Ran 1 test / FAILED (failures=1)`（1.278 秒）、`OSError not raised`。关闭错误必须回传，保留可重试的 native handle，并阻止重新认证不确定 backend；worker 异常后 pending 控制完成、入队失败不抢占旧 epoch、有效 successor 的失败清理一致性仍待各自验证。旧只读探针只是退出 0 的坏状态观察，不登记为失败 unittest，也不能由旧 green 掩盖。
+- 证据边界：no-content daemon tracer 使用真实 daemon client 构建路径；音乐 tracer 在真实 SDK handler/worker 上接外部 source/clock/PortAudio/Pulse ports，验证同一 backend 和 PCM/FLAC 首段样本，不注入私有音频队列。它不是完整 `daemon.run` + 真实 WebSocket 音乐链路，不是实机声学证明。缺失完整 controller、失联反馈和孤立 READY lease 的故障退场证据仍保留。所有本节结果来自隔离开发源码，不是最终 provenance-validated canonical replay。
+
 **本票仍 claimed，以下不是已完成项：**
 
 1. 运行时物理失联需要可靠传回 MA，撤销/冻结权威 source 与 timeline；仅本地 daemon pause/release 不证明该闭环。
