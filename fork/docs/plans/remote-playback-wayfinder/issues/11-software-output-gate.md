@@ -88,6 +88,14 @@ Blocked by: 01, 02, 03
 - 保留的 native-close/retry 回归目前真实 red：`Ran 1 test / FAILED (failures=1)`（1.278 秒）、`OSError not raised`。关闭错误必须回传，保留可重试的 native handle，并阻止重新认证不确定 backend；worker 异常后 pending 控制完成、入队失败不抢占旧 epoch、有效 successor 的失败清理一致性仍待各自验证。旧只读探针只是退出 0 的坏状态观察，不登记为失败 unittest，也不能由旧 green 掩盖。
 - 证据边界：no-content daemon tracer 使用真实 daemon client 构建路径；音乐 tracer 在真实 SDK handler/worker 上接外部 source/clock/PortAudio/Pulse ports，验证同一 backend 和 PCM/FLAC 首段样本，不注入私有音频队列。它不是完整 `daemon.run` + 真实 WebSocket 音乐链路，不是实机声学证明。缺失完整 controller、失联反馈和孤立 READY lease 的故障退场证据仍保留。所有本节结果来自隔离开发源码，不是最终 provenance-validated canonical replay。
 
+### 2026-10-10 基本 SDK 生命周期与 fresh ACK 检查点（取消补齐前）
+
+- 六项 SDK 公开回归均已完成真实 red→green：阻止内容绕过 Prepare 改格式；native close 错误回传并同 backend 重试；worker 失败完成 pending 控制并允许 bounded shutdown；无效 float 入队前拒绝而不抢占 pending owner；队列满拒绝保留最后已接受 owner；drain 中有效 successor 失败仍持有清理权。另验证匹配格式 drain 与 pre-content disconnect。当前 SDK class `Ran 21 tests / OK`（1.573 秒），不是最终取消覆盖。
+- Bridge fresh-ACK 两项真实 red 分别为 `TimeoutError not raised`（同 epoch 复验错误接受旧缓存）与 `PreparationError not raised`（ready lease 绕过实际 SDK 确认）。新增有界 request ID 的 typed command 编解码、daemon ACK 和 parent IPC allowlist，显式 lease 复验走同一真实 Prepare 路径；对应单项 green 0.400 秒，manager class `Ran 25 tests / OK`（0.692 秒）。一次中间运行因遗漏 IPC allowlist 挂起，只停止已核验的隔离测试 sandbox，修复后重跑；未操作生产。
+- 取消补齐前的完整开发快照：Bridge `Ran 66 tests / OK`（45.632 秒，无 skipped，含 SDK 21 项）、MA `Ran 26 tests / OK`（2.789 秒，无 skipped），三个源码目录 `git diff --check` 通过。**这仅是 pre-cancellation 基线，不授权 canonical 导出。** 两项新取消回归会修改 SDK/测试，之后必须重新完整验证当前快照。
+- 架构评估收敛为现有 worker 的控制生命周期 Module：原 Prepare/Release Interface 不变，入队、desired epoch 撤销和晚到清理集中，不增加 backend/音频队列或重写 decoder/clock。计划仅在有效成功入队的 Prepare 后锁定受控模式，Release/取消不退回 legacy；从未 Prepare 的行为保留。标记范围为 worker 生命周期，断线后重建 worker 的重准备/供流安全仍无整链路结论。若局部改动扩成 worker/协议重写则停止重估。
+- 尚待真实 red→green：满队列下取消正在 native Prepare 的请求必须退休所有 allocation、阻止排队旧内容重开 backend；取消已入队 successor 必须清理旧资源且不影响更晚 successor。协调者已把既有 `SdkPreparationTests` class 单独交由 SDK 实现者完成，Bridge/MA 其余源码保持唯一写入者；完成后整体重跑、独立审阅、冻结再导出。SDK canonical patch 尚未登记，准备好的 runner-owned export checkout 保持干净。
+
 **本票仍 claimed，以下不是已完成项：**
 
 1. 运行时物理失联需要可靠传回 MA，撤销/冻结权威 source 与 timeline；仅本地 daemon pause/release 不证明该闭环。
