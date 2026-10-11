@@ -1372,10 +1372,10 @@ index 0000000000000000000000000000000000000000..4f7f177f0f7fde7873c0ab160b93ac0b
 +    return blueprint
 diff --git a/tests/test_output_preparation.py b/tests/test_output_preparation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b241579034c589b0f3f56c7802f89bd0418557ba
+index 0000000000000000000000000000000000000000..ff3578d661ada33ba46d4377901ae135c2fe1c67
 --- /dev/null
 +++ b/tests/test_output_preparation.py
-@@ -0,0 +1,628 @@
+@@ -0,0 +1,661 @@
 +"""Output-use contracts at the public Prepare/Release seam."""
 +
 +import asyncio
@@ -1609,6 +1609,36 @@ index 0000000000000000000000000000000000000000..b241579034c589b0f3f56c7802f89bd0
 +        self.before_open = lambda: None
 +        self.on_open = lambda stream: None
 +        self.on_close = lambda stream: None
++        self.before_close = lambda stream: None
++        self.before_stop = lambda stream: None
++        self.close_attempts = []
++        self.stop_attempts = []
++
++    def fail_close_once(self, message):
++        entered = threading.Event()
++        previous = len(self.close_attempts)
++
++        def fail(stream):
++            entered.set()
++            if len(self.close_attempts) == previous + 1:
++                raise OSError(message)
++
++        self.before_close = fail
++        return entered
++
++    def gate_close(self, timeout, *, fail_first=False):
++        entered, finish = threading.Event(), threading.Event()
++        previous = len(self.close_attempts)
++
++        def wait(stream):
++            if fail_first and len(self.close_attempts) == previous + 1:
++                raise OSError("External first close failed")
++            entered.set()
++            if not finish.wait(timeout):
++                raise RuntimeError("External close was not released")
++
++        self.before_close = wait
++        return entered, finish
 +
 +    def open(self, **kwargs):
 +        self.before_open()
@@ -1631,9 +1661,12 @@ index 0000000000000000000000000000000000000000..b241579034c589b0f3f56c7802f89bd0
 +                port.started.set()
 +
 +            def stop(self):
-+                pass
++                port.stop_attempts.append(self)
++                port.before_stop(self)
 +
 +            def close(self):
++                port.close_attempts.append(self)
++                port.before_close(self)
 +                self.closed = True
 +                port.on_close(self)
 +                port.closed.set()
@@ -2006,10 +2039,10 @@ index 0000000000000000000000000000000000000000..b241579034c589b0f3f56c7802f89bd0
 +            await preparation.prepare("configured-player", "intent-1", 1)
 diff --git a/tests/test_output_preparation_http.py b/tests/test_output_preparation_http.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..8a395dfaa1c08873cf3e3448fd8a3aa8d37b7600
+index 0000000000000000000000000000000000000000..cbb130283949870cabe65b5a32f4eafe4cc5319d
 --- /dev/null
 +++ b/tests/test_output_preparation_http.py
-@@ -0,0 +1,1071 @@
+@@ -0,0 +1,1398 @@
 +"""Machine authentication at the real management HTTP entrance."""
 +
 +import asyncio
@@ -2636,19 +2669,346 @@ index 0000000000000000000000000000000000000000..8a395dfaa1c08873cf3e3448fd8a3aa8
 +        self.assertTrue(all(output.closed for output in self.backend.streams))
 +        self.assertEqual(self.transport.chunks_sent, 0)
 +
++    async def test_shutdown_stop_failure_with_successful_close_does_not_reclose_retired_handle(self):
++        await self.handler.prepare_output(self.format, "original")
++        stream = self.backend.streams[0]
++
++        def failed_stop(output):
++            if len(self.backend.stop_attempts) == 1:
++                raise OSError("External native stop failed")
++
++        self.backend.before_stop = failed_stop
++        with self.assertRaisesRegex(OSError, "External native stop failed"):
++            await self.handler.shutdown()
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(self.backend.close_attempts), 1)
++        with self.assertRaises(RuntimeError):
++            self.handler.attach_client(self.transport)
++        await self.handler.shutdown()
++        self.assertEqual(len(self.backend.close_attempts), 1)
++        self.handler.attach_client(self.transport)
++        await self.handler.prepare_output(self.format, "successor")
++        self.assertEqual(len(self.backend.streams), 2)
++        self.assertFalse(self.backend.streams[-1].closed)
++
++    async def test_late_legacy_close_failure_rejects_prepare_and_retains_latest_cleanup_owner(self):
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        await self._release_barrier()
++        stream = self.backend.streams[0]
++        entered, finish = self.backend.gate_close(2)
++        gate = self.backend.before_close
++
++        def delayed_failure(output):
++            gate(output)
++            if len(self.backend.close_attempts) == 1:
++                raise OSError("External delayed legacy close failed")
++
++        self.backend.before_close = delayed_failure
++        self.transport.emit_end()
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        preparing = asyncio.create_task(self.handler.prepare_output(self.format, "successor"))
++        try:
++            await asyncio.wait({preparing}, timeout=0.05)
++            self.assertFalse(preparing.done())
++            self.assertEqual(len(self.backend.streams), 1)
++        finally:
++            finish.set()
++        with self.assertRaisesRegex(OSError, "External delayed legacy close failed"):
++            await preparing
++        self.assertFalse(stream.closed)
++        await self.handler.release_output("original")
++        self.assertFalse(stream.closed)
++        await self.handler.release_output("successor")
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(self.backend.close_attempts), 2)
++        self.assertEqual(len(self.backend.streams), 1)
++        await self.handler.prepare_output(self.format, "new-owner")
++        await self.handler.release_output("successor")
++        self.assertFalse(self.backend.streams[-1].closed)
++
++    async def test_pending_legacy_close_is_shared_and_same_format_prepare_waits_for_retirement(self):
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        await self._release_barrier()
++        stream = self.backend.streams[0]
++        entered, finish = self.backend.gate_close(2)
++        self.transport.emit_end()
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        self.transport.emit_end()
++        await self._release_barrier()
++        preparing = asyncio.create_task(self.handler.prepare_output(self.format, "successor"))
++        try:
++            await asyncio.wait({preparing}, timeout=0.05)
++            self.assertFalse(preparing.done(), "Ready cannot precede native retirement")
++            self.assertEqual(len(self.backend.close_attempts), 1)
++            self.assertEqual(len(self.backend.streams), 1)
++            self.assertFalse(stream.closed)
++        finally:
++            finish.set()
++        await preparing
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(self.backend.streams), 2)
++        await self.handler.release_output("original")
++        self.assertFalse(self.backend.streams[-1].closed)
++        await self.handler.release_output("successor")
++        self.assertTrue(self.backend.streams[-1].closed)
++
++    async def test_retiring_worker_never_announces_stream_start_without_playback(self):
++        await self.handler.prepare_output(self.format, "original")
++        stream = self.backend.streams[0]
++        entered, finish = self.backend.gate_close(2)
++        stopping = asyncio.create_task(self.handler.handle_disconnect())
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        try:
++            self.transport.emit_start(self.format)
++            self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++            self.assertEqual(self.events, [])
++        finally:
++            finish.set()
++            await stopping
++        self.assertEqual(self.events, [])
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(self.backend.streams), 1)
++
++    async def test_shutdown_stops_independent_volume_monitor_without_masking_native_failure(self):
++        from unittest.mock import AsyncMock
++        from sendspin.audio_connector import AudioStreamHandler
++        from sendspin.audio_devices import AudioDevice
++
++        await self.handler.shutdown()
++        monitor = AsyncMock()
++        monitor.stop_monitoring.side_effect = ValueError("External monitor cleanup failed")
++        self.handler = AudioStreamHandler(
++            AudioDevice(index=1, name="pulse", output_channels=2, sample_rate=48000, is_default=True),
++            volume_controller=monitor,
++        )
++        self.handler.attach_client(self.transport)
++        await self.handler.prepare_output(self.format, "original")
++        stream = self.backend.streams[0]
++        close = stream.close
++
++        def failed_close():
++            raise OSError("External native retirement failed")
++
++        stream.close = failed_close
++        try:
++            with self.assertRaisesRegex(OSError, "External native retirement failed"):
++                await self.handler.shutdown()
++            self.assertEqual(monitor.stop_monitoring.await_count, 1)
++            self.assertFalse(stream.closed)
++            with self.assertRaises(RuntimeError):
++                self.handler.attach_client(self.transport)
++            self.assertEqual(len(self.backend.streams), 1)
++        finally:
++            stream.close = close
++            monitor.stop_monitoring.side_effect = None
++        await self.handler.shutdown()
++        self.assertTrue(stream.closed)
++        self.assertEqual(monitor.stop_monitoring.await_count, 2)
++
++    async def test_legacy_stream_end_close_failure_remains_owned_by_shutdown_and_retry(self):
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        await self._release_barrier()
++        stream = self.backend.streams[0]
++        entered = self.backend.fail_close_once("External legacy stream-end close failed")
++        attempts = self.backend.close_attempts
++        self.transport.emit_end()
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        await self._release_barrier()
++        self.assertFalse(stream.closed)
++        with self.assertRaises(OSError):
++            await self.handler.handle_disconnect()
++        with self.assertRaises(RuntimeError):
++            self.handler.attach_client(self.transport)
++        self.assertEqual(len(self.backend.streams), 1)
++        await self.handler.handle_disconnect()
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(attempts), 2)
++        self.handler.attach_client(self.transport)
++        await self.handler.prepare_output(self.format, "successor")
++        self.assertEqual(len(self.backend.streams), 2)
++        self.assertFalse(self.backend.streams[-1].closed)
++
++    async def test_cancelled_shutdown_keeps_late_prepare_retirement_owned_until_retry(self):
++        import threading
++
++        entered, finish = threading.Event(), threading.Event()
++
++        def delayed_open():
++            entered.set()
++            if not finish.wait(5):
++                raise RuntimeError("External open was not released")
++
++        self.backend.before_open = delayed_open
++        preparing = asyncio.create_task(self.handler.prepare_output(self.format, "original"))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        stopping = asyncio.create_task(self.handler.handle_disconnect())
++        await asyncio.sleep(0)
++        stopping.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await stopping
++        try:
++            with self.assertRaises(RuntimeError):
++                self.handler.attach_client(self.transport)
++            with self.assertRaises(RuntimeError):
++                await self.handler.prepare_output(self.format, "too-early")
++            retry = asyncio.create_task(self.handler.handle_disconnect())
++            await asyncio.wait({retry}, timeout=1.5)
++            self.assertTrue(retry.done())
++            with self.assertRaises(TimeoutError):
++                await retry
++        finally:
++            finish.set()
++        with self.assertRaises(RuntimeError):
++            await preparing
++        await self.handler.handle_disconnect()
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertTrue(self.backend.streams[0].closed)
++        self.handler.attach_client(self.transport)
++        await self.handler.prepare_output(self.format, "successor")
++        await self.handler.release_output("original")
++        self.assertEqual(len(self.backend.streams), 2)
++        self.assertFalse(self.backend.streams[-1].closed)
++
++    async def test_concurrent_disconnects_retire_once_and_do_not_clear_successor(self):
++        await self.handler.prepare_output(self.format, "original")
++        stream = self.backend.streams[0]
++        entered, finish = self.backend.gate_close(2)
++        attempts = self.backend.close_attempts
++        first = asyncio.create_task(self.handler.handle_disconnect())
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        second = asyncio.create_task(self.handler.handle_disconnect())
++        await asyncio.sleep(0)
++        finish.set()
++        await first
++        self.handler.attach_client(self.transport)
++        await second
++        await self.handler.prepare_output(self.format, "successor")
++        self.assertEqual(len(attempts), 1)
++        self.assertEqual(len(self.backend.streams), 2)
++        self.assertTrue(stream.closed)
++        self.assertFalse(self.backend.streams[-1].closed)
++        await self.handler.release_output("original")
++        self.assertFalse(self.backend.streams[-1].closed)
++
++    async def test_legacy_shutdown_failure_is_retryable_without_preparation_or_new_allocation(self):
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        await self._release_barrier()
++        stream = self.backend.streams[0]
++        self.backend.fail_close_once("External legacy close failed")
++        attempts = self.backend.close_attempts
++        with self.assertRaises(OSError):
++            await self.handler.shutdown()
++        self.assertFalse(stream.closed)
++        with self.assertRaises(RuntimeError):
++            self.handler.attach_client(self.transport)
++        await self.handler.shutdown()
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(attempts), 2)
++        self.assertEqual(len(self.backend.streams), 1)
++        self.handler.attach_client(self.transport)
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        await self._release_barrier()
++        self.assertEqual(len(self.backend.streams), 2)
++        self.transport.emit_end()
++        await self._release_barrier()
++        self.assertTrue(all(output.closed for output in self.backend.streams))
++
++    async def test_shutdown_retry_is_bounded_and_concurrent_callers_do_not_overlap_native_close(self):
++        await self.handler.prepare_output(self.format, "original")
++        stream = self.backend.streams[0]
++        entered, finish = self.backend.gate_close(5, fail_first=True)
++        attempts = self.backend.close_attempts
++        with self.assertRaises(OSError):
++            await self.handler.handle_disconnect()
++        retry = asyncio.create_task(self.handler.handle_disconnect())
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        try:
++            await asyncio.wait({retry}, timeout=1.5)
++            self.assertTrue(retry.done(), "Native retry exceeded the worker join bound")
++            with self.assertRaises(TimeoutError):
++                await retry
++            repeated = asyncio.create_task(self.handler.handle_disconnect())
++            await asyncio.wait({repeated}, timeout=1.5)
++            self.assertTrue(repeated.done())
++            with self.assertRaises(TimeoutError):
++                await repeated
++            self.assertEqual(len(attempts), 2)
++            with self.assertRaises(RuntimeError):
++                self.handler.attach_client(self.transport)
++            self.assertEqual(len(self.backend.streams), 1)
++        finally:
++            finish.set()
++            if not retry.done():
++                await retry
++        await self.handler.handle_disconnect()
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(attempts), 2)
++
++    async def test_shutdown_join_timeout_preserves_owner_and_late_close_before_successor(self):
++        await self.handler.prepare_output(self.format, "original")
++        stream = self.backend.streams[0]
++        entered, finish = self.backend.gate_close(5)
++        stopping = asyncio.create_task(self.handler.handle_disconnect())
++        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++        try:
++            await asyncio.wait({stopping}, timeout=1.5)
++            self.assertTrue(stopping.done(), "Shutdown exceeded the worker join bound")
++            with self.assertRaises(TimeoutError):
++                await stopping
++            self.assertFalse(stream.closed)
++            with self.assertRaises(RuntimeError):
++                self.handler.attach_client(self.transport)
++            with self.assertRaises(RuntimeError):
++                await self.handler.prepare_output(self.format, "too-early")
++            self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++            self.assertEqual(len(self.backend.streams), 1)
++        finally:
++            finish.set()
++        await self.handler.handle_disconnect()
++        self.assertTrue(stream.closed)
++        self.handler.attach_client(self.transport)
++        await self.handler.prepare_output(self.format, "successor")
++        await self.handler.release_output("original")
++        self.assertEqual(len(self.backend.streams), 2)
++        self.assertFalse(self.backend.streams[-1].closed)
++        self.transport.emit_start(self.format)
++        self.transport.emit_audio(bytes(range(64)) * 800, self.format)
++        await self.handler.prepare_output(self.format, "successor")
++        self.assertEqual(len(self.backend.streams), 2)
++        await self.handler.release_output("successor")
++        self.assertTrue(all(output.closed for output in self.backend.streams))
++
++    async def test_shutdown_reports_native_retirement_failure_and_retains_retry_ownership(self):
++        await self.handler.prepare_output(self.format, "original")
++        stream = self.backend.streams[0]
++        self.backend.fail_close_once("External shutdown close failed")
++        attempts = self.backend.close_attempts
++        with self.assertRaises(OSError):
++            await self.handler.shutdown()
++        self.assertFalse(stream.closed)
++        with self.assertRaises(RuntimeError):
++            self.handler.attach_client(self.transport)
++        self.assertEqual(len(self.backend.streams), 1)
++        await self.handler.shutdown()
++        self.assertTrue(stream.closed)
++        self.assertEqual(len(attempts), 2)
++        self.handler.attach_client(self.transport)
++        await self.handler.prepare_output(self.format, "successor")
++        await self.handler.release_output("original")
++        self.assertFalse(self.backend.streams[-1].closed)
++        await self.handler.release_output("successor")
++        self.assertTrue(all(output.closed for output in self.backend.streams))
++
 +    async def test_release_reports_native_close_failure_and_retries_the_same_backend(self):
 +        await self.handler.prepare_output(self.format, "epoch")
 +        stream = self.backend.streams[0]
-+        close = stream.close
-+        attempts = []
-+
-+        def retryable_close():
-+            attempts.append(True)
-+            if len(attempts) == 1:
-+                raise OSError("External native close failed")
-+            close()
-+
-+        stream.close = retryable_close
++        self.backend.fail_close_once("External native close failed")
++        attempts = self.backend.close_attempts
 +        with self.assertRaises(OSError):
 +            await self.handler.release_output("epoch")
 +        self.assertFalse(stream.closed)
