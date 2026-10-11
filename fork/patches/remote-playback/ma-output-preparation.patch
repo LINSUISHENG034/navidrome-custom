@@ -18,10 +18,10 @@ index c3cca4a9d20c7c868a76c76982d8e784783d0f4d..19a94ebe4fdf9e56cdc7ac920dc7a6e5
  CONF_PAIRING_TOKEN = "pairing_token"
 diff --git a/music_assistant/providers/sendspin/output_preparation.py b/music_assistant/providers/sendspin/output_preparation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..7e39df37656777ec4e5659efea8437b7d4f93c5e
+index 0000000000000000000000000000000000000000..652f914053acf4bc6ac7a73e90341a888e49370d
 --- /dev/null
 +++ b/music_assistant/providers/sendspin/output_preparation.py
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,225 @@
 +"""Correlated output preparation before Sendspin content streaming."""
 +
 +from __future__ import annotations
@@ -109,36 +109,8 @@ index 0000000000000000000000000000000000000000..7e39df37656777ec4e5659efea8437b7
 +                raise OutputPreparationError("Output lease PCM format cannot change")
 +            if lease is None:
 +                lease = OutputLease(self._output_id, uuid4().hex, "", normalized_format)
-+            request: dict[str, Any] = {
-+                "output_id": lease.output_id,
-+                "lease_id": lease.lease_id,
-+                "timeout_seconds": self._timeout_seconds,
-+            }
-+            if normalized_format is not None:
-+                request["pcm_format"] = dict(
-+                    zip(("sample_rate", "bit_depth", "channels"), normalized_format, strict=True)
-+                )
-+            payload = await self._request("prepare", request)
-+            if (
-+                not isinstance(payload, dict)
-+                or payload.get("status") != "ready"
-+                or payload.get("output_id") != lease.output_id
-+                or payload.get("lease_id") != lease.lease_id
-+                or not isinstance(payload.get("output_epoch"), str)
-+                or not payload["output_epoch"]
-+            ):
-+                raise OutputPreparationError("Output preparation returned an invalid readiness lease")
-+            if (
-+                normalized_format is not None
-+                and self._normalize_pcm_format(payload.get("pcm_format")) != normalized_format
-+            ):
-+                raise OutputPreparationError("Output preparation returned a mismatched PCM format")
-+            task = asyncio.current_task()
-+            if task is not None and task.cancelling():
-+                raise asyncio.CancelledError
-+            return OutputLease(
-+                lease.output_id, lease.lease_id, payload["output_epoch"], normalized_format
-+            )
++            payload = await self._request("prepare", self._lease_request(lease))
++            return self._readiness_lease(payload, lease)
 +        except asyncio.CancelledError:
 +            self._schedule_release(lease, "cancelled")
 +            raise
@@ -149,11 +121,58 @@ index 0000000000000000000000000000000000000000..7e39df37656777ec4e5659efea8437b7
 +            self._schedule_release(lease, "failed")
 +            raise
 +
++    async def verify(self, lease: OutputLease) -> OutputLease:
++        """Observe an existing ready lease without preparing, repairing, or releasing output."""
++        if lease.output_id != self._output_id or not lease.output_epoch:
++            raise OutputPreparationError("Output verification requires this output's ready lease")
++        try:
++            payload = await self._request(
++                "verify", {**self._lease_request(lease), "output_epoch": lease.output_epoch}
++            )
++            result = self._readiness_lease(payload, lease)
++            if result.output_epoch != lease.output_epoch:
++                raise OutputPreparationError("Output verification returned a different output lifetime")
++            return result
++        except TimeoutError:
++            raise OutputPreparationError("Output verification timed out") from None
++
 +    async def release(self, lease: OutputLease, reason: str) -> None:
 +        """Revoke this caller's pending or ready output lease."""
 +        await self._request(
 +            "release", {"output_id": lease.output_id, "lease_id": lease.lease_id, "reason": reason}
 +        )
++
++    def _lease_request(self, lease: OutputLease) -> dict[str, Any]:
++        request: dict[str, Any] = {
++            "output_id": lease.output_id,
++            "lease_id": lease.lease_id,
++            "timeout_seconds": self._timeout_seconds,
++        }
++        if lease.pcm_format is not None:
++            request["pcm_format"] = dict(
++                zip(("sample_rate", "bit_depth", "channels"), lease.pcm_format, strict=True)
++            )
++        return request
++
++    def _readiness_lease(self, payload: Any, lease: OutputLease) -> OutputLease:
++        if (
++            not isinstance(payload, dict)
++            or payload.get("status") != "ready"
++            or payload.get("output_id") != lease.output_id
++            or payload.get("lease_id") != lease.lease_id
++            or not isinstance(payload.get("output_epoch"), str)
++            or not payload["output_epoch"]
++        ):
++            raise OutputPreparationError("Output preparation returned an invalid readiness lease")
++        if (
++            lease.pcm_format is not None
++            and self._normalize_pcm_format(payload.get("pcm_format")) != lease.pcm_format
++        ):
++            raise OutputPreparationError("Output preparation returned a mismatched PCM format")
++        task = asyncio.current_task()
++        if task is not None and task.cancelling():
++            raise asyncio.CancelledError
++        return OutputLease(lease.output_id, lease.lease_id, payload["output_epoch"], lease.pcm_format)
 +
 +    @staticmethod
 +    def _normalize_pcm_format(pcm_format: Any) -> tuple[int, int, int]:
@@ -210,7 +229,7 @@ index 0000000000000000000000000000000000000000..7e39df37656777ec4e5659efea8437b7
 +                ) as response:
 +                    if not 200 <= response.status < 300:
 +                        raise OutputPreparationError("Output management request was rejected")
-+                    if action == "prepare":
++                    if action in ("prepare", "verify"):
 +                        return await response.json()
 +                    return None
 +        except (ClientError, ValueError):
@@ -439,10 +458,10 @@ index be02aebdca54c9fb79486942dae3ee42cf21eb01..a38d91f80c662d21a49447c4d00d01d8
          if player_role is not None:
 diff --git a/tests/test_output_preparation_client.py b/tests/test_output_preparation_client.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..9c792b28d8ce2a4c05b371ceea33f71abe379410
+index 0000000000000000000000000000000000000000..a663f03613c147765f926fdc4a71dd6ebd3762f2
 --- /dev/null
 +++ b/tests/test_output_preparation_client.py
-@@ -0,0 +1,856 @@
+@@ -0,0 +1,906 @@
 +"""Output preparation contract at the public HTTP client seam."""
 +
 +from __future__ import annotations
@@ -516,8 +535,8 @@ index 0000000000000000000000000000000000000000..9c792b28d8ce2a4c05b371ceea33f71a
 +    def post(self, url: str, **kwargs: Any) -> HttpResponse:
 +        self.requests.append((url, kwargs))
 +        body = kwargs["json"]
-+        is_prepare = url.endswith("/prepare")
-+        if is_prepare:
++        is_readiness = url.endswith(("/prepare", "/verify"))
++        if is_readiness:
 +            self.prepare_started.set()
 +        return HttpResponse(
 +            {
@@ -528,10 +547,10 @@ index 0000000000000000000000000000000000000000..9c792b28d8ce2a4c05b371ceea33f71a
 +                **({"pcm_format": body["pcm_format"]} if "pcm_format" in body else {}),
 +                **self.payload_updates,
 +            },
-+            self.gate if is_prepare else None,
-+            self.status if is_prepare else 200,
-+            self.cancel_on_ready if is_prepare else False,
-+            self.prepare_error if is_prepare else None,
++            self.gate if is_readiness else None,
++            self.status if is_readiness else 200,
++            self.cancel_on_ready if is_readiness else False,
++            self.prepare_error if is_readiness else None,
 +        )
 +
 +
@@ -577,6 +596,56 @@ index 0000000000000000000000000000000000000000..9c792b28d8ce2a4c05b371ceea33f71a
 +                {"sample_rate": 48000, "bit_depth": 24, "channels": 2},
 +            )
 +            self.assertEqual(request["json"]["lease_id"], lease.lease_id)
++
++    async def test_verify_uses_correlated_nonhealing_request_without_prepare_or_release(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        http = HttpPort()
++        client = OutputPreparationClient(
++            http, "https://output-manager.example", "configured-output", "machine-secret", 0.1
++        )
++        lease = await client.prepare(pcm_format={"sample_rate": 48000, "bit_depth": 24, "channels": 2})
++        self.assertEqual(await client.verify(lease), lease)
++        url, request = http.requests[-1]
++        self.assertEqual(url, "https://output-manager.example/api/output/verify")
++        self.assertEqual(request["json"]["output_epoch"], "opaque-backend-generation")
++        self.assertEqual(request["json"]["lease_id"], lease.lease_id)
++        self.assertEqual(request["json"]["timeout_seconds"], 0.1)
++        self.assertEqual(request["json"]["pcm_format"], {"sample_rate": 48000, "bit_depth": 24, "channels": 2})
++        self.assertEqual(len(http.requests), 2)
++
++    async def test_verify_rejects_stale_epoch_and_format_without_releasing_output(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        http = HttpPort()
++        client = OutputPreparationClient(http, "https://output-manager.example", "configured-output", "machine-secret", 0.1)
++        lease = await client.prepare(pcm_format={"sample_rate": 48000, "bit_depth": 24, "channels": 2})
++        for changed in ({"output_epoch": "successor"}, {"lease_id": "successor"},
++                        {"pcm_format": {"sample_rate": 44100, "bit_depth": 24, "channels": 2}}):
++            http.payload_updates = changed
++            with self.assertRaises(RuntimeError):
++                await client.verify(lease)
++        await asyncio.sleep(0)
++        self.assertEqual([url.rsplit("/", 1)[-1] for url, _ in http.requests], ["prepare", "verify", "verify", "verify"])
++
++    async def test_verify_timeout_and_cancellation_never_prepare_or_release_output(self) -> None:
++        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient
++
++        http = HttpPort()
++        client = OutputPreparationClient(http, "https://output-manager.example", "configured-output", "machine-secret", 0.01)
++        lease = await client.prepare()
++        http.gate = asyncio.Event()
++        with self.assertRaisesRegex(RuntimeError, "verification timed out"):
++            await client.verify(lease)
++        pending = asyncio.create_task(client.verify(lease))
++        await asyncio.sleep(0)
++        pending.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await pending
++        await asyncio.sleep(0)
++        self.assertEqual([url.rsplit("/", 1)[-1] for url, _ in http.requests], ["prepare", "verify", "verify"])
++        http.gate.set()
++        self.assertEqual(await client.verify(lease), lease)
 +
 +    async def test_invalid_pcm_dimensions_fail_before_allocating_http_lease(self) -> None:
 +        from music_assistant.providers.sendspin.output_preparation import OutputPreparationClient

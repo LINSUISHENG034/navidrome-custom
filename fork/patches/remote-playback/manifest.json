@@ -30,7 +30,7 @@
       "patches": [
         {
           "file": "bridge-output-preparation.patch",
-          "sha256": "284e7ad14d641f2c3b5991ed9e1cdee61207b41f25129ec1d13e812e89c5ef92"
+          "sha256": "8418e7e6142119c7a8fc5f8eb9d4e009155b093e7037de3946e66cdcd9faaa52"
         }
       ]
     },
@@ -58,7 +58,7 @@
       "patches": [
         {
           "file": "ma-output-preparation.patch",
-          "sha256": "4344a0171bb0e9fd61f7db4a454edee705d8343b62b4bef8023c844539f4c654"
+          "sha256": "ce60c70da3571bd9ece7384813a662a58fc161646e338ea5c0b1bb1747c4e4fb"
         }
       ]
     },
@@ -77,7 +77,7 @@
       "patches": [
         {
           "file": "sendspin-output-preparation.patch",
-          "sha256": "e2fff487dc3df0c14096afea0deeb1947b9ac9244359263d2593c4897a2fb59e"
+          "sha256": "397400f240ad2faf142677ae60eef0a58dc90692fb379bf5df32136c92e1bbe3"
         }
       ]
     }

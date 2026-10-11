@@ -76,7 +76,7 @@ index c2d1a252eb57e1e9b0c7fd74b4b250009a8c48f2..f24a752feff2268823d4ca3e282ef4ba
              continue
  
 diff --git a/src/sendspin_bridge/bridge/client.py b/src/sendspin_bridge/bridge/client.py
-index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb82c2f685 100644
+index dae528406d91f1fae29b0421524f432ccf6cd0de..83c6e68a3f422aa789730211f9d4dd3f393f4782 100644
 --- a/src/sendspin_bridge/bridge/client.py
 +++ b/src/sendspin_bridge/bridge/client.py
 @@ -67,6 +67,7 @@ from sendspin_bridge.services.infrastructure.config_validation import (
@@ -87,7 +87,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
      Command,
      Reconnect,
      SetMinBufferMs,
-@@ -210,6 +211,11 @@ _MA_RECONNECT_TIMEOUT_S = 15.0
+@@ -210,6 +211,16 @@ _MA_RECONNECT_TIMEOUT_S = 15.0
  
  _IPC_ALLOWED_KEYS = frozenset(
      {
@@ -96,10 +96,15 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
 +        "output_binding_sink",
 +        "output_binding_pid",
 +        "output_binding_ready",
++        "output_verification_epoch",
++        "output_verification_request_id",
++        "output_verification_sink",
++        "output_verification_pid",
++        "output_verification_ready",
          "playing",
          "connected",
          "server_connected",
-@@ -453,6 +459,11 @@ class DeviceStatus:
+@@ -453,6 +464,16 @@ class DeviceStatus:
      supported_commands: list | None = None
      group_volume: int | None = None
      group_muted: bool | None = None
@@ -108,10 +113,15 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
 +    output_binding_sink: str | None = None
 +    output_binding_pid: int | None = None
 +    output_binding_ready: bool = False
++    output_verification_epoch: str | None = None
++    output_verification_request_id: str | None = None
++    output_verification_sink: str | None = None
++    output_verification_pid: int | None = None
++    output_verification_ready: bool = False
      bt_standby: bool = False
      bt_standby_since: str | None = None
      bt_waking: bool = False
-@@ -596,6 +607,8 @@ class SendspinClient:
+@@ -596,6 +617,8 @@ class SendspinClient:
      D-Bus callbacks all read/write status through this single gate.
      """
  
@@ -120,7 +130,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
      def __init__(
          self,
          player_name: str,
-@@ -618,7 +631,15 @@ class SendspinClient:
+@@ -618,7 +641,15 @@ class SendspinClient:
          static_delay_source: str = "default",
          static_delay_calibrated_at: str | None = None,
          static_delay_codec: str | None = None,
@@ -136,7 +146,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
          self.player_name = player_name
          self.server_host = server_host
          self.server_port = server_port
-@@ -628,8 +649,11 @@ class SendspinClient:
+@@ -628,8 +659,11 @@ class SendspinClient:
          self.static_delay_ms = static_delay_ms  # per-device delay override (None = use env var)
          self.preferred_format = preferred_format  # preferred audio format string (e.g. "flac:44100:16:2")
          self._effective_bridge = effective_bridge  # bridge instance label for MA device info
@@ -149,7 +159,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
          self.keepalive_interval = max(30, keepalive_interval)  # seconds between keepalive bursts
          # v2.63.0-rc.2 — payload selector: "infrasound" (default) | "silence" | "none"
          self.keep_alive_method = keep_alive_method if keep_alive_method in _KEEPALIVE_METHODS else "infrasound"
-@@ -798,6 +822,8 @@ class SendspinClient:
+@@ -798,6 +832,8 @@ class SendspinClient:
                  details=event["details"] if isinstance(event["details"], dict) else None,
              )
          _state.notify_status_changed()
@@ -158,7 +168,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
          # ── Idle disconnect timer ─────────────────────────────────────
          # Daemon-reported playback flags always participate in idle timer
          # management, regardless of SinkMonitor availability.  PipeWire's
-@@ -1070,6 +1096,127 @@ class SendspinClient:
+@@ -1070,6 +1106,149 @@ class SendspinClient:
          if hasattr(task, "cancel"):
              task.cancel()
  
@@ -239,22 +249,44 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
 +            await self.release(epoch)
 +
 +    async def validate_binding(self, epoch: str) -> bool:
++        """Observe the existing lease without reconnecting, routing, or allocating output."""
++        import secrets
++
 +        from sendspin_bridge.bluetooth.adapter_session import LinkState
 +        from sendspin_bridge.services.audio.pulse import averify_output_binding
 +
-+        if self._output_epoch != epoch or not self.is_running() or not self.bt_manager or not self.bt_management_enabled:
-+            return False
-+        if self._prepared_output_format is not None:
-+            return (await self.prepare(epoch, pcm_format=self._prepared_output_format)).ready
-+        proc = self._daemon_proc
-+        profile, present, bound = await averify_output_binding(
-+            proc.pid, self.bluetooth_sink_name or "", self._pulse_application_name
-+        )
-+        link = await asyncio.get_running_loop().run_in_executor(bt_executor(), self.bt_manager.link_state)
-+        return (profile and present and bound and link is LinkState.CONNECTED and self._output_epoch == epoch
-+                and proc is self._daemon_proc and self.status.get("output_binding_epoch") == epoch
-+                and self.status.get("output_binding_pid") == proc.pid
-+                and self.status.get("output_binding_ready") is True)
++        async with self._output_lock:
++            if self._output_epoch != epoch or not self.is_running() or not self.bt_manager or not self.bt_management_enabled:
++                return False
++            proc, sink, pcm_format = self._daemon_proc, self.bluetooth_sink_name, self._prepared_output_format
++
++            def current():
++                return (self._output_epoch == epoch and proc is self._daemon_proc and self.is_running()
++                        and sink == self.bluetooth_sink_name and self.bt_management_enabled)
++
++            async def observed():
++                profile, present, bound = await averify_output_binding(proc.pid, sink or "", self._pulse_application_name)
++                link = await asyncio.get_running_loop().run_in_executor(bt_executor(), self.bt_manager.link_state)
++                return profile and present and bound and link is LinkState.CONNECTED and current()
++
++            if not await observed():
++                return False
++            request_id = None
++            if pcm_format is not None:
++                request_id = secrets.token_urlsafe(24)
++                await self._send_subprocess_command(
++                    BindOutput(epoch=epoch, sink=sink, pcm_format=pcm_format, request_id=request_id, verify_only=True)
++                )
++                while current() and self.status.get("output_verification_request_id") != request_id:
++                    await asyncio.sleep(self._output_config["OUTPUT_PREPARATION_POLL_SECONDS"])
++                if not current() or not await observed():
++                    return False
++            prefix = "output_binding" if request_id is None else "output_verification"
++            return (current() and self.status.get(f"{prefix}_epoch") == epoch
++                    and self.status.get(f"{prefix}_pid") == proc.pid
++                    and self.status.get(f"{prefix}_sink") == sink
++                    and self.status.get(f"{prefix}_ready") is True
++                    and (request_id is None or self.status.get(f"{prefix}_request_id") == request_id))
 +
 +    async def release(self, epoch: str) -> None:
 +        """Park only this generation; never disconnect a successor's output."""
@@ -286,7 +318,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
      async def _disconnect_bt_for_standby(self) -> bool:
          """Drop the BT link for standby, off the loop and under a lease.
  
-@@ -1080,6 +1227,17 @@ class SendspinClient:
+@@ -1080,6 +1259,17 @@ class SendspinClient:
          """
          if not self.bt_manager:
              return False
@@ -304,7 +336,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
          handle = getattr(self.bt_manager, "adapter_handle", None)
          lease = handle.try_lease(f"standby {self.player_name}") if handle is not None else None
          if lease is None:
-@@ -1087,8 +1245,19 @@ class SendspinClient:
+@@ -1087,8 +1277,19 @@ class SendspinClient:
              return False
          try:
              loop = asyncio.get_running_loop()
@@ -326,7 +358,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
          except Exception as exc:
              logger.warning("[%s] BT disconnect on standby failed: %s", self.player_name, exc)
              return False
-@@ -1122,6 +1291,10 @@ class SendspinClient:
+@@ -1122,6 +1323,10 @@ class SendspinClient:
          Phase 2 behavior: daemon stays alive on a PA null sink so the player
          remains visible in MA.  When MA sends play, the bridge auto-reconnects BT.
          """
@@ -337,7 +369,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
          if self.status.get("bt_standby"):
              return
          self._update_status(
-@@ -1196,6 +1369,8 @@ class SendspinClient:
+@@ -1196,6 +1401,8 @@ class SendspinClient:
          while ``bt_standby=True``.  The daemon is alive on the null sink;
          audio streams there silently until BT reconnects and streams are moved.
          """
@@ -346,7 +378,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
          if not self.status.get("bt_standby") or self.status.get("bt_waking"):
              return
          logger.info("[%s] Play detected during standby — auto-waking", self.player_name)
-@@ -1431,7 +1606,7 @@ class SendspinClient:
+@@ -1431,7 +1638,7 @@ class SendspinClient:
                          # Don't restart if BT is disconnected — monitor_and_reconnect
                          # will call start_sendspin() once BT reconnects.
                          decision = self._supervisor.on_death(
@@ -355,7 +387,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
                          )
                          if isinstance(decision, Halted):
                              await asyncio.sleep(decision.delay_s)
-@@ -1519,6 +1694,8 @@ class SendspinClient:
+@@ -1519,6 +1726,8 @@ class SendspinClient:
      async def _start_sendspin_inner(self) -> None:
          """Spawn daemon_process.py subprocess with PULSE_SINK in its environment."""
          try:
@@ -364,7 +396,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
              # Pre-flight gate (#291): refuse to spawn when SENDSPIN_SERVER is
              # malformed (scheme prefix, embedded port, slashes, whitespace).
              # The web-UI form rejects these values up front and the migration
-@@ -1546,7 +1723,7 @@ class SendspinClient:
+@@ -1546,7 +1755,7 @@ class SendspinClient:
              # Configure BT audio sink if not yet done (offloaded to executor
              # because configure_bluetooth_audio is a blocking call that sleeps
              # during sink discovery retries — up to ~18 s).
@@ -373,7 +405,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
                  loop = asyncio.get_running_loop()
                  await loop.run_in_executor(None, self.bt_manager.configure_bluetooth_audio)
  
-@@ -1696,6 +1873,13 @@ class SendspinClient:
+@@ -1696,6 +1905,13 @@ class SendspinClient:
                  loop = asyncio.get_running_loop()
                  bt_product_name, bt_manufacturer = await loop.run_in_executor(None, _read_bt_identity, bt_dbus_path)
  
@@ -387,7 +419,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
              params = json.dumps(
                  with_protocol_version(
                      {
-@@ -1706,7 +1890,8 @@ class SendspinClient:
+@@ -1706,7 +1922,8 @@ class SendspinClient:
                          "static_delay_ms": static_delay_ms,
                          "required_lead_time_ms": self.required_lead_time_ms,
                          "min_buffer_ms": self.min_buffer_ms,
@@ -397,7 +429,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
                          "bluetooth_device_path": bt_dbus_path,
                          "volume": self.status.get("volume", 100),
                          "muted": bool(self.status.get("muted", False)),
-@@ -1723,12 +1908,16 @@ class SendspinClient:
+@@ -1723,12 +1940,16 @@ class SendspinClient:
              # CRITICAL: Audio routing — PULSE_SINK determines which BT speaker this
              # subprocess sends audio to. Wrong value = audio to wrong speaker or silence.
              env = os.environ.copy()
@@ -417,7 +449,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
  
              self._daemon_proc = await asyncio.create_subprocess_exec(
                  sys.executable,
-@@ -2549,6 +2738,11 @@ class SendspinClient:
+@@ -2549,6 +2770,11 @@ class SendspinClient:
          # Start Sendspin player: immediately if no BT device, deferred if BT configured
          if not self.bt_management_enabled:
              logger.info("[%s] BT management disabled — skipping sendspin startup", self.player_name)
@@ -429,7 +461,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
          elif not self.bt_manager:
              # No BT device configured — start on default audio immediately
              await self.start_sendspin()
-@@ -2570,7 +2764,7 @@ class SendspinClient:
+@@ -2570,7 +2796,7 @@ class SendspinClient:
                  """Connect Bluetooth in background without blocking"""
                  logger.info("Bluetooth async task started, waiting 2 seconds...")
                  await asyncio.sleep(2)  # Let sendspin start first
@@ -438,7 +470,7 @@ index dae528406d91f1fae29b0421524f432ccf6cd0de..768bbb6b603c96eae05816e3221836eb
                      return
                  logger.info("Connecting Bluetooth speaker...")
                  try:
-@@ -2655,6 +2849,8 @@ class SendspinClient:
+@@ -2655,6 +2881,8 @@ class SendspinClient:
              logger.info("Client shutting down...")
          finally:
              # Cleanup
@@ -484,10 +516,10 @@ index b5d35dbd4600010bc9abe77a9b92494142bd638e..c07895e5dfe7e57b92aa4cb67fe213c9
              bt_manager_factory=bt_manager_factory,
 diff --git a/src/sendspin_bridge/bridge/output_preparation.py b/src/sendspin_bridge/bridge/output_preparation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c7f985bee1a46058135b8e6ba379bc7968ed58be
+index 0000000000000000000000000000000000000000..c6aa2e6825f5efb34025bd69f0fdc838672aafc6
 --- /dev/null
 +++ b/src/sendspin_bridge/bridge/output_preparation.py
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,246 @@
 +"""Cancellable ownership of configured physical outputs, independent of music."""
 +
 +from __future__ import annotations
@@ -613,9 +645,48 @@ index 0000000000000000000000000000000000000000..c7f985bee1a46058135b8e6ba379bc79
 +        if lease.task is not None:
 +            lease.task.cancel()
 +
-+    async def prepare(self, output_id: str, lease_id: str, timeout_seconds: float, *, pcm_format=None) -> dict:
++    def _bounded_timeout(self, timeout_seconds):
 +        if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
 +            raise PreparationError("invalid_request")
++        return min(timeout_seconds, self._timeout_seconds)
++
++    def _ready_reply(self, lease):
++        result = dict(lease.result.result())
++        if lease.pcm_format is not None:
++            result["pcm_format"] = lease.pcm_format.as_dict()
++        return result
++
++    async def verify(self, output_id: str, lease_id: str, output_epoch: str, timeout_seconds: float) -> dict:
++        """Freshly observe a ready lease; never admit, wake, or repair an output."""
++        timeout = self._bounded_timeout(timeout_seconds)
++        if output_id not in self._outputs:
++            raise PreparationError("unknown_output")
++        lease = self._leases.get(output_id)
++        if lease is None or lease.lease_id != lease_id or lease.epoch != output_epoch:
++            raise PreparationError("superseded")
++        if not lease.result.done() or lease.result.exception() is not None:
++            raise PreparationError("output_unavailable")
++        observation = self._track(lease.output.validate_binding(lease.epoch))
++        try:
++            done, _ = await asyncio.wait({observation}, timeout=timeout)
++            valid = bool(done) and observation.result()
++        except asyncio.CancelledError:
++            observation.cancel()
++            raise
++        except Exception:
++            valid = False
++        finally:
++            if not observation.done():
++                observation.cancel()
++        if lease.revoked or self._leases.get(output_id) is not lease:
++            raise PreparationError(lease.revoked or "superseded")
++        if not valid:
++            await self.release(output_id, lease_id, "output_unavailable")
++            raise PreparationError("output_unavailable")
++        return self._ready_reply(lease)
++
++    async def prepare(self, output_id: str, lease_id: str, timeout_seconds: float, *, pcm_format=None) -> dict:
++        timeout_seconds = self._bounded_timeout(timeout_seconds)
 +        pcm_format = OutputFormat.from_value(pcm_format)
 +        if output_id not in self._outputs:
 +            raise PreparationError("unknown_output")
@@ -645,23 +716,14 @@ index 0000000000000000000000000000000000000000..c7f985bee1a46058135b8e6ba379bc79
 +            lease.task = self._track(self._prepare(output_id, lease))
 +        try:
 +            if lease.result.done() and lease.result.exception() is None:
-+                try:
-+                    valid = await asyncio.wait_for(lease.output.validate_binding(lease.epoch), self._timeout_seconds)
-+                except Exception:
-+                    valid = False
-+                if not valid or self._leases.get(output_id) is not lease:
-+                    await self.release(output_id, lease_id, "output_unavailable")
-+                    raise PreparationError("output_unavailable")
++                return await self.verify(output_id, lease_id, lease.epoch, timeout_seconds)
 +            done, _ = await asyncio.wait({lease.result}, timeout=max(0, lease.deadline - self._clock()))
 +            if not done:
 +                await self.release(output_id, lease_id, "timeout")
 +                raise PreparationError("timeout")
 +            if lease.revoked or self._leases.get(output_id) is not lease:
 +                raise PreparationError(lease.revoked or "superseded")
-+            result = dict(lease.result.result())
-+            if lease.pcm_format is not None:
-+                result["pcm_format"] = lease.pcm_format.as_dict()
-+            return result
++            return self._ready_reply(lease)
 +        except asyncio.CancelledError:
 +            await self.release(output_id, lease_id, "cancelled")
 +            raise
@@ -932,7 +994,7 @@ index 1a34435001658bb14d3e490c16a20783ba5e2d3f..9528fb0f9bd8e3a4b4cd06dfdce9c4da
              "static_delay_calibrated_at": device.get("static_delay_calibrated_at"),
              "static_delay_codec": device.get("static_delay_codec"),
 diff --git a/src/sendspin_bridge/services/ipc/commands.py b/src/sendspin_bridge/services/ipc/commands.py
-index d3084baf7cc516919ddf9689a89dfd054fd52045..49281a060e85d1ab5f48d6875b8c1bbe6a2b5da9 100644
+index d3084baf7cc516919ddf9689a89dfd054fd52045..89255b25c0f0237877795074d9da286b4deb11fa 100644
 --- a/src/sendspin_bridge/services/ipc/commands.py
 +++ b/src/sendspin_bridge/services/ipc/commands.py
 @@ -23,6 +23,7 @@ from typing import Any
@@ -943,7 +1005,7 @@ index d3084baf7cc516919ddf9689a89dfd054fd52045..49281a060e85d1ab5f48d6875b8c1bbe
      "Command",
      "CommandError",
      "InvalidCommand",
-@@ -123,6 +124,14 @@ class Transport:
+@@ -123,6 +124,15 @@ class Transport:
      value: Any = None
  
  
@@ -953,12 +1015,13 @@ index d3084baf7cc516919ddf9689a89dfd054fd52045..49281a060e85d1ab5f48d6875b8c1bbe
 +    sink: str
 +    pcm_format: Any = None
 +    request_id: str | None = None
++    verify_only: bool = False
 +
 +
  @dataclass(frozen=True)
  class SetStandby:
      #: The sink to redirect to; ``None`` restores the device's own sink.
-@@ -142,6 +151,7 @@ Command = (
+@@ -142,6 +152,7 @@ Command = (
      | SetMinBufferMs
      | Transport
      | SetStandby
@@ -966,7 +1029,7 @@ index d3084baf7cc516919ddf9689a89dfd054fd52045..49281a060e85d1ab5f48d6875b8c1bbe
  )
  
  
-@@ -200,6 +210,19 @@ def decode_command(message: Any) -> Command:
+@@ -200,6 +211,23 @@ def decode_command(message: Any) -> Command:
          if not action:
              raise InvalidCommand("transport requires 'action'")
          return Transport(action=action, value=message.get("value"))
@@ -982,11 +1045,15 @@ index d3084baf7cc516919ddf9689a89dfd054fd52045..49281a060e85d1ab5f48d6875b8c1bbe
 +        request_id = message.get("request_id")
 +        if request_id is not None and (not isinstance(request_id, str) or not 0 < len(request_id) <= 128):
 +            raise InvalidCommand("bind_output requires a bounded request ID")
-+        return BindOutput(epoch=message["epoch"], sink=message["sink"], pcm_format=pcm_format, request_id=request_id)
++        verify_only = message.get("verify_only", False)
++        if type(verify_only) is not bool or (verify_only and (pcm_format is None or request_id is None)):
++            raise InvalidCommand("output verification requires PCM and a request ID")
++        return BindOutput(epoch=message["epoch"], sink=message["sink"], pcm_format=pcm_format,
++                          request_id=request_id, verify_only=verify_only)
      if name == "set_standby":
          sink = message.get("sink")
          return SetStandby(sink=str(sink) if sink else None)
-@@ -231,6 +254,13 @@ def encode_command(command: Command) -> dict:
+@@ -231,6 +259,15 @@ def encode_command(command: Command) -> dict:
          return build_command_envelope("set_min_buffer_ms", value=command.value)
      if isinstance(command, Transport):
          return build_command_envelope("transport", action=command.action, value=command.value)
@@ -996,12 +1063,14 @@ index d3084baf7cc516919ddf9689a89dfd054fd52045..49281a060e85d1ab5f48d6875b8c1bbe
 +            payload["pcm_format"] = command.pcm_format.as_dict()
 +        if command.request_id is not None:
 +            payload["request_id"] = command.request_id
++        if command.verify_only:
++            payload["verify_only"] = True
 +        return build_command_envelope("bind_output", **payload)
      if isinstance(command, SetStandby):
          return build_command_envelope("set_standby", sink=command.sink)
  
 diff --git a/src/sendspin_bridge/services/ipc/daemon_process.py b/src/sendspin_bridge/services/ipc/daemon_process.py
-index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b6df7a02e 100644
+index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..126e2e83c57cf8fda3c0e9414b35d4d30e783732 100644
 --- a/src/sendspin_bridge/services/ipc/daemon_process.py
 +++ b/src/sendspin_bridge/services/ipc/daemon_process.py
 @@ -448,7 +448,8 @@ async def _timing_telemetry_watcher(
@@ -1014,7 +1083,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b
  ) -> None:
      """Correct PA sink routing whenever this daemon starts an audio stream.
  
-@@ -470,16 +471,75 @@ async def _startup_sink_routing_watcher(
+@@ -470,16 +471,79 @@ async def _startup_sink_routing_watcher(
          is_streaming = bool(status.get("audio_streaming"))
          if is_streaming and not was_streaming:
              try:
@@ -1043,8 +1112,8 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b
 +        await controller.bind_sink(sink)
 +
 +
-+async def _prepare_daemon_output(daemon, epoch: str, value) -> None:
-+    """Prepare the exact SDK worker using the negotiated, decoded integer PCM."""
++async def _prepare_daemon_output(daemon, epoch: str, value, *, verify_only: bool = False) -> None:
++    """Prepare or observe the exact SDK worker using negotiated integer PCM."""
 +    from aiosendspin.client import AudioFormat, PCMFormat
 +    from aiosendspin.models.types import AudioCodec
 +
@@ -1054,6 +1123,12 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b
 +    requested = OutputFormat.from_value(value)
 +    if requested is None:
 +        raise PreparationError("output_unavailable")
++    audio_format = AudioFormat(AudioCodec.PCM, PCMFormat(**requested.as_dict()))
++    if verify_only:
++        if getattr(daemon, "_prepared_output_epoch", None) != epoch:
++            raise PreparationError("output_unavailable")
++        await daemon._audio_handler.validate_output(audio_format, epoch)
++        return
 +    supported = detect_supported_audio_formats_for_device(daemon._args.audio_device)
 +    if daemon._args.preferred_format is not None:
 +        supported.append(daemon._args.preferred_format)
@@ -1061,9 +1136,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b
 +               (requested.sample_rate, requested.bit_depth, requested.channels) for fmt in supported):
 +        raise PreparationError("output_unavailable")
 +    daemon._prepared_output_epoch = epoch
-+    await daemon._audio_handler.prepare_output(
-+        AudioFormat(AudioCodec.PCM, PCMFormat(**requested.as_dict())), epoch
-+    )
++    await daemon._audio_handler.prepare_output(audio_format, epoch)
 +
 +
 +async def _read_commands(
@@ -1094,7 +1167,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b
      loop = asyncio.get_running_loop()
      reader = asyncio.StreamReader()
      protocol = asyncio.StreamReaderProtocol(reader)
-@@ -689,14 +749,53 @@ async def _read_commands(daemon_ref: list, stop_event: asyncio.Event, *, bt_sink
+@@ -689,14 +753,60 @@ async def _read_commands(daemon_ref: list, stop_event: asyncio.Event, *, bt_sink
              _background_tasks.add(_task)
              _task.add_done_callback(_background_tasks.discard)
              _task.add_done_callback(lambda t, _a=action: _log_background_task_result(t, f"transport {_a}"))
@@ -1105,28 +1178,35 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b
 +            from sendspin_bridge.services.audio.pulse import amove_pid_sink_inputs, averify_output_binding
 +
 +            sink = cmd.payload["sink"]
-+            await _set_daemon_output(daemon, sink)
++            verifying = cmd.payload.get("verify_only", False)
 +            application_name = os.environ.get("PULSE_PROP_application.name", "")
-+            await amove_pid_sink_inputs(os.getpid(), sink, application_name=application_name)
++            if not verifying:
++                await _set_daemon_output(daemon, sink)
++                await amove_pid_sink_inputs(os.getpid(), sink, application_name=application_name)
 +            profile, present, bound = await averify_output_binding(os.getpid(), sink, application_name)
-+            if prepared_output and cmd.payload.get("pcm_format") is not None:
++            if verifying and not prepared_output:
++                bound = False
++            elif prepared_output and cmd.payload.get("pcm_format") is not None:
 +                try:
-+                    if not profile or not present:
++                    if not profile or not present or (verifying and (not bound or os.environ.get("PULSE_SINK") != sink)):
 +                        raise RuntimeError("Physical output is unavailable")
-+                    await _prepare_daemon_output(daemon, cmd.payload["epoch"], cmd.payload["pcm_format"])
-+                    await amove_pid_sink_inputs(os.getpid(), sink, application_name=application_name)
++                    await _prepare_daemon_output(daemon, cmd.payload["epoch"], cmd.payload["pcm_format"],
++                                                 verify_only=verifying)
++                    if not verifying:
++                        await amove_pid_sink_inputs(os.getpid(), sink, application_name=application_name)
 +                    profile, present, bound = await averify_output_binding(os.getpid(), sink, application_name)
 +                except Exception as exc:
 +                    bound = False
-+                    logger.warning("Output preparation failed: %s", exc)
++                    logger.warning("Output %s failed: %s", "verification" if verifying else "preparation", exc)
++            prefix = "output_verification" if verifying else "output_binding"
 +            _patch_status(
 +                daemon._bridge_status,
 +                {
-+                    "output_binding_epoch": cmd.payload["epoch"],
-+                    "output_binding_request_id": cmd.payload.get("request_id"),
-+                    "output_binding_sink": sink,
-+                    "output_binding_pid": os.getpid(),
-+                    "output_binding_ready": profile and present and bound,
++                    f"{prefix}_epoch": cmd.payload["epoch"],
++                    f"{prefix}_request_id": cmd.payload.get("request_id"),
++                    f"{prefix}_sink": sink,
++                    f"{prefix}_pid": os.getpid(),
++                    f"{prefix}_ready": profile and present and bound,
 +                },
 +            )
 +            daemon._notify()
@@ -1154,7 +1234,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b
  
  
  # ---------------------------------------------------------------------------
-@@ -916,7 +1015,10 @@ async def _run(params: dict) -> None:
+@@ -916,7 +1026,10 @@ async def _run(params: dict) -> None:
  
          pa_volume_controller.set_external_change_tap(_mirror_external_volume_to_bridge)
  
@@ -1166,7 +1246,7 @@ index 147adf030cd2bbfc9dff1a23ced3dd6c8420211b..8b033780121a38a5c8106118aa26243b
      daemon_task = asyncio.create_task(daemon.run())
      watcher_task = asyncio.create_task(_reanchor_watcher(status, _on_status_change, stop_event))
      timing_task = asyncio.create_task(_timing_telemetry_watcher(daemon, status, _on_status_change, stop_event))
-@@ -926,7 +1028,9 @@ async def _run(params: dict) -> None:
+@@ -926,7 +1039,9 @@ async def _run(params: dict) -> None:
      routing_task = None
      if bluetooth_sink_name:
          routing_task = asyncio.create_task(
@@ -1270,10 +1350,10 @@ index 54979092dc9ea67e71e19ca350782ed139617bdc..f7368585b8d5eeae65203a0282c4f7f2
      # HA_INTEGRATION carries an MQTT password — surface its presence
 diff --git a/src/sendspin_bridge/web/routes/api_output.py b/src/sendspin_bridge/web/routes/api_output.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..4f7f177f0f7fde7873c0ab160b93ac0bc19d2156
+index 0000000000000000000000000000000000000000..23fa3ffe85052de9bc2e4ddf80eac7d34e284691
 --- /dev/null
 +++ b/src/sendspin_bridge/web/routes/api_output.py
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,102 @@
 +"""Opt-in machine-only output preparation; independent of web/ingress login."""
 +
 +import asyncio
@@ -1316,7 +1396,7 @@ index 0000000000000000000000000000000000000000..4f7f177f0f7fde7873c0ab160b93ac0b
 +        if not hmac.compare_digest(supplied.encode(), token.encode()):
 +            return jsonify(status="error", error="unauthorized"), 401
 +
-+    async def dispatch(data, releasing, config):
++    async def dispatch(data, action, config):
 +        nonlocal preparation
 +        if preparation is None:
 +            preparation = OutputPreparation(
@@ -1327,20 +1407,26 @@ index 0000000000000000000000000000000000000000..4f7f177f0f7fde7873c0ab160b93ac0b
 +            )
 +        outputs.clear()
 +        outputs.update(outputs_provider())
-+        if releasing:
++        if action == "release":
 +            return await preparation.release(data["output_id"], data["lease_id"], data["reason"])
++        if action == "verify":
++            return await preparation.verify(data["output_id"], data["lease_id"], data["output_epoch"], data["timeout_seconds"])
 +        return await preparation.prepare(data["output_id"], data["lease_id"], data["timeout_seconds"],
 +                                         pcm_format=data.get("pcm_format"))
 +
 +    @blueprint.post("/api/output/prepare")
 +    @blueprint.post("/api/output/release")
++    @blueprint.post("/api/output/verify")
 +    def output_request():
 +        data = request.get_json(silent=True)
 +        config = {**DEFAULT_CONFIG, **config_provider()}
-+        releasing = request.path.endswith("/release")
++        action = request.path.rsplit("/", 1)[-1]
++        releasing = action == "release"
 +        if not isinstance(data, dict):
 +            return jsonify(status="error", error="invalid_request"), 400
 +        if any(not isinstance(data.get(key), str) or not 0 < len(data[key]) <= 128 for key in ("output_id", "lease_id")):
++            return jsonify(status="error", error="invalid_request"), 400
++        if action == "verify" and (not isinstance(data.get("output_epoch"), str) or not 0 < len(data["output_epoch"]) <= 128):
 +            return jsonify(status="error", error="invalid_request"), 400
 +        timeout = data.get("timeout_seconds")
 +        if not releasing and (
@@ -1354,7 +1440,7 @@ index 0000000000000000000000000000000000000000..4f7f177f0f7fde7873c0ab160b93ac0b
 +        loop = loop_provider()
 +        if loop is None or not loop.is_running():
 +            return jsonify(status="error", error="output_unavailable"), 503
-+        future = asyncio.run_coroutine_threadsafe(dispatch(data, releasing, config), loop)
++        future = asyncio.run_coroutine_threadsafe(dispatch(data, action, config), loop)
 +        try:
 +            result = future.result(
 +                timeout=config["OUTPUT_PREPARATION_TIMEOUT_SECONDS"] + config["OUTPUT_PREPARATION_POLL_SECONDS"]
@@ -1372,10 +1458,10 @@ index 0000000000000000000000000000000000000000..4f7f177f0f7fde7873c0ab160b93ac0b
 +    return blueprint
 diff --git a/tests/test_output_preparation.py b/tests/test_output_preparation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..ff3578d661ada33ba46d4377901ae135c2fe1c67
+index 0000000000000000000000000000000000000000..fb7e85bc371d76035024b849ff4d094a4d95ab69
 --- /dev/null
 +++ b/tests/test_output_preparation.py
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,746 @@
 +"""Output-use contracts at the public Prepare/Release seam."""
 +
 +import asyncio
@@ -1469,14 +1555,16 @@ index 0000000000000000000000000000000000000000..ff3578d661ada33ba46d4377901ae135
 +        self.commands.append(command)
 +        if command["cmd"] == "bind_output":
 +            self.binding_requested.set()
-+            self.pulse.owned.sink = self.pulse.sink.index
++            if not command.get("verify_only"):
++                self.pulse.owned.sink = self.pulse.sink.index
 +            if self.hold_binding_acks:
 +                return
-+            status = build_status_envelope({"output_binding_request_id": command.get("request_id"),
-+                                            "output_binding_epoch": command["epoch"],
-+                                            "output_binding_pid": self.pid,
-+                                            "output_binding_sink": command["sink"],
-+                                            "output_binding_ready": True})
++            prefix = "output_verification" if command.get("verify_only") else "output_binding"
++            status = build_status_envelope({f"{prefix}_request_id": command.get("request_id"),
++                                            f"{prefix}_epoch": command["epoch"],
++                                            f"{prefix}_pid": self.pid,
++                                            f"{prefix}_sink": command["sink"],
++                                            f"{prefix}_ready": self.pulse.owned.sink == self.pulse.sink.index})
 +            self.stdout.feed_data((json.dumps(status) + "\n").encode())
 +        elif command["cmd"] == "stop":
 +            self.returncode = 0
@@ -1761,6 +1849,21 @@ index 0000000000000000000000000000000000000000..ff3578d661ada33ba46d4377901ae135
 +                except asyncio.CancelledError:
 +                    pass
 +
++    async def test_explicit_ready_revalidation_does_not_reconnect_or_repair_a_lost_output(self):
++        async with physical_client() as (output, external, process):
++            preparation = preparation_for(output, timeout_seconds=0.05)
++            requested = {"sample_rate": 48000, "bit_depth": 16, "channels": 2}
++            await preparation.prepare("configured-player", "intent", 0.05, pcm_format=requested)
++            reconnects = []
++            connect = output.bt_manager.connect_prepared_output
++            output.bt_manager.connect_prepared_output = lambda: reconnects.append(True) or connect()
++            external.owned.sink = external.standby.index
++            with self.assertRaises(PreparationError) as error:
++                await preparation.prepare("configured-player", "intent", 0.05, pcm_format=requested)
++            self.assertEqual(error.exception.code, "output_unavailable")
++            self.assertEqual(reconnects, [])
++            self.assertEqual([cmd["cmd"] for cmd in process.commands if cmd["cmd"] == "bind_output"], ["bind_output"])
++
 +    async def test_ready_lease_revalidation_requires_a_fresh_sdk_ack_before_returning_ready(self):
 +        async with physical_client() as (output, external, process):
 +            preparation = preparation_for(output, timeout_seconds=0.05)
@@ -1972,6 +2075,74 @@ index 0000000000000000000000000000000000000000..ff3578d661ada33ba46d4377901ae135
 +            await preparation.prepare("configured-player", "intent-1", 1)
 +        self.assertEqual(error.exception.code, "output_unavailable")
 +
++    async def test_verify_deadline_does_not_wait_for_late_observation_or_release_its_successor(self):
++        output = PhysicalOutput()
++        preparation = preparation_for(output)
++        ready = await preparation.prepare("configured-player", "old", 1)
++        finish, completed = asyncio.Event(), asyncio.Event()
++        async def late(epoch):
++            try:
++                await finish.wait()
++            except asyncio.CancelledError:
++                await finish.wait()
++            completed.set()
++            return True
++        output.validate_binding = late
++        pending = asyncio.create_task(preparation.verify("configured-player", "old", ready["output_epoch"], 0.01))
++        try:
++            done, _ = await asyncio.wait({pending}, timeout=0.1)
++            self.assertIn(pending, done, "Verification must finish without waiting for uncancellable observation")
++            with self.assertRaises(PreparationError) as error:
++                await pending
++            self.assertEqual(error.exception.code, "output_unavailable")
++            successor = await preparation.prepare("configured-player", "new", 1)
++        finally:
++            finish.set()
++            await asyncio.gather(pending, return_exceptions=True)
++        await asyncio.wait_for(completed.wait(), 0.1)
++        releases = list(output.releases)
++        self.assertEqual(await preparation.verify("configured-player", "new", successor["output_epoch"], 0.1), successor)
++        self.assertEqual(output.releases, releases)
++
++    async def test_cancelled_verify_does_not_revoke_the_ready_lease(self):
++        output = PhysicalOutput()
++        preparation = preparation_for(output)
++        ready = await preparation.prepare("configured-player", "intent", 1)
++        observing, finish = asyncio.Event(), asyncio.Event()
++        async def validate(epoch):
++            observing.set()
++            await finish.wait()
++            return True
++        output.validate_binding = validate
++        pending = asyncio.create_task(preparation.verify("configured-player", "intent", ready["output_epoch"], 1))
++        await observing.wait()
++        pending.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await pending
++        finish.set()
++        self.assertEqual(await preparation.verify("configured-player", "intent", ready["output_epoch"], 0.1), ready)
++        self.assertEqual(output.releases, [])
++
++    async def test_verify_late_reply_cannot_return_ready_or_release_a_successor(self):
++        output = PhysicalOutput()
++        preparation = preparation_for(output)
++        ready = await preparation.prepare("configured-player", "old", 1)
++        observing, finish = asyncio.Event(), asyncio.Event()
++        async def validate(epoch):
++            observing.set()
++            await finish.wait()
++            return True
++        output.validate_binding = validate
++        pending = asyncio.create_task(preparation.verify("configured-player", "old", ready["output_epoch"], 1))
++        await observing.wait()
++        successor = await preparation.prepare("configured-player", "new", 1)
++        finish.set()
++        with self.assertRaises(PreparationError) as error:
++            await pending
++        self.assertEqual(error.exception.code, "superseded")
++        self.assertEqual(await preparation.verify("configured-player", "new", successor["output_epoch"], 0.1), successor)
++        self.assertEqual(output.releases, [])
++
 +    async def test_public_prepare_rejects_invalid_deadlines_before_touching_output(self):
 +        output = PhysicalOutput()
 +        preparation = preparation_for(output)
@@ -2039,10 +2210,10 @@ index 0000000000000000000000000000000000000000..ff3578d661ada33ba46d4377901ae135
 +            await preparation.prepare("configured-player", "intent-1", 1)
 diff --git a/tests/test_output_preparation_http.py b/tests/test_output_preparation_http.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..cbb130283949870cabe65b5a32f4eafe4cc5319d
+index 0000000000000000000000000000000000000000..4e986002375467287c28bc7328b0fd836b15d673
 --- /dev/null
 +++ b/tests/test_output_preparation_http.py
-@@ -0,0 +1,1398 @@
+@@ -0,0 +1,1510 @@
 +"""Machine authentication at the real management HTTP entrance."""
 +
 +import asyncio
@@ -2086,6 +2257,26 @@ index 0000000000000000000000000000000000000000..cbb130283949870cabe65b5a32f4eafe
 +        response = await asyncio.to_thread(client.post, "/api/output/prepare", json=body, headers=headers)
 +        self.assertEqual(response.status_code, 409)
 +        self.assertEqual(response.json["error"], "cancelled")
++
++    async def test_http_verify_observes_only_the_exact_ready_lease_and_never_prepares_unknown_intents(self):
++        output = PhysicalOutput()
++        app = self.make_app({"OUTPUT_PREPARATION_ENABLED": True, "OUTPUT_PREPARATION_TOKEN": "machine-secret"},
++                            {"configured-player": output})
++        headers = {"X-Output-Preparation-Token": "machine-secret"}
++        post = app.test_client().post
++        body = {"output_id": "configured-player", "lease_id": "intent", "timeout_seconds": 0.05,
++                "pcm_format": {"sample_rate": 48000, "bit_depth": 16, "channels": 2}}
++        ready = await asyncio.to_thread(post, "/api/output/prepare", json=body, headers=headers)
++        request = {**body, "output_epoch": ready.json["output_epoch"]}
++        response = await asyncio.to_thread(post, "/api/output/verify", json=request, headers=headers)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(response.json, ready.json)
++        for changed in ({"lease_id": "unknown"}, {"output_epoch": "wrong-epoch"}):
++            response = await asyncio.to_thread(post, "/api/output/verify", json={**request, **changed}, headers=headers)
++            self.assertEqual(response.status_code, 409)
++        self.assertEqual(len(output.prepares), 1)
++        response = await asyncio.to_thread(post, "/api/output/verify", json=request)
++        self.assertEqual(response.status_code, 401)
 +
 +    async def test_http_propagates_negotiated_pcm_and_rejects_changed_nonce_format(self):
 +        from dataclasses import asdict
@@ -2165,6 +2356,10 @@ index 0000000000000000000000000000000000000000..cbb130283949870cabe65b5a32f4eafe
 +    response = client.post("/api/output/prepare", json={}, headers={"X-Ingress-Path": "/trusted"})
 +    assert response.status_code == 401, response.status_code
 +    response = client.post("/api/output/prepare", json={}, headers={"X-Output-Preparation-Token": "machine-secret"})
++    assert response.status_code == 400, response.status_code
++    response = client.post("/api/output/verify", json={}, headers={"X-Ingress-Path": "/trusted"})
++    assert response.status_code == 401, response.status_code
++    response = client.post("/api/output/verify", json={}, headers={"X-Output-Preparation-Token": "machine-secret"})
 +    assert response.status_code == 400, response.status_code
 +    response = client.get("/api/config")
 +    assert response.status_code == 200, response.status_code
@@ -2408,6 +2603,42 @@ index 0000000000000000000000000000000000000000..cbb130283949870cabe65b5a32f4eafe
 +        self.assertEqual(messages[-1]["starts"], [], diagnostics)
 +        self.assertEqual(messages[-1]["closes"], [True], diagnostics)
 +
++    async def test_daemon_fresh_verification_cannot_reallocate_a_released_output(self):
++        verify = {**self.bind_request("old-epoch"), "verify_only": True, "request_id": "verify-old"}
++        messages, diagnostics = await self.run_cold_output_daemon([
++            self.bind_request("old-epoch"), {"cmd": "set_standby", "sink": "sendspin_fallback"}, verify])
++        statuses = [message for message in messages if message.get("type") == "status"]
++        self.assertEqual([status["output_binding_ready"] for status in statuses], [True, False, False], diagnostics)
++        self.assertEqual(statuses[-1].get("output_verification_request_id"), "verify-old", diagnostics)
++        self.assertFalse(statuses[-1].get("output_verification_ready"), diagnostics)
++        self.assertIsNone(statuses[-1].get("output_binding_epoch"), diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [1], diagnostics)
++        self.assertEqual(messages[-1]["closes"], [True], diagnostics)
++        self.assertEqual(messages[-1]["unrelated_sink"], 0, diagnostics)
++
++    async def test_stale_daemon_verification_cannot_replace_successor_binding_authority(self):
++        messages, diagnostics = await self.run_cold_output_daemon([
++            self.bind_request("old-epoch"), self.bind_request("new-epoch"),
++            {**self.bind_request("old-epoch"), "verify_only": True, "request_id": "stale-check"}])
++        statuses = [message for message in messages if message.get("type") == "status"]
++        self.assertEqual(statuses[-1]["output_binding_epoch"], "new-epoch", diagnostics)
++        self.assertTrue(statuses[-1]["output_binding_ready"], diagnostics)
++        self.assertEqual(statuses[-1]["output_verification_epoch"], "old-epoch", diagnostics)
++        self.assertFalse(statuses[-1]["output_verification_ready"], diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [1], diagnostics)
++        self.assertEqual(messages[-1]["closes"], [True], diagnostics)
++
++    async def test_fresh_daemon_verification_reuses_backend_and_keeps_content_start_exclusive(self):
++        messages, diagnostics = await self.run_cold_output_daemon([
++            self.bind_request("epoch"),
++            {**self.bind_request("epoch"), "verify_only": True, "request_id": "fresh-check"}])
++        statuses = [message for message in messages if message.get("type") == "status"]
++        self.assertTrue(statuses[-1]["output_verification_ready"], diagnostics)
++        self.assertEqual(statuses[-1]["output_verification_request_id"], "fresh-check", diagnostics)
++        self.assertEqual(messages[-1]["allocations"], [1], diagnostics)
++        self.assertEqual(messages[-1]["starts"], [], diagnostics)
++        self.assertTrue(all(not status.get("playing") and not status.get("audio_streaming") for status in statuses), diagnostics)
++
 +    async def test_explicit_cold_binding_and_first_content_use_one_worker_backend(self):
 +        for codec in (True, "flac"):
 +            with self.subTest(codec=codec):
@@ -2572,6 +2803,58 @@ index 0000000000000000000000000000000000000000..cbb130283949870cabe65b5a32f4eafe
 +        self.assertFalse(self.backend.streams[-1].closed)
 +        await self.handler.release_output("successor")
 +        self.assertTrue(all(stream.closed for stream in self.backend.streams))
++
++    async def test_sdk_revalidation_observes_existing_output_without_allocating_or_reviving_it(self):
++        await self.handler.prepare_output(self.format, "epoch")
++        await self.handler.validate_output(self.format, "epoch")
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertEqual(self.backend.streams[0].samples, [])
++        await self.handler.release_output("epoch")
++        with self.assertRaises(RuntimeError):
++            await self.handler.validate_output(self.format, "epoch")
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertTrue(self.backend.streams[0].closed)
++        await self.handler.prepare_output(self.format, "successor")
++        with self.assertRaises(RuntimeError):
++            await self.handler.validate_output(self.format, "epoch")
++        await self.handler.validate_output(self.format, "successor")
++        self.assertEqual(len(self.backend.streams), 2)
++        self.assertFalse(self.backend.streams[-1].closed)
++
++    async def test_cancelled_queued_sdk_verification_cannot_retire_its_active_output(self):
++        import threading
++        from unittest.mock import patch
++
++        await self.handler.prepare_output(self.format, "epoch")
++        entered, finish = threading.Event(), threading.Event()
++        def settings(**kwargs):
++            entered.set()
++            if not finish.wait(2):
++                raise RuntimeError("External settings observation was not released")
++        with patch("sounddevice.check_output_settings", side_effect=settings):
++            blocking = asyncio.create_task(self.handler.prepare_output(self.format, "epoch"))
++            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
++            verification = asyncio.create_task(self.handler.validate_output(self.format, "epoch"))
++            await asyncio.sleep(0)
++            try:
++                verification.cancel()
++                with self.assertRaises(asyncio.CancelledError):
++                    await verification
++            finally:
++                finish.set()
++                await blocking
++        await self.handler.validate_output(self.format, "epoch")
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertEqual(self.backend.close_attempts, [])
++        self.assertFalse(self.backend.streams[0].closed)
++
++    async def test_sdk_verification_rejects_externally_closed_backend_without_repair(self):
++        await self.handler.prepare_output(self.format, "epoch")
++        self.backend.streams[0].closed = True
++        with self.assertRaises(RuntimeError):
++            await self.handler.validate_output(self.format, "epoch")
++        self.assertEqual(len(self.backend.streams), 1)
++        self.assertEqual(self.backend.close_attempts, [])
 +
 +    async def test_cancelled_inflight_prepare_with_full_queue_retires_all_output_without_resurrection(self):
 +        import threading

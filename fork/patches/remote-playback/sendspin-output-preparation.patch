@@ -1,5 +1,5 @@
 diff --git a/sendspin/audio.py b/sendspin/audio.py
-index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..a92d03d3bf51e631b89af7c8bc9547f5aae36860 100644
+index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..85f1c25a9eae53896bb50fefd7837bc920a0de76 100644
 --- a/sendspin/audio.py
 +++ b/sendspin/audio.py
 @@ -168,8 +168,11 @@ class AudioPlayer:
@@ -14,7 +14,7 @@ index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..a92d03d3bf51e631b89af7c8bc9547f5
          self._closed = False
          self._stream_started = False
          self._stream_executor = concurrent.futures.ThreadPoolExecutor(
-@@ -245,6 +248,59 @@ class AudioPlayer:
+@@ -245,6 +248,72 @@ class AudioPlayer:
          # Thread-safe flag for deferred operations (audio thread → main thread)
          self._clear_requested: bool = False
  
@@ -60,6 +60,19 @@ index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..a92d03d3bf51e631b89af7c8bc9547f5
 +            self.set_format(audio_format, device)
 +        return changed
 +
++    def validate_output(self, audio_format: AudioFormat, epoch: str) -> None:
++        """Observe this prepared native lifetime without allocating or repairing output."""
++        if (
++            self._prepared_epoch != epoch
++            or self._closed
++            or self._release_pending
++            or self._stream_close is not None
++            or self._stream is None
++            or self._stream.closed
++            or self._format != audio_format.pcm_format
++        ):
++            raise RuntimeError("Prepared audio output is unavailable")
++
 +    def validate_output_format(
 +        self, audio_format: AudioFormat, *, require_prepared: bool = False
 +    ) -> None:
@@ -74,7 +87,7 @@ index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..a92d03d3bf51e631b89af7c8bc9547f5
      def set_format(self, audio_format: AudioFormat, device: AudioDevice) -> None:
          """Configure the audio output format.
  
-@@ -253,8 +309,14 @@ class AudioPlayer:
+@@ -253,8 +322,14 @@ class AudioPlayer:
              device: Audio device to use.
          """
          pcm_format = audio_format.pcm_format
@@ -90,7 +103,7 @@ index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..a92d03d3bf51e631b89af7c8bc9547f5
  
          # Reset state on format change
          self._stream_started = False
-@@ -336,11 +398,29 @@ class AudioPlayer:
+@@ -336,11 +411,29 @@ class AudioPlayer:
      def stop(self) -> None:
          """Stop playback and release resources."""
          self._closed = True
@@ -123,7 +136,7 @@ index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..a92d03d3bf51e631b89af7c8bc9547f5
  
          Unlike clear(), which only stops the stream (leaving the device FD open),
          this fully closes the PortAudio stream. Call when the server signals
-@@ -350,7 +430,8 @@ class AudioPlayer:
+@@ -350,7 +443,8 @@ class AudioPlayer:
          if self._closed:
              return
          self.clear()
@@ -133,7 +146,7 @@ index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..a92d03d3bf51e631b89af7c8bc9547f5
  
      def clear(self) -> None:
          """Drop all queued audio chunks."""
-@@ -1291,20 +1372,41 @@ class AudioPlayer:
+@@ -1291,20 +1385,41 @@ class AudioPlayer:
                  self._queued_duration_us / 1_000_000,
              )
  
@@ -183,7 +196,7 @@ index 5bf1a63b5fd713d4f8d5de8b0a1bdbd912f23abb..a92d03d3bf51e631b89af7c8bc9547f5
 +        if raise_errors and error is not None:
 +            raise error
 diff --git a/sendspin/audio_connector.py b/sendspin/audio_connector.py
-index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5d69f3613 100644
+index fd82602c886490d7fe35761d7564e5f87940e63c..5036e14b89615528fa85d15029c628ae05640877 100644
 --- a/sendspin/audio_connector.py
 +++ b/sendspin/audio_connector.py
 @@ -8,6 +8,7 @@ import queue
@@ -194,7 +207,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, cast
  
-@@ -66,8 +67,18 @@ class _CloseStreamWorkItem:
+@@ -66,8 +67,19 @@ class _CloseStreamWorkItem:
      """Close the audio stream and release the audio device on stream end."""
  
  
@@ -205,6 +218,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
 +    audio_format: AudioFormat | None
 +    epoch: str
 +    result: Future[None]
++    verify: bool = False
 +
 +
  type _AudioWorkItem = (
@@ -214,7 +228,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
      | _ClearWorkItem
      | _SetVolumeWorkItem
      | _DelayChangeWorkItem
-@@ -86,6 +97,7 @@ class _AudioSyncWorker:
+@@ -86,6 +98,7 @@ class _AudioSyncWorker:
          use_software_volume: bool,
          volume: int,
          muted: bool,
@@ -222,7 +236,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
      ) -> None:
          self._audio_device = audio_device
          self._use_software_volume = use_software_volume
-@@ -94,6 +106,14 @@ class _AudioSyncWorker:
+@@ -94,6 +107,14 @@ class _AudioSyncWorker:
  
          self._queue: queue.Queue[_AudioWorkItem] | None = None
          self._thread: threading.Thread | None = None
@@ -237,7 +251,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
  
      def start(
          self,
-@@ -103,12 +123,17 @@ class _AudioSyncWorker:
+@@ -103,12 +124,17 @@ class _AudioSyncWorker:
          is_clock_synced: Callable[[], bool] | None = None,
      ) -> None:
          """Start worker thread if needed."""
@@ -256,7 +270,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
          self._thread = threading.Thread(
              target=self._run,
              args=(compute_play_time, compute_server_time),
-@@ -118,8 +143,97 @@ class _AudioSyncWorker:
+@@ -118,8 +144,116 @@ class _AudioSyncWorker:
          self._thread.start()
  
      def is_running(self) -> bool:
@@ -277,7 +291,9 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
 +        with self._output_lock:
 +            return self._finished and self._player is None
 +
-+    def _request_output(self, audio_format: AudioFormat | None, epoch: str) -> Future[None]:
++    def _request_output(
++        self, audio_format: AudioFormat | None, epoch: str, *, verify: bool = False
++    ) -> Future[None]:
 +        if audio_format is not None:
 +            AudioPlayer.validate_preparation_format(audio_format)
 +        with self._output_lock:
@@ -286,14 +302,15 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
 +                raise RuntimeError("Audio worker is not running")
 +            result: Future[None] = Future()
 +            try:
-+                queue_obj.put_nowait(_OutputWorkItem(audio_format, epoch, result))
++                queue_obj.put_nowait(_OutputWorkItem(audio_format, epoch, result, verify=verify))
 +            except queue.Full as exc:
 +                raise RuntimeError("Audio output control queue is full") from exc
-+            if audio_format is not None:
-+                self._output_epoch = epoch
-+                self._output_controlled = True
-+            elif self._output_epoch == epoch:
-+                self._output_epoch = None
++            if not verify:
++                if audio_format is not None:
++                    self._output_epoch = epoch
++                    self._output_controlled = True
++                elif self._output_epoch == epoch:
++                    self._output_epoch = None
 +            return result
 +
 +    def _owns_output_epoch(self, epoch: str) -> bool:
@@ -324,12 +341,22 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
 +        if not self._owns_output_epoch(epoch):
 +            raise RuntimeError("Output preparation superseded")
 +
++    async def validate_output(self, audio_format: AudioFormat, epoch: str) -> None:
++        """Observe the current backend without changing output ownership."""
++        if not self._owns_output_epoch(epoch):
++            raise RuntimeError("Prepared audio output is unavailable")
++        await asyncio.wrap_future(self._request_output(audio_format, epoch, verify=True))
++        if not self._owns_output_epoch(epoch):
++            raise RuntimeError("Output verification superseded")
++
 +    async def release_output(self, epoch: str) -> None:
 +        """Acknowledge closing only the matching prepared output."""
 +        await asyncio.wrap_future(self._request_output(None, epoch))
 +
 +    def _handle_output(self, item: _OutputWorkItem, player: AudioPlayer) -> bool:
 +        if not item.result.set_running_or_notify_cancel():
++            if item.verify:
++                return False
 +            try:
 +                if item.audio_format is None:
 +                    return player.release_output(item.epoch)
@@ -340,13 +367,19 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
 +        try:
 +            if item.audio_format is not None and not self._owns_output_epoch(item.epoch):
 +                raise RuntimeError("Output preparation superseded")
-+            changed = (
-+                player.release_output(item.epoch)
-+                if item.audio_format is None
-+                else player.prepare_output(item.audio_format, self._audio_device, item.epoch)
-+            )
++            if item.verify:
++                assert item.audio_format is not None
++                player.validate_output(item.audio_format, item.epoch)
++                changed = False
++            else:
++                changed = (
++                    player.release_output(item.epoch)
++                    if item.audio_format is None
++                    else player.prepare_output(item.audio_format, self._audio_device, item.epoch)
++                )
 +            if item.audio_format is not None and not self._owns_output_epoch(item.epoch):
-+                player.release_output(item.epoch)
++                if not item.verify:
++                    player.release_output(item.epoch)
 +                raise RuntimeError("Output preparation superseded")
 +        except Exception as exc:
 +            item.result.set_exception(exc)
@@ -356,7 +389,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
  
      def submit_chunk(
          self, server_timestamp_us: int, audio_data: bytes | bytearray, fmt: AudioFormat
-@@ -145,30 +259,62 @@ class _AudioSyncWorker:
+@@ -145,30 +279,62 @@ class _AudioSyncWorker:
              self._enqueue(_SetVolumeWorkItem(volume=volume, muted=muted))
  
      async def stop(self) -> None:
@@ -442,7 +475,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
  
      def _enqueue(self, item: _AudioWorkItem) -> None:
          """Best-effort enqueue to worker; drops on sustained overload."""
-@@ -190,12 +336,35 @@ class _AudioSyncWorker:
+@@ -190,12 +356,35 @@ class _AudioSyncWorker:
          if queue_obj is None:
              return
  
@@ -484,7 +517,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
          current_format: AudioFormat | None = None
          flac_decoder: FlacDecoder | None = None
          software_volume = self._initial_volume
-@@ -215,6 +384,11 @@ class _AudioSyncWorker:
+@@ -215,6 +404,11 @@ class _AudioSyncWorker:
              if item_type is _StopWorkItem:
                  break
  
@@ -496,7 +529,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
              if item_type is _ClearWorkItem:
                  player.clear()
                  continue
-@@ -238,6 +412,11 @@ class _AudioSyncWorker:
+@@ -238,6 +432,11 @@ class _AudioSyncWorker:
  
              chunk_item = cast(_ChunkWorkItem, item)
              fmt = chunk_item.fmt
@@ -508,7 +541,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
              if current_format != fmt:
                  # Format changed: drain old-format audio before switching
                  # to prevent pitch shift from old PCM played at new sample rate.
-@@ -254,8 +433,21 @@ class _AudioSyncWorker:
+@@ -254,8 +453,21 @@ class _AudioSyncWorker:
                          continue
  
                      drain_type = type(drain_item)
@@ -531,7 +564,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
                          return
                      if drain_type is _ClearWorkItem or drain_type is _CloseStreamWorkItem:
                          if drain_type is _CloseStreamWorkItem:
-@@ -326,8 +518,6 @@ class _AudioSyncWorker:
+@@ -326,8 +538,6 @@ class _AudioSyncWorker:
  
              player.submit(chunk_item.server_timestamp_us, payload)
  
@@ -540,7 +573,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
  
  class AudioStreamHandler:
      """Manages audio playback state and stream lifecycle.
-@@ -376,6 +566,7 @@ class AudioStreamHandler:
+@@ -376,6 +586,7 @@ class AudioStreamHandler:
          self.audio_player: AudioPlayer | None = None
  
          self._audio_worker: _AudioSyncWorker | None = None
@@ -548,7 +581,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
          self._client_unsubscribers: list[Callable[[], None]] = []
  
          self._volume_controller: VolumeController | None = volume_controller
-@@ -482,12 +673,17 @@ class AudioStreamHandler:
+@@ -482,12 +693,17 @@ class AudioStreamHandler:
  
      def _start_audio_worker(self, client: SendspinClient) -> None:
          """Start sync worker once during attach and fail fast if unavailable."""
@@ -567,7 +600,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
              )
  
          self._audio_worker.start(
-@@ -499,6 +695,19 @@ class AudioStreamHandler:
+@@ -499,6 +715,28 @@ class AudioStreamHandler:
          if not self._audio_worker.is_running():
              raise RuntimeError("Audio worker failed to start")
  
@@ -578,6 +611,15 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
 +            raise RuntimeError("Audio worker is not attached")
 +        await worker.prepare_output(audio_format, epoch)
 +
++    async def validate_output(self, audio_format: AudioFormat, epoch: str) -> None:
++        """Await a fresh observation of the existing backend, never prepare a replacement."""
++        worker = self._audio_worker
++        if worker is None:
++            raise RuntimeError("Audio worker is not attached")
++        await worker.validate_output(audio_format, epoch)
++        if self._audio_worker is not worker:
++            raise RuntimeError("Output verification superseded")
++
 +    async def release_output(self, epoch: str) -> None:
 +        """Close the matching prepared native backend without detaching the client."""
 +        worker = self._audio_worker
@@ -587,7 +629,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
      def notify_delay_change(self, delta_us: int) -> None:
          """Notify the audio worker that static delay changed."""
          worker = self._audio_worker
-@@ -541,8 +750,11 @@ class AudioStreamHandler:
+@@ -541,8 +779,11 @@ class AudioStreamHandler:
          if message.payload.player is None:
              return
          assert self._client is not None, "Received stream start but client is not attached"
@@ -600,7 +642,7 @@ index fd82602c886490d7fe35761d7564e5f87940e63c..92c3080dc27c6f4edc6c1e9712d00cb5
              self._start_audio_worker(self._client)
  
          self._clear_audio_worker()
-@@ -582,17 +794,29 @@ class AudioStreamHandler:
+@@ -582,17 +823,29 @@ class AudioStreamHandler:
              if self._on_event:
                  self._on_event("stop")
  
