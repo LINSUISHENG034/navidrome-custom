@@ -54,6 +54,7 @@ Created: 2026-10-09
 - [确定输出准备与释放的最小协调位置](issues/02-output-readiness-contract.md)：优先验证播放会话到输出 adapter 的 pre-stream 准备/释放契约；现有 wake success 不等于物理 ready，首段与取消闭环仍需原型。
 - [确定验收语义与验证止损预算](issues/03-acceptance-and-budget.md)：按用户最新技术委托进入 MA-first 隔离软件开发；首期沿用暂停即 stop 保位、释放后重新准备的原生语义，物理宽限期留作后续选项；真实设备验收仍需维护窗口。
 - [实施隔离的软件输出准备闭环](issues/11-software-output-gate.md)：交付 MA+Bridge+SDK 同 worker 准备、退休、失联复验与权威队列隔离的软件闭环；95/49/42 干净重放通过，判定值得进入硬件窗口。
+- [准备可恢复且排他的硬件验证窗口](issues/04-hardware-validation-readiness.md)：建立宿主脱敏基线、独立测试卷与短音源规程，制定严格串行排他与恢复验证清单，解阻塞实机原型。
 
 ## Not yet specified
 

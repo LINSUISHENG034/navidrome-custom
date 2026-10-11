@@ -3,8 +3,8 @@
 Type: task
 Label: wayfinder:task
 Mode: HITL
-Status: open
-Assignee: unassigned
+Status: resolved
+Assignee: LINSUISHENG034
 Parent: ../map.md
 Blocked by: 01, 02, 03, 11
 
@@ -24,3 +24,33 @@ Blocked by: 01, 02, 03, 11
 ## Comments
 
 - 2026-10-09：显式加入软件闭环票 11 为 blocker，落实已约定的「先有软件证据，再确认硬件窗口」顺序。27/17 的局部重放通过不等于 11 全部完成，也不构成这张 HITL 票的维护窗口授权。已获准的无硬件隔离软件容器测试与本票接入真实音箱/生产资源的实验区分处理。
+- 2026-10-11：用户确认允许进入硬件窗口准备阶段。脱敏核实生产环境基线（MA/Bridge 均 Exited 255、宿主 PipeWire 默认 sink 为 alsa_output.pci-0000_00_1f.3.iec958-stereo、目标音箱 24:C4:06:FA:00:37 配对未连、无外部重连抢占进程）。建立独立测试配置与短音源规程，制定严格恢复验证清单。本票闭环，解除 05 与 06 硬件前置阻塞。
+
+## Answer
+
+在用户明确授权并确认维护窗口的前提下，**已成功建立可恢复、可观测、排他独占的真实硬件验证环境与规程基线**。
+
+### 1. 运行环境与设备脱敏基线
+- **宿主音频栈与默认路由**：Ubuntu Linux 5.15，BlueZ 5.64 / bluetoothd (PID 905)，PipeWire 0.3.48 (PulseAudio 15.0.0 模拟层)。默认全局输出锚定为 `alsa_output.pci-0000_00_1f.3.iec958-stereo`，测试期间严格保留该基线，禁止全局篡改 default-sink。
+- **物理蓝牙音箱**：目标输出设备为已配对的 `24:C4:06:FA:00:37` (`Aura Studio 5`)，状态为 `Paired=yes, Trusted=yes, Blocked=no, Connected=no`。
+- **生产容器状态锁定**：生产容器 `music-stack-a-sendspin-bt-bridge-1` (2.75.0) 与 `music-stack-a-music-assistant-1` (2.10.4) 均已停止 (Exited 255)，无常驻进程拉起；生产 Navidrome 与开发 Navidrome (端口 4538) 维持现状，不重启、不修改配置、不操作生产卷。
+
+### 2. 排他性与竞争规避机制
+- **排他独占**：宿主无外部自动重连守护进程。后续 05 (MA+Bridge) 与 06 (Go SDK) 实机测试实行**绝对串行排他**，同一时刻仅允许一个受控测试实例持有蓝牙音频 sink，禁止多实例并发。
+- **广播隔离**：测试容器网络限定于受控测试端口与本地隔离网络，禁用/屏蔽向局域网广播 mDNS，防止劫持局域网正常客户端。
+
+### 3. 数据与音源隔离规程
+- **数据卷隔离**：严禁读写生产数据目录 `/home/docker/music-stack/*` 与 `/mnt/sda1/docker/navidrome/data`；实机测试统一使用独立临时测试数据目录（如 `tmp/hardware-validation/`）。
+- **短测试音源与安全音量**：严禁对生产曲库 `/mnt/sda3/Music` 进行全库扫描或写入播放历史；实机验证仅挂载只读合成短测试音频（44.1k/48k 16-bit WAV/PCM，时长 5~10 秒）；测试增益统一设定为安全低音量（≤ 25%），以真实时间戳和可听证据为准。
+
+### 4. 逐步恢复清单与验收验证（Recovery Checklist）
+每次实机测试退出后，必须按顺序执行以下恢复验证：
+1. **停止测试进程**：优雅关闭并清理该次测试容器与后台测试进程，确保进程不残留。
+2. **显式断开蓝牙**：执行 `bluetoothctl disconnect 24:C4:06:FA:00:37`，确认连接状态回到 `Connected: no`。
+3. **验证默认路由**：执行 `pactl info`，确认 Default Sink 依然保持为 `alsa_output.pci-0000_00_1f.3.iec958-stereo`，无残留悬挂 sink-input 或孤儿 ALSA/Pulse 流。
+4. **验证生产状态**：核验生产容器维持原有状态，生产数据目录时间戳未变。
+
+### 5. 结论与后续解阻塞
+本任务已为后续候选比较建立可信、可恢复的安全基线，正式关闭本票，解阻塞两个串行实机原型任务：
+- [05-ma-bridge-lifecycle.md](issues/05-ma-bridge-lifecycle.md)
+- [06-go-sdk-interoperability.md](issues/06-go-sdk-interoperability.md)
