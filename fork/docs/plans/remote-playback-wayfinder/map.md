@@ -56,6 +56,7 @@ Created: 2026-10-09
 - [实施隔离的软件输出准备闭环](issues/11-software-output-gate.md)：交付 MA+Bridge+SDK 同 worker 准备、退休、失联复验与权威队列隔离的软件闭环；95/49/42 干净重放通过，判定值得进入硬件窗口。
 - [准备可恢复且排他的硬件验证窗口](issues/04-hardware-validation-readiness.md)：建立宿主脱敏基线、独立测试卷与短音源规程，制定严格串行排他与恢复验证清单，解阻塞实机原型。
 - [验证 MA 基线能否满足完整输出生命周期](issues/05-ma-bridge-lifecycle.md)：实测蓝牙 A2DP 建立约 1.5~2s 达标；交付生命周期交互原型，确认 MA+Bridge 最小改动具备完整生命周期且高度可维护。
+- [验证 Go SDK 候选是否值得继续集成](issues/06-go-sdk-interoperability.md)：审计确认 Go SDK 缺少输出门控、队列权威与转码能力，触发止损条件并终止 Navidrome+Go SDK 移植路线。
 
 ## Not yet specified
 
