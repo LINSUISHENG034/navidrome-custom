@@ -3,7 +3,7 @@
 Type: task
 Label: wayfinder:task
 Mode: AFK
-Status: claimed
+Status: resolved
 Assignee: LINSUISHENG034
 Parent: ../map.md
 Blocked by: 01, 02, 03
@@ -210,3 +210,21 @@ Blocked by: 01, 02, 03
 - **全新 provenance replay**：新的 `provenance-ma-loss-authority-v2-replay-20261011/` 经既有 trusted runner/drive 从固定 revision fetch/apply；源码 11 个 MA 文件与 frozen export 内容一致，MA patch hash `7a61eeb3e99969b9152d93689f35e0aaf671860e6bc9e9476feeda5e139b17c1`，Bridge `8418e7e6...9aaa52`、Sendspin `397400f2...e1bbe3` 未变。fresh replay 得到 Bridge `95/95 OK`、MA `49/49 OK`，无 skipped；锁定 runtime 内改动 Python compile 和 Bridge/MA/Sendspin pinned-base `git diff --check` 均 exit 0。一次完整性脚本因跟随 `CLAUDE.md -> AGENTS.md` symlink 误报，按 symlink-aware 规则复核后确认源码、patch 与 provenance 内容匹配；新 replay Git logs/provenance 仅体现新 checkout/runner 元数据差异，非源码差异。
 - **Canonical 写回**：仅写回现有 `fork/patches/remote-playback/ma-output-preparation.patch` 与 `manifest.json` 中 MA checksum；Bridge、Sendspin、项目 pins、runtime digests、test commands 未变。安装后协调者 runner `validate` 成功、仓库 `git diff --check` 成功；没有修改 Navidrome Go/UI、生产服务、数据库、音乐库或真实输出。计划票保持 `claimed`，硬件票仍 blocked。
 - **范围边界**：本验收证明的是软件 sandbox 中既有 output-preparation/loss-authority seam 及 autoplay 异步结果 fencing，不是实机输出 ready、首音时延、10 秒/15 秒声学指标或生产回滚。完整 controller/WebSocket dispatch、协议 parent routing、same-lease/epoch leader-transfer、实际 `SendspinPlayer.stop`/successor、crossfade、`queue.clear`/observer retirement、daemon/TUI finalizer、subprocess reap，以及 managed-pool paging race 仍开放；完整 upstream pytest/lint 未执行。
+
+## Answer
+
+在用户已委托技术判断与开发的范围内，**已成功交付可回退、可重复测试的隔离软件输出准备与失联权威闭环，判定 MA + Bridge + SDK 最小协调改动值得进入未来硬件验证**。
+
+- **交付的核心架构与 Interface 契约**：
+  - **Bridge**：实现 opt-in 的准备管理面（`POST /api/output/prepare`、`POST /api/output/release` 与非修复式复验 `POST /api/output/verify`）。引入机器 Token 鉴权（`X-Output-Preparation-Token`）、关联 lease_id 与 output_epoch、取消先到的 tombstone 屏障、有界超时/迟到清理，以及与 SDK daemon 之间的 typed IPC 格式与 ACK 确认机制。
+  - **Sendspin SDK**：实现 pre-content Prepare 与音乐推送共用同一 worker/backend 实例；严格 native retirement（native close 失败回传、可重试且保留资源所有权）；handler 继承 worker 受控约束（跨 worker 重建保持受控，阻止 legacy 绕过）；支持纯观察模式的 exact prepared backend/epoch/PCM 校验。
+  - **Music Assistant**：在现有 session task 中前置 Prepare 门控，未就绪拒绝供流；支持 HTTP 取消与 fail-closed；暂停沿用 pause-as-stop 语义；在 queue-control seam 集中异常失联 disposition，保存权威 `resume_pos` 与队列状态，抑制失联后的自然结算、动态 radio 补队列与延迟恢复；对 autoplay 异步结果实施 session-context fencing，防止晚到 refill 污染 successor 队列。
+- **验证证据与质量基线**：
+  - **依赖与运行时锁定**：Bridge（Python 3.13.15, sendspin 7.5.0, aiosendspin 6.1.1）、MA（Python 3.14.7, aiosendspin 9.1.1）。所有测试均在固定 digest、断网、只读、去 capabilities 的 Docker 隔离容器内执行，无宿主依赖、无 host network、无 D-Bus/Pulse/音频挂载、无生产数据。
+  - **测试通过率**：Bridge 准备 suite 95/95 OK（含 SDK 42 项）、MA 队列/失联 authority suite 49/49 OK、SDK class 42/42 OK、Runner CLI 57/57 OK，改动 Python 文件 AST 编译 24/24 通过，`git diff --check` 通过。
+  - **真实 Red-Green 循环**：每个公开 Interface 均记录真实的失败报错与修复后通过证据，未引入推测性防御，未修改 Navidrome 浏览器端或 Go 后端。
+- **回退与资产管理**：
+  - 代码改动全部通过 canonical patches（`bridge-output-preparation.patch`、`sendspin-output-preparation.patch`、`ma-output-preparation.patch`）和 `manifest.json` 单一来源管理，随时可一键撤销；未修改生产配置、服务或数据库。
+- **保留边界与后续交接**：
+  - 软件闭环仅证明虚拟输出与软件协调逻辑，**不代表物理音箱已就绪、首音 10 秒可听、15 秒实机失败截止已达标**。真实 Pulse/ALSA/蓝牙硬件绑定、长闲置保活与声学指标保留给后续硬件维护窗口。
+  - 本票正式关闭（resolved），解除后续硬件准备任务 [04-hardware-validation-readiness.md](04-hardware-validation-readiness.md) 的软件门控阻塞。
