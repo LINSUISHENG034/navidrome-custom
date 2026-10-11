@@ -1,8 +1,514 @@
+diff --git a/music_assistant/controllers/player_queues/base.py b/music_assistant/controllers/player_queues/base.py
+index 0ff326100d8e5ddab6d7053c828aeccf98703b42..dbbbc44e2e869bd1b217bceb83c0defd6431598e 100644
+--- a/music_assistant/controllers/player_queues/base.py
++++ b/music_assistant/controllers/player_queues/base.py
+@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any
+ from music_assistant.models.core_controller import CoreController
+ 
+ if TYPE_CHECKING:
++    from collections.abc import Callable
++
+     from music_assistant_models.enums import QueueOption
+     from music_assistant_models.media_items import MediaItemType
+     from music_assistant_models.player_queue import PlayerQueue
+@@ -45,6 +47,21 @@ class _PlayerQueuesBase(CoreController):
+     _managed_pool: ManagedPool
+     _media_resolver: MediaResolver
+ 
++    def queue_session_context(self, queue_id: str) -> Callable[[], bool]:
++        """Capture queue-session authority for work that must revalidate after suspension."""
++        queue_data = self._queue_data.get(queue_id)
++        session_id = queue_data.session_id if queue_data else None
++
++        def is_current() -> bool:
++            return (
++                queue_data is not None
++                and self._queue_data.get(queue_id) is queue_data
++                and queue_data.session_id == session_id
++                and queue_data.interrupted_session_id is None
++            )
++
++        return is_current
++
+     if TYPE_CHECKING:
+         # core operations implemented on PlayerQueuesController
+         def get(self, queue_id: str) -> PlayerQueue | None: ...
+diff --git a/music_assistant/controllers/player_queues/controller.py b/music_assistant/controllers/player_queues/controller.py
+index 419f09abb0e040c44df9f09b823f5aa4cb2e210f..f4c7334922078f877122eb074c8bbbb339894c99 100644
+--- a/music_assistant/controllers/player_queues/controller.py
++++ b/music_assistant/controllers/player_queues/controller.py
+@@ -84,6 +84,7 @@ from music_assistant.controllers.player_queues.queue_loader import QueueLoaderMi
+ from music_assistant.controllers.player_queues.smart_shuffle import SmartShuffle
+ from music_assistant.controllers.player_queues.state import PlayerQueueData
+ from music_assistant.controllers.player_queues.stream_feeder import StreamFeederMixin
++from music_assistant.controllers.players.constants import PlayerLockPurpose
+ from music_assistant.controllers.players.helpers import is_own_client_player
+ from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
+ from music_assistant.helpers.api import api_command
+@@ -93,7 +94,7 @@ from music_assistant.models.music_provider import ProviderStreamLimitError
+ from music_assistant.models.player import Player, PlayerMedia
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Iterator
++    from collections.abc import Callable, Iterator
+ 
+     from music_assistant_models import BackgroundTask
+     from music_assistant_models.config_entries import (
+@@ -720,6 +721,12 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
+         self._set_transitioning(queue_id, False)
+         if not (queue := self.get(queue_id)):
+             return
++        queue_data = self._queue_data[queue_id]
++        if queue_data.session_id is not None and queue_data.output_session_id == queue_data.session_id:
++            queue_data.interrupted_session_id = queue_data.session_id
++            self._cancel_queue_playback_work(queue_id)
++            await self._handle_stop(queue_id)
++            return
+         queue_active = queue.active
+         if queue.active and queue.state == PlaybackState.PLAYING:
+             queue.resume_pos = int(queue.corrected_elapsed_time)
+@@ -978,6 +985,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
+                 raise PlayerUnavailableError(f"Player {queue_id} is not available")
+             queue_data.next_item_id_enqueued = None
+             # always update session id when we start a new playback session
++            queue_data.interrupted_session_id = None
++            queue_data.output_session_id = None
+             queue_data.session_id = shortuuid.random(length=8)
+             self.mass.streams.audio_processing.start_session(
+                 queue_id,
+@@ -1198,6 +1207,55 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
+         if auto_play:
+             await self.resume(target_queue_id)
+ 
++    def observe_output_session(self, queue_id: str, session_id: str) -> None:
++        """Associate configured output observation with the existing playback session."""
++        if (queue_data := self._queue_data.get(queue_id)) and queue_data.session_id == session_id:
++            queue_data.output_session_id = session_id
++
++    async def handle_output_loss(
++        self, queue_id: str, session_id: str, cancel_playback: Callable[[], bool]
++    ) -> None:
++        """
++        Freeze a queue after correlated active-output loss, without treating it as EOF.
++
++        :param queue_id: The queue owning the lost output.
++        :param session_id: The observed queue playback session.
++        :param cancel_playback: Atomically validate and cancel the exact observed task and lease.
++            False means a newer playback owns the output and this report is stale.
++        """
++        queue_data = self._queue_data.get(queue_id)
++        if queue_data is None or queue_data.session_id != session_id:
++            return
++        queue = queue_data.queue
++        if not queue.active or not cancel_playback():
++            return
++        # Claim the disposition and freeze the existing authority before any suspension.
++        # A prior pause already saved resume_pos; an IDLE zero must not overwrite it.
++        if queue.state == PlaybackState.PLAYING:
++            queue.resume_pos = int(queue.corrected_elapsed_time)
++        elif not queue.resume_pos:
++            queue.resume_pos = int(queue.elapsed_time)
++        queue_data.interrupted_session_id = session_id
++        queue_data.session_id = None
++        queue_data.transitioning = False
++        queue.state = PlaybackState.IDLE
++        queue.elapsed_time = queue.resume_pos
++        queue.elapsed_time_last_updated = time.time()
++        self._cancel_queue_playback_work(queue_id)
++        self.mass.streams.audio_processing.clear(queue_id, session_id)
++        cleanup = self.mass.create_task(self._cleanup_queue_audio_data(queue_id, session_id))
++        self.signal_update(queue_id)
++        try:
++            async with self.mass.players.get_player_lock(queue_id, PlayerLockPurpose.PLAYBACK):
++                if (
++                    self._queue_data.get(queue_id) is queue_data
++                    and queue_data.interrupted_session_id == session_id
++                    and queue_data.session_id is None
++                ):
++                    await self.mass.players._handle_cmd_stop(queue_id)
++        finally:
++            await asyncio.shield(cleanup)
++
+     # Interaction with player
+ 
+     async def on_player_register(self, player: Player) -> None:
+@@ -1284,7 +1342,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
+         queue_id = player.player_id
+         if (queue := self.get(queue_id)) is None:
+             return
+-        if not queue.active:
++        if not queue.active or self._queue_data[queue_id].interrupted_session_id is not None:
+             return
+         player_elapsed = player.state.corrected_elapsed_time
+         if player_elapsed is None:
+@@ -1446,6 +1504,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
+         # capture session_id so we can bail out if playback restarts
+         queue_data = self._queue_data[queue_id]
+         original_session_id = queue_data.session_id
++        if queue_data.interrupted_session_id is not None:
++            return
+         # record so player providers can detect flow EOF without an idle report
+         if original_session_id is not None:
+             queue_data.flow_buffer_completed = original_session_id
+@@ -1457,7 +1517,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
+             idle_detected = False
+             for _ in range(60):
+                 await asyncio.sleep(1)
+-                if not queue.active or queue_data.session_id != original_session_id:
++                if (
++                    not queue.active or queue_data.session_id != original_session_id
++                    or queue_data.interrupted_session_id is not None
++                ):
+                     return
+                 if queue.state == PlaybackState.IDLE:
+                     idle_detected = True
+@@ -1838,13 +1901,16 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
+             msg = f"{current_user.username} does not have access to player {queue_id}"
+             raise InsufficientPermissions(msg)
+ 
+-    @handle_play_action
+-    async def _handle_stop(self, queue_id: str) -> None:
+-        """
+-        Handle stop without checking the caller's player permissions.
++    def _cancel_queue_playback_work(self, queue_id: str) -> None:
++        """Cancel queued work that could keep a stopped queue consuming or resume it."""
++        self.mass.cancel_task(f"queue_buffer_completed_{queue_id}")
++        for task_id in (f"fill_dynamic_tracks_{queue_id}", f"fill_autoplay_tracks_{queue_id}"):
++            self.mass.cancel_timer(task_id)
++            self.mass.cancel_task(task_id)
++        self._cancel_queue_stream_work(queue_id)
+ 
+-        :param queue_id: queue_id of the playerqueue to stop.
+-        """
++    def _cancel_queue_stream_work(self, queue_id: str) -> None:
++        """Cancel pending stream handover and preparation for a stopped session."""
+         # cancel any pending play_index calls for this queue to prevent conflicts
+         self.mass.cancel_timer(f"queue_play_index_{queue_id}")
+         # cancel in-flight preload/enqueue-next so it can't enqueue after stop
+@@ -1855,6 +1921,15 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
+         # leaving a stopped queue holding a provider's stream. Cancelled here rather than
+         # alongside that teardown, where the task id can already belong to a new session.
+         self.mass.cancel_task(f"prepare_next_audio_buffer_{queue_id}")
++
++    @handle_play_action
++    async def _handle_stop(self, queue_id: str) -> None:
++        """
++        Handle stop without checking the caller's player permissions.
++
++        :param queue_id: queue_id of the playerqueue to stop.
++        """
++        self._cancel_queue_stream_work(queue_id)
+         self._set_transitioning(queue_id, False)
+         queue_data = self._queue_data[queue_id]
+         session_id = queue_data.session_id
+diff --git a/music_assistant/controllers/player_queues/managed_pool.py b/music_assistant/controllers/player_queues/managed_pool.py
+index 7d3db0d444435a91d9c03ffd55b7323376067d34..a1f960c517b566d15a66abd319ac9512380cde8f 100644
+--- a/music_assistant/controllers/player_queues/managed_pool.py
++++ b/music_assistant/controllers/player_queues/managed_pool.py
+@@ -129,16 +129,21 @@ class ManagedPool:
+         if (queue_data := self.queues.queue_data_or_none(queue_id)) is None:
+             # the queue was removed while this background refill was starting up
+             return []
++        is_current = self.queues.queue_session_context(queue_id)
++        if not is_current():
++            return []
+         queue = queue_data.queue
+         windows = self.queues.recency_windows()
+         snapshot = await self.mass.music.recency.snapshot(windows, userid=queue_data.userid)
++        if not is_current():
++            return []
+         # publish a best-effort recency filter so dynamic-playlist generation can pre-skip recently
+         # played tracks while over-generating; allocate_refill still applies the authoritative gate
+         with track_filter(lambda track: not snapshot.track_recent(track, windows.song_seconds)):
+             # the initial fill skips dynamic playlists (each seeds its own first batch directly); a
+             # top-up folds them in so all sources are mixed, weighted and recency-gated together
+             sources = await self._collect_sources(queue_id, include_dynamic=not is_initial)
+-        if not sources:
++        if not is_current() or not sources:
+             return []
+         # dedupe only against the active (current + unplayed) tail; played history is left out so
+         # recency, not permanent exclusion, decides when a track may return. Besides exact item
+@@ -176,7 +181,7 @@ class ManagedPool:
+         # advance each finite source's deque: drop what was just dispatched, rotate recency-denied
+         # tracks to the back, page in more if it is draining, and retire it once fully played
+         await self._reconcile_tracks(queue_id, sources, chosen, snapshot, windows)
+-        return chosen
++        return chosen if is_current() else []
+ 
+     def forget(self, queue_id: str) -> None:
+         """Drop all materialized finite-source state for a queue (it was cleared or removed)."""
+@@ -212,6 +217,9 @@ class ManagedPool:
+         if (queue_data := self.queues.queue_data_or_none(queue_id)) is None:
+             # the queue was removed while earlier fetches of this refill were awaited
+             return []
++        is_current = self.queues.queue_session_context(queue_id)
++        if not is_current():
++            return []
+         # multiplicity = how often a source was added (adding a source more than once weights it up)
+         counts: dict[str, int] = {}
+         items: dict[str, MediaItemType] = {}
+@@ -230,6 +238,8 @@ class ManagedPool:
+             if is_dynamic_source(media_item):
+                 fill_mode = DynamicFillMode.DYNAMIC
+                 candidates = await self._fetch_dynamic(media_item)
++                if not is_current():
++                    return []
+             else:
+                 # a finite source is materialized once, then its deque feeds (and is advanced by)
+                 # every refill so it plays through instead of recycling tracks that age out
+@@ -237,6 +247,8 @@ class ManagedPool:
+                 source = materialized.get(uri)
+                 if source is None:
+                     source = await self._materialize(media_item, counts[uri])
++                    if not is_current():
++                        return []
+                     materialized[uri] = source
+                 else:
+                     source.multiplicity = counts[uri]
+diff --git a/music_assistant/controllers/player_queues/playback_tracker.py b/music_assistant/controllers/player_queues/playback_tracker.py
+index 09600e2a1504d1bad6323aa94d8952ed3bbf7f2a..049a4bf60b6c34903df50e202ba3dd0993f56433 100644
+--- a/music_assistant/controllers/player_queues/playback_tracker.py
++++ b/music_assistant/controllers/player_queues/playback_tracker.py
+@@ -74,6 +74,8 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
+         Returns True if the update was successful, False if the caller should return early.
+         """
+         queue_id = queue.queue_id
++        if self._queue_data[queue_id].interrupted_session_id is not None:
++            return True
+         if queue.active and queue.state in (
+             PlaybackState.PLAYING,
+             PlaybackState.PAUSED,
+@@ -145,6 +147,7 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
+         queue.items = len(self._queue_data[queue_id].items)
+ 
+         queue.state = (
++            PlaybackState.IDLE if queue_data.interrupted_session_id is not None else
+             player.state.playback_state or PlaybackState.IDLE
+             if queue.active
+             else PlaybackState.IDLE
+@@ -279,19 +282,27 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
+             self._handle_end_of_queue(queue, prev_state, new_state)
+ 
+         # refill the queue (dynamic mode or autoplay) when running low on tracks
+-        if "current_item_id" in changed_keys:
++        if "current_item_id" in changed_keys and queue_data.interrupted_session_id is None:
+             running_low = (
+                 queue.current_index is not None and (queue.items - queue.current_index) < 5
+             )
+-            if queue.is_dynamic and running_low:
+-                # a dynamic queue tops up its bounded managed pool from its (dynamic + finite) sources
+-                task_id = f"fill_dynamic_tracks_{queue_id}"
+-                self.mass.call_later(5, self._fill_dynamic_tracks, queue_id, task_id=task_id)
+-            elif queue.autoplay_enabled and running_low:
+-                # autoplay appends whatever continues the queue's last item (more music, the
+-                # next podcast episode/audiobook, or nothing at all)
+-                task_id = f"fill_autoplay_tracks_{queue_id}"
+-                self.mass.call_later(5, self._fill_autoplay_tracks, queue_id, task_id=task_id)
++            if running_low and (queue.is_dynamic or queue.autoplay_enabled):
++                refill = self._fill_dynamic_tracks if queue.is_dynamic else self._fill_autoplay_tracks
++                task_id = f"fill_{'dynamic' if queue.is_dynamic else 'autoplay'}_tracks_{queue_id}"
++                session_id = queue_data.session_id
++
++                async def _refill_current_session() -> None:
++                    if (
++                        self._queue_data.get(queue_id) is queue_data
++                        and queue_data.session_id == session_id
++                        and queue_data.interrupted_session_id is None
++                    ):
++                        await refill(queue_id)
++
++                if queue_data.output_session_id is None:
++                    self.mass.call_later(5, refill, queue_id, task_id=task_id)
++                else:
++                    self.mass.call_later(5, _refill_current_session, task_id=task_id)
+ 
+     def _get_output_player_ids(self, player: Player) -> set[str]:
+         """Return destination player IDs represented in the processing chain."""
+@@ -427,6 +438,8 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
+     ) -> None:
+         """Check if the queue should be cleared after the current item."""
+         queue_data = self._queue_data[queue.queue_id]
++        if queue_data.interrupted_session_id is not None:
++            return
+         # check if queue state changed to stopped (from playing/paused to idle)
+         if not (
+             prev_state["state"] in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+@@ -447,10 +460,19 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
+         if prev_item is not None and prev_item.media_type in UNENDABLE_MEDIA_TYPES:
+             return
+ 
++        session_id = queue_data.session_id
++
++        def may_settle() -> bool:
++            return (
++                self._queue_data.get(queue.queue_id) is queue_data
++                and queue_data.session_id == session_id
++                and queue_data.interrupted_session_id is None
++            )
++
+         async def _settle_or_resume_delayed() -> None:
+             for _ in range(5):
+                 await asyncio.sleep(1)
+-                if self._queue_data.get(queue.queue_id) is not queue_data:
++                if not may_settle():
+                     # the queue was removed or re-registered while we waited
+                     return
+                 if queue.state != PlaybackState.IDLE:
+@@ -486,7 +508,7 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
+                     dynamic_tracks = await self._media_resolver.get_dynamic_source_tracks(
+                         dynamic_source
+                     )
+-                    if self._queue_data.get(queue.queue_id) is not queue_data:
++                    if not may_settle():
+                         # the queue was removed or re-registered while tracks were fetched
+                         return
+                     if dynamic_tracks:
+@@ -521,7 +543,7 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
+                         queue.display_name,
+                         err,
+                     )
+-            if self._queue_data.get(queue.queue_id) is not queue_data:
++            if not may_settle():
+                 # the queue was removed or re-registered while the source was fetched
+                 return
+             self._finish_queue(queue, prev_item)
+diff --git a/music_assistant/controllers/player_queues/queue_loader.py b/music_assistant/controllers/player_queues/queue_loader.py
+index b61748403030df393626fe5f033606cd4eb91884..d867b64376697578dd97a612fccafaa7ace1a9a0 100644
+--- a/music_assistant/controllers/player_queues/queue_loader.py
++++ b/music_assistant/controllers/player_queues/queue_loader.py
+@@ -513,6 +513,9 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+         if (queue_data := self._queue_data.get(queue_id)) is None:
+             # the delayed refill timer can fire after the queue was removed
+             return
++        is_current = self.queue_session_context(queue_id)
++        if not is_current():
++            return
+         queue = queue_data.queue
+         # restore the queue owner's user context so provider filters are respected during this
+         # background refill (dynamic-playlist generation honours the current user)
+@@ -522,13 +525,15 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+             else None
+         )
+         set_current_user(playback_user)
++        if not is_current():
++            return
+         # Top up from the queue's dynamic sources (dynamic playlists and any mixed-in finite items),
+         # weighted per source and recency-gated. fill() already sizes the batch to the pool target;
+         # the tail cap below is a defensive ceiling so the unplayed tail never grows past
+         # MANAGED_POOL_MAX.
+         pool_tracks = await self._managed_pool.fill(queue_id, is_initial=False)
+-        if self._queue_data.get(queue_id) is not queue_data:
+-            # the queue was removed or re-registered while tracks were fetched
++        if not is_current():
++            # Ownership may change even when the same queue record remains registered.
+             return
+         # keep the unplayed tail within the bounded pool size (no current_index => nothing played yet)
+         played = 0 if queue.current_index is None else queue.current_index + 1
+@@ -554,7 +559,8 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+         if queue is None or not queue.autoplay_enabled:
+             return
+         queue_data = self._queue_data[queue_id]
+-        if not queue_data.items:
++        is_current = self.queue_session_context(queue_id)
++        if not is_current() or not queue_data.items:
+             return
+         last_item = queue_data.items[-1]
+         if last_item.media_type in AUTOPLAY_EXCLUDED_MEDIA_TYPES:
+@@ -568,8 +574,8 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+             else None
+         )
+         set_current_user(playback_user)
+-        if self._queue_data.get(queue_id) is not queue_data:
+-            # the queue was removed or re-registered while the user context was restored
++        if not is_current():
++            # The session may have been interrupted or replaced while restoring the user.
+             return
+         if last_item.media_type in AUTOPLAY_SERIES_MEDIA_TYPES:
+             await self._fill_autoplay_next_in_series(queue_id, last_item)
+@@ -587,6 +593,9 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+         :param last_item: The queue's last item, an audiobook or podcast episode.
+         """
+         queue_data = self._queue_data[queue_id]
++        is_current = self.queue_session_context(queue_id)
++        if not is_current():
++            return
+         media_item = last_item.media_item
+         next_item: PodcastEpisode | Audiobook | None
+         try:
+@@ -613,8 +622,7 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+         ):
+             # already queued (e.g. the user added it themselves), so there is nothing to do
+             return
+-        if self._queue_data.get(queue_id) is not queue_data:
+-            # the queue was removed or re-registered while the successor was fetched
++        if not is_current():
+             return
+         await self.load(
+             queue_id,
+@@ -628,7 +636,8 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+         if queue is None:
+             return
+         queue_data = self._queue_data[queue_id]
+-        if not queue_data.enqueued_media_items:
++        is_current = self.queue_session_context(queue_id)
++        if not is_current() or not queue_data.enqueued_media_items:
+             # the music refill needs what the user enqueued as its seed
+             return
+         mode = self._autoplay.resolve_mode(queue_id)
+@@ -658,6 +667,8 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+                     tracks = await self._get_similar_tracks(
+                         queue_id, seed_items=queue_data.enqueued_media_items
+                     )
++                if not is_current():
++                    return
+                 if not tracks:
+                     tracks = await self._autoplay.get_library_tracks(queue, existing_tracks)
+         except MusicAssistantError as err:
+@@ -665,10 +676,14 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+                 "Autoplay failed to fetch tracks for queue %s: %s", queue.display_name, err
+             )
+             return
++        if not is_current():
++            return
+         # route the autoplay batch through the recency engine so a recently-heard track isn't
+         # immediately re-added (ungated fallback keeps autoplay going if everything is recent)
+         windows = self._smart_shuffle.windows()
+         snapshot = await self.mass.music.recency.snapshot(windows, userid=queue_data.userid)
++        if not is_current():
++            return
+         tracks = gate_tracks(
+             [track for track in tracks if isinstance(track, Track)], snapshot, windows
+         )
+@@ -676,9 +691,6 @@ class QueueLoaderMixin(_PlayerQueuesBase):
+         if not queue_items:
+             self.logger.info("Autoplay found no new tracks to add for queue %s", queue.display_name)
+             return
+-        if self._queue_data.get(queue_id) is not queue_data:
+-            # the queue was removed or re-registered while tracks were fetched
+-            return
+         await self.load(
+             queue_id,
+             queue_items,
+diff --git a/music_assistant/controllers/player_queues/state.py b/music_assistant/controllers/player_queues/state.py
+index 2d1bd675e7654c34a1ab95f6448ae887c8d7825f..351b825addefd3ff6d0ac7ddfabb4bccb4f67b8c 100644
+--- a/music_assistant/controllers/player_queues/state.py
++++ b/music_assistant/controllers/player_queues/state.py
+@@ -75,6 +75,10 @@ class PlayerQueueData:
+     flow_queue_exhausted: str | None = None
+     # the current stream session id (set when a stream starts, cleared between sessions)
+     session_id: str | None = None
++    # Configured output observation belongs to the same queue playback session.
++    output_session_id: str | None = None
++    # Output loss or pause-as-stop blocks automatic continuation until a new play intent.
++    interrupted_session_id: str | None = None
+     # per-item play log for the active flow-mode stream
+     flow_mode_stream_log: list[PlayLogEntry] = field(default_factory=list)
+     # queue_item_id most recently handed to the player as the next item
 diff --git a/music_assistant/providers/sendspin/constants.py b/music_assistant/providers/sendspin/constants.py
-index c3cca4a9d20c7c868a76c76982d8e784783d0f4d..19a94ebe4fdf9e56cdc7ac920dc7a6e50ee7663a 100644
+index c3cca4a9d20c7c868a76c76982d8e784783d0f4d..ea530e89c4a382e0c401ed0fe2c3c884cea64012 100644
 --- a/music_assistant/providers/sendspin/constants.py
 +++ b/music_assistant/providers/sendspin/constants.py
-@@ -13,6 +13,13 @@ CONF_ALLOW_LEGACY_CLIENTS = "allow_legacy_clients"
+@@ -13,6 +13,16 @@ CONF_ALLOW_LEGACY_CLIENTS = "allow_legacy_clients"
  CONF_MIN_PIN_LENGTH = "min_pin_length"
  DEFAULT_MIN_PIN_LENGTH = 4
  
@@ -12,6 +518,9 @@ index c3cca4a9d20c7c868a76c76982d8e784783d0f4d..19a94ebe4fdf9e56cdc7ac920dc7a6e5
 +CONF_OUTPUT_PREPARATION_TIMEOUT = "output_preparation_timeout"
 +MAX_OUTPUT_PREPARATION_TIMEOUT = 15.0
 +DEFAULT_OUTPUT_PREPARATION_TIMEOUT = MAX_OUTPUT_PREPARATION_TIMEOUT
++CONF_OUTPUT_VERIFICATION_INTERVAL = "output_verification_interval"
++DEFAULT_OUTPUT_VERIFICATION_INTERVAL = 1.0
++MAX_OUTPUT_VERIFICATION_INTERVAL = 15.0
 +
  # Pairing method the setup flow lets the user pick between.
  CONF_PAIRING_METHOD = "pairing_method"
@@ -248,10 +757,18 @@ index 0000000000000000000000000000000000000000..652f914053acf4bc6ac7a73e90341a88
 +
 +        task.add_done_callback(done)
 diff --git a/music_assistant/providers/sendspin/playback.py b/music_assistant/providers/sendspin/playback.py
-index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e63813dd1 100644
+index 0eb552d1b58009953bf4ce628b86776cec4558ad..e65cba96b69c10013db7fd099e0786b9efd013c5 100644
 --- a/music_assistant/providers/sendspin/playback.py
 +++ b/music_assistant/providers/sendspin/playback.py
-@@ -29,6 +29,18 @@ from music_assistant.providers.sendspin.bridge_role import (
+@@ -7,6 +7,7 @@ import time
+ from collections import deque
+ from contextlib import suppress
+ from dataclasses import dataclass, field
++from math import isfinite
+ from typing import TYPE_CHECKING, Any, cast
+ from uuid import UUID, uuid4
+ 
+@@ -29,6 +30,21 @@ from music_assistant.providers.sendspin.bridge_role import (
      BRIDGE_SAMPLE_RATE,
      BridgePlayerRole,
  )
@@ -261,6 +778,9 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
 +    CONF_OUTPUT_PREPARATION_TOKEN,
 +    CONF_OUTPUT_PREPARATION_URL,
 +    DEFAULT_OUTPUT_PREPARATION_TIMEOUT,
++    CONF_OUTPUT_VERIFICATION_INTERVAL,
++    DEFAULT_OUTPUT_VERIFICATION_INTERVAL,
++    MAX_OUTPUT_VERIFICATION_INTERVAL,
 +)
 +from music_assistant.providers.sendspin.output_preparation import (
 +    OutputLease,
@@ -270,7 +790,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
  
  if TYPE_CHECKING:
      from music_assistant.helpers.dsp import ComplexFilter
-@@ -359,6 +371,8 @@ class SendspinPlaybackSession:
+@@ -359,6 +375,8 @@ class SendspinPlaybackSession:
          self._sendspin_pcm_format: SendspinAudioFormat = _DEFAULT_SENDSPIN_PCM_FORMAT
          self._queue_id: str | None = None
          self._queue_session_id: str | None = None
@@ -279,7 +799,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
  
      def flow_track_anchor_us(self, track_start_offset_us: int) -> int | None:
          """
-@@ -412,12 +426,13 @@ class SendspinPlaybackSession:
+@@ -412,12 +430,13 @@ class SendspinPlaybackSession:
              mishandle stream/clear.
          """
          task = self.playback_task
@@ -296,7 +816,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
          provider = cast("SendspinProvider", self.player.provider)
          if provider.server_api.allow_noncompliant_clients:
              keep_stream = False
-@@ -431,6 +446,8 @@ class SendspinPlaybackSession:
+@@ -431,6 +450,8 @@ class SendspinPlaybackSession:
              await task
          if self.playback_task is task:
              self.playback_task = None
@@ -305,7 +825,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
  
      async def start(self, media: PlayerMedia, restart: bool = False) -> None:
          """Start background playback for `media`."""
-@@ -510,6 +527,14 @@ class SendspinPlaybackSession:
+@@ -510,6 +531,14 @@ class SendspinPlaybackSession:
  
      # -- Helpers ---------------------------------------------------------------
  
@@ -320,15 +840,17 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
      def _attach_task_exception_logger(self, task: asyncio.Task[Any], name: str) -> None:
          """Log unhandled exception from background task when it finishes."""
  
-@@ -736,7 +761,57 @@ class SendspinPlaybackSession:
+@@ -736,7 +765,112 @@ class SendspinPlaybackSession:
  
      # -- Playback pipeline -----------------------------------------------------
  
 -    async def _run_playback(self, media: PlayerMedia) -> None:  # noqa: PLR0915
 +    async def _run_playback(self, media: PlayerMedia) -> None:
 +        """Prepare output before streaming and revoke authority on failure."""
++        monitor: asyncio.Task[None] | None = None
 +        try:
 +            if url := self.player.config.get_value(CONF_OUTPUT_PREPARATION_URL):
++                interval = self._get_output_verification_interval()
 +                pcm_format = self._get_output_preparation_pcm_format()
 +                if self._output_client is None:
 +                    self._output_client = OutputPreparationClient(
@@ -346,6 +868,13 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
 +                self._output_lease = await self._output_client.prepare(
 +                    previous_lease, pcm_format=pcm_format
 +                )
++                if media.source_id and (session_id := get_media_session_id(media)):
++                    self.player.mass.player_queues.observe_output_session(media.source_id, session_id)
++                    monitor = asyncio.create_task(self._observe_output(
++                        media.source_id, session_id, asyncio.current_task(),
++                        self._output_client, self._output_lease, interval,
++                    ))
++                    self._attach_task_exception_logger(monitor, "output verification")
 +                if self.player.volume_level is not None:
 +                    await self.player.volume_set(self.player.volume_level)
 +                if self.player.volume_muted is not None:
@@ -354,6 +883,52 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
 +        except Exception:
 +            await self._release_output("failed")
 +            raise
++        finally:
++            if monitor is not None:
++                monitor.cancel()
++                with suppress(asyncio.CancelledError):
++                    await monitor
++
++    def _get_output_verification_interval(self) -> float:
++        interval = self.player.config.get_value(
++            CONF_OUTPUT_VERIFICATION_INTERVAL, DEFAULT_OUTPUT_VERIFICATION_INTERVAL
++        )
++        if (
++            isinstance(interval, bool) or not isinstance(interval, (int, float))
++            or not isfinite(interval) or not 0 < interval <= MAX_OUTPUT_VERIFICATION_INTERVAL
++        ):
++            raise OutputPreparationError("Output verification requires a bounded positive interval")
++        return float(interval)
++
++    async def _observe_output(
++        self, queue_id: str, session_id: str, task: asyncio.Task[None] | None,
++        client: OutputPreparationClient, lease: OutputLease, interval: float,
++    ) -> None:
++        def cancel_observed_playback() -> bool:
++            if (
++                self.player.playback_session is not self
++                or self.playback_task is not task
++                or self._output_client is not client or self._output_lease is not lease
++                or self._cancel_requested or task is None or task.done()
++            ):
++                return False
++            self._cancel_requested = True
++            self._output_client = None
++            self._output_lease = None
++            self.player.mass.create_task(client.release(lease, "failed"))
++            task.cancel("output lost")
++            return True
++
++        while task is not None and not task.done() and not self._cancel_requested:
++            await asyncio.sleep(interval)
++            try:
++                await client.verify(lease)
++            except Exception:
++                self.player.logger.warning("Output authority verification failed; stopping playback")
++                self.player.mass.create_task(self.player.mass.player_queues.handle_output_loss(
++                    queue_id, session_id, cancel_observed_playback,
++                ))
++                return
 +
 +    def _get_output_preparation_pcm_format(self) -> dict[str, int]:
 +        provider = cast("SendspinProvider", self.player.provider)
@@ -379,7 +954,7 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
          """
          Run the playback pipeline for a single media session.
  
-@@ -981,6 +1056,7 @@ class SendspinPlaybackSession:
+@@ -981,6 +1115,7 @@ class SendspinPlaybackSession:
              # Only emit a group STOP when MA stream playback reached natural EOF.
              # Skip this on cancellation/error paths to avoid stop-event races with transitions.
              if producer_stopped_cleanly and not self._cancel_requested:
@@ -388,10 +963,10 @@ index 0eb552d1b58009953bf4ce628b86776cec4558ad..d93f5f2e060401577d86b69a2e9cf03e
                      await self.player.api.group.stop()
  
 diff --git a/music_assistant/providers/sendspin/player.py b/music_assistant/providers/sendspin/player.py
-index be02aebdca54c9fb79486942dae3ee42cf21eb01..a38d91f80c662d21a49447c4d00d01d85bfd75f4 100644
+index be02aebdca54c9fb79486942dae3ee42cf21eb01..780626c3110ac6c3ef43643c8e67e9d10d60d760 100644
 --- a/music_assistant/providers/sendspin/player.py
 +++ b/music_assistant/providers/sendspin/player.py
-@@ -90,6 +90,10 @@ from .constants import (
+@@ -90,6 +90,11 @@ from .constants import (
      CONF_ACTION_MANAGEMENT_STATIC_PIN_ENABLE,
      CONF_ACTION_UNPAIR,
      CONF_CONNECT_METHOD,
@@ -399,20 +974,23 @@ index be02aebdca54c9fb79486942dae3ee42cf21eb01..a38d91f80c662d21a49447c4d00d01d8
 +    CONF_OUTPUT_PREPARATION_TIMEOUT,
 +    CONF_OUTPUT_PREPARATION_TOKEN,
 +    CONF_OUTPUT_PREPARATION_URL,
++    CONF_OUTPUT_VERIFICATION_INTERVAL,
      CONF_PAIRING_METHOD,
      CONF_PAIRING_PIN,
      CONF_PAIRING_TOKEN,
-@@ -99,7 +103,9 @@ from .constants import (
+@@ -99,7 +104,11 @@ from .constants import (
      CONF_SOURCE_INPUT_ACTION,
      CONNECT_METHOD_PAIR,
      CONNECT_METHOD_UNPAIRED,
 +    DEFAULT_OUTPUT_PREPARATION_TIMEOUT,
++    DEFAULT_OUTPUT_VERIFICATION_INTERVAL,
      DEFAULT_SENDSPIN_STATIC_DELAY,
 +    MAX_OUTPUT_PREPARATION_TIMEOUT,
++    MAX_OUTPUT_VERIFICATION_INTERVAL,
      PAIR_METHOD_DYNAMIC_PIN,
      PAIR_METHOD_PIN,
      PAIR_METHOD_STATIC_PIN,
-@@ -1664,6 +1670,43 @@ class SendspinPlayer(SendspinBasePlayer):
+@@ -1664,6 +1673,54 @@ class SendspinPlayer(SendspinBasePlayer):
          """Return all (provider/player specific) Config Entries for the player."""
          entries: list[ConfigEntry] = []
          entries.extend(await super().get_config_entries())
@@ -451,6 +1029,17 @@ index be02aebdca54c9fb79486942dae3ee42cf21eb01..a38d91f80c662d21a49447c4d00d01d8
 +                    default_value=DEFAULT_OUTPUT_PREPARATION_TIMEOUT,
 +                    advanced=True,
 +                ),
++                ConfigEntry(
++                    key=CONF_OUTPUT_VERIFICATION_INTERVAL,
++                    type=ConfigEntryType.FLOAT,
++                    title="Active output verification interval (seconds)",
++                    description="Observe configured output authority without reconnecting. "
++                    "Each request uses the output preparation deadline; loss stops the queue "
++                    "at its saved position until explicit playback is requested.",
++                    range=(0.1, MAX_OUTPUT_VERIFICATION_INTERVAL),
++                    default_value=DEFAULT_OUTPUT_VERIFICATION_INTERVAL,
++                    advanced=True,
++                ),
 +            ]
 +        )
          # Build dynamic format options from player's supported formats
@@ -458,10 +1047,10 @@ index be02aebdca54c9fb79486942dae3ee42cf21eb01..a38d91f80c662d21a49447c4d00d01d8
          if player_role is not None:
 diff --git a/tests/test_output_preparation_client.py b/tests/test_output_preparation_client.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a663f03613c147765f926fdc4a71dd6ebd3762f2
+index 0000000000000000000000000000000000000000..f0ffb3bbd1f40ca159d06ceecd3bc819f997c496
 --- /dev/null
 +++ b/tests/test_output_preparation_client.py
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,1670 @@
 +"""Output preparation contract at the public HTTP client seam."""
 +
 +from __future__ import annotations
@@ -469,6 +1058,7 @@ index 0000000000000000000000000000000000000000..a663f03613c147765f926fdc4a71dd6e
 +import asyncio
 +import logging
 +import unittest
++from contextlib import asynccontextmanager
 +from types import SimpleNamespace
 +from typing import Any
 +
@@ -894,6 +1484,7 @@ index 0000000000000000000000000000000000000000..a663f03613c147765f926fdc4a71dd6e
 +        self.events: list[str] = []
 +        self.read_started = asyncio.Event()
 +        self.committed = asyncio.Event()
++        self.stream_stopped = asyncio.Event()
 +        self.eof = asyncio.Event()
 +        self.drain_started = asyncio.Event()
 +        self.drain_gate: asyncio.Event | None = None
@@ -946,6 +1537,7 @@ index 0000000000000000000000000000000000000000..a663f03613c147765f926fdc4a71dd6e
 +            def stop(self, *, keep_stream: bool = False) -> None:
 +                self.is_stopped = True
 +                ports.events.append("stream-stop")
++                ports.stream_stopped.set()
 +
 +        return PushOutput()
 +
@@ -1030,8 +1622,769 @@ index 0000000000000000000000000000000000000000..a663f03613c147765f926fdc4a71dd6e
 +        return None
 +
 +
++class QueuePorts:
++    """External player/source/clock ports driving the real queue and playback session."""
++
++    def __init__(self) -> None:
++        from music_assistant_models.enums import PlaybackState, PlayerType
++        from music_assistant.controllers.player_queues.controller import PlayerQueuesController
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        self.http = HttpPort()
++        self.media = MediaPorts()
++        self.player = SessionPlayer(self.http, self.media)
++        self.player.values["output_verification_interval"] = 0.01
++        self.player.type = PlayerType.PLAYER
++        self.player.extra_data = {}
++        self.player.active_output_protocol = "native"
++        self.player.protocol_parent_id = None
++        self.player.current_media = None
++        self.player.state = SimpleNamespace(
++            name="Test output", available=True, active_source=self.player.player_id,
++            playback_state=PlaybackState.IDLE, corrected_elapsed_time=0,
++            group_members=[], powered=True,
++        )
++        self.tasks: dict[str, asyncio.Task[Any]] = {}
++        self.timers: dict[str, tuple[Any, tuple[Any, ...]]] = {}
++        self.processing_clears: list[tuple[Any, ...]] = []
++        self.buffers: list[Any] = []
++        self.source_closed = asyncio.Event()
++        self.source_close_started = asyncio.Event()
++        self.source_close_gate: asyncio.Event | None = None
++        self.stop_started = asyncio.Event()
++        self.stop_gate: asyncio.Event | None = None
++        self.started_media: list[Any] = []
++        self.mass = self.player.mass
++        self.mass.create_task = self.create_task
++        self.mass.call_later = self.call_later
++        self.mass.cancel_task = self.cancel_task
++        self.mass.cancel_timer = lambda task_id: self.timers.pop(task_id, None)
++        self.mass.signal_event = lambda *args, **kwargs: None
++        self.mass.config.get_raw_core_config_value = lambda domain, key, default=None: default
++        self.mass.cache = SimpleNamespace(get=self.cache_get)
++        self.dynamic_fetches = 0
++        self.dynamic_started = asyncio.Event()
++        self.dynamic_gate: asyncio.Event | None = None
++        self.dynamic_ignore_cancel = False
++        self.dynamic_results: list[Any] = []
++        self.recency_started = asyncio.Event()
++        self.recency_gate: asyncio.Event | None = None
++        self.mass.music = SimpleNamespace(
++            radio=SimpleNamespace(dynamic_tracks=self.dynamic_tracks),
++            albums=SimpleNamespace(tracks=self.dynamic_tracks),
++            podcasts=SimpleNamespace(episodes=self.podcast_episodes),
++            get_resume_position=self.resume_position,
++            recency=SimpleNamespace(snapshot=self.recency_snapshot),
++        )
++        from music_assistant.controllers.players.controller import PlayerController
++
++        self.player_controller = PlayerController(self.mass)
++        self.mass.players = SimpleNamespace(
++            get_player=lambda *args: self.player,
++            trigger_player_update=lambda *args: None,
++            get_player_lock=self.player_controller.get_player_lock,
++            wait_for_player_update=self.wait_for_update,
++            play_media=self.play_media,
++            _handle_cmd_stop=self.stop,
++            _handle_cmd_pause=self.stop,
++        )
++        self.mass.streams.is_smart_fades_active = lambda queue: False
++        self.mass.streams.audio_processing = SimpleNamespace(
++            start_session=lambda *args: None,
++            prune=lambda *args: None,
++            retain_outputs=lambda *args: False,
++            update_output=lambda *args, **kwargs: None,
++            clear=lambda *args: self.processing_clears.append(args),
++        )
++        self.mass.streams.audio.get_player_output_plan = lambda *args, **kwargs: SimpleNamespace(
++            filter_params=[], output_details=SimpleNamespace(player_ids=[self.player.player_id])
++        )
++        self.mass.streams.audio.get_stream_details = self.get_stream_details
++        self.mass.streams.audio.get_audio_buffer = self.get_audio_buffer
++        self.mass.streams.audio.clear_crossfade_handover = lambda *args: None
++        self.mass.streams.get_stream = self.get_stream
++        self.mass.streams.base_url = ""
++        self.queues = PlayerQueuesController(self.mass)
++        self.mass.player_queues = self.queues
++        self.player.playback_session = SendspinPlaybackSession(self.player)
++        self.player.api.group.stop = self.group_stop
++
++    async def recency_snapshot(self, *args: Any, **kwargs: Any) -> Any:
++        from music_assistant.controllers.music.recency import RecencySnapshot
++
++        self.recency_started.set()
++        await self.wait_for_fetch(self.recency_gate)
++        return RecencySnapshot(now=1_000_000)
++
++    async def wait_for_fetch(self, gate: asyncio.Event | None) -> None:
++        if gate is not None:
++            try:
++                await gate.wait()
++            except asyncio.CancelledError:
++                if not self.dynamic_ignore_cancel:
++                    raise
++                await gate.wait()
++
++    async def dynamic_tracks(self, *args: Any, **kwargs: Any) -> list[Any]:
++        self.dynamic_fetches += 1
++        self.dynamic_started.set()
++        await self.wait_for_fetch(self.dynamic_gate)
++        return self.dynamic_results
++
++    @staticmethod
++    def provider_mappings(item_id: str) -> set[Any]:
++        """Return a playable test-provider mapping shared by the external media results."""
++        from music_assistant_models.media_items import ProviderMapping
++
++        return {ProviderMapping(
++            item_id=item_id, provider_domain="test", provider_instance="test", available=True,
++        )}
++
++    @classmethod
++    def available_track(cls, item_id: str = "late-old-refill") -> Any:
++        """Return a genuinely playable external provider result, not an empty-mapping no-op."""
++        from music_assistant_models.media_items import Track
++
++        return Track(
++            item_id=item_id, provider="test", name="Late old refill", duration=100,
++            provider_mappings=cls.provider_mappings(item_id),
++        )
++
++    @classmethod
++    def available_episode(cls, item_id: str, position: int) -> Any:
++        from music_assistant_models.enums import MediaType
++        from music_assistant_models.media_items import ItemMapping, PodcastEpisode
++
++        return PodcastEpisode(
++            item_id=item_id, provider="test", name=item_id, duration=100, position=position,
++            provider_mappings=cls.provider_mappings(item_id),
++            podcast=ItemMapping(
++                item_id="test-podcast", provider="test", name="Test podcast", media_type=MediaType.PODCAST,
++            ),
++        )
++
++    async def podcast_episodes(self, *args: Any) -> Any:
++        for episode in await self.dynamic_tracks(*args):
++            yield episode
++
++    async def resume_position(self, *args: Any, **kwargs: Any) -> tuple[bool, int]:
++        return False, 0
++
++    async def cache_get(self, *args: Any, **kwargs: Any) -> None:
++        return None
++
++    @asynccontextmanager
++    async def wait_for_update(self, *args: Any, **kwargs: Any) -> Any:
++        yield
++
++    def call_later(self, delay: float, callback: Any, *args: Any, task_id: str) -> None:
++        self.timers[task_id] = (callback, args)
++
++    def create_task(self, coro: Any, *args: Any, task_id: str | None = None,
++                    abort_existing: bool = False, **kwargs: Any) -> asyncio.Task[Any]:
++        if callable(coro):
++            coro = coro(*args)
++        task_id = task_id or f"task-{len(self.tasks)}"
++        if abort_existing:
++            self.cancel_task(task_id)
++        task = asyncio.create_task(coro)
++        self.tasks[task_id] = task
++        return task
++
++    def cancel_task(self, task_id: str) -> None:
++        if task := self.tasks.get(task_id):
++            task.cancel()
++
++    async def get_stream_details(self, queue_item: Any, seek_position: int = 0,
++                                 **kwargs: Any) -> Any:
++        from music_assistant_models.enums import ContentType
++        from music_assistant_models.media_items.audio_format import AudioFormat
++        from music_assistant_models.streamdetails import StreamDetails
++
++        return StreamDetails(
++            provider="test", item_id=queue_item.queue_item_id,
++            audio_format=AudioFormat(content_type=ContentType.PCM_F32LE, sample_rate=48000,
++                                     bit_depth=32, channels=2),
++            duration=100, queue_id=queue_item.queue_id,
++            queue_session_id=self.queues.queue_data(queue_item.queue_id).session_id,
++            seek_position=seek_position,
++        )
++
++    async def get_audio_buffer(self, queue_item: Any, **kwargs: Any) -> Any:
++        from music_assistant.controllers.streams.audio_buffer import AudioBuffer
++
++        buffer = AudioBuffer(queue_item.streamdetails.audio_format, ready_threshold=0)
++        buffer.fill(self.source(), source_name="test-external-source")
++        queue_item.streamdetails.buffer = buffer
++        self.buffers.append(buffer)
++        return buffer
++
++    async def source(self) -> Any:
++        try:
++            yield b"\x00" * 3840
++            await self.media.eof.wait()
++        finally:
++            self.source_close_started.set()
++            if self.source_close_gate is not None:
++                await self.source_close_gate.wait()
++            self.source_closed.set()
++
++    def get_stream(self, media: Any, *args: Any) -> Any:
++        self.media.events.append("read")
++        self.media.read_started.set()
++        item = self.queues.get_item(media.source_id, media.queue_item_id)
++        return item.streamdetails.buffer.get_raw_stream()
++
++    async def play_media(self, queue_id: str, media: Any) -> None:
++        from music_assistant_models.enums import PlaybackState
++
++        self.started_media.append(media)
++        self.player.current_media = media
++        self.media.committed.clear()
++        await self.player.playback_session.start(media, restart=True)
++        await asyncio.wait_for(self.media.committed.wait(), 1)
++        self.player.state.playback_state = PlaybackState.PLAYING
++        self.player.state.corrected_elapsed_time = 0
++
++    async def group_stop(self) -> None:
++        from music_assistant_models.enums import PlaybackState
++
++        self.media.events.append("group-stop")
++        self.player.current_media = None
++        self.player.state.playback_state = PlaybackState.IDLE
++        self.player.state.corrected_elapsed_time = 0
++        self.queues.on_player_update(self.player, {})
++
++    async def stop(self, queue_id: str) -> None:
++        self.stop_started.set()
++        if self.stop_gate is not None:
++            await self.stop_gate.wait()
++        await self.group_stop()
++        await self.player.playback_session.cancel("stop command")
++
++    async def start(self, *, dynamic: bool = False) -> Any:
++        from music_assistant_models.media_items import Radio
++        from music_assistant_models.queue_item import QueueItem
++
++        await self.queues.on_player_register(self.player)
++        if dynamic:
++            queue = self.queues.get(self.player.player_id)
++            queue.is_dynamic = True
++            self.queues.store_sources(queue, [Radio(
++                item_id="dynamic-radio", provider="test", name="Dynamic radio",
++                provider_mappings=set(), is_dynamic=True,
++            )])
++        await self.queues.load(self.player.player_id, [QueueItem(
++            queue_id=self.player.player_id, queue_item_id="audible-track", name="Audible track",
++            duration=100,
++        )])
++        await self.queues.play_index(self.player.player_id, 0)
++        self.player.state.corrected_elapsed_time = 98
++        self.queues.on_player_update(self.player, {})
++        return self.queues.get(self.player.player_id)
++
++    async def close(self) -> None:
++        if self.recency_gate is not None:
++            self.recency_gate.set()
++        if self.dynamic_gate is not None:
++            self.dynamic_gate.set()
++        if self.source_close_gate is not None:
++            self.source_close_gate.set()
++        if self.stop_gate is not None:
++            self.stop_gate.set()
++        await self.player.playback_session.cancel("test cleanup")
++        for buffer in self.buffers:
++            await buffer.clear()
++        for task in list(self.tasks.values()):
++            task.cancel()
++        await asyncio.gather(*self.tasks.values(), return_exceptions=True)
++
++
++class OutputLossQueueTests(unittest.IsolatedAsyncioTestCase):
++    """Output loss is not EOF at the real queue/session/tracker interfaces."""
++
++    async def test_old_autoplay_music_fetch_cannot_append_to_resumed_session(self) -> None:
++        await self._assert_autoplay_music_is_retired(during_recency=False)
++
++    async def test_old_autoplay_recency_fetch_cannot_append_to_resumed_session(self) -> None:
++        await self._assert_autoplay_music_is_retired(during_recency=True)
++
++    async def _assert_autoplay_music_is_retired(self, *, during_recency: bool) -> None:
++        from music_assistant_models.enums import QueueOption
++
++        ports = QueuePorts()
++        ports.mass.config.get_effective_player_queue_config_value = lambda *args: "library"
++        ports.mass.music.tracks = SimpleNamespace(
++            library_items=ports.dynamic_tracks, get_library_item_by_prov_id=ports.cache_get,
++        )
++        ports.mass.music.get_controller = lambda media_type: ports.mass.music.tracks
++        ports.dynamic_results = [ports.available_track()]
++        ports.dynamic_ignore_cancel = True
++        gate = asyncio.Event()
++        pending = None
++        try:
++            queue = await ports.start()
++            seed = ports.available_track("autoplay-seed")
++            seed.name = "Autoplay seed"
++            await ports.queues.play_media(queue.queue_id, seed, option=QueueOption.ADD, shuffle=False)
++            expected = [item.name for item in ports.queues.items(queue.queue_id)]
++            ports.dynamic_started.clear()
++            ports.recency_started.clear()
++            if during_recency:
++                ports.recency_gate = gate
++                started = ports.recency_started
++            else:
++                ports.dynamic_gate = gate
++                started = ports.dynamic_started
++            ports.queues.set_autoplay(queue.queue_id, True)
++            task_id = f"fill_autoplay_tracks_{queue.queue_id}"
++            callback, args = ports.timers[task_id]
++            pending = ports.create_task(callback(*args), task_id=task_id)
++            await asyncio.wait_for(started.wait(), 0.3)
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            ports.http.status = 200
++            await ports.queues.resume(queue.queue_id)
++            gate.set()
++            await asyncio.wait_for(pending, 0.3)
++            self.assertEqual([item.name for item in ports.queues.items(queue.queue_id)], expected)
++            self.assertFalse(ports.buffers[-1].cancelled)
++        finally:
++            gate.set()
++            if pending is not None:
++                await asyncio.gather(pending, return_exceptions=True)
++            await ports.close()
++
++    async def test_old_autoplay_episode_fetch_cannot_append_to_resumed_session(self) -> None:
++        from music_assistant_models.queue_item import QueueItem
++
++        ports = QueuePorts()
++        first_episode = ports.available_episode("First episode", 0)
++        ports.dynamic_results = [first_episode, ports.available_episode("Late next episode", 1)]
++        ports.dynamic_gate = asyncio.Event()
++        ports.dynamic_ignore_cancel = True
++        pending = None
++        try:
++            queue = await ports.start()
++            await ports.queues.load(queue.queue_id, [QueueItem(
++                queue_id=queue.queue_id, queue_item_id="first-episode", name="First episode",
++                duration=100, media_item=first_episode,
++            )], insert_at_index=1)
++            ports.queues.set_autoplay(queue.queue_id, True)
++            task_id = f"fill_autoplay_tracks_{queue.queue_id}"
++            callback, args = ports.timers[task_id]
++            pending = ports.create_task(callback(*args), task_id=task_id)
++            await asyncio.wait_for(ports.dynamic_started.wait(), 0.3)
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            ports.http.status = 200
++            await ports.queues.resume(queue.queue_id)
++            ports.dynamic_gate.set()
++            await asyncio.wait_for(pending, 0.3)
++            self.assertEqual(
++                [item.name for item in ports.queues.items(queue.queue_id)],
++                ["Audible track", "First episode"],
++            )
++            self.assertFalse(ports.buffers[-1].cancelled)
++        finally:
++            ports.dynamic_gate.set()
++            if pending is not None:
++                await asyncio.gather(pending, return_exceptions=True)
++            await ports.close()
++
++    async def test_old_finite_refill_cannot_retire_sources_owned_by_resumed_session(self) -> None:
++        from music_assistant_models.media_items import Album
++
++        ports = QueuePorts()
++        ports.dynamic_gate = asyncio.Event()
++        ports.dynamic_ignore_cancel = True
++        ports.dynamic_results = [ports.available_track()]
++        pending = None
++        try:
++            queue = await ports.start(dynamic=True)
++            ports.queues.store_sources(queue, [Album(
++                item_id="finite-album", provider="test", name="Finite album",
++                provider_mappings=ports.provider_mappings("finite-album"),
++            )])
++            task_id = f"fill_dynamic_tracks_{queue.queue_id}"
++            callback, args = ports.timers[task_id]
++            pending = ports.create_task(callback(*args), task_id=task_id)
++            await asyncio.wait_for(ports.dynamic_started.wait(), 0.3)
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            ports.http.status = 200
++            await ports.queues.resume(queue.queue_id)
++            ports.dynamic_gate.set()
++            await asyncio.wait_for(pending, 0.3)
++            self.assertEqual([source.name for source in queue.sources], ["Finite album"])
++            self.assertEqual([item.name for item in ports.queues.items(queue.queue_id)], ["Audible track"])
++        finally:
++            ports.dynamic_gate.set()
++            if pending is not None:
++                await asyncio.gather(pending, return_exceptions=True)
++            await ports.close()
++
++    async def test_inflight_available_dynamic_refill_cannot_append_to_resumed_session(self) -> None:
++        await self._assert_inflight_dynamic_refill_is_retired(resume=True)
++
++    async def test_inflight_available_dynamic_refill_cannot_append_after_loss_without_resume(self) -> None:
++        await self._assert_inflight_dynamic_refill_is_retired(resume=False)
++
++    async def test_unconfigured_queue_keeps_existing_playback_without_observation(self) -> None:
++        from music_assistant_models.enums import PlaybackState
++
++        ports = QueuePorts()
++        ports.player.values["output_preparation_url"] = ""
++        ports.player.values["output_verification_interval"] = False
++        try:
++            queue = await ports.start()
++            ports.http.status = 503
++            await asyncio.sleep(0.05)
++            self.assertEqual(queue.state, PlaybackState.PLAYING)
++            self.assertEqual(ports.http.requests, [])
++            self.assertFalse(ports.buffers[0].cancelled)
++            self.assertFalse(ports.stop_started.is_set())
++        finally:
++            await ports.close()
++
++    async def test_late_playing_report_cannot_advance_interrupted_item_or_timeline(self) -> None:
++        from music_assistant_models.enums import PlaybackState
++        from music_assistant_models.queue_item import QueueItem
++        from music_assistant.models.player import PlayerMedia
++
++        ports = QueuePorts()
++        try:
++            queue = await ports.start()
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            await ports.queues.load(queue.queue_id, [QueueItem(
++                queue_id=queue.queue_id, queue_item_id="next-track", name="Next track", duration=100,
++            )], insert_at_index=1)
++            ports.player.current_media = PlayerMedia(
++                uri="test://next", source_id=queue.queue_id, queue_item_id="next-track",
++            )
++            ports.player.state.playback_state = PlaybackState.PLAYING
++            ports.player.state.corrected_elapsed_time = 500
++            ports.queues.on_player_update(ports.player, {})
++            ports.queues.on_player_elapsed_time_corrected(ports.player)
++            self.assertEqual(queue.state, PlaybackState.IDLE)
++            self.assertEqual(queue.current_index, 0)
++            self.assertEqual(queue.current_item.queue_item_id, "audible-track")
++            self.assertEqual(queue.elapsed_time, 98)
++            self.assertEqual(queue.resume_pos, 98)
++            self.assertEqual(len(ports.started_media), 1)
++        finally:
++            await ports.close()
++
++    async def test_resume_queued_before_loss_teardown_uses_fresh_nonce_and_retires_old_source(self) -> None:
++        from music_assistant_models.enums import PlaybackState
++
++        ports = QueuePorts()
++        try:
++            queue = await ports.start()
++            old_nonce = ports.http.requests[0][1]["json"]["lease_id"]
++            async with ports.player_controller.get_player_lock(queue.queue_id):
++                resume = asyncio.create_task(ports.queues.resume(queue.queue_id))
++                await asyncio.sleep(0)
++                ports.http.status = 503
++                await asyncio.wait_for(ports.media.stream_stopped.wait(), 0.3)
++                ports.http.status = 200
++            await asyncio.wait_for(resume, 0.5)
++            await asyncio.sleep(0.03)
++            prepares = [body["json"]["lease_id"] for url, body in ports.http.requests
++                        if url.endswith("/prepare")]
++            self.assertEqual(len(prepares), 2)
++            self.assertNotEqual(prepares[-1], old_nonce)
++            self.assertTrue(ports.buffers[0].cancelled)
++            self.assertFalse(ports.buffers[-1].cancelled)
++            self.assertEqual(queue.state, PlaybackState.PLAYING)
++        finally:
++            await ports.close()
++
++    async def test_old_dynamic_timer_cannot_fetch_into_explicitly_resumed_session(self) -> None:
++        ports = QueuePorts()
++        try:
++            queue = await ports.start(dynamic=True)
++            callback, args = ports.timers[f"fill_dynamic_tracks_{queue.queue_id}"]
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            ports.http.status = 200
++            await ports.queues.resume(queue.queue_id)
++            await callback(*args)
++            self.assertEqual(ports.dynamic_fetches, 0)
++            self.assertFalse(ports.buffers[-1].cancelled)
++        finally:
++            await ports.close()
++
++    async def test_delayed_dynamic_refill_timer_cannot_fetch_after_output_loss(self) -> None:
++        ports = QueuePorts()
++        try:
++            queue = await ports.start(dynamic=True)
++            callback, args = ports.timers[f"fill_dynamic_tracks_{queue.queue_id}"]
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            self.assertNotIn(f"fill_dynamic_tracks_{queue.queue_id}", ports.timers)
++            await callback(*args)
++            self.assertEqual(ports.dynamic_fetches, 0)
++            self.assertFalse(queue.ended)
++            self.assertEqual(len(ports.queues.items(queue.queue_id)), 1)
++        finally:
++            await ports.close()
++
++    async def test_management_failure_timeout_and_malformed_response_fail_closed_without_reprepare(self) -> None:
++        from aiohttp import ClientConnectionError
++
++        for failure in ("http", "timeout", "json", "uncorrelated", "network", "unexpected"):
++            with self.subTest(failure=failure):
++                ports = QueuePorts()
++                ports.player.values["output_preparation_timeout"] = 0.02
++                try:
++                    queue = await ports.start()
++                    ready_requests = len(ports.http.requests)
++                    if failure == "http":
++                        ports.http.status = 503
++                    elif failure == "timeout":
++                        ports.http.gate = asyncio.Event()
++                    elif failure == "json":
++                        ports.http.prepare_error = ValueError("invalid JSON")
++                    elif failure == "uncorrelated":
++                        ports.http.payload_updates = {"output_epoch": True}
++                    elif failure == "network":
++                        ports.http.prepare_error = ClientConnectionError("transport unavailable")
++                    else:
++                        ports.http.prepare_error = RuntimeError("unexpected response failure")
++                    await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++                    self.assertEqual(queue.resume_pos, 98)
++                    self.assertFalse(queue.ended)
++                    actions = [url.rsplit("/", 1)[-1] for url, _ in ports.http.requests]
++                    self.assertEqual(actions.count("prepare"), 1)
++                    self.assertEqual(
++                        [url.rsplit("/", 1)[-1] for url, _ in ports.http.requests[ready_requests:]],
++                        ["verify", "release"],
++                    )
++                    before = len(ports.http.requests)
++                    await asyncio.sleep(0.05)
++                    self.assertEqual(len(ports.http.requests), before)
++                finally:
++                    await ports.close()
++
++    async def test_real_content_eof_still_settles_queue_and_releases_ended_lease(self) -> None:
++        ports = QueuePorts()
++        try:
++            queue = await ports.start()
++            ports.media.eof.set()
++            await asyncio.wait_for(ports.player.playback_session.playback_task, 0.3)
++            await asyncio.sleep(5.2)
++            self.assertTrue(queue.ended)
++            self.assertEqual(queue.current_index, 0)
++            releases = [body["json"]["reason"] for url, body in ports.http.requests
++                        if url.endswith("/release")]
++            self.assertEqual(releases, ["ended"])
++            before = len(ports.http.requests)
++            await asyncio.sleep(0.05)
++            self.assertEqual(len(ports.http.requests), before)
++        finally:
++            await ports.close()
++
++    async def test_loss_cancels_already_scheduled_natural_settlement_and_dynamic_refill(self) -> None:
++        from music_assistant_models.media_items import Radio
++
++        ports = QueuePorts()
++        ports.player.values["output_verification_interval"] = 0.05
++        try:
++            queue = await ports.start()
++            ports.queues.store_sources(queue, [Radio(
++                item_id="dynamic-radio", provider="test", name="Dynamic radio",
++                provider_mappings=set(), is_dynamic=True,
++            )])
++            await ports.group_stop()
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            await asyncio.sleep(5.2)
++            self.assertEqual(ports.dynamic_fetches, 0)
++            self.assertFalse(queue.ended)
++            self.assertEqual(queue.current_index, 0)
++            self.assertEqual(queue.resume_pos, 98)
++        finally:
++            await ports.close()
++
++    async def test_old_source_cleanup_and_loss_report_cannot_retire_resumed_output(self) -> None:
++        from music_assistant_models.enums import PlaybackState
++
++        ports = QueuePorts()
++        ports.source_close_gate = asyncio.Event()
++        try:
++            queue = await ports.start()
++            old_media = ports.started_media[-1]
++            old_nonce = ports.http.requests[0][1]["json"]["lease_id"]
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_close_started.wait(), 0.3)
++            ports.http.status = 200
++            await ports.queues.resume(queue.queue_id)
++            new_buffer = ports.buffers[-1]
++            new_nonce = [body["json"]["lease_id"] for url, body in ports.http.requests
++                         if url.endswith("/prepare")][-1]
++            self.assertNotEqual(new_nonce, old_nonce)
++            await ports.queues.handle_output_loss(
++                queue.queue_id, old_media.queue_session_id,
++                lambda: self.fail("Old observation cannot touch the successor task or lease"),
++            )
++            ports.source_close_gate.set()
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            await asyncio.sleep(0.03)
++            self.assertEqual(queue.state, PlaybackState.PLAYING)
++            self.assertFalse(new_buffer.cancelled)
++            self.assertIs(ports.queues.get_item(queue.queue_id, 0).streamdetails.buffer, new_buffer)
++            releases = [body["json"]["lease_id"] for url, body in ports.http.requests
++                        if url.endswith("/release")]
++            self.assertEqual(releases, [old_nonce])
++        finally:
++            await ports.close()
++
++    async def test_explicit_resume_reprepares_same_item_at_saved_position(self) -> None:
++        from music_assistant_models.enums import PlaybackState
++
++        ports = QueuePorts()
++        try:
++            queue = await ports.start()
++            old_media = ports.started_media[-1]
++            old_nonce = ports.http.requests[0][1]["json"]["lease_id"]
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            ports.http.status = 200
++            await ports.queues.resume(queue.queue_id)
++            self.assertEqual(queue.state, PlaybackState.PLAYING)
++            self.assertEqual(queue.current_index, 0)
++            self.assertEqual(queue.current_item.queue_item_id, "audible-track")
++            self.assertEqual(ports.queues.get_item(queue.queue_id, 0).streamdetails.seek_position, 98)
++            prepares = [body["json"] for url, body in ports.http.requests if url.endswith("/prepare")]
++            self.assertEqual(len(prepares), 2)
++            self.assertNotEqual(prepares[-1]["lease_id"], old_nonce)
++            await ports.queues.handle_output_loss(
++                queue.queue_id, old_media.queue_session_id,
++                lambda: self.fail("Stale session must be rejected before touching playback"),
++            )
++            self.assertEqual(queue.state, PlaybackState.PLAYING)
++            self.assertFalse(ports.buffers[-1].cancelled)
++        finally:
++            await ports.close()
++
++    async def test_pause_before_observation_keeps_saved_resume_and_cancels_source(self) -> None:
++        ports = QueuePorts()
++        ports.player.values["output_verification_interval"] = 0.1
++        try:
++            queue = await ports.start()
++            ports.http.status = 503
++            await ports.queues.pause(queue.queue_id)
++            self.assertEqual(queue.resume_pos, 98)
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            await asyncio.sleep(5.1)
++            self.assertEqual(queue.resume_pos, 98)
++            self.assertEqual(queue.current_index, 0)
++            self.assertFalse(queue.ended)
++            self.assertEqual(len(ports.started_media), 1)
++        finally:
++            await ports.close()
++
++    async def test_flow_loss_rejects_late_buffer_completed_auto_resume(self) -> None:
++        from music_assistant_models.player_queue import PlayLogEntry
++        from music_assistant_models.queue_item import QueueItem
++
++        ports = QueuePorts()
++        try:
++            queue = await ports.start()
++            queue.flow_mode = True
++            ports.queues.queue_data(queue.queue_id).flow_mode_stream_log = [
++                PlayLogEntry(queue_item_id="audible-track", duration=100, seconds_streamed=100)
++            ]
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            ports.http.status = 200
++            await ports.queues.load(queue.queue_id, [QueueItem(
++                queue_id=queue.queue_id, queue_item_id="next-track", name="Next track", duration=100,
++            )], insert_at_index=1)
++            ports.queues.queue_buffer_completed(queue.queue_id, queue_exhausted=True)
++            await asyncio.sleep(2.2)
++            self.assertEqual(len(ports.started_media), 1)
++            self.assertEqual(queue.current_index, 0)
++            self.assertEqual(queue.current_item.queue_item_id, "audible-track")
++            self.assertEqual(queue.resume_pos, 98)
++            self.assertFalse(queue.ended)
++        finally:
++            await ports.close()
++
++    async def test_active_output_loss_freezes_audible_item_and_source_near_eof(self) -> None:
++        ports = QueuePorts()
++        try:
++            queue = await ports.start()
++            ports.http.status = 503
++            await asyncio.wait_for(ports.stop_started.wait(), 0.3)
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            await asyncio.sleep(5.1)
++            self.assertEqual(queue.current_index, 0)
++            self.assertEqual(queue.current_item.queue_item_id, "audible-track")
++            self.assertEqual(queue.resume_pos, 98)
++            self.assertFalse(queue.ended)
++            self.assertEqual(len(ports.started_media), 1)
++            self.assertTrue(ports.buffers[0].cancelled)
++            self.assertIn("verify", [url.rsplit("/", 1)[-1] for url, _ in ports.http.requests])
++        finally:
++            await ports.close()
++
++
++    async def _assert_inflight_dynamic_refill_is_retired(self, *, resume: bool) -> None:
++        ports = QueuePorts()
++        ports.dynamic_gate = asyncio.Event()
++        ports.dynamic_ignore_cancel = True
++        ports.dynamic_results = [ports.available_track()]
++        pending = None
++        try:
++            self.assertTrue(ports.dynamic_results[0].available)
++            queue = await ports.start(dynamic=True)
++            task_id = f"fill_dynamic_tracks_{queue.queue_id}"
++            callback, args = ports.timers[task_id]
++            pending = ports.create_task(callback(*args), task_id=task_id)
++            await asyncio.wait_for(ports.dynamic_started.wait(), 0.3)
++            ports.http.status = 503
++            await asyncio.wait_for(ports.source_closed.wait(), 0.3)
++            if resume:
++                ports.http.status = 200
++                await ports.queues.resume(queue.queue_id)
++            ports.dynamic_gate.set()
++            await asyncio.wait_for(pending, 0.3)
++            self.assertEqual(
++                [item.name for item in ports.queues.items(queue.queue_id)], ["Audible track"]
++            )
++            self.assertEqual(ports.buffers[-1].cancelled, not resume)
++        finally:
++            ports.dynamic_gate.set()
++            if pending is not None:
++                await asyncio.gather(pending, return_exceptions=True)
++            await ports.close()
++
++
 +class OutputPreparationSessionTests(unittest.IsolatedAsyncioTestCase):
 +    """Exercise the existing session's public start/cancel pre-stream seam."""
++
++    async def test_configured_session_rejects_unbounded_verification_interval_before_source(self) -> None:
++        from music_assistant.models.player import PlayerMedia
++        from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
++
++        for interval in (0, -1, True, float("nan"), float("inf"), 16, "1"):
++            with self.subTest(interval=interval):
++                http = HttpPort()
++                ports = MediaPorts()
++                player = SessionPlayer(http, ports)
++                player.values["output_verification_interval"] = interval
++                session = SendspinPlaybackSession(player)
++                await session.start(PlayerMedia(uri="test://track"))
++                try:
++                    with self.assertRaisesRegex(RuntimeError, "bounded positive interval"):
++                        await asyncio.wait_for(session.playback_task, 0.2)
++                    self.assertEqual(ports.events, [])
++                    self.assertEqual(http.requests, [])
++                finally:
++                    await session.cancel("cleanup")
 +
 +    async def test_configured_session_rejects_float_or_unsupported_negotiation_before_http(self) -> None:
 +        from music_assistant.models.player import PlayerMedia

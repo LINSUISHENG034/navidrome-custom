@@ -58,7 +58,7 @@
       "patches": [
         {
           "file": "ma-output-preparation.patch",
-          "sha256": "ce60c70da3571bd9ece7384813a662a58fc161646e338ea5c0b1bb1747c4e4fb"
+          "sha256": "7a61eeb3e99969b9152d93689f35e0aaf671860e6bc9e9476feeda5e139b17c1"
         }
       ]
     },
