@@ -149,3 +149,9 @@ Blocked by: 01, 02, 03
 - **失败步骤如实保留与验证层评估**：export 前 helper 按字符串而非原算法的 `Path` 排序，指纹 guard 在任何写入前停止；按原算法核实三树匹配后仅修正 helper。额外 SDK 命令重复 `-B -m unittest`，首次 exit 2、零测试，原 `sdk-class-replay.json` 保留；改为复用捕获的公开 runner 安全 command prefix 后一次重跑 39/39，记录于独立的 verified 文件。宿主修正语句也曾因语法错误在执行前被拒绝，未运行测试或写文件。临时验证脚本的多次配置差错不归因于产品源码：验证层应收敛到既有 runner/清单的单一命令构造，不继续堆叠临时参数拼接或另建 runner；这些证据不支持更换 MA/SDK 产品栈。协调者最终安装后 `validate`、runner `Ran 57 tests in 0.825s / OK` 与仓库 `git diff --check` 通过。
 - **范围与下一步**：native 调用无法被线程 join 强制终止；超时/取消保留资源所有权并拒绝重建，清理失败由显式 stop 重试驱动，不宣称自治回收 daemon。完整 daemon/TUI finalizer、subprocess reap、失联反馈到 MA 的 source/timeline、controller/WebSocket 与硬件/声学验收仍开放；本票仍 claimed。下一切片的只读核查建议复用现有 lease Interface，但先改成不重连/不唤醒的 fresh 复验，再由 MA 播放会话有界监测并经权威 pause/stop 冻结进度；当前显式 PCM 复验调用 Prepare 会隐式修复失联，不能直接加轮询后冒充可靠失联反馈。该建议尚未实现或测试。
 - **未执行**：完整 upstream lint/pre-commit/pytest、patched image 构建/发布、生产部署、真实音箱或声学实验均未执行；无宿主依赖安装，测试容器固定 digest、断网、只读、去 capabilities、禁止提权，无生产数据、host network、音频、Pulse 或 D-Bus 挂载。真实设备仍须逐次确认维护窗口，软件检查点不关闭硬件票。
+
+### 2026-10-11 运行中失联反馈切片：续认领与实施范围
+
+- **续认领**：用户本轮要求继续推进本目录计划；沿用地图已记录的技术判断与隔离开发授权，本票保持 claimed，不把软件测试当作硬件票解阻塞。
+- **顺序与 Interface**：先把现有 lease 复验收敛为不 Connect、不 wake、不重新分配 native output 的 fresh、相关联检查；再评估 MA 现有播放会话中的配置化有界监测。失联由 MA 的权威 pause-as-stop 路径冻结 source/timeline 并保留队列，不当作自然 EOF 或推进下一曲；恢复需新的 Prepare。旧任务、取消和 successor 的竞争由同一使用权关联约束，未配置路径保持兼容。
+- **验证计划**：在新的 runner-owned 隔离 root 内恢复锁定 canonical 基线，逐项公开 Interface red→green，独立审阅冻结候选，再全新 provenance 重放。只修改现有补丁/清单和本票进度；不复制上游源码、不另建 runner、不触碰已有未跟踪资产或生产/真实输出。本检查点尚无新实现、测试或成功结论；若 MA 整体接入尚未可安全验收，先交付可独立使用的非修复式复验前置切片并明确剩余范围。
