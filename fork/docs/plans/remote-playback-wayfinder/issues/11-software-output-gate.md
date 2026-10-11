@@ -174,3 +174,10 @@ Blocked by: 01, 02, 03
 - **验证过程边界**：复用既有 runner、drive、fingerprint/probe/fixture adapter 和捕获的安全 command prefix，无新增 runner/helper。协调者只读证据摘要误将整数 `compiled_python_files` 当列表调用 `len()`，产生 `TypeError`；无测试或文件改动，改用直接 Read 核对 24，不归因于产品失败，也未继续堆叠参数构造。passing suite 中出现的 native/monitor/HTTP 故障 traceback 是既有注入断言，不是测试失败。
 - **交付与剩余范围**：交付 authenticated、有界、相关联的非修复式复验 Interface 及 MA client；active-session polling、MA abnormal-loss disposition/source/timeline 冻结仍未接入。下一阶段沿用前述 queue-owned seam 和公开集成测试，不用 polling+普通 Stop 替代权威证明。本票保持 claimed，硬件票保持 blocked；完整 upstream lint/pre-commit/pytest、patched image 构建/发布、生产操作、真实音箱/声学实验均未执行。回退只需撤销本次 canonical 代码提交，不涉及生产容器或数据。
 - **验收后的补充证据登记**：canonical 代码提交 `31552020` 已备份到 fork 同名开发分支。审阅者补充报告 MA `/verify` 阴性公开 probes 3/3（0.014 秒，wall 5.406 秒，exit 0），覆盖 HTTP 503、无效 JSON、非 ready/外部 output/null 或 bool epoch，均拒绝且无 Prepare/Release 副作用；协调者核对 `review-verify-evidence/ma-adversarial-probes.json` 真实输出，完整 7248 文件 freeze guard 仍不变。该补充登记不修改产品代码或扩大验收范围；WSGI 外层 504 取消观察与内层 fresh 检查截止 503/撤销当前 lease 已在 Interface 分开说明。
+
+### 2026-10-11 MA 运行中失联权威处理：续认领与范围
+
+- **起点与续认领**：用户要求继续；沿用地图中的技术判断/隔离软件开发授权，本票保持 claimed。起点为已验收的非修复式复验 `31552020` 和补充证据 `68ca8852`；协调者本轮 canonical `validate` 成功、runner 57/57（0.816 秒），已跟踪工作区干净。
+- **目标与单一权威**：配置化有界的 active-session 观察调用现有 `verify()`，失联由现有 MA queue-control seam 集中处理异常 disposition；在 awaited teardown 前保存或沿用权威 `resume_pos`、current item/index，并关联 queue session、playback task 和 lease。复用现有源/缓冲/预加载清理，抑制失联后的自然结算、动态补队列与延迟自动恢复；explicit resume 才清除 disposition 并重新 Prepare。Bridge Pause 先到时不得从 STOPPED 的零时间重算位置，旧观察/清理不得影响 successor。不复制队列/时间线，不把普通 Stop 或仅暂停 downstream 当完整冻结。
+- **实施与测试范围**：优先只扩展既有 MA provider/queue/controller 模块及现有测试文件；Bridge/SDK 先保持已验收字节。新 runner-owned export root 保留修改前完整 inventory、Git/provenance 和逐项公开 red→green 证据；测试实际 queue/tracker/source/buffer seams，包括 flow/non-flow 近曲终失联、Pause 先到、旧会话晚到/explicit resume、正常 EOF、配置关闭与管理面故障。候选须冻结、独立审阅及全新 runner 重放后再 canonical 写回；若变成 broad queue rewrite 或三次同类集成阻塞，暂停并评估较小安全切片，不盲目扩大实现。本检查点尚无新功能/测试成功结论。
+- **边界**：无新模块/文档/runner、无宿主依赖安装、无生产服务/配置/数据库/音乐库/真实音箱操作；只允许固定 digest 断网只读软件 sandbox，硬件票仍 blocked，完整 upstream 和声学证明仍独立计算。
