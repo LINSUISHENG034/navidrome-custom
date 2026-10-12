@@ -383,12 +383,7 @@ var _ = Describe("MPV null output prototype", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		var processLog bytes.Buffer
 		// Explicit null AO without fallback and no config/scripts must never use a host output.
-		cmd := exec.CommandContext(ctx, path,
-			"--no-config", "--load-scripts=no", "--no-video", "--vo=null", "--no-audio-display",
-			"--ao=null", "--audio-fallback-to-null=no", "--idle=yes", "--pause=yes",
-			"--gapless-audio=yes", "--audio-samplerate=48000", "--audio-format=s16", "--audio-channels=stereo",
-			"--input-ipc-server="+socket,
-		)
+		cmd := exec.CommandContext(ctx, path, nullOutputMPVArgs(socket)...)
 		cmd.Stdout, cmd.Stderr = &processLog, &processLog
 		DeferCleanup(func() {
 			cancel()
@@ -485,7 +480,99 @@ var _ = Describe("MPV null output prototype", func() {
 		_, err = probe.command("quit")
 		Expect(err).ToNot(HaveOccurred())
 	})
+
+	It("does not report natural completion when only IPC transport closes", func() {
+		if os.Getenv("ND_TEST_MPV_NULL_OUTPUT") != "1" {
+			Skip("Set ND_TEST_MPV_NULL_OUTPUT=1 to run the real MPV null-output prototype")
+		}
+		tests.SkipOnWindows("prototype uses a Unix IPC socket")
+		DeferCleanup(configtest.SetupConfig())
+		mpvOnce = sync.Once{}
+		mpvPath, mpvErr = "", nil
+		DeferCleanup(func() {
+			mpvOnce = sync.Once{}
+			mpvPath, mpvErr = "", nil
+		})
+
+		path, err := exec.LookPath("mpv")
+		Expect(err).ToNot(HaveOccurred())
+		dir := GinkgoT().TempDir()
+		Expect(writeNullOutputWAV(filepath.Join(dir, "transport-fault.wav"))).To(Succeed())
+		args := append([]string{"mpv"}, nullOutputMPVArgs("%s")...)
+		conf.Server.MPVPath = path
+		conf.Server.MPVCmdTemplate = strings.Join(append(args, "%f"), " ")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		DeferCleanup(cancel)
+		playbackDone := make(chan bool, 1)
+		track, err := NewTrack(ctx, playbackDone, "auto", model.MediaFile{
+			ID: "transport-fault", LibraryPath: dir, Path: "transport-fault.wav", Suffix: "wav",
+		})
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func() {
+			cancel()
+			track.Close()
+			_ = track.Conn.Close()
+			_ = track.Exe.Close()
+		})
+		var processLog bytes.Buffer
+		outputDone := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(&processLog, track.Exe)
+			close(outputDone)
+		}()
+		DeferCleanup(func() {
+			cancel()
+			select {
+			case <-outputDone:
+				fmt.Fprintf(GinkgoWriter, "NewTrack process output:\n%s\n", processLog.String())
+			case <-time.After(time.Second):
+				fmt.Fprintln(GinkgoWriter, "NewTrack output drain exceeded cleanup observation window")
+			}
+		})
+
+		// Independent IPC observes the live paused player while only NewTrack's transport is closed.
+		conn, err := net.DialTimeout("unix", track.IPCSocketName, 100*time.Millisecond)
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func() { _ = conn.Close() })
+		probe := &nullOutputProbe{conn: conn, decoder: json.NewDecoder(conn)}
+		Eventually(func() (any, error) {
+			return probe.command("get_property", "current-ao")
+		}, 2*time.Second, 20*time.Millisecond).Should(Equal("null"))
+		paused, err := probe.command("get_property", "pause")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(paused).To(BeTrue())
+		position, err := probe.command("get_property", "time-pos")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(position).To(BeNumerically("<=", 0.001))
+		Consistently(func() (any, error) {
+			return probe.command("get_property", "time-pos")
+		}, 200*time.Millisecond, 20*time.Millisecond).Should(Equal(position))
+		fmt.Fprintf(GinkgoWriter, "Before transport fault: pause=%v, time-pos=%v, current-ao=null\n", paused, position)
+		Expect(playbackDone).ToNot(Receive())
+
+		Expect(track.Conn.Close()).To(Succeed())
+		paused, err = probe.command("get_property", "pause")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(paused).To(BeTrue())
+		position, err = probe.command("get_property", "time-pos")
+		Expect(err).ToNot(HaveOccurred())
+		fmt.Fprintf(GinkgoWriter, "After transport fault: independent player pause=%v, time-pos=%v\n", paused, position)
+		select {
+		case completed := <-playbackDone:
+			Fail(fmt.Sprintf("Transport fault incorrectly reported playback completion=%v while the player is still paused", completed))
+		case <-time.After(500 * time.Millisecond):
+		}
+	})
 })
+
+func nullOutputMPVArgs(socket string) []string {
+	return []string{
+		"--no-config", "--load-scripts=no", "--no-video", "--vo=null", "--no-audio-display",
+		"--ao=null", "--audio-fallback-to-null=no", "--idle=yes", "--pause=yes",
+		"--gapless-audio=yes", "--audio-samplerate=48000", "--audio-format=s16", "--audio-channels=stereo",
+		"--input-ipc-server=" + socket,
+	}
+}
 
 // This IPC probe retains real events and bounds every exchange; no ready events are fabricated.
 type nullOutputProbe struct {
