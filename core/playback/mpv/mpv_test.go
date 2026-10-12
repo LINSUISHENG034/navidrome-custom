@@ -1,10 +1,15 @@
 package mpv
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -357,6 +362,206 @@ var _ = Describe("MPV", func() {
 		})
 	})
 })
+
+// Public-state observations with null AO do not prove physical readiness or native output identity.
+var _ = Describe("MPV null output prototype", func() {
+	It("observes paused output without advancing and distinguishes file lifecycle events", func() {
+		if os.Getenv("ND_TEST_MPV_NULL_OUTPUT") != "1" {
+			Skip("Set ND_TEST_MPV_NULL_OUTPUT=1 to run the real MPV null-output prototype")
+		}
+		tests.SkipOnWindows("prototype uses a Unix IPC socket")
+
+		path, err := exec.LookPath("mpv")
+		Expect(err).ToNot(HaveOccurred())
+		dir := GinkgoT().TempDir()
+		first := filepath.Join(dir, "first.wav")
+		second := filepath.Join(dir, "second.wav")
+		Expect(writeNullOutputWAV(first)).To(Succeed())
+		Expect(writeNullOutputWAV(second)).To(Succeed())
+		socket := filepath.Join(dir, "mpv.socket")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		var processLog bytes.Buffer
+		// Explicit null AO without fallback and no config/scripts must never use a host output.
+		cmd := exec.CommandContext(ctx, path,
+			"--no-config", "--load-scripts=no", "--no-video", "--vo=null", "--no-audio-display",
+			"--ao=null", "--audio-fallback-to-null=no", "--idle=yes", "--pause=yes",
+			"--gapless-audio=yes", "--audio-samplerate=48000", "--audio-format=s16", "--audio-channels=stereo",
+			"--input-ipc-server="+socket,
+		)
+		cmd.Stdout, cmd.Stderr = &processLog, &processLog
+		DeferCleanup(func() {
+			cancel()
+			_ = cmd.Wait()
+			fmt.Fprintf(GinkgoWriter, "MPV process output:\n%s\n", processLog.String())
+		})
+		Expect(cmd.Start()).To(Succeed())
+
+		var conn net.Conn
+		Eventually(func() error {
+			conn, err = net.DialTimeout("unix", socket, 100*time.Millisecond)
+			return err
+		}, 3*time.Second, 20*time.Millisecond).Should(Succeed())
+		DeferCleanup(func() { _ = conn.Close() })
+		probe := &nullOutputProbe{conn: conn, decoder: json.NewDecoder(conn)}
+		properties := []string{"current-ao", "audio-out-params", "pause", "time-pos", "idle-active"}
+		inspect := func(stage string) map[string]any {
+			state := make(map[string]any)
+			for _, name := range properties {
+				value, err := probe.command("get_property", name)
+				if err != nil {
+					state[name] = err.Error()
+				} else {
+					state[name] = value
+				}
+			}
+			fmt.Fprintf(GinkgoWriter, "%s: %v\n", stage, state)
+			return state
+		}
+		inspect("idle before content")
+
+		_, err = probe.command("loadfile", first, "replace")
+		Expect(err).ToNot(HaveOccurred())
+		_, err = probe.waitEvent("file-loaded")
+		Expect(err).ToNot(HaveOccurred())
+		Eventually(func() error {
+			_, err := probe.command("get_property", "audio-out-params")
+			return err
+		}, 2*time.Second, 20*time.Millisecond).Should(Succeed())
+		state := inspect("first loaded while paused")
+		Expect(state["current-ao"]).To(Equal("null"))
+		Expect(state["audio-out-params"]).To(HaveKeyWithValue("samplerate", float64(48000)))
+		Expect(state["pause"]).To(BeTrue())
+		Expect(state["time-pos"]).To(BeNumerically("<=", 0.001))
+		Consistently(func() (any, error) {
+			return probe.command("get_property", "time-pos")
+		}, 300*time.Millisecond, 25*time.Millisecond).Should(Equal(state["time-pos"]))
+
+		_, err = probe.command("set_property", "pause", false)
+		Expect(err).ToNot(HaveOccurred())
+		Eventually(func() (any, error) {
+			return probe.command("get_property", "time-pos")
+		}, time.Second, 20*time.Millisecond).Should(BeNumerically(">", 0.05))
+		_, err = probe.command("set_property", "pause", true)
+		Expect(err).ToNot(HaveOccurred())
+		_, err = probe.command("seek", 0.5, "absolute+exact")
+		Expect(err).ToNot(HaveOccurred())
+		Eventually(func() (any, error) {
+			return probe.command("get_property", "time-pos")
+		}, time.Second, 20*time.Millisecond).Should(BeNumerically("~", 0.5, 0.01))
+		inspect("first paused after seek")
+
+		_, err = probe.command("loadfile", second, "replace")
+		Expect(err).ToNot(HaveOccurred())
+		ended, err := probe.waitEvent("end-file")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ended["reason"]).To(Equal("stop"))
+		_, err = probe.waitEvent("file-loaded")
+		Expect(err).ToNot(HaveOccurred())
+		state = inspect("second loaded in persistent process")
+		Expect(state["current-ao"]).To(Equal("null"))
+		Expect(state["pause"]).To(BeTrue())
+		_, err = probe.command("set_property", "pause", false)
+		Expect(err).ToNot(HaveOccurred())
+		ended, err = probe.waitEvent("end-file")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ended["reason"]).To(Equal("eof"))
+		state = inspect("idle after natural EOF")
+		Expect(state["idle-active"]).To(BeTrue())
+
+		_, err = probe.command("set_property", "pause", true)
+		Expect(err).ToNot(HaveOccurred())
+		_, err = probe.command("loadfile", first, "replace")
+		Expect(err).ToNot(HaveOccurred())
+		_, err = probe.waitEvent("file-loaded")
+		Expect(err).ToNot(HaveOccurred())
+		_, err = probe.command("stop")
+		Expect(err).ToNot(HaveOccurred())
+		ended, err = probe.waitEvent("end-file")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ended["reason"]).To(Equal("stop"))
+		state = inspect("idle after explicit stop")
+		Expect(state["idle-active"]).To(BeTrue())
+		_, err = probe.command("quit")
+		Expect(err).ToNot(HaveOccurred())
+	})
+})
+
+// This IPC probe retains real events and bounds every exchange; no ready events are fabricated.
+type nullOutputProbe struct {
+	conn      net.Conn
+	decoder   *json.Decoder
+	requestID int
+	events    []map[string]any
+}
+
+func (p *nullOutputProbe) command(args ...any) (any, error) {
+	p.requestID++
+	if err := p.conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return nil, err
+	}
+	if err := json.NewEncoder(p.conn).Encode(map[string]any{"command": args, "request_id": p.requestID}); err != nil {
+		return nil, err
+	}
+	for {
+		var message map[string]any
+		if err := p.decoder.Decode(&message); err != nil {
+			return nil, err
+		}
+		if message["event"] != nil {
+			p.events = append(p.events, message)
+			fmt.Fprintf(GinkgoWriter, "MPV event: %v\n", message)
+			continue
+		}
+		if message["request_id"] == float64(p.requestID) {
+			if message["error"] != "success" {
+				return nil, fmt.Errorf("MPV %v: %v", args, message["error"])
+			}
+			return message["data"], nil
+		}
+	}
+}
+
+func (p *nullOutputProbe) waitEvent(name string) (map[string]any, error) {
+	if err := p.conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return nil, err
+	}
+	for {
+		for i, event := range p.events {
+			if event["event"] == name {
+				p.events = append(p.events[:i], p.events[i+1:]...)
+				return event, nil
+			}
+		}
+		var event map[string]any
+		if err := p.decoder.Decode(&event); err != nil {
+			return nil, err
+		}
+		if event["event"] != nil {
+			p.events = append(p.events, event)
+			fmt.Fprintf(GinkgoWriter, "MPV event: %v\n", event)
+		}
+	}
+}
+
+func writeNullOutputWAV(path string) error {
+	const sampleRate, channels, bits, seconds = 8000, 1, 16, 2
+	dataSize := sampleRate * channels * (bits / 8) * seconds
+	header := make([]byte, 44)
+	copy(header[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(header[4:8], uint32(36+dataSize))
+	copy(header[8:16], "WAVEfmt ")
+	binary.LittleEndian.PutUint32(header[16:20], 16)
+	binary.LittleEndian.PutUint16(header[20:22], 1)
+	binary.LittleEndian.PutUint16(header[22:24], channels)
+	binary.LittleEndian.PutUint32(header[24:28], sampleRate)
+	binary.LittleEndian.PutUint32(header[28:32], sampleRate*channels*(bits/8))
+	binary.LittleEndian.PutUint16(header[32:34], channels*(bits/8))
+	binary.LittleEndian.PutUint16(header[34:36], bits)
+	copy(header[36:40], "data")
+	binary.LittleEndian.PutUint32(header[40:44], uint32(dataSize))
+	return os.WriteFile(path, append(header, make([]byte, dataSize)...), 0600)
+}
 
 // createMockMPVScript creates a mock script that outputs arguments to stdout
 func createMockMPVScript(tempDir string) string {
