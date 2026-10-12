@@ -4,8 +4,10 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/navidrome/navidrome/model"
+	"github.com/navidrome/navidrome/tests"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -62,6 +64,103 @@ func TestPlaybackDeviceInvokesStateChangeCallbackOnSkip(t *testing.T) {
 	default:
 		t.Fatal("expected state change callback to be invoked")
 	}
+}
+
+func testPlaybackDeviceCancelsPendingStart(t *testing.T, stop func(*playbackDevice, context.Context) (DeviceStatus, error), resume bool) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	repo := tests.CreateMockMediaFileRepo()
+	repo.SetData(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
+	server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
+	device := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
+	if _, err := device.Set(ctx, []string{"1"}); err != nil {
+		t.Fatalf("set queue: %v", err)
+	}
+
+	track := &mockTrack{}
+	successor := &mockTrack{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	var releaseOnce sync.Once
+	var startStatus DeviceStatus
+	var startErr error
+	previousNewTrack := newTrack
+	calls := 0
+	newTrack = func(context.Context, chan bool, string, model.MediaFile) (Track, error) {
+		calls++
+		if calls == 1 {
+			close(entered)
+			<-release
+			return track, nil
+		}
+		return successor, nil
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("pending start did not finish during cleanup")
+		}
+		newTrack = previousNewTrack
+	})
+	go func() {
+		startStatus, startErr = device.Start(ctx)
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("start did not begin preparing the output")
+	}
+
+	stopped, err := stop(device, ctx)
+	if err != nil || stopped.Playing {
+		t.Fatalf("stop while preparing: status=%#v, err=%v", stopped, err)
+	}
+	if resume {
+		resumed, err := device.Start(ctx)
+		if err != nil || !resumed.Playing {
+			t.Fatalf("successor start: status=%#v, err=%v", resumed, err)
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("start did not finish after releasing the output")
+	}
+	if startErr != nil {
+		t.Fatalf("start completion: %v", startErr)
+	}
+	status, err := device.Status(ctx)
+	if err != nil || status.Playing != resume || startStatus.Playing != resume {
+		t.Fatalf("cancelled preparation changed playback: status=%#v, start=%#v, err=%v", status, startStatus, err)
+	}
+	if track.playing || track.closeCalls != 1 {
+		t.Fatalf("cancelled output was not retired: playing=%v, closes=%d", track.playing, track.closeCalls)
+	}
+	if resume && (!successor.playing || successor.closeCalls != 0) {
+		t.Fatalf("cancelled output displaced successor: playing=%v, closes=%d", successor.playing, successor.closeCalls)
+	}
+	queue, _, err := device.Get(ctx)
+	if err != nil || len(queue) != 1 || queue[0].ID != "1" {
+		t.Fatalf("cancellation changed the authoritative queue: queue=%#v, err=%v", queue, err)
+	}
+}
+
+func TestPlaybackDeviceStopCancelsPendingStart(t *testing.T) {
+	testPlaybackDeviceCancelsPendingStart(t, (*playbackDevice).Stop, false)
+}
+
+func TestPlaybackDeviceShutdownCancelsPendingStart(t *testing.T) {
+	testPlaybackDeviceCancelsPendingStart(t, (*playbackDevice).Shutdown, false)
+}
+
+func TestPlaybackDeviceCancelledStartDoesNotDisplaceSuccessor(t *testing.T) {
+	testPlaybackDeviceCancelsPendingStart(t, (*playbackDevice).Stop, true)
 }
 
 var _ = Describe("playbackDevice concurrency", func() {

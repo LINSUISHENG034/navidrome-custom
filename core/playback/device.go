@@ -23,7 +23,7 @@ type Track interface {
 }
 
 type playbackDevice struct {
-	mu                   sync.Mutex // protects all mutable state
+	mu                   sync.Mutex      // protects all mutable state
 	serviceCtx           context.Context //nolint:containedctx // playback service lifecycle ctx
 	ParentPlaybackServer PlaybackServer
 	Default              bool
@@ -37,6 +37,7 @@ type playbackDevice struct {
 	ActiveTrack          Track
 	onStateChange        func(DeviceStatus)
 	startTrackSwitcher   sync.Once
+	startVersion         uint64
 }
 
 type DeviceStatus struct {
@@ -176,10 +177,18 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, bool, 
 		}
 	} else {
 		if !pd.PlaybackQueue.IsEmpty() {
+			pd.startVersion++
+			version := pd.startVersion
 			idx := pd.PlaybackQueue.Index
 			pd.mu.Unlock()
 			track, err := pd.switchActiveTrackByIndex(idx)
 			pd.mu.Lock()
+			if version != pd.startVersion {
+				if track != nil {
+					track.Close()
+				}
+				return pd.getStatus(), false, nil
+			}
 			if err != nil {
 				return pd.getStatus(), false, err
 			}
@@ -221,6 +230,7 @@ func (pd *playbackDevice) Shutdown(ctx context.Context) (DeviceStatus, error) {
 // stopLocked contains the Stop logic and must be called with pd.mu held.
 func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing Stop action", "device", pd)
+	pd.startVersion++
 	changed := pd.ActiveTrack != nil && pd.isPlaying()
 	if pd.ActiveTrack != nil {
 		pd.ActiveTrack.Pause()
@@ -230,6 +240,7 @@ func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, bool, e
 
 func (pd *playbackDevice) shutdownLocked(ctx context.Context) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing Shutdown action", "device", pd)
+	pd.startVersion++
 	changed := pd.ActiveTrack != nil
 	if pd.ActiveTrack != nil {
 		pd.ActiveTrack.Pause()
