@@ -2,14 +2,127 @@ package playback
 
 import (
 	"context"
+	"testing"
 	"time"
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core/playback/bluetooth"
 	"github.com/navidrome/navidrome/model"
+	"github.com/navidrome/navidrome/tests"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
+
+func TestPlaybackServerDiscoveryPreservesNaturalAdvanceAuthority(t *testing.T) {
+	for _, discovery := range []struct {
+		name string
+		run  func(*playbackServer, context.Context) error
+	}{
+		{name: "RefreshDevices", run: (*playbackServer).RefreshDevices},
+		{name: "ListDevices", run: func(server *playbackServer, _ context.Context) error {
+			server.ListDevices()
+			return nil
+		}},
+	} {
+		t.Run(discovery.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			repo := tests.CreateMockMediaFileRepo()
+			repo.SetData(model.MediaFiles{{ID: "1", Path: "/a.mp3"}, {ID: "2", Path: "/b.mp3"}})
+			server := &playbackServer{
+				ctx:            &ctx,
+				datastore:      &tests.MockDataStore{MockedMediaFile: repo},
+				sessionManager: NewSessionManager(time.Minute),
+			}
+			initial := NewPlaybackDevice(ctx, server, "BT speaker", "pulse/bluez_output.AA_BB_CC.a2dp-sink")
+			initial.Default = true
+			server.playbackDevices = []playbackDevice{*initial}
+
+			previousDiscover := discoverAllSinks
+			previousAutoDiscover := conf.Server.Jukebox.AutoDiscoverBluetooth
+			conf.Server.Jukebox.AutoDiscoverBluetooth = true
+			discoverAllSinks = func(context.Context) []bluetooth.AudioSink {
+				return []bluetooth.AudioSink{
+					{Name: "bluez_output.AA_BB_CC.a2dp-sink"},
+					{Name: "bluez_output.DD_EE_FF.a2dp-sink"},
+				}
+			}
+			previousNewTrack := newTrack
+			ended := make(chan chan bool, 1)
+			newTrack = func(_ context.Context, done chan bool, _ string, mf model.MediaFile) (Track, error) {
+				if mf.ID == "1" {
+					ended <- done
+					return &mockTrack{position: 7}, nil
+				}
+				return &mockTrack{}, nil
+			}
+			t.Cleanup(func() {
+				cancel()
+				newTrack = previousNewTrack
+				discoverAllSinks = previousDiscover
+				conf.Server.Jukebox.AutoDiscoverBluetooth = previousAutoDiscover
+			})
+
+			playingDevice, err := server.GetDeviceForUser("admin")
+			if err != nil {
+				t.Fatalf("get playing device: %v", err)
+			}
+			if _, err := playingDevice.Set(ctx, []string{"1", "2"}); err != nil {
+				t.Fatalf("set queue: %v", err)
+			}
+			if status, err := playingDevice.Start(ctx); err != nil || !status.Playing {
+				t.Fatalf("start: status=%#v, err=%v", status, err)
+			}
+			if _, err := server.AttachSession(ctx, AttachRequest{SessionID: "discovery-session", ClientID: "tab-1", User: "admin"}); err != nil {
+				t.Fatalf("attach session: %v", err)
+			}
+			if err := discovery.run(server, ctx); err != nil {
+				t.Fatalf("discover device: %v", err)
+			}
+			if devices := server.ListDevices(); len(devices) != 2 || !devices[1].IsBluetooth || !devices[1].Connected {
+				t.Fatalf("new bluetooth device was not discovered: %#v", devices)
+			}
+
+			outputEnded := <-ended
+			select {
+			case outputEnded <- true:
+			case <-time.After(time.Second):
+				t.Fatal("natural track end was not accepted")
+			}
+			deadline := time.After(time.Second)
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			var live DeviceStatus
+			for {
+				live, err = playingDevice.Status(ctx)
+				if err != nil {
+					t.Fatalf("live device status: %v", err)
+				}
+				if live.CurrentIndex == 1 && live.Playing && live.Position == 0 {
+					break
+				}
+				select {
+				case <-ticker.C:
+				case <-deadline:
+					t.Fatalf("live playback did not advance to the second track: %#v", live)
+				}
+			}
+
+			registeredDevice, err := server.GetDeviceForUser("admin")
+			if err != nil {
+				t.Fatalf("get registered device: %v", err)
+			}
+			queue, registered, err := registeredDevice.Get(ctx)
+			if err != nil || len(queue) != 2 || queue[1].ID != "2" || registered != live {
+				t.Errorf("registered device disagrees with live second-track playback: live=%#v, registered=%#v, queueLength=%d, err=%v", live, registered, len(queue), err)
+			}
+			session, err := server.SessionStatus(ctx, "discovery-session")
+			if err != nil || session.TrackID != "2" || session.CurrentIndex != live.CurrentIndex || session.Playing != live.Playing || session.Position != live.Position {
+				t.Errorf("session disagrees with live second-track playback: live=%#v, session=%#v, err=%v", live, session, err)
+			}
+		})
+	}
+}
 
 var _ = Describe("PlaybackServer", func() {
 	var ps *playbackServer
