@@ -23,15 +23,15 @@ func newDurableScenarioHarness(t *testing.T) *durableScenarioHarness {
 	server := &playbackServer{
 		ctx:            &ctx,
 		sessionManager: NewSessionManager(50*time.Millisecond, 100*time.Millisecond),
-		playbackDevices: []playbackDevice{
-			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+		playbackDevices: []*playbackDevice{
+			NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
 		},
 	}
 	harness := &durableScenarioHarness{
 		ctx:    ctx,
 		now:    time.Now(),
 		server: server,
-		device: &server.playbackDevices[0],
+		device: server.playbackDevices[0],
 	}
 	server.sessionManager.now = func() time.Time { return harness.now }
 	return harness

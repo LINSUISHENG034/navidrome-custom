@@ -49,7 +49,7 @@ type playbackServer struct {
 	sessionManager      *SessionManager
 	eventBroker         serverevents.Broker
 	onDeviceStateChange func(*playbackDevice, DeviceStatus)
-	playbackDevices     []playbackDevice
+	playbackDevices     []*playbackDevice
 }
 
 var discoverAllSinks = bluetooth.DiscoverSinks
@@ -137,7 +137,7 @@ func (ps *playbackServer) getDeviceByName(deviceName string) *playbackDevice {
 	defer ps.mu.Unlock()
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].DeviceName == deviceName {
-			return &ps.playbackDevices[idx]
+			return ps.playbackDevices[idx]
 		}
 	}
 	return nil
@@ -299,7 +299,7 @@ func (ps *playbackServer) checkBluetoothConnections(ctx context.Context) {
 	var disconnected []*playbackDevice
 	ps.mu.Lock()
 	for idx := range ps.playbackDevices {
-		d := &ps.playbackDevices[idx]
+		d := ps.playbackDevices[idx]
 		if !strings.HasPrefix(d.DeviceName, "pulse/bluez_") {
 			continue
 		}
@@ -318,26 +318,26 @@ func (ps *playbackServer) checkBluetoothConnections(ctx context.Context) {
 	}
 }
 
-func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.AudioDeviceDefinition, defaultDevice string) ([]playbackDevice, error) {
-	pbDevices := make([]playbackDevice, max(1, len(devices)))
+func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.AudioDeviceDefinition, defaultDevice string) ([]*playbackDevice, error) {
+	pbDevices := make([]*playbackDevice, max(1, len(devices)))
 	defaultDeviceFound := false
 
 	if defaultDevice == "" {
 		// if there are no devices given and no default device, we create a synthetic device named "auto"
 		if len(devices) == 0 {
-			pbDevices[0] = *ps.newPlaybackDevice(ctx, "auto", "auto")
+			pbDevices[0] = ps.newPlaybackDevice(ctx, "auto", "auto")
 		}
 
 		// if there is but only one entry and no default given, just use that.
 		if len(devices) == 1 {
 			if len(devices[0]) != 2 {
-				return []playbackDevice{}, fmt.Errorf("audio device definition ought to contain 2 fields, found: %d ", len(devices[0]))
+				return []*playbackDevice{}, fmt.Errorf("audio device definition ought to contain 2 fields, found: %d ", len(devices[0]))
 			}
-			pbDevices[0] = *ps.newPlaybackDevice(ctx, devices[0][0], devices[0][1])
+			pbDevices[0] = ps.newPlaybackDevice(ctx, devices[0][0], devices[0][1])
 		}
 
 		if len(devices) > 1 {
-			return []playbackDevice{}, fmt.Errorf("number of audio device found is %d, but no default device defined. Set Jukebox.Default", len(devices))
+			return []*playbackDevice{}, fmt.Errorf("number of audio device found is %d, but no default device defined. Set Jukebox.Default", len(devices))
 		}
 
 		pbDevices[0].Default = true
@@ -346,10 +346,10 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 
 	for idx, audioDevice := range devices {
 		if len(audioDevice) != 2 {
-			return []playbackDevice{}, fmt.Errorf("audio device definition ought to contain 2 fields, found: %d ", len(audioDevice))
+			return []*playbackDevice{}, fmt.Errorf("audio device definition ought to contain 2 fields, found: %d ", len(audioDevice))
 		}
 
-		pbDevices[idx] = *ps.newPlaybackDevice(ctx, audioDevice[0], audioDevice[1])
+		pbDevices[idx] = ps.newPlaybackDevice(ctx, audioDevice[0], audioDevice[1])
 
 		if audioDevice[0] == defaultDevice {
 			pbDevices[idx].Default = true
@@ -358,7 +358,7 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 	}
 
 	if !defaultDeviceFound {
-		return []playbackDevice{}, fmt.Errorf("default device name not found: %s ", defaultDevice)
+		return []*playbackDevice{}, fmt.Errorf("default device name not found: %s ", defaultDevice)
 	}
 	return pbDevices, nil
 }
@@ -366,7 +366,7 @@ func (ps *playbackServer) initDeviceStatus(ctx context.Context, devices []conf.A
 func (ps *playbackServer) getDefaultDeviceLocked() (*playbackDevice, error) {
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].Default {
-			return &ps.playbackDevices[idx], nil
+			return ps.playbackDevices[idx], nil
 		}
 	}
 	return nil, fmt.Errorf("no default device found")
@@ -413,7 +413,7 @@ func (ps *playbackServer) mergeBluetoothDevicesFromSinks(ctx context.Context, si
 			continue
 		}
 		dev := ps.newPlaybackDevice(deviceCtx, sink.FriendlyName(), devName)
-		ps.playbackDevices = append(ps.playbackDevices, *dev)
+		ps.playbackDevices = append(ps.playbackDevices, dev)
 		log.Info(ctx, "Discovered Bluetooth device", "name", sink.FriendlyName(), "device", devName)
 	}
 }
@@ -474,7 +474,7 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 	var newDev *playbackDevice
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].DeviceName == deviceName {
-			newDev = &ps.playbackDevices[idx]
+			newDev = ps.playbackDevices[idx]
 			break
 		}
 	}
@@ -486,7 +486,7 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 	var oldDev *playbackDevice
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].Default {
-			oldDev = &ps.playbackDevices[idx]
+			oldDev = ps.playbackDevices[idx]
 			break
 		}
 	}

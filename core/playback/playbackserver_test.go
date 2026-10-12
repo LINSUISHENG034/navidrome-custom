@@ -36,7 +36,7 @@ func TestPlaybackServerDiscoveryPreservesNaturalAdvanceAuthority(t *testing.T) {
 			}
 			initial := NewPlaybackDevice(ctx, server, "BT speaker", "pulse/bluez_output.AA_BB_CC.a2dp-sink")
 			initial.Default = true
-			server.playbackDevices = []playbackDevice{*initial}
+			server.playbackDevices = []*playbackDevice{initial}
 
 			previousDiscover := discoverAllSinks
 			previousAutoDiscover := conf.Server.Jukebox.AutoDiscoverBluetooth
@@ -132,9 +132,9 @@ var _ = Describe("PlaybackServer", func() {
 		ctx = context.Background()
 		ps = &playbackServer{
 			ctx: &ctx,
-			playbackDevices: []playbackDevice{
-				*NewPlaybackDevice(ctx, nil, "Speaker", "alsa_output.analog"),
-				*NewPlaybackDevice(ctx, nil, "BT Headphones", "pulse/bluez_output.AA_BB_CC.a2dp-sink"),
+			playbackDevices: []*playbackDevice{
+				NewPlaybackDevice(ctx, nil, "Speaker", "alsa_output.analog"),
+				NewPlaybackDevice(ctx, nil, "BT Headphones", "pulse/bluez_output.AA_BB_CC.a2dp-sink"),
 			},
 		}
 		ps.playbackDevices[0].Default = true
@@ -164,8 +164,8 @@ var _ = Describe("PlaybackServer", func() {
 			}()
 
 			conf.Server.Jukebox.AutoDiscoverBluetooth = true
-			ps.playbackDevices = []playbackDevice{
-				*NewPlaybackDevice(ctx, nil, "Speaker", "alsa_output.analog"),
+			ps.playbackDevices = []*playbackDevice{
+				NewPlaybackDevice(ctx, nil, "Speaker", "alsa_output.analog"),
 			}
 			ps.playbackDevices[0].Default = true
 
@@ -226,7 +226,7 @@ var _ = Describe("PlaybackServer", func() {
 			err := ps.SwitchDevice(ctx, "pulse/bluez_output.AA_BB_CC.a2dp-sink")
 			Expect(err).ToNot(HaveOccurred())
 
-			newDev := &ps.playbackDevices[1]
+			newDev := ps.playbackDevices[1]
 			Expect(newDev.PlaybackQueue.Size()).To(Equal(2))
 			Expect(newDev.PlaybackQueue.Index).To(Equal(1))
 			Expect(newDev.Gain).To(Equal(float32(0.75)))

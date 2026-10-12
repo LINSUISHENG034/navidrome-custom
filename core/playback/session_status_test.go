@@ -43,8 +43,8 @@ func TestPlaybackServerDetachSessionReturnsSnapshot(t *testing.T) {
 	ps := &playbackServer{
 		ctx:            &ctx,
 		sessionManager: NewSessionManager(time.Minute),
-		playbackDevices: []playbackDevice{
-			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+		playbackDevices: []*playbackDevice{
+			NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
 		},
 	}
 	ps.playbackDevices[0].PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
@@ -164,9 +164,9 @@ func TestPlaybackServerPublishJukeboxStateUpdatesTargetsMatchingDeviceSessions(t
 		ctx:            &ctx,
 		sessionManager: NewSessionManager(time.Minute),
 		eventBroker:    broker,
-		playbackDevices: []playbackDevice{
-			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
-			*NewPlaybackDevice(ctx, nil, "Other", "pulse/other"),
+		playbackDevices: []*playbackDevice{
+			NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+			NewPlaybackDevice(ctx, nil, "Other", "pulse/other"),
 		},
 	}
 	ps.playbackDevices[0].PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
@@ -175,7 +175,7 @@ func TestPlaybackServerPublishJukeboxStateUpdatesTargetsMatchingDeviceSessions(t
 	ps.sessionManager.Attach(AttachRequest{SessionID: "s1", ClientID: "tab-1", User: "admin", DeviceName: "pulse/test"})
 	ps.sessionManager.Attach(AttachRequest{SessionID: "s2", ClientID: "tab-2", User: "admin", DeviceName: "pulse/other"})
 
-	ps.publishJukeboxStateUpdates(&ps.playbackDevices[0])
+	ps.publishJukeboxStateUpdates(ps.playbackDevices[0])
 
 	if len(broker.sent) != 1 {
 		t.Fatalf("expected 1 targeted event, got %d", len(broker.sent))
@@ -207,9 +207,9 @@ func TestPlaybackServerPublishJukeboxStateUpdatesUsesMigratedSessionBinding(t *t
 		ctx:            &ctx,
 		sessionManager: NewSessionManager(time.Minute),
 		eventBroker:    broker,
-		playbackDevices: []playbackDevice{
-			*NewPlaybackDevice(ctx, nil, "Speaker", "alsa_output.analog"),
-			*NewPlaybackDevice(ctx, nil, "BT", "pulse/bluez_output.AA_BB_CC.a2dp-sink"),
+		playbackDevices: []*playbackDevice{
+			NewPlaybackDevice(ctx, nil, "Speaker", "alsa_output.analog"),
+			NewPlaybackDevice(ctx, nil, "BT", "pulse/bluez_output.AA_BB_CC.a2dp-sink"),
 		},
 	}
 	ps.playbackDevices[0].Default = true
@@ -231,7 +231,7 @@ func TestPlaybackServerPublishJukeboxStateUpdatesUsesMigratedSessionBinding(t *t
 	}
 	broker.sent = nil
 
-	ps.publishJukeboxStateUpdates(&ps.playbackDevices[1])
+	ps.publishJukeboxStateUpdates(ps.playbackDevices[1])
 
 	if len(broker.sent) != 1 {
 		t.Fatalf("expected 1 targeted event, got %d", len(broker.sent))
@@ -254,8 +254,8 @@ func TestPlaybackServerReaperTransitionsHeartbeatLapseToRecovering(t *testing.T)
 		ctx:            &ctx,
 		sessionManager: NewSessionManager(50*time.Millisecond, 10*time.Minute),
 		eventBroker:    broker,
-		playbackDevices: []playbackDevice{
-			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+		playbackDevices: []*playbackDevice{
+			NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
 		},
 	}
 
@@ -291,8 +291,8 @@ func TestPlaybackServerSessionStatusReturnsRecoveringSession(t *testing.T) {
 	ps := &playbackServer{
 		ctx:            &ctx,
 		sessionManager: NewSessionManager(50*time.Millisecond, 10*time.Minute),
-		playbackDevices: []playbackDevice{
-			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+		playbackDevices: []*playbackDevice{
+			NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
 		},
 	}
 
@@ -334,8 +334,8 @@ func TestPlaybackServerReaperBroadcastsDetachOnHardExpiry(t *testing.T) {
 		ctx:            &ctx,
 		sessionManager: NewSessionManager(50*time.Millisecond, 100*time.Millisecond),
 		eventBroker:    broker,
-		playbackDevices: []playbackDevice{
-			*NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+		playbackDevices: []*playbackDevice{
+			NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
 		},
 	}
 
@@ -376,7 +376,7 @@ func TestPlaybackServerCheckBluetoothConnectionsPublishesPauseState(t *testing.T
 		sessionManager: NewSessionManager(time.Minute),
 		eventBroker:    broker,
 	}
-	ps.playbackDevices = []playbackDevice{*ps.newPlaybackDevice(ctx, "BT", "pulse/bluez_output.AA_BB_CC.a2dp-sink")}
+	ps.playbackDevices = []*playbackDevice{ps.newPlaybackDevice(ctx, "BT", "pulse/bluez_output.AA_BB_CC.a2dp-sink")}
 	ps.playbackDevices[0].Default = true
 	ps.playbackDevices[0].PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
 	ps.playbackDevices[0].ActiveTrack = &mockTrack{playing: true, position: 12}
