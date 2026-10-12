@@ -99,6 +99,7 @@ vi.mock('./locale', () => ({
 vi.mock('./jukeboxClient', () => ({
   default: {
     volume: vi.fn(() => Promise.resolve({})),
+    stop: vi.fn(() => Promise.resolve({})),
     attachSession: vi.fn(() =>
       Promise.resolve({ sessionId: 'jukebox-session:admin' }),
     ),
@@ -111,11 +112,38 @@ vi.mock('./jukeboxCommandQueue', () => ({
   enqueueJukeboxCommand: vi.fn((fn) => Promise.resolve(fn())),
 }))
 
-describe('<Player /> Bluetooth volume profile', () => {
+describe('<Player />', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.setItem('username', 'admin')
     sessionStorage.clear()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    localStorage.removeItem('token')
+  })
+
+  it('does not stop remote playback when the page hides and the controller unmounts', async () => {
+    localStorage.setItem('token', 'fake-jwt-token')
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response())
+    const { unmount } = render(<Player />)
+
+    await waitFor(() => {
+      expect(jukeboxClient.attachSession).toHaveBeenCalled()
+    })
+
+    fireEvent(window, new Event('pagehide'))
+    unmount()
+
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining('/api/jukebox/stop'),
+      expect.anything(),
+    )
+    expect(jukeboxClient.stop).not.toHaveBeenCalled()
+    expect(jukeboxClient.detachSession).toHaveBeenCalled()
   })
 
   it('maps outgoing jukebox volume changes through the Bluetooth profile', async () => {
