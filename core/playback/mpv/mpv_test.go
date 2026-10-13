@@ -354,8 +354,8 @@ var _ = Describe("MPV", func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 				defer cancel()
 
-				playbackDone := make(chan bool, 1)
-				_, err := NewTrack(ctx, playbackDone, "auto", testMediaFile)
+				events := make(chan model.PlaybackEvent, 1)
+				_, err := NewTrack(ctx, events, 1, "auto", testMediaFile)
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(Equal("no mpv command arguments provided"))
 			})
@@ -481,32 +481,22 @@ var _ = Describe("MPV null output prototype", func() {
 		Expect(err).ToNot(HaveOccurred())
 	})
 
-	It("does not report natural completion when only IPC transport closes", func() {
+	It("reports a transport fault with its token and position, then exits the old MPV", func() {
 		if os.Getenv("ND_TEST_MPV_NULL_OUTPUT") != "1" {
 			Skip("Set ND_TEST_MPV_NULL_OUTPUT=1 to run the real MPV null-output prototype")
 		}
 		tests.SkipOnWindows("prototype uses a Unix IPC socket")
-		DeferCleanup(configtest.SetupConfig())
-		mpvOnce = sync.Once{}
-		mpvPath, mpvErr = "", nil
-		DeferCleanup(func() {
-			mpvOnce = sync.Once{}
-			mpvPath, mpvErr = "", nil
-		})
-
-		path, err := exec.LookPath("mpv")
-		Expect(err).ToNot(HaveOccurred())
+		configureNullOutputMPV()
 		dir := GinkgoT().TempDir()
 		Expect(writeNullOutputWAV(filepath.Join(dir, "transport-fault.wav"))).To(Succeed())
-		args := append([]string{"mpv"}, nullOutputMPVArgs("%s")...)
-		conf.Server.MPVPath = path
-		conf.Server.MPVCmdTemplate = strings.Join(append(args, "%f"), " ")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		DeferCleanup(cancel)
-		playbackDone := make(chan bool, 1)
-		track, err := NewTrack(ctx, playbackDone, "auto", model.MediaFile{
+		const token model.PlaybackToken = 42
+		mediaFile := model.MediaFile{
 			ID: "transport-fault", LibraryPath: dir, Path: "transport-fault.wav", Suffix: "wav",
-		})
+		}
+		events := make(chan model.PlaybackEvent, 2)
+		track, err := NewTrack(ctx, events, token, "auto", mediaFile)
 		Expect(err).ToNot(HaveOccurred())
 		DeferCleanup(func() {
 			cancel()
@@ -525,12 +515,11 @@ var _ = Describe("MPV null output prototype", func() {
 			select {
 			case <-outputDone:
 				fmt.Fprintf(GinkgoWriter, "NewTrack process output:\n%s\n", processLog.String())
-			case <-time.After(time.Second):
+			case <-time.After(trackCloseTimeout):
 				fmt.Fprintln(GinkgoWriter, "NewTrack output drain exceeded cleanup observation window")
 			}
 		})
 
-		// Independent IPC observes the live paused player while only NewTrack's transport is closed.
 		conn, err := net.DialTimeout("unix", track.IPCSocketName, 100*time.Millisecond)
 		Expect(err).ToNot(HaveOccurred())
 		DeferCleanup(func() { _ = conn.Close() })
@@ -547,23 +536,162 @@ var _ = Describe("MPV null output prototype", func() {
 		Consistently(func() (any, error) {
 			return probe.command("get_property", "time-pos")
 		}, 200*time.Millisecond, 20*time.Millisecond).Should(Equal(position))
-		fmt.Fprintf(GinkgoWriter, "Before transport fault: pause=%v, time-pos=%v, current-ao=null\n", paused, position)
-		Expect(playbackDone).ToNot(Receive())
+		Expect(track.SetPosition(1)).To(Succeed())
+		track.Unpause()
+		Eventually(func() (any, error) {
+			return probe.command("get_property", "time-pos")
+		}, time.Second, 20*time.Millisecond).Should(BeNumerically(">", 1.2))
+		track.Pause()
+		Expect(track.Position()).To(Equal(1))
 
 		Expect(track.Conn.Close()).To(Succeed())
-		paused, err = probe.command("get_property", "pause")
-		Expect(err).ToNot(HaveOccurred())
-		Expect(paused).To(BeTrue())
-		position, err = probe.command("get_property", "time-pos")
-		Expect(err).ToNot(HaveOccurred())
-		fmt.Fprintf(GinkgoWriter, "After transport fault: independent player pause=%v, time-pos=%v\n", paused, position)
+		var event model.PlaybackEvent
 		select {
-		case completed := <-playbackDone:
-			Fail(fmt.Sprintf("Transport fault incorrectly reported playback completion=%v while the player is still paused", completed))
-		case <-time.After(500 * time.Millisecond):
+		case event = <-events:
+		case <-time.After(trackCloseTimeout):
+			Fail("IPC transport loss did not produce a bounded failure event")
+		}
+		Expect(event.Token).To(Equal(token))
+		Expect(event.Kind).To(Equal(model.PlaybackEventFailure))
+		Expect(event.Err).To(HaveOccurred())
+		if event.Position == nil {
+			Fail("IPC failure did not retain an observed recovery position")
+			return
+		}
+		Expect(*event.Position).To(Equal(1))
+		select {
+		case <-outputDone:
+		case <-time.After(trackCloseTimeout):
+			Fail("failed MPV process remained alive after transport loss")
+		}
+		_, err = probe.command("get_property", "pause")
+		Expect(err).To(HaveOccurred())
+
+		recoveredEvents := make(chan model.PlaybackEvent, 1)
+		recovered, err := NewTrack(ctx, recoveredEvents, token+1, "auto", mediaFile)
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(recovered.Close)
+		Expect(recovered.SetPosition(*event.Position)).To(Succeed())
+		Expect(recovered.Position()).To(Equal(1))
+	})
+
+	It("reports natural EOF with the active token while null MPV remains idle", func() {
+		if os.Getenv("ND_TEST_MPV_NULL_OUTPUT") != "1" {
+			Skip("Set ND_TEST_MPV_NULL_OUTPUT=1 to run the real MPV null-output prototype")
+		}
+		tests.SkipOnWindows("prototype uses a Unix IPC socket")
+		configureNullOutputMPV()
+		dir := GinkgoT().TempDir()
+		Expect(writeNullOutputWAV(filepath.Join(dir, "natural-eof.wav"))).To(Succeed())
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		DeferCleanup(cancel)
+		const token model.PlaybackToken = 43
+		events := make(chan model.PlaybackEvent, 2)
+		track, err := NewTrack(ctx, events, token, "auto", model.MediaFile{
+			ID: "natural-eof", LibraryPath: dir, Path: "natural-eof.wav", Suffix: "wav",
+		})
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(track.Close)
+
+		track.Unpause()
+		var event model.PlaybackEvent
+		select {
+		case event = <-events:
+		case <-ctx.Done():
+			Fail("real MPV did not report natural EOF before the deadline")
+		}
+		Expect(event.Token).To(Equal(token))
+		Expect(event.Kind).To(Equal(model.PlaybackEventNaturalEnd))
+		Expect(event.Err).To(BeNil())
+		idle, err := track.Conn.Call(ctx, "get_property", "idle-active")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(idle).To(BeTrue())
+		Expect(track.Conn.Err()).To(BeNil())
+	})
+
+	It("reports explicit close as retirement, never as natural EOF", func() {
+		if os.Getenv("ND_TEST_MPV_NULL_OUTPUT") != "1" {
+			Skip("Set ND_TEST_MPV_NULL_OUTPUT=1 to run the real MPV null-output prototype")
+		}
+		tests.SkipOnWindows("prototype uses a Unix IPC socket")
+		configureNullOutputMPV()
+		dir := GinkgoT().TempDir()
+		Expect(writeNullOutputWAV(filepath.Join(dir, "explicit-close.wav"))).To(Succeed())
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		DeferCleanup(cancel)
+		const token model.PlaybackToken = 44
+		events := make(chan model.PlaybackEvent, 2)
+		track, err := NewTrack(ctx, events, token, "auto", model.MediaFile{
+			ID: "explicit-close", LibraryPath: dir, Path: "explicit-close.wav", Suffix: "wav",
+		})
+		Expect(err).ToNot(HaveOccurred())
+		track.Pause()
+		Consistently(events, 100*time.Millisecond).ShouldNot(Receive())
+		track.Close()
+		var event model.PlaybackEvent
+		select {
+		case event = <-events:
+		case <-ctx.Done():
+			Fail("explicit close did not report retirement before the deadline")
+		}
+		Expect(event.Token).To(Equal(token))
+		Expect(event.Kind).To(Equal(model.PlaybackEventRetired))
+	})
+
+	It("releases the output process when its context is canceled", func() {
+		if os.Getenv("ND_TEST_MPV_NULL_OUTPUT") != "1" {
+			Skip("Set ND_TEST_MPV_NULL_OUTPUT=1 to run the real MPV null-output prototype")
+		}
+		tests.SkipOnWindows("prototype uses a Unix IPC socket")
+		configureNullOutputMPV()
+		dir := GinkgoT().TempDir()
+		Expect(writeNullOutputWAV(filepath.Join(dir, "context-close.wav"))).To(Succeed())
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		DeferCleanup(cancel)
+		const token model.PlaybackToken = 45
+		events := make(chan model.PlaybackEvent, 2)
+		track, err := NewTrack(ctx, events, token, "auto", model.MediaFile{
+			ID: "context-close", LibraryPath: dir, Path: "context-close.wav", Suffix: "wav",
+		})
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(track.Close)
+		outputDone := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, track.Exe)
+			close(outputDone)
+		}()
+
+		cancel()
+		var event model.PlaybackEvent
+		select {
+		case event = <-events:
+		case <-time.After(trackCloseTimeout):
+			Fail("context cancellation did not report bounded retirement")
+		}
+		Expect(event.Token).To(Equal(token))
+		Expect(event.Kind).To(Equal(model.PlaybackEventRetired))
+		select {
+		case <-outputDone:
+		case <-time.After(trackCloseTimeout):
+			Fail("context cancellation left the MPV process alive")
 		}
 	})
 })
+
+func configureNullOutputMPV() {
+	DeferCleanup(configtest.SetupConfig())
+	mpvOnce = sync.Once{}
+	mpvPath, mpvErr = "", nil
+	DeferCleanup(func() {
+		mpvOnce = sync.Once{}
+		mpvPath, mpvErr = "", nil
+	})
+	path, err := exec.LookPath("mpv")
+	Expect(err).ToNot(HaveOccurred())
+	conf.Server.MPVPath = path
+	args := append([]string{"mpv"}, nullOutputMPVArgs("%s")...)
+	conf.Server.MPVCmdTemplate = strings.Join(append(args, "%f"), " ")
+}
 
 func nullOutputMPVArgs(socket string) []string {
 	return []string{

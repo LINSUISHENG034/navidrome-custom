@@ -30,6 +30,7 @@ func (api *Router) addJukeboxSessionRoute(r chi.Router) {
 		r.Post("/heartbeat", api.jukeboxSessionHeartbeat)
 		r.Post("/detach", api.jukeboxSessionDetach)
 		r.Get("/status", api.jukeboxSessionStatus)
+		r.Get("/snapshot", api.jukeboxSessionSnapshot)
 	})
 }
 
@@ -116,6 +117,23 @@ func (api *Router) jukeboxSessionStatus(w http.ResponseWriter, r *http.Request) 
 	}
 
 	api.writeJukeboxJSON(w, r, status)
+}
+
+func (api *Router) jukeboxSessionSnapshot(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("sessionId")
+	if sessionID == "" {
+		http.Error(w, "sessionId is required", http.StatusBadRequest)
+		return
+	}
+
+	user, _ := request.UserFrom(r.Context())
+	snapshot, err := api.playback.SessionSnapshot(r.Context(), sessionID, user.UserName)
+	if err != nil {
+		api.writeJukeboxSessionError(w, err)
+		return
+	}
+
+	api.writeJukeboxJSON(w, r, snapshot)
 }
 
 func (api *Router) writeJukeboxSessionError(w http.ResponseWriter, err error) {

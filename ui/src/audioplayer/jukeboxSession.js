@@ -2,6 +2,18 @@ import { updateJukeboxSessionStatus } from '../actions'
 
 const JUKEBOX_SESSION_ID_PREFIX = 'jukebox-session:'
 const JUKEBOX_CLIENT_ID_KEY = 'jukebox-client-id'
+const JUKEBOX_HEARTBEAT_INTERVAL_MS = 15000
+
+const startJukeboxHeartbeatLoop = ({
+  jukeboxMode,
+  sessionId,
+  clientId,
+  onHeartbeat,
+}) => {
+  if (!jukeboxMode || !sessionId || !clientId || !onHeartbeat) return () => {}
+  const interval = setInterval(onHeartbeat, JUKEBOX_HEARTBEAT_INTERVAL_MS)
+  return () => clearInterval(interval)
+}
 
 const getJukeboxSessionId = () => {
   const username = localStorage.getItem('username')
@@ -120,4 +132,5 @@ export {
   getOrCreateJukeboxClientId,
   refreshJukeboxSessionStatus,
   runJukeboxHeartbeat,
+  startJukeboxHeartbeatLoop,
 }

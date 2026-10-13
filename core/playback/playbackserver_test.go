@@ -117,10 +117,10 @@ func TestPlaybackServerDiscoveryPreservesNaturalAdvanceAuthority(t *testing.T) {
 				}
 			}
 			previousNewTrack := newTrack
-			ended := make(chan chan bool, 1)
-			newTrack = func(_ context.Context, done chan bool, _ string, mf model.MediaFile) (Track, error) {
+			ended := make(chan model.PlaybackEvent, 1)
+			newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, token model.PlaybackToken, _ string, mf model.MediaFile) (Track, error) {
 				if mf.ID == "1" {
-					ended <- done
+					ended <- model.PlaybackEvent{Token: token, Kind: model.PlaybackEventNaturalEnd}
 					return &mockTrack{position: 7}, nil
 				}
 				return &mockTrack{}, nil
@@ -154,7 +154,7 @@ func TestPlaybackServerDiscoveryPreservesNaturalAdvanceAuthority(t *testing.T) {
 
 			outputEnded := <-ended
 			select {
-			case outputEnded <- true:
+			case playingDevice.PlaybackEvents <- outputEnded:
 			case <-time.After(time.Second):
 				t.Fatal("natural track end was not accepted")
 			}
@@ -410,17 +410,21 @@ var _ = Describe("PlaybackServer", func() {
 		oldTrack := &mockTrack{playing: true}
 		nextTrack := &mockTrack{}
 		previousNewTrack := newTrack
-		newTrack = func(_ context.Context, _ chan bool, _ string, _ model.MediaFile) (Track, error) {
+		newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, _ model.PlaybackToken, _ string, _ model.MediaFile) (Track, error) {
 			return nextTrack, nil
 		}
 		defer func() { newTrack = previousNewTrack }()
 
 		pd := ps.newPlaybackDevice(ctx, "Speaker", "auto")
 		pd.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}, {ID: "2", Path: "/b.mp3"}})
+		pd.mu.Lock()
 		pd.ActiveTrack = oldTrack
+		pd.activePlaybackToken = 1
+		pd.nextPlaybackToken = 1
+		pd.mu.Unlock()
 
 		go pd.trackSwitcherGoroutine()
-		pd.PlaybackDone <- true
+		pd.PlaybackEvents <- model.PlaybackEvent{Token: 1, Kind: model.PlaybackEventNaturalEnd}
 
 		Eventually(events, time.Second).Should(Receive(Equal(DeviceStatus{
 			CurrentIndex: 1,

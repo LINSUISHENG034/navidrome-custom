@@ -24,6 +24,7 @@ func TestJukeboxSessionRoutes(t *testing.T) {
 
 	want := map[string]bool{
 		"GET /jukebox/session/status":     true,
+		"GET /jukebox/session/snapshot":   true,
 		"POST /jukebox/session/attach":    true,
 		"POST /jukebox/session/heartbeat": true,
 		"POST /jukebox/session/detach":    true,
@@ -54,6 +55,8 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 	forbiddenDetachID := uniqueSessionID("forbidden-detach")
 	missingHeartbeatID := uniqueSessionID("missing-heartbeat")
 	missingStatusID := uniqueSessionID("missing-status")
+	snapshotID := uniqueSessionID("snapshot")
+	forbiddenSnapshotID := uniqueSessionID("forbidden-snapshot")
 	detachSnapshotID := uniqueSessionID("detach-snapshot")
 
 	tests := []struct {
@@ -208,6 +211,74 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 			path:       "/jukebox/session/status?sessionId=" + missingStatusID,
 			handler:    (*Router).jukeboxSessionStatus,
 			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "snapshot validates session id",
+			method:     http.MethodGet,
+			path:       "/jukebox/session/snapshot",
+			handler:    (*Router).jukeboxSessionSnapshot,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:   "snapshot returns one session-bound playlist payload",
+			method: http.MethodGet,
+			path:   "/jukebox/session/snapshot?sessionId=" + snapshotID,
+			setup: func(t *testing.T) {
+				t.Helper()
+				_, err := api.playback.AttachSession(context.Background(), playback.AttachRequest{
+					SessionID:  snapshotID,
+					User:       "admin",
+					ClientID:   "tab-1",
+					DeviceName: "pulse/test",
+				})
+				if err != nil {
+					t.Fatalf("attach snapshot setup: %v", err)
+				}
+			},
+			handler:    (*Router).jukeboxSessionSnapshot,
+			wantStatus: http.StatusOK,
+			assertJSON: func(t *testing.T, body []byte) {
+				t.Helper()
+				var got struct {
+					SessionStatus struct {
+						SessionID string `json:"sessionId"`
+						Attached  bool   `json:"attached"`
+					} `json:"sessionStatus"`
+					JukeboxPlaylist struct {
+						Entry []struct {
+							ID string `json:"id"`
+						} `json:"entry"`
+					} `json:"jukeboxPlaylist"`
+				}
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatalf("decode snapshot: %v", err)
+				}
+				if got.SessionStatus.SessionID != snapshotID || !got.SessionStatus.Attached {
+					t.Fatalf("unexpected snapshot session status: %#v", got.SessionStatus)
+				}
+				if got.JukeboxPlaylist.Entry == nil {
+					t.Fatalf("snapshot playlist entries should be an array: %#v", got.JukeboxPlaylist)
+				}
+			},
+		},
+		{
+			name:   "snapshot rejects another user's session",
+			method: http.MethodGet,
+			path:   "/jukebox/session/snapshot?sessionId=" + forbiddenSnapshotID,
+			setup: func(t *testing.T) {
+				t.Helper()
+				_, err := api.playback.AttachSession(context.Background(), playback.AttachRequest{
+					SessionID:  forbiddenSnapshotID,
+					User:       "another-user",
+					ClientID:   "tab-1",
+					DeviceName: "pulse/test",
+				})
+				if err != nil {
+					t.Fatalf("attach forbidden snapshot setup: %v", err)
+				}
+			},
+			handler:    (*Router).jukeboxSessionSnapshot,
+			wantStatus: http.StatusForbidden,
 		},
 	}
 

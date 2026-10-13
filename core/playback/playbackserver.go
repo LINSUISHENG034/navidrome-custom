@@ -31,6 +31,7 @@ type PlaybackServer interface {
 	HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
 	DetachSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
 	SessionStatus(ctx context.Context, sessionID string) (SessionStatus, error)
+	SessionSnapshot(ctx context.Context, sessionID, user string) (SessionSnapshot, error)
 }
 
 // DeviceInfo represents an audio output device exposed via the API.
@@ -40,6 +41,27 @@ type DeviceInfo struct {
 	IsDefault   bool   `json:"isDefault"`
 	IsBluetooth bool   `json:"isBluetooth"`
 	Connected   bool   `json:"connected"`
+}
+
+type SessionSnapshot struct {
+	SessionStatus   SessionStatus           `json:"sessionStatus"`
+	JukeboxPlaylist JukeboxPlaylistSnapshot `json:"jukeboxPlaylist"`
+}
+
+type JukeboxPlaylistSnapshot struct {
+	CurrentIndex int                    `json:"currentIndex"`
+	Playing      bool                   `json:"playing"`
+	Position     int                    `json:"position"`
+	Gain         float32                `json:"gain"`
+	Entry        []JukeboxEntrySnapshot `json:"entry"`
+}
+
+type JukeboxEntrySnapshot struct {
+	ID       string  `json:"id"`
+	Title    string  `json:"title"`
+	Artist   string  `json:"artist"`
+	Album    string  `json:"album"`
+	Duration float32 `json:"duration"`
 }
 
 type playbackServer struct {
@@ -86,10 +108,15 @@ func (ps *playbackServer) publishJukeboxStateUpdates(device *playbackDevice) {
 }
 
 func (ps *playbackServer) reapExpiredSessions() {
-	if ps.sessionManager == nil {
+	ps.mu.Lock()
+	sessionManager := ps.sessionManager
+	if sessionManager == nil {
+		ps.mu.Unlock()
 		return
 	}
-	transitioned, expired := ps.sessionManager.ReapExpired()
+	transitioned, expired := sessionManager.ReapExpired()
+	ps.mu.Unlock()
+
 	for _, session := range transitioned {
 		if session.User == "" {
 			continue
@@ -144,6 +171,17 @@ func (ps *playbackServer) getDeviceByName(deviceName string) *playbackDevice {
 }
 
 func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
+	device := ps.getDeviceByName(session.DeviceName)
+	if device == nil {
+		return newSessionStatus(session)
+	}
+
+	device.mu.Lock()
+	defer device.mu.Unlock()
+	return sessionStatusFromDevice(session, device)
+}
+
+func newSessionStatus(session Session) SessionStatus {
 	status := SessionStatus{
 		SessionID:      session.SessionID,
 		DeviceName:     session.DeviceName,
@@ -156,15 +194,16 @@ func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 	if status.OwnershipState == "" {
 		status.OwnershipState = SessionOwnershipAttached
 	}
-
-	device := ps.getDeviceByName(session.DeviceName)
-	if device == nil {
-		return status
+	if session.StaleSince != nil {
+		staleSince := *session.StaleSince
+		status.StaleSince = &staleSince
 	}
+	return status
+}
 
-	device.mu.Lock()
-	defer device.mu.Unlock()
-
+// sessionStatusFromDevice copies playback state while the device mutex is held.
+func sessionStatusFromDevice(session Session, device *playbackDevice) SessionStatus {
+	status := newSessionStatus(session)
 	deviceStatus := device.getStatus()
 	status.CurrentIndex = deviceStatus.CurrentIndex
 	status.Playing = deviceStatus.Playing
@@ -174,7 +213,6 @@ func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
 	}
-
 	return status
 }
 
@@ -187,19 +225,29 @@ func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) 
 		req.DeviceName = device.DeviceName
 	}
 
-	session := ps.ensureSessionManager().Attach(req)
+	sessionManager := ps.ensureSessionManager()
+	ps.mu.Lock()
+	session := sessionManager.Attach(req)
+	ps.mu.Unlock()
 	return ps.statusFromSession(session), nil
 }
 
 func (ps *playbackServer) HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error) {
-	if err := ps.ensureSessionManager().Heartbeat(sessionID, clientID); err != nil {
+	sessionManager := ps.ensureSessionManager()
+	ps.mu.Lock()
+	err := sessionManager.Heartbeat(sessionID, clientID)
+	ps.mu.Unlock()
+	if err != nil {
 		return SessionStatus{}, err
 	}
 	return ps.SessionStatus(ctx, sessionID)
 }
 
 func (ps *playbackServer) DetachSession(_ context.Context, sessionID, clientID string) (SessionStatus, error) {
-	session, err := ps.ensureSessionManager().DetachSnapshot(sessionID, clientID)
+	sessionManager := ps.ensureSessionManager()
+	ps.mu.Lock()
+	session, err := sessionManager.DetachSnapshot(sessionID, clientID)
+	ps.mu.Unlock()
 	if err != nil {
 		return SessionStatus{}, err
 	}
@@ -216,6 +264,64 @@ func (ps *playbackServer) SessionStatus(_ context.Context, sessionID string) (Se
 		return SessionStatus{}, ErrSessionNotFound
 	}
 	return ps.statusFromSession(session), nil
+}
+
+func (ps *playbackServer) SessionSnapshot(_ context.Context, sessionID, user string) (SessionSnapshot, error) {
+	sessionManager := ps.ensureSessionManager()
+	ps.mu.Lock()
+	session, ok := sessionManager.Get(sessionID)
+	if !ok {
+		ps.mu.Unlock()
+		return SessionSnapshot{}, ErrSessionNotFound
+	}
+	if session.User != user {
+		ps.mu.Unlock()
+		return SessionSnapshot{}, ErrSessionOwnership
+	}
+
+	var device *playbackDevice
+	for _, candidate := range ps.playbackDevices {
+		if candidate.DeviceName == session.DeviceName {
+			device = candidate
+			break
+		}
+	}
+	if device == nil {
+		ps.mu.Unlock()
+		status := newSessionStatus(session)
+		return sessionSnapshotFromStatus(status, []JukeboxEntrySnapshot{}), nil
+	}
+
+	// Keep the device binding stable until its state lock is held.
+	device.mu.Lock()
+	ps.mu.Unlock()
+	defer device.mu.Unlock()
+
+	status := sessionStatusFromDevice(session, device)
+	entries := make([]JukeboxEntrySnapshot, len(device.PlaybackQueue.Items))
+	for i, item := range device.PlaybackQueue.Items {
+		entries[i] = JukeboxEntrySnapshot{
+			ID:       item.ID,
+			Title:    item.Title,
+			Artist:   item.Artist,
+			Album:    item.Album,
+			Duration: item.Duration,
+		}
+	}
+	return sessionSnapshotFromStatus(status, entries), nil
+}
+
+func sessionSnapshotFromStatus(status SessionStatus, entries []JukeboxEntrySnapshot) SessionSnapshot {
+	return SessionSnapshot{
+		SessionStatus: status,
+		JukeboxPlaylist: JukeboxPlaylistSnapshot{
+			CurrentIndex: status.CurrentIndex,
+			Playing:      status.Playing,
+			Position:     status.Position,
+			Gain:         status.Gain,
+			Entry:        entries,
+		},
+	}
 }
 
 // playbackDeviceContext returns the long-lived playback service context when

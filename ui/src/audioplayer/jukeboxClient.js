@@ -6,6 +6,11 @@ const jukeboxClient = {
       `/api/jukebox/session/status?sessionId=${encodeURIComponent(sessionId)}`,
     ).then(({ json }) => json),
 
+  sessionSnapshot: (sessionId) =>
+    httpClient(
+      `/api/jukebox/session/snapshot?sessionId=${encodeURIComponent(sessionId)}`,
+    ).then(({ json }) => json),
+
   attachSession: (sessionId, clientId, deviceName = null) =>
     httpClient('/api/jukebox/session/attach', {
       method: 'POST',

@@ -59,6 +59,7 @@ import {
   getOrCreateJukeboxClientId,
   refreshJukeboxSessionStatus,
   runJukeboxHeartbeat,
+  startJukeboxHeartbeatLoop,
 } from './jukeboxSession'
 import {
   selectEffectiveCurrentTrack,
@@ -68,19 +69,6 @@ import {
 
 const snapshotQueue = (audioLists = []) =>
   audioLists.map((item) => ({ ...item }))
-
-const JUKEBOX_HEARTBEAT_INTERVAL_MS = 15000
-
-const startJukeboxHeartbeatLoop = ({
-  jukeboxMode,
-  sessionId,
-  clientId,
-  onHeartbeat,
-}) => {
-  if (!jukeboxMode || !sessionId || !clientId || !onHeartbeat) return () => {}
-  const interval = setInterval(onHeartbeat, JUKEBOX_HEARTBEAT_INTERVAL_MS)
-  return () => clearInterval(interval)
-}
 
 const syncRemotePositionIfNeeded = ({
   jukeboxMode,

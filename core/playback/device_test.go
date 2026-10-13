@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -13,13 +14,14 @@ import (
 )
 
 type mockTrack struct {
-	playing      bool
-	pauseCalls   int
-	closeCalls   int
-	position     int
-	volumeValues []float32
-	onUnpause    func()
-	onClose      func()
+	playing          bool
+	pauseCalls       int
+	closeCalls       int
+	position         int
+	positionSetCalls int
+	volumeValues     []float32
+	onUnpause        func()
+	onClose          func()
 }
 
 func (m *mockTrack) IsPlaying() bool { return m.playing }
@@ -38,6 +40,7 @@ func (m *mockTrack) Unpause() {
 }
 func (m *mockTrack) Position() int { return m.position }
 func (m *mockTrack) SetPosition(offset int) error {
+	m.positionSetCalls++
 	m.position = offset
 	return nil
 }
@@ -49,13 +52,202 @@ func (m *mockTrack) Close() {
 }
 func (m *mockTrack) String() string { return "mockTrack" }
 
+func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	repo := tests.CreateMockMediaFileRepo()
+	repo.SetData(model.MediaFiles{{ID: "1", Path: "/same.mp3"}, {ID: "2", Path: "/next.mp3"}})
+	server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
+	device := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
+	if _, err := device.Set(ctx, []string{"1", "1", "2"}); err != nil {
+		t.Fatalf("set queue: %v", err)
+	}
+
+	type preparedTrack struct {
+		token model.PlaybackToken
+		track *mockTrack
+	}
+	prepared := make(chan preparedTrack, 2)
+	previousNewTrack := newTrack
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, token model.PlaybackToken, _ string, _ model.MediaFile) (Track, error) {
+		track := &mockTrack{}
+		prepared <- preparedTrack{token: token, track: track}
+		return track, nil
+	}
+	t.Cleanup(func() {
+		_, _ = device.Shutdown(ctx)
+		cancel()
+		newTrack = previousNewTrack
+	})
+
+	if status, err := device.Start(ctx); err != nil || !status.Playing {
+		t.Fatalf("initial start: status=%#v, err=%v", status, err)
+	}
+	first := <-prepared
+	position := 17
+	device.PlaybackEvents <- model.PlaybackEvent{
+		Token:    first.token,
+		Kind:     model.PlaybackEventFailure,
+		Position: &position,
+		Err:      errors.New("IPC disconnected"),
+	}
+	waitDeviceStatus(t, device, ctx, DeviceStatus{
+		CurrentIndex: 0,
+		Playing:      false,
+		Gain:         DefaultGain,
+		Position:     position,
+		QueueVersion: 1,
+	})
+	if first.track.closeCalls != 1 {
+		t.Fatalf("failed output was not released: closes=%d", first.track.closeCalls)
+	}
+
+	if status, err := device.Start(ctx); err != nil || !status.Playing {
+		t.Fatalf("resume after output failure: status=%#v, err=%v", status, err)
+	}
+	second := <-prepared
+	if second.token == first.token {
+		t.Fatalf("reused playback token for repeated media ID: %d", second.token)
+	}
+	if second.track.position != position {
+		t.Fatalf("recovery position: got=%d, want=%d", second.track.position, position)
+	}
+
+	device.PlaybackEvents <- model.PlaybackEvent{Token: first.token, Kind: model.PlaybackEventNaturalEnd}
+	device.PlaybackEvents <- model.PlaybackEvent{Token: first.token, Kind: model.PlaybackEventFailure, Err: errors.New("late fault")}
+	assertDeviceStatusStable(t, device, ctx, DeviceStatus{
+		CurrentIndex: 0,
+		Playing:      true,
+		Gain:         DefaultGain,
+		Position:     position,
+		QueueVersion: 1,
+	}, 100*time.Millisecond)
+	if second.track.closeCalls != 0 {
+		t.Fatalf("stale event closed successor output: closes=%d", second.track.closeCalls)
+	}
+
+	retiredPosition := 20
+	device.PlaybackEvents <- model.PlaybackEvent{
+		Token:    second.token,
+		Kind:     model.PlaybackEventRetired,
+		Position: &retiredPosition,
+	}
+	waitDeviceStatus(t, device, ctx, DeviceStatus{
+		CurrentIndex: 0,
+		Playing:      false,
+		Gain:         DefaultGain,
+		Position:     retiredPosition,
+		QueueVersion: 1,
+	})
+	if second.track.closeCalls != 1 {
+		t.Fatalf("retired output was not released: closes=%d", second.track.closeCalls)
+	}
+}
+
+func TestPlaybackDeviceUnknownFailurePositionDoesNotInventSeekOffset(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	repo := tests.CreateMockMediaFileRepo()
+	repo.SetData(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
+	server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
+	device := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
+	if _, err := device.Set(ctx, []string{"1"}); err != nil {
+		t.Fatalf("set queue: %v", err)
+	}
+
+	type preparedOutput struct {
+		token model.PlaybackToken
+		track *mockTrack
+	}
+	prepared := make(chan preparedOutput, 2)
+	previousNewTrack := newTrack
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, token model.PlaybackToken, _ string, _ model.MediaFile) (Track, error) {
+		track := &mockTrack{}
+		prepared <- preparedOutput{token: token, track: track}
+		return track, nil
+	}
+	t.Cleanup(func() {
+		_, _ = device.Shutdown(ctx)
+		cancel()
+		newTrack = previousNewTrack
+	})
+
+	if _, err := device.Start(ctx); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	first := <-prepared
+	device.PlaybackEvents <- model.PlaybackEvent{Token: first.token, Kind: model.PlaybackEventFailure, Err: errors.New("position unavailable")}
+	waitDeviceStatus(t, device, ctx, DeviceStatus{
+		CurrentIndex: 0,
+		Playing:      false,
+		Gain:         DefaultGain,
+		Position:     0,
+		QueueVersion: 1,
+	})
+	if first.track.closeCalls != 1 {
+		t.Fatalf("failed output was not released: closes=%d", first.track.closeCalls)
+	}
+
+	if _, err := device.Start(ctx); err != nil {
+		t.Fatalf("resume after output failure: %v", err)
+	}
+	second := <-prepared
+	if second.track.positionSetCalls != 0 {
+		t.Fatalf("unknown position was fabricated as a seek target: calls=%d", second.track.positionSetCalls)
+	}
+}
+
+func waitDeviceStatus(t *testing.T, device *playbackDevice, ctx context.Context, expected DeviceStatus) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status, err := device.Status(ctx)
+		if err != nil {
+			t.Fatalf("read playback status: %v", err)
+		}
+		if status == expected {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("playback status did not become %#v; got %#v", expected, status)
+		}
+	}
+}
+
+func assertDeviceStatusStable(t *testing.T, device *playbackDevice, ctx context.Context, expected DeviceStatus, duration time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status, err := device.Status(ctx)
+		if err != nil {
+			t.Fatalf("read playback status: %v", err)
+		}
+		if status != expected {
+			t.Fatalf("playback status changed: expected %#v, got %#v", expected, status)
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			return
+		}
+	}
+}
+
 func TestPlaybackDeviceInvokesStateChangeCallbackOnSkip(t *testing.T) {
 	called := make(chan DeviceStatus, 1)
 	pd := &playbackDevice{
-		PlaybackQueue: NewQueue(),
-		PlaybackDone:  make(chan bool, 1),
-		ActiveTrack:   &mockTrack{},
-		onStateChange: func(status DeviceStatus) { called <- status },
+		PlaybackQueue:  NewQueue(),
+		PlaybackEvents: make(chan model.PlaybackEvent, 16),
+		ActiveTrack:    &mockTrack{},
+		onStateChange:  func(status DeviceStatus) { called <- status },
 	}
 	pd.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
 
@@ -79,6 +271,15 @@ type pendingPlaybackResult struct {
 	err    error
 }
 
+type playbackEventEmitter struct {
+	events chan<- model.PlaybackEvent
+	token  model.PlaybackToken
+}
+
+func (e playbackEventEmitter) emit(kind model.PlaybackEventKind, position *int, err error) {
+	e.events <- model.PlaybackEvent{Token: e.token, Kind: kind, Position: position, Err: err}
+}
+
 type pendingPlaybackHarness struct {
 	ctx        context.Context
 	device     *playbackDevice
@@ -88,7 +289,7 @@ type pendingPlaybackHarness struct {
 	resolved   chan struct{}
 	playedGain chan float32
 	playedIDs  chan string
-	ended      chan chan bool
+	ended      chan playbackEventEmitter
 	release    func()
 }
 
@@ -108,7 +309,7 @@ func newPendingPlaybackHarness(t *testing.T, blockedID string, ids []string) *pe
 		resolved:   make(chan struct{}),
 		playedGain: make(chan float32, 1),
 		playedIDs:  make(chan string, 3),
-		ended:      make(chan chan bool, 1),
+		ended:      make(chan playbackEventEmitter, 1),
 	}
 	if _, err := h.device.Set(ctx, ids); err != nil {
 		t.Fatalf("set queue: %v", err)
@@ -140,7 +341,7 @@ func newPendingPlaybackHarness(t *testing.T, blockedID string, ids []string) *pe
 	previousNewTrack := newTrack
 	blocked := false
 	initial := &mockTrack{}
-	newTrack = func(_ context.Context, done chan bool, _ string, mf model.MediaFile) (Track, error) {
+	newTrack = func(_ context.Context, events chan<- model.PlaybackEvent, token model.PlaybackToken, _ string, mf model.MediaFile) (Track, error) {
 		if mf.ID == blockedID {
 			if !blocked {
 				blocked = true
@@ -151,7 +352,7 @@ func newPendingPlaybackHarness(t *testing.T, blockedID string, ids []string) *pe
 			}
 			return observe(h.successor, mf.ID), nil
 		}
-		h.ended <- done
+		h.ended <- playbackEventEmitter{events: events, token: token}
 		return observe(initial, mf.ID), nil
 	}
 	t.Cleanup(func() {
@@ -304,17 +505,13 @@ func testPlaybackDeviceCancelsPendingAdvance(t *testing.T, resume bool) {
 	if status, err := h.device.Start(h.ctx); err != nil || !status.Playing {
 		t.Fatalf("initial start: status=%#v, err=%v", status, err)
 	}
-	var ended chan bool
+	var ended playbackEventEmitter
 	select {
 	case ended = <-h.ended:
 	case <-time.After(time.Second):
 		t.Fatal("initial output did not expose its natural-end event")
 	}
-	select {
-	case ended <- true:
-	case <-time.After(time.Second):
-		t.Fatal("natural track end was not accepted")
-	}
+	ended.emit(model.PlaybackEventNaturalEnd, nil, nil)
 	h.wait(t, h.entered, "natural advance did not begin preparing the next output")
 	if status, err := h.device.Stop(h.ctx); err != nil || status.Playing {
 		t.Fatalf("stop while advancing: status=%#v, err=%v", status, err)
@@ -409,8 +606,8 @@ func TestPlaybackDeviceCancelledStartDoesNotDisplaceSuccessor(t *testing.T) {
 var _ = Describe("playbackDevice concurrency", func() {
 	It("handles concurrent Status and Clear calls without panic", func() {
 		pd := &playbackDevice{
-			PlaybackQueue: NewQueue(),
-			PlaybackDone:  make(chan bool),
+			PlaybackQueue:  NewQueue(),
+			PlaybackEvents: make(chan model.PlaybackEvent, 16),
 		}
 
 		ctx := context.Background()
@@ -435,9 +632,9 @@ var _ = Describe("playbackDevice concurrency", func() {
 	It("Stop pauses but keeps the active track resumable", func() {
 		track := &mockTrack{playing: true, position: 17}
 		pd := &playbackDevice{
-			PlaybackQueue: NewQueue(),
-			PlaybackDone:  make(chan bool),
-			ActiveTrack:   track,
+			PlaybackQueue:  NewQueue(),
+			PlaybackEvents: make(chan model.PlaybackEvent, 16),
+			ActiveTrack:    track,
 		}
 
 		status, err := pd.Stop(context.Background())
@@ -452,9 +649,9 @@ var _ = Describe("playbackDevice concurrency", func() {
 	It("Shutdown pauses, closes, and releases the active track", func() {
 		track := &mockTrack{playing: true, position: 23}
 		pd := &playbackDevice{
-			PlaybackQueue: NewQueue(),
-			PlaybackDone:  make(chan bool),
-			ActiveTrack:   track,
+			PlaybackQueue:  NewQueue(),
+			PlaybackEvents: make(chan model.PlaybackEvent, 16),
+			ActiveTrack:    track,
 		}
 
 		status, err := pd.Shutdown(context.Background())

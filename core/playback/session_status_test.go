@@ -37,6 +37,9 @@ func (s *sessionStatusStubServer) DetachSession(context.Context, string, string)
 func (s *sessionStatusStubServer) SessionStatus(context.Context, string) (SessionStatus, error) {
 	return SessionStatus{}, nil
 }
+func (s *sessionStatusStubServer) SessionSnapshot(context.Context, string, string) (SessionSnapshot, error) {
+	return SessionSnapshot{}, nil
+}
 
 func TestPlaybackServerDetachSessionReturnsSnapshot(t *testing.T) {
 	ctx := context.Background()

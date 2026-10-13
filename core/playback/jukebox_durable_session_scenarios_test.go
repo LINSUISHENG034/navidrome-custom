@@ -14,6 +14,7 @@ type durableScenarioHarness struct {
 	now    time.Time
 	server *playbackServer
 	device *playbackDevice
+	token  model.PlaybackToken
 }
 
 func newDurableScenarioHarness(t *testing.T) *durableScenarioHarness {
@@ -70,15 +71,24 @@ func (h *durableScenarioHarness) setCurrentIndex(index int) {
 
 func (h *durableScenarioHarness) startPlayback(t *testing.T) {
 	t.Helper()
-	h.device.ActiveTrack = &mockTrack{playing: true}
 
 	previousNewTrack := newTrack
-	newTrack = func(_ context.Context, _ chan bool, _ string, _ model.MediaFile) (Track, error) {
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, token model.PlaybackToken, _ string, _ model.MediaFile) (Track, error) {
+		h.token = token
 		return &mockTrack{playing: true}, nil
 	}
 	t.Cleanup(func() { newTrack = previousNewTrack })
 
-	go h.device.trackSwitcherGoroutine()
+	if _, err := h.device.Start(h.ctx); err != nil {
+		t.Fatalf("start playback: %v", err)
+	}
+}
+
+func (h *durableScenarioHarness) sendNaturalEnd() {
+	h.device.PlaybackEvents <- model.PlaybackEvent{
+		Token: h.token,
+		Kind:  model.PlaybackEventNaturalEnd,
+	}
 }
 
 func waitForSessionStatus(t *testing.T, server *playbackServer, sessionID string, predicate func(SessionStatus) bool) SessionStatus {
@@ -110,7 +120,7 @@ func TestDurableSessionDoesNotRewindAfterRemoteNaturalAdvance(t *testing.T) {
 
 	h.advance(80 * time.Millisecond)
 	h.server.reapExpiredSessions()
-	h.device.PlaybackDone <- true
+	h.sendNaturalEnd()
 
 	status := waitForSessionStatus(t, h.server, "s1", func(status SessionStatus) bool {
 		return status.CurrentIndex == 1 && status.TrackID == "2"
@@ -149,7 +159,7 @@ func TestDurableSessionHiddenTabReconnectPreservesRemoteAdvance(t *testing.T) {
 
 	h.advance(80 * time.Millisecond)
 	h.server.reapExpiredSessions()
-	h.device.PlaybackDone <- true
+	h.sendNaturalEnd()
 
 	advanced := waitForSessionStatus(t, h.server, "s1", func(status SessionStatus) bool {
 		return status.OwnershipState == SessionOwnershipRecovering &&
