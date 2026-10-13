@@ -37,7 +37,7 @@ type playbackDevice struct {
 	ActiveTrack          Track
 	onStateChange        func(DeviceStatus)
 	startTrackSwitcher   sync.Once
-	startVersion         uint64
+	preparationVersion   uint64
 }
 
 type DeviceStatus struct {
@@ -177,19 +177,8 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, bool, 
 		}
 	} else {
 		if !pd.PlaybackQueue.IsEmpty() {
-			pd.startVersion++
-			version := pd.startVersion
-			idx := pd.PlaybackQueue.Index
-			pd.mu.Unlock()
-			track, err := pd.switchActiveTrackByIndex(idx)
-			pd.mu.Lock()
-			if version != pd.startVersion {
-				if track != nil {
-					track.Close()
-				}
-				return pd.getStatus(), false, nil
-			}
-			if err != nil {
+			track, current, err := pd.loadTrackLocked(pd.PlaybackQueue.Index)
+			if err != nil || !current {
 				return pd.getStatus(), false, err
 			}
 			pd.assignTrack(track)
@@ -230,7 +219,7 @@ func (pd *playbackDevice) Shutdown(ctx context.Context) (DeviceStatus, error) {
 // stopLocked contains the Stop logic and must be called with pd.mu held.
 func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing Stop action", "device", pd)
-	pd.startVersion++
+	pd.preparationVersion++
 	changed := pd.ActiveTrack != nil && pd.isPlaying()
 	if pd.ActiveTrack != nil {
 		pd.ActiveTrack.Pause()
@@ -240,7 +229,7 @@ func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, bool, e
 
 func (pd *playbackDevice) shutdownLocked(ctx context.Context) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing Shutdown action", "device", pd)
-	pd.startVersion++
+	pd.preparationVersion++
 	changed := pd.ActiveTrack != nil
 	if pd.ActiveTrack != nil {
 		pd.ActiveTrack.Pause()
@@ -284,10 +273,8 @@ func (pd *playbackDevice) skipLocked(ctx context.Context, index int, offset int)
 	}
 
 	if pd.ActiveTrack == nil {
-		pd.mu.Unlock()
-		track, err := pd.switchActiveTrackByIndex(index)
-		pd.mu.Lock()
-		if err != nil {
+		track, current, err := pd.loadTrackLocked(index)
+		if err != nil || !current {
 			return pd.getStatus(), false, err
 		}
 		pd.assignTrack(track)
@@ -406,6 +393,7 @@ func (pd *playbackDevice) Clear(ctx context.Context) (DeviceStatus, error) {
 // clearLocked contains the Clear logic and must be called with pd.mu held.
 func (pd *playbackDevice) clearLocked(ctx context.Context) {
 	log.Debug(ctx, "Processing Clear action", "device", pd)
+	pd.preparationVersion++
 	if pd.ActiveTrack != nil {
 		pd.ActiveTrack.Pause()
 		pd.ActiveTrack.Close()
@@ -418,11 +406,14 @@ func (pd *playbackDevice) Remove(ctx context.Context, index int) (DeviceStatus, 
 	pd.mu.Lock()
 	log.Debug(ctx, "Processing Remove action", "index", index, "device", pd)
 	changed := index > -1 && index < pd.PlaybackQueue.Size()
-	// close and nil the active track if removing the currently playing track
-	if pd.PlaybackQueue.Index == index && pd.ActiveTrack != nil {
-		pd.ActiveTrack.Pause()
-		pd.ActiveTrack.Close()
-		pd.ActiveTrack = nil
+	// Cancel preparation and close the output when removing the current item.
+	if changed && pd.PlaybackQueue.Index == index {
+		pd.preparationVersion++
+		if pd.ActiveTrack != nil {
+			pd.ActiveTrack.Pause()
+			pd.ActiveTrack.Close()
+			pd.ActiveTrack = nil
+		}
 	}
 
 	if index > -1 && index < pd.PlaybackQueue.Size() {
@@ -520,16 +511,17 @@ func (pd *playbackDevice) trackSwitcherGoroutine() {
 			if !pd.PlaybackQueue.IsAtLastElement() {
 				pd.PlaybackQueue.IncreaseIndex()
 				idx := pd.PlaybackQueue.Index
-				pd.mu.Unlock()
 
 				log.Debug("Switching to next song", "index", idx)
-				track, err := pd.switchActiveTrackByIndex(idx)
-				if err != nil {
-					log.Error("Error switching track", err)
+				track, current, err := pd.loadTrackLocked(idx)
+				if err != nil || !current {
+					pd.mu.Unlock()
+					if err != nil {
+						log.Error("Error switching track", err)
+					}
 					continue
 				}
 
-				pd.mu.Lock()
 				pd.assignTrack(track)
 				if pd.ActiveTrack != nil {
 					pd.ActiveTrack.Unpause()
@@ -553,19 +545,33 @@ func (pd *playbackDevice) trackSwitcherGoroutine() {
 	}
 }
 
-func (pd *playbackDevice) switchActiveTrackByIndex(index int) (Track, error) {
+// loadTrackLocked snapshots queue state before releasing the mutex for output creation.
+// A superseded result is retired without replacing current playback authority.
+func (pd *playbackDevice) loadTrackLocked(index int) (Track, bool, error) {
 	pd.PlaybackQueue.SetIndex(index)
 	currentTrack := pd.PlaybackQueue.Current()
 	if currentTrack == nil {
-		return nil, errors.New("could not get current track")
+		return nil, false, errors.New("could not get current track")
 	}
 
-	track, err := newTrack(pd.serviceCtx, pd.PlaybackDone, pd.DeviceName, *currentTrack)
+	pd.preparationVersion++
+	version := pd.preparationVersion
+	mediaFile := *currentTrack
+	ctx, done, deviceName := pd.serviceCtx, pd.PlaybackDone, pd.DeviceName
+	pd.mu.Unlock()
+	track, err := newTrack(ctx, done, deviceName, mediaFile)
+	pd.mu.Lock()
+	if version != pd.preparationVersion {
+		if track != nil {
+			track.Close()
+		}
+		return nil, false, nil
+	}
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	track.SetVolume(pd.Gain)
-	return track, nil
+	return track, true, nil
 }
 
 // assignTrack safely replaces the active track while holding the mutex.

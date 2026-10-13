@@ -18,6 +18,8 @@ type mockTrack struct {
 	closeCalls   int
 	position     int
 	volumeValues []float32
+	onUnpause    func()
+	onClose      func()
 }
 
 func (m *mockTrack) IsPlaying() bool { return m.playing }
@@ -30,6 +32,9 @@ func (m *mockTrack) Pause() {
 }
 func (m *mockTrack) Unpause() {
 	m.playing = true
+	if m.onUnpause != nil {
+		m.onUnpause()
+	}
 }
 func (m *mockTrack) Position() int { return m.position }
 func (m *mockTrack) SetPosition(offset int) error {
@@ -38,6 +43,9 @@ func (m *mockTrack) SetPosition(offset int) error {
 }
 func (m *mockTrack) Close() {
 	m.closeCalls++
+	if m.onClose != nil {
+		m.onClose()
+	}
 }
 func (m *mockTrack) String() string { return "mockTrack" }
 
@@ -66,88 +74,323 @@ func TestPlaybackDeviceInvokesStateChangeCallbackOnSkip(t *testing.T) {
 	}
 }
 
-func testPlaybackDeviceCancelsPendingStart(t *testing.T, stop func(*playbackDevice, context.Context) (DeviceStatus, error), resume bool) {
+type pendingPlaybackResult struct {
+	status DeviceStatus
+	err    error
+}
+
+type pendingPlaybackHarness struct {
+	ctx        context.Context
+	device     *playbackDevice
+	track      *mockTrack
+	successor  *mockTrack
+	entered    chan struct{}
+	resolved   chan struct{}
+	playedGain chan float32
+	playedIDs  chan string
+	ended      chan chan bool
+	release    func()
+}
+
+func newPendingPlaybackHarness(t *testing.T, blockedID string, ids []string) *pendingPlaybackHarness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	repo := tests.CreateMockMediaFileRepo()
-	repo.SetData(model.MediaFiles{{ID: "1", Path: "/a.mp3"}})
+	repo.SetData(model.MediaFiles{{ID: "1", Path: "/a.mp3"}, {ID: "2", Path: "/b.mp3"}, {ID: "3", Path: "/c.mp3"}})
 	server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
-	device := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
-	if _, err := device.Set(ctx, []string{"1"}); err != nil {
+	h := &pendingPlaybackHarness{
+		ctx:        ctx,
+		device:     NewPlaybackDevice(ctx, server, "Speaker", "pulse/test"),
+		track:      &mockTrack{},
+		successor:  &mockTrack{},
+		entered:    make(chan struct{}),
+		resolved:   make(chan struct{}),
+		playedGain: make(chan float32, 1),
+		playedIDs:  make(chan string, 3),
+		ended:      make(chan chan bool, 1),
+	}
+	if _, err := h.device.Set(ctx, ids); err != nil {
 		t.Fatalf("set queue: %v", err)
 	}
-
-	track := &mockTrack{}
-	successor := &mockTrack{}
-	entered := make(chan struct{})
 	release := make(chan struct{})
-	done := make(chan struct{})
-	var releaseOnce sync.Once
-	var startStatus DeviceStatus
-	var startErr error
-	previousNewTrack := newTrack
-	calls := 0
-	newTrack = func(context.Context, chan bool, string, model.MediaFile) (Track, error) {
-		calls++
-		if calls == 1 {
-			close(entered)
-			<-release
-			return track, nil
+	var releaseOnce, resolvedOnce, playedOnce sync.Once
+	h.release = func() { releaseOnce.Do(func() { close(release) }) }
+	h.track.onClose = func() { resolvedOnce.Do(func() { close(h.resolved) }) }
+	h.track.onUnpause = func() {
+		playedOnce.Do(func() {
+			gain := float32(0)
+			if len(h.track.volumeValues) > 0 {
+				gain = h.track.volumeValues[len(h.track.volumeValues)-1]
+			}
+			h.playedGain <- gain
+		})
+		resolvedOnce.Do(func() { close(h.resolved) })
+	}
+	observe := func(output *mockTrack, id string) *mockTrack {
+		onUnpause := output.onUnpause
+		output.onUnpause = func() {
+			if onUnpause != nil {
+				onUnpause()
+			}
+			h.playedIDs <- id
 		}
-		return successor, nil
+		return output
+	}
+	previousNewTrack := newTrack
+	blocked := false
+	initial := &mockTrack{}
+	newTrack = func(_ context.Context, done chan bool, _ string, mf model.MediaFile) (Track, error) {
+		if mf.ID == blockedID {
+			if !blocked {
+				blocked = true
+				output := observe(h.track, mf.ID)
+				close(h.entered)
+				<-release
+				return output, nil
+			}
+			return observe(h.successor, mf.ID), nil
+		}
+		h.ended <- done
+		return observe(initial, mf.ID), nil
 	}
 	t.Cleanup(func() {
-		releaseOnce.Do(func() { close(release) })
+		_, _ = h.device.Shutdown(ctx)
+		h.release()
 		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("pending start did not finish during cleanup")
+		case <-h.entered:
+			select {
+			case <-h.resolved:
+			case <-time.After(time.Second):
+				t.Error("pending output did not resolve during cleanup")
+			}
+		default:
 		}
+		cancel()
 		newTrack = previousNewTrack
 	})
-	go func() {
-		startStatus, startErr = device.Start(ctx)
-		close(done)
-	}()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("start did not begin preparing the output")
-	}
+	return h
+}
 
-	stopped, err := stop(device, ctx)
+func (h *pendingPlaybackHarness) wait(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatal(message)
+	}
+}
+
+func (h *pendingPlaybackHarness) begin(t *testing.T, action func(context.Context) (DeviceStatus, error)) <-chan pendingPlaybackResult {
+	t.Helper()
+	done := make(chan pendingPlaybackResult, 1)
+	go func() {
+		status, err := action(h.ctx)
+		done <- pendingPlaybackResult{status: status, err: err}
+	}()
+	h.wait(t, h.entered, "playback did not begin preparing the output")
+	return done
+}
+
+func (h *pendingPlaybackHarness) finish(t *testing.T, done <-chan pendingPlaybackResult) DeviceStatus {
+	t.Helper()
+	h.release()
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("preparation completion: %v", result.err)
+		}
+		return result.status
+	case <-time.After(time.Second):
+		t.Fatal("playback did not finish after releasing the output")
+		return DeviceStatus{}
+	}
+}
+
+func (h *pendingPlaybackHarness) assertRetired(t *testing.T, playing bool, ids []string) {
+	t.Helper()
+	queue, status, err := h.device.Get(h.ctx)
+	if err != nil || status.Playing != playing {
+		t.Fatalf("cancelled preparation changed playback: status=%#v, err=%v", status, err)
+	}
+	if h.track.playing || h.track.closeCalls != 1 {
+		t.Fatalf("cancelled output was not retired: playing=%v, closes=%d", h.track.playing, h.track.closeCalls)
+	}
+	if playing && (!h.successor.playing || h.successor.closeCalls != 0) {
+		t.Fatalf("cancelled output displaced successor: playing=%v, closes=%d", h.successor.playing, h.successor.closeCalls)
+	}
+	if len(queue) != len(ids) {
+		t.Fatalf("unexpected authoritative queue length: got=%d, want=%d", len(queue), len(ids))
+	}
+	for i, id := range ids {
+		if queue[i].ID != id {
+			t.Fatalf("unexpected authoritative queue at %d: got=%s, want=%s", i, queue[i].ID, id)
+		}
+	}
+}
+
+func testPlaybackDeviceCancelsPendingStart(t *testing.T, stop func(*playbackDevice, context.Context) (DeviceStatus, error), resume bool) {
+	t.Helper()
+	h := newPendingPlaybackHarness(t, "1", []string{"1"})
+	done := h.begin(t, h.device.Start)
+	stopped, err := stop(h.device, h.ctx)
 	if err != nil || stopped.Playing {
 		t.Fatalf("stop while preparing: status=%#v, err=%v", stopped, err)
 	}
 	if resume {
-		resumed, err := device.Start(ctx)
+		resumed, err := h.device.Start(h.ctx)
 		if err != nil || !resumed.Playing {
 			t.Fatalf("successor start: status=%#v, err=%v", resumed, err)
 		}
 	}
-	releaseOnce.Do(func() { close(release) })
+	if status := h.finish(t, done); status.Playing != resume {
+		t.Fatalf("cancelled start returned the wrong playback state: %#v", status)
+	}
+	h.assertRetired(t, resume, []string{"1"})
+}
+
+func TestPlaybackDeviceClearCancelsPendingStart(t *testing.T) {
+	h := newPendingPlaybackHarness(t, "1", []string{"1"})
+	done := h.begin(t, h.device.Start)
+	if _, err := h.device.Clear(h.ctx); err != nil {
+		t.Fatalf("clear while preparing: %v", err)
+	}
+	h.finish(t, done)
+	h.assertRetired(t, false, nil)
+}
+
+func TestPlaybackDeviceSetCancelsPendingStart(t *testing.T) {
+	h := newPendingPlaybackHarness(t, "1", []string{"1"})
+	done := h.begin(t, h.device.Start)
+	if _, err := h.device.Set(h.ctx, []string{"3"}); err != nil {
+		t.Fatalf("replace queue while preparing: %v", err)
+	}
+	h.finish(t, done)
+	h.assertRetired(t, false, []string{"3"})
+}
+
+func testPlaybackDeviceCancelsPendingSkip(t *testing.T, stop func(*playbackDevice, context.Context) (DeviceStatus, error), resume bool) {
+	t.Helper()
+	h := newPendingPlaybackHarness(t, "2", []string{"1", "2"})
+	if status, err := h.device.Start(h.ctx); err != nil || !status.Playing {
+		t.Fatalf("initial start: status=%#v, err=%v", status, err)
+	}
+	done := h.begin(t, func(ctx context.Context) (DeviceStatus, error) { return h.device.Skip(ctx, 1, 0) })
+	if status, err := stop(h.device, h.ctx); err != nil || status.Playing {
+		t.Fatalf("stop while skipping: status=%#v, err=%v", status, err)
+	}
+	if resume {
+		if status, err := h.device.Start(h.ctx); err != nil || !status.Playing {
+			t.Fatalf("successor start: status=%#v, err=%v", status, err)
+		}
+	}
+	if status := h.finish(t, done); status.Playing != resume {
+		t.Fatalf("cancelled skip returned the wrong playback state: %#v", status)
+	}
+	h.assertRetired(t, resume, []string{"1", "2"})
+}
+
+func TestPlaybackDeviceStopCancelsPendingSkip(t *testing.T) {
+	testPlaybackDeviceCancelsPendingSkip(t, (*playbackDevice).Stop, false)
+}
+
+func TestPlaybackDeviceShutdownCancelsPendingSkip(t *testing.T) {
+	testPlaybackDeviceCancelsPendingSkip(t, (*playbackDevice).Shutdown, false)
+}
+
+func testPlaybackDeviceCancelsPendingAdvance(t *testing.T, resume bool) {
+	t.Helper()
+	h := newPendingPlaybackHarness(t, "2", []string{"1", "2"})
+	if status, err := h.device.Start(h.ctx); err != nil || !status.Playing {
+		t.Fatalf("initial start: status=%#v, err=%v", status, err)
+	}
+	var ended chan bool
 	select {
-	case <-done:
+	case ended = <-h.ended:
 	case <-time.After(time.Second):
-		t.Fatal("start did not finish after releasing the output")
+		t.Fatal("initial output did not expose its natural-end event")
 	}
-	if startErr != nil {
-		t.Fatalf("start completion: %v", startErr)
+	select {
+	case ended <- true:
+	case <-time.After(time.Second):
+		t.Fatal("natural track end was not accepted")
 	}
-	status, err := device.Status(ctx)
-	if err != nil || status.Playing != resume || startStatus.Playing != resume {
-		t.Fatalf("cancelled preparation changed playback: status=%#v, start=%#v, err=%v", status, startStatus, err)
+	h.wait(t, h.entered, "natural advance did not begin preparing the next output")
+	if status, err := h.device.Stop(h.ctx); err != nil || status.Playing {
+		t.Fatalf("stop while advancing: status=%#v, err=%v", status, err)
 	}
-	if track.playing || track.closeCalls != 1 {
-		t.Fatalf("cancelled output was not retired: playing=%v, closes=%d", track.playing, track.closeCalls)
+	if resume {
+		if status, err := h.device.Start(h.ctx); err != nil || !status.Playing {
+			t.Fatalf("successor start: status=%#v, err=%v", status, err)
+		}
 	}
-	if resume && (!successor.playing || successor.closeCalls != 0) {
-		t.Fatalf("cancelled output displaced successor: playing=%v, closes=%d", successor.playing, successor.closeCalls)
+	h.release()
+	h.wait(t, h.resolved, "natural-advance output did not resolve")
+	h.assertRetired(t, resume, []string{"1", "2"})
+}
+
+func TestPlaybackDeviceStopCancelsPendingNaturalAdvance(t *testing.T) {
+	testPlaybackDeviceCancelsPendingAdvance(t, false)
+}
+
+func TestPlaybackDeviceCancelledSkipDoesNotDisplaceSuccessor(t *testing.T) {
+	testPlaybackDeviceCancelsPendingSkip(t, (*playbackDevice).Stop, true)
+}
+
+func TestPlaybackDeviceCancelledNaturalAdvanceDoesNotDisplaceSuccessor(t *testing.T) {
+	testPlaybackDeviceCancelsPendingAdvance(t, true)
+}
+
+func TestPlaybackDevicePendingStartUsesLatestGainBeforeUnpause(t *testing.T) {
+	h := newPendingPlaybackHarness(t, "1", []string{"1"})
+	done := h.begin(t, h.device.Start)
+	if status, err := h.device.SetGain(h.ctx, 0.37); err != nil || status.Gain != float32(0.37) {
+		t.Fatalf("gain while preparing: status=%#v, err=%v", status, err)
 	}
-	queue, _, err := device.Get(ctx)
-	if err != nil || len(queue) != 1 || queue[0].ID != "1" {
-		t.Fatalf("cancellation changed the authoritative queue: queue=%#v, err=%v", queue, err)
+	if status := h.finish(t, done); !status.Playing || status.Gain != float32(0.37) {
+		t.Fatalf("start did not retain the latest gain: %#v", status)
+	}
+	select {
+	case gain := <-h.playedGain:
+		if gain != float32(0.37) {
+			t.Fatalf("first playback used stale gain: %v", gain)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("output did not expose its gain at first playback")
+	}
+}
+
+func TestPlaybackDeviceRemoveCancelsPreparationForCurrentItem(t *testing.T) {
+	h := newPendingPlaybackHarness(t, "1", []string{"1", "2"})
+	done := h.begin(t, h.device.Start)
+	if _, err := h.device.Remove(h.ctx, 0); err != nil {
+		t.Fatalf("remove current item while preparing: %v", err)
+	}
+	h.finish(t, done)
+	queue, status, err := h.device.Get(h.ctx)
+	if err != nil || len(queue) != 1 || queue[0].ID != "2" {
+		t.Fatalf("remove did not retain the next queue item: length=%d, status=%#v, err=%v", len(queue), status, err)
+	}
+	select {
+	case playedID := <-h.playedIDs:
+		t.Fatalf("deleted prepared content started: output=%s, current queue item=%s", playedID, queue[0].ID)
+	default:
+	}
+	h.assertRetired(t, false, []string{"2"})
+	if resumed, err := h.device.Start(h.ctx); err != nil || !resumed.Playing {
+		t.Fatalf("start retained queue item: status=%#v, err=%v", resumed, err)
+	}
+	queue, status, err = h.device.Get(h.ctx)
+	if err != nil || status.CurrentIndex < 0 || status.CurrentIndex >= len(queue) {
+		t.Fatalf("retained item status: status=%#v, length=%d, err=%v", status, len(queue), err)
+	}
+	select {
+	case playedID := <-h.playedIDs:
+		if playedID != "2" || playedID != queue[status.CurrentIndex].ID {
+			t.Fatalf("output differs from current queue: output=%s, queue=%s", playedID, queue[status.CurrentIndex].ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retained item did not reach the output")
 	}
 }
 
