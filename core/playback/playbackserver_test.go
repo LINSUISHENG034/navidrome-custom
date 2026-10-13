@@ -13,6 +13,75 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+func TestPlaybackServerGetReturnsIndependentQueueSnapshot(t *testing.T) {
+	ctx := context.Background()
+	repo := tests.CreateMockMediaFileRepo()
+	repo.SetData(model.MediaFiles{
+		{ID: "track-a", Path: "/a.mp3", Title: "A"},
+		{ID: "track-b", Path: "/b.mp3", Title: "B"},
+		{ID: "track-c", Path: "/c.mp3", Title: "C"},
+	})
+	server := &playbackServer{
+		ctx:       &ctx,
+		datastore: &tests.MockDataStore{MockedMediaFile: repo},
+	}
+	device := NewPlaybackDevice(ctx, server, "Speaker", "speaker")
+	device.Default = true
+	server.playbackDevices = []*playbackDevice{device}
+
+	device, err := server.GetDeviceForUser("admin")
+	if err != nil {
+		t.Fatalf("get device: %v", err)
+	}
+	if _, err := device.Set(ctx, []string{"track-a", "track-b", "track-c"}); err != nil {
+		t.Fatalf("set queue: %v", err)
+	}
+
+	previousQueue, previousStatus, err := device.Get(ctx)
+	if err != nil {
+		t.Fatalf("get initial queue: %v", err)
+	}
+	if len(previousQueue) != 3 || previousQueue[0].ID != "track-a" || previousQueue[1].ID != "track-b" || previousQueue[2].ID != "track-c" {
+		t.Fatalf("unexpected initial queue: %#v", previousQueue)
+	}
+	if previousStatus.CurrentIndex != 0 {
+		t.Fatalf("unexpected initial status: %#v", previousStatus)
+	}
+
+	if _, err := device.Remove(ctx, 0); err != nil {
+		t.Fatalf("remove first track: %v", err)
+	}
+	if len(previousQueue) != 3 || previousQueue[0].ID != "track-a" || previousQueue[1].ID != "track-b" || previousQueue[2].ID != "track-c" {
+		t.Errorf("previous queue snapshot changed after Remove: %#v", previousQueue)
+	}
+	if previousStatus.CurrentIndex != 0 {
+		t.Errorf("previous status snapshot changed after Remove: %#v", previousStatus)
+	}
+
+	currentQueue, currentStatus, err := device.Get(ctx)
+	if err != nil {
+		t.Fatalf("get queue after Remove: %v", err)
+	}
+	if len(currentQueue) != 2 || currentQueue[0].ID != "track-b" || currentQueue[1].ID != "track-c" {
+		t.Fatalf("unexpected queue after Remove: %#v", currentQueue)
+	}
+	if currentStatus.CurrentIndex != -1 {
+		t.Fatalf("unexpected status after Remove: %#v", currentStatus)
+	}
+
+	currentQueue[0].ID = "controller-mutated"
+	latestQueue, latestStatus, err := device.Get(ctx)
+	if err != nil {
+		t.Fatalf("get queue after caller mutation: %v", err)
+	}
+	if len(latestQueue) != 2 || latestQueue[0].ID != "track-b" || latestQueue[1].ID != "track-c" {
+		t.Errorf("caller mutation changed current queue: %#v", latestQueue)
+	}
+	if latestStatus.CurrentIndex != -1 {
+		t.Errorf("unexpected status after caller mutation: %#v", latestStatus)
+	}
+}
+
 func TestPlaybackServerDiscoveryPreservesNaturalAdvanceAuthority(t *testing.T) {
 	for _, discovery := range []struct {
 		name string

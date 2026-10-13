@@ -3,6 +3,7 @@ package playback
 import (
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 
 	"github.com/navidrome/navidrome/log"
@@ -44,7 +45,7 @@ func (pd *Queue) Current() *model.MediaFile {
 
 // returns the whole queue
 func (pd *Queue) Get() model.MediaFiles {
-	return pd.Items
+	return slices.Clone(pd.Items)
 }
 
 func (pd *Queue) Size() int {
