@@ -444,6 +444,9 @@ var _ = Describe("MPV null output prototype", func() {
 		Eventually(func() (any, error) {
 			return probe.command("get_property", "time-pos")
 		}, time.Second, 20*time.Millisecond).Should(BeNumerically("~", 0.5, 0.01))
+		Consistently(func() (any, error) {
+			return probe.command("get_property", "time-pos")
+		}, 300*time.Millisecond, 25*time.Millisecond).Should(BeNumerically("~", 0.5, 0.01))
 		inspect("first paused after seek")
 
 		_, err = probe.command("loadfile", second, "replace")
@@ -504,21 +507,6 @@ var _ = Describe("MPV null output prototype", func() {
 			_ = track.Conn.Close()
 			_ = track.Exe.Close()
 		})
-		var processLog bytes.Buffer
-		outputDone := make(chan struct{})
-		go func() {
-			_, _ = io.Copy(&processLog, track.Exe)
-			close(outputDone)
-		}()
-		DeferCleanup(func() {
-			cancel()
-			select {
-			case <-outputDone:
-				fmt.Fprintf(GinkgoWriter, "NewTrack process output:\n%s\n", processLog.String())
-			case <-time.After(trackCloseTimeout):
-				fmt.Fprintln(GinkgoWriter, "NewTrack output drain exceeded cleanup observation window")
-			}
-		})
 
 		conn, err := net.DialTimeout("unix", track.IPCSocketName, 100*time.Millisecond)
 		Expect(err).ToNot(HaveOccurred())
@@ -559,11 +547,9 @@ var _ = Describe("MPV null output prototype", func() {
 			return
 		}
 		Expect(*event.Position).To(Equal(1))
-		select {
-		case <-outputDone:
-		case <-time.After(trackCloseTimeout):
-			Fail("failed MPV process remained alive after transport loss")
-		}
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), trackCloseTimeout)
+		DeferCleanup(waitCancel)
+		Expect(track.Exe.Wait(waitCtx)).To(Succeed())
 		_, err = probe.command("get_property", "pause")
 		Expect(err).To(HaveOccurred())
 
@@ -627,7 +613,12 @@ var _ = Describe("MPV null output prototype", func() {
 		Expect(err).ToNot(HaveOccurred())
 		track.Pause()
 		Consistently(events, 100*time.Millisecond).ShouldNot(Receive())
+		closedAt := time.Now()
 		track.Close()
+		Expect(time.Since(closedAt)).To(BeNumerically("<", trackCloseTimeout))
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		DeferCleanup(waitCancel)
+		Expect(track.Exe.Wait(waitCtx)).To(Succeed())
 		var event model.PlaybackEvent
 		select {
 		case event = <-events:
@@ -655,12 +646,6 @@ var _ = Describe("MPV null output prototype", func() {
 		})
 		Expect(err).ToNot(HaveOccurred())
 		DeferCleanup(track.Close)
-		outputDone := make(chan struct{})
-		go func() {
-			_, _ = io.Copy(io.Discard, track.Exe)
-			close(outputDone)
-		}()
-
 		cancel()
 		var event model.PlaybackEvent
 		select {
@@ -670,11 +655,9 @@ var _ = Describe("MPV null output prototype", func() {
 		}
 		Expect(event.Token).To(Equal(token))
 		Expect(event.Kind).To(Equal(model.PlaybackEventRetired))
-		select {
-		case <-outputDone:
-		case <-time.After(trackCloseTimeout):
-			Fail("context cancellation left the MPV process alive")
-		}
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), trackCloseTimeout)
+		DeferCleanup(waitCancel)
+		Expect(track.Exe.Wait(waitCtx)).To(Succeed())
 	})
 })
 

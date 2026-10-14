@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -70,6 +71,8 @@ func NewTrack(ctx context.Context, events chan<- model.PlaybackEvent, token mode
 		log.Error("Error starting mpv process", err)
 		return nil, err
 	}
+	// Drain stdout even when no caller reads it; exec.Cmd.Wait also waits for its output copier.
+	go func() { _, _ = io.Copy(io.Discard, &exe) }()
 	cleanup := func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), trackCloseTimeout)
 		defer cancel()
