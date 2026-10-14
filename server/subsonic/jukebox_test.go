@@ -3,6 +3,7 @@ package subsonic
 import (
 	"context"
 	"net/http/httptest"
+	"os"
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core/playback"
@@ -68,6 +69,31 @@ var _ = Describe("JukeboxControl", func() {
 		Expect(resp.JukeboxStatus.Playing).To(BeFalse())
 		Expect(device.PlaybackQueue.Current()).ToNot(BeNil())
 		Expect(device.PlaybackQueue.Current().Path).To(Equal("/music/a2.mp3"))
+	})
+
+	It("rejects non-owner mutation after session heartbeat denial", func() {
+		if os.Getenv("ND_TEST_SESSION_COMMAND_AUTHORITY") != "1" {
+			Skip("set ND_TEST_SESSION_COMMAND_AUTHORITY=1 to run unresolved acceptance probe")
+		}
+		device, err := ps.GetDeviceForUser("admin")
+		Expect(err).ToNot(HaveOccurred())
+		sessionID := "validation-subsonic-command-owner"
+		_, err = ps.AttachSession(ctx, playback.AttachRequest{
+			SessionID: sessionID, ClientID: "owner-tab", User: "admin", DeviceName: device.DeviceName,
+		})
+		Expect(err).ToNot(HaveOccurred())
+		_, err = ps.HeartbeatSession(ctx, sessionID, "non-owner-tab")
+		Expect(err).To(MatchError(playback.ErrSessionOwnership))
+		before, err := device.Status(ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		req := httptest.NewRequest("GET", "/rest/jukeboxControl?action=setGain&gain=0.25&sessionId="+sessionID+"&clientId=non-owner-tab", nil)
+		req = req.WithContext(request.WithUser(req.Context(), model.User{ID: "u1", UserName: "admin", IsAdmin: true}))
+		resp, commandErr := api.JukeboxControl(req)
+		after, err := device.Status(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(commandErr).To(HaveOccurred(), "non-owner command accepted: response=%#v gain=%v->%v", resp, before.Gain, after.Gain)
+		Expect(after.Gain).To(Equal(before.Gain))
 	})
 
 	It("returns failed response when jukebox is disabled", func() {
