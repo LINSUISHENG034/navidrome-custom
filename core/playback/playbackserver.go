@@ -372,7 +372,14 @@ func (ps *playbackServer) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 
-	// Should confirm all subprocess are terminated before returning
+	ps.mu.Lock()
+	devices = append([]*playbackDevice(nil), ps.playbackDevices...)
+	ps.mu.Unlock()
+	for _, device := range devices {
+		if _, err := device.Shutdown(context.WithoutCancel(ctx)); err != nil {
+			log.Warn(ctx, "Could not retire playback device during shutdown", "device", device.Name, err)
+		}
+	}
 	return nil
 }
 
@@ -597,59 +604,47 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 		}
 	}
 
-	wasPlaying := oldDev != nil && oldDev.isPlaying()
-	var savedPosition int
+	var wasPlaying bool
+	var savedPosition *int
 	var savedGain float32
 	var savedQueue model.MediaFiles
 	var savedIndex int
+	var preparationVersion uint64
 	oldDeviceName := ""
 
-	if oldDev != nil && oldDev.DeviceName != deviceName {
+	if oldDev != nil && oldDev != newDev {
 		oldDeviceName = oldDev.DeviceName
+		oldDev.mu.Lock()
+		wasPlaying = oldDev.isPlaying()
 		savedGain = oldDev.Gain
 		savedQueue = oldDev.PlaybackQueue.Get()
 		savedIndex = oldDev.PlaybackQueue.Index
-
 		if oldDev.ActiveTrack != nil {
-			savedPosition = oldDev.ActiveTrack.Position()
-			oldDev.ActiveTrack.Pause()
-			oldDev.ActiveTrack.Close()
-			oldDev.ActiveTrack = nil
-			log.Info(ctx, "Stopped playback on previous device", "device", oldDev.Name, "position", savedPosition)
+			position := oldDev.ActiveTrack.Position()
+			savedPosition = &position
+		} else if oldDev.recoveryPosition != nil {
+			position := *oldDev.recoveryPosition
+			savedPosition = &position
 		}
+		oldDev.clearLocked(ctx)
+		oldDev.incrementQueueVersionLocked()
+		oldDev.mu.Unlock()
 
-		oldDev.PlaybackQueue.Clear()
-		oldDev.queueVersion++
+		if len(savedQueue) > 0 {
+			newDev.mu.Lock()
+			newDev.clearLocked(ctx)
+			newDev.PlaybackQueue.Set(savedQueue)
+			newDev.PlaybackQueue.SetIndex(savedIndex)
+			newDev.Gain = savedGain
+			newDev.recoveryPosition = savedPosition
+			newDev.incrementQueueVersionLocked()
+			preparationVersion = newDev.preparationVersion
+			newDev.mu.Unlock()
+		}
 	}
 
 	for idx := range ps.playbackDevices {
 		ps.playbackDevices[idx].Default = (ps.playbackDevices[idx].DeviceName == deviceName)
-	}
-
-	if oldDev != nil && oldDev.DeviceName != deviceName && len(savedQueue) > 0 {
-		newDev.PlaybackQueue.Set(savedQueue)
-		newDev.PlaybackQueue.SetIndex(savedIndex)
-		newDev.Gain = savedGain
-		newDev.queueVersion++
-
-		if wasPlaying {
-			_, err := newDev.Start(ctx)
-			if err != nil {
-				ps.mu.Unlock()
-				log.Error(ctx, "Error starting playback on new device", err)
-				return err
-			}
-			if savedPosition > 0 {
-				err = newDev.ActiveTrack.SetPosition(savedPosition)
-				if err != nil {
-					log.Warn(ctx, "Could not restore position on new device", "position", savedPosition, err)
-				}
-			}
-			if newDev.ActiveTrack != nil {
-				newDev.ActiveTrack.SetVolume(savedGain)
-			}
-			log.Info(ctx, "Resumed playback on new device", "device", deviceName, "position", savedPosition)
-		}
 	}
 
 	var reboundSessions []Session
@@ -659,6 +654,26 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 
 	log.Info(ctx, "Switched default audio device", "device", deviceName)
 	ps.mu.Unlock()
+
+	// Preparation and notification must not hold the server mutex. Start restores
+	// the recovery position and gain before the first unpause on the new output.
+	if oldDeviceName != "" && len(savedQueue) > 0 && wasPlaying {
+		newDev.mu.Lock()
+		if newDev.preparationVersion == preparationVersion {
+			_, changed, err := newDev.startLocked(ctx)
+			notify := newDev.stateChangeNotifierLocked()
+			if err != nil || !changed {
+				notify = nil
+			}
+			newDev.mu.Unlock()
+			invokeCallback(notify)
+			if err != nil {
+				return err
+			}
+		} else {
+			newDev.mu.Unlock()
+		}
+	}
 
 	for _, session := range reboundSessions {
 		if session.User == "" {
