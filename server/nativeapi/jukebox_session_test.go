@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core/playback"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
@@ -49,7 +50,8 @@ func TestJukeboxSessionRoutes(t *testing.T) {
 }
 
 func TestJukeboxSessionHandlers(t *testing.T) {
-	api := &Router{playback: playback.GetInstance(nil)}
+	_, ps := startJukeboxLogicalFixture(t, "Session Fixture", []conf.AudioDeviceDefinition{{"Session Fixture", "pulse/test"}})
+	api := &Router{playback: ps}
 	attachID := uniqueSessionID("attach")
 	forbiddenHeartbeatID := uniqueSessionID("forbidden-heartbeat")
 	forbiddenDetachID := uniqueSessionID("forbidden-detach")
@@ -284,6 +286,11 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				for _, sessionID := range []string{attachID, forbiddenHeartbeatID, forbiddenDetachID, snapshotID, forbiddenSnapshotID, detachSnapshotID} {
+					_, _ = ps.DetachSession(context.Background(), sessionID, "tab-1")
+				}
+			})
 			if tt.setup != nil {
 				tt.setup(t)
 			}

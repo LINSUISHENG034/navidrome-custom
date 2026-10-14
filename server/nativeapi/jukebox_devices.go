@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/navidrome/navidrome/core/playback"
 	"github.com/navidrome/navidrome/log"
 )
 
@@ -27,6 +28,7 @@ func (api *Router) listDevices(w http.ResponseWriter, r *http.Request) {
 
 func (api *Router) switchDevice(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		playback.CommandScope
 		DeviceName string `json:"deviceName"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -38,8 +40,13 @@ func (api *Router) switchDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := api.playback.SwitchDevice(r.Context(), req.DeviceName); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+	scope, err := commandScopeFromRequest(r, req.CommandScope)
+	if err != nil {
+		api.writeJukeboxSessionError(w, err)
+		return
+	}
+	if err := api.playback.SwitchDeviceForCommand(r.Context(), scope, req.DeviceName); err != nil {
+		api.writeJukeboxSessionError(w, err)
 		return
 	}
 

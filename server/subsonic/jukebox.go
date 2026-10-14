@@ -1,6 +1,7 @@
 package subsonic
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -34,82 +35,91 @@ func (api *Router) JukeboxControl(r *http.Request) (*responses.Subsonic, error) 
 	if !conf.Server.Jukebox.Enabled {
 		return nil, newError(responses.ErrorGeneric, "Jukebox is disabled")
 	}
-
 	if conf.Server.Jukebox.AdminOnly && !user.IsAdmin {
 		return nil, newError(responses.ErrorAuthorizationFail, "Jukebox is admin only")
 	}
-
 	actionString, err := p.String("action")
-	if err != nil {
-		return nil, err
-	}
-
-	pb, err := api.playback.GetDeviceForUser(user.UserName)
 	if err != nil {
 		return nil, err
 	}
 	log.Info(ctx, "JukeboxControl request received", "action", actionString)
 
-	switch actionString {
-	case ActionGet:
+	if actionString == ActionGet || actionString == ActionStatus {
+		pb, err := api.playback.GetDeviceForUser(user.UserName)
+		if err != nil {
+			return nil, err
+		}
+		if actionString == ActionStatus {
+			return createResponse(pb.Status(ctx))
+		}
 		mediafiles, status, err := pb.Get(ctx)
 		if err != nil {
 			return nil, err
 		}
-
 		playlist := responses.JukeboxPlaylist{
 			JukeboxStatus: *deviceStatusToJukeboxStatus(status),
 			Entry:         slice.MapWithArg(mediafiles, ctx, childFromMediaFile),
 		}
-
 		response := newResponse()
 		response.JukeboxPlaylist = &playlist
 		return response, nil
-	case ActionStatus:
-		return createResponse(pb.Status(ctx))
+	}
+
+	command := playback.PlaybackCommand{}
+	switch actionString {
 	case ActionSet:
-		ids := p.Strings("id")
-		return createResponse(pb.Set(ctx, ids))
+		command.Action, command.IDs = playback.CommandSet, p.Strings("id")
 	case ActionStart:
-		return createResponse(pb.Start(ctx))
+		command.Action = playback.CommandStart
 	case ActionStop:
-		return createResponse(pb.Stop(ctx))
+		// The Subsonic stop action historically means resumable pause.
+		command.Action = playback.CommandPause
 	case ActionSkip:
-		index, err := p.Int("index")
+		command.Action = playback.CommandSkip
+		command.Index, err = p.Int("index")
 		if err != nil {
 			return nil, newError(responses.ErrorMissingParameter, "missing parameter index, err: %s", err)
 		}
-		offset := p.IntOr("offset", 0)
-		return createResponse(pb.Skip(ctx, index, offset))
+		command.Offset = p.IntOr("offset", 0)
 	case ActionAdd:
-		ids := p.Strings("id")
-		return createResponse(pb.Add(ctx, ids))
+		command.Action, command.IDs = playback.CommandAdd, p.Strings("id")
 	case ActionClear:
-		return createResponse(pb.Clear(ctx))
+		command.Action = playback.CommandClear
 	case ActionRemove:
-		index, err := p.Int("index")
+		command.Action = playback.CommandRemove
+		command.Index, err = p.Int("index")
 		if err != nil {
 			return nil, err
 		}
-
-		return createResponse(pb.Remove(ctx, index))
 	case ActionShuffle:
-		return createResponse(pb.Shuffle(ctx))
+		command.Action = playback.CommandShuffle
 	case ActionSetGain:
 		gainStr, err := p.String("gain")
 		if err != nil {
 			return nil, newError(responses.ErrorMissingParameter, "missing parameter gain, err: %s", err)
 		}
-
 		gain, err := strconv.ParseFloat(gainStr, 32)
 		if err != nil {
 			return nil, newError(responses.ErrorMissingParameter, "error parsing gain float value, err: %s", err)
 		}
-
-		return createResponse(pb.SetGain(ctx, float32(gain)))
+		command.Action, command.Gain = playback.CommandGain, float32(gain)
 	default:
 		return nil, newError(responses.ErrorMissingParameter, "Unknown action: %s", actionString)
 	}
+	scope := playback.CommandScope{
+		User: user.UserName, SessionID: p.StringOr("sessionId", ""), ClientID: p.StringOr("clientId", ""),
+	}
+	status, err := api.playback.ExecuteCommand(ctx, scope, command)
+	if errors.Is(err, playback.ErrSessionOwnership) {
+		return nil, newError(responses.ErrorAuthorizationFail, "%s", err)
+	}
+	if errors.Is(err, playback.ErrSessionNotFound) {
+		return nil, newError(responses.ErrorDataNotFound, "%s", err)
+	}
+	if errors.Is(err, playback.ErrCommandScope) {
+		return nil, newError(responses.ErrorMissingParameter, "%s", err)
+	}
+	return createResponse(status, err)
 }
 
 // createResponse is to shorten the case-switch in the JukeboxController

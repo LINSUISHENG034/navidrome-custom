@@ -28,6 +28,7 @@ type AttachRequest struct {
 	User       string
 	ClientID   string
 	DeviceName string
+	Takeover   bool
 }
 
 type Session struct {
@@ -140,6 +141,17 @@ func (sm *SessionManager) Get(sessionID string) (Session, bool) {
 
 	session, ok := sm.sessions[sessionID]
 	return session, ok
+}
+
+func (sm *SessionManager) HasUserSession(user string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, session := range sm.sessions {
+		if session.User == user {
+			return true
+		}
+	}
+	return false
 }
 
 func (sm *SessionManager) FindByDevice(deviceName string) []Session {

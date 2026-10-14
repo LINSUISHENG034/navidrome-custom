@@ -42,7 +42,7 @@ func (h *durableScenarioHarness) advance(d time.Duration) {
 	h.now = h.now.Add(d)
 }
 
-func (h *durableScenarioHarness) attach(t *testing.T, clientID string) SessionStatus {
+func (h *durableScenarioHarness) attach(t *testing.T, clientID string, takeover ...bool) SessionStatus {
 	t.Helper()
 
 	status, err := h.server.AttachSession(h.ctx, AttachRequest{
@@ -50,6 +50,7 @@ func (h *durableScenarioHarness) attach(t *testing.T, clientID string) SessionSt
 		ClientID:   clientID,
 		User:       "admin",
 		DeviceName: "pulse/test",
+		Takeover:   len(takeover) > 0 && takeover[0],
 	})
 	if err != nil {
 		t.Fatalf("attach session: %v", err)
@@ -180,12 +181,33 @@ func TestDurableSessionHiddenTabReconnectPreservesRemoteAdvance(t *testing.T) {
 	}
 }
 
+func TestDurableSessionOrdinaryAttachDoesNotStealActiveOwner(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	h.setCurrentIndex(1)
+	h.startPlayback(t)
+	if _, err := h.device.Skip(h.ctx, 1, 17); err != nil {
+		t.Fatal(err)
+	}
+	h.attach(t, "tab-1")
+	_, err := h.server.AttachSession(h.ctx, AttachRequest{
+		SessionID: "s1", ClientID: "tab-2", User: "admin", DeviceName: "pulse/test",
+	})
+	if !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("ordinary new-page attach stole ownership: %v", err)
+	}
+	state, err := h.server.SessionStatus(h.ctx, "s1")
+	if err != nil || state.OwnerClientID != "tab-1" || state.CurrentIndex != 1 || state.TrackID != "2" || state.Position != 17 || !state.Playing {
+		t.Fatalf("denied attach changed playback authority: %#v err=%v", state, err)
+	}
+}
+
 func TestDurableSessionTakeoverRejectsOldOwnerWithoutRewindingRemoteState(t *testing.T) {
 	h := newDurableScenarioHarness(t)
 	h.configureQueue("1", "2", "3")
 	h.setCurrentIndex(2)
 	h.attach(t, "tab-1")
-	takenOver := h.attach(t, "tab-2")
+	takenOver := h.attach(t, "tab-2", true)
 
 	if takenOver.OwnerClientID != "tab-2" || takenOver.CurrentIndex != 2 || takenOver.TrackID != "3" {
 		t.Fatalf("expected takeover to preserve remote state, got %#v", takenOver)
@@ -210,7 +232,7 @@ func TestDurableSessionPageReloadRehydratesRemoteStateForNewOwner(t *testing.T) 
 	h.setCurrentIndex(1)
 	h.attach(t, "tab-1")
 
-	status := h.attach(t, "tab-2")
+	status := h.attach(t, "tab-2", true)
 	if status.OwnerClientID != "tab-2" || status.CurrentIndex != 1 || status.TrackID != "2" {
 		t.Fatalf("expected reload attach to rehydrate remote state, got %#v", status)
 	}

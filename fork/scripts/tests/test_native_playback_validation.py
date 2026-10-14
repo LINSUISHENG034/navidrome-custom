@@ -429,17 +429,45 @@ class ValidationRunnerTests(unittest.TestCase):
 
 
 class AppSmokeEvidenceTests(unittest.TestCase):
-    def test_wait_trace_matches_only_owned_child_exit(self):
+    def setUp(self):
         script = SCRIPT.with_name("native-playback-app-smoke.py")
         spec = importlib.util.spec_from_file_location("native_playback_app_smoke", script)
-        smoke = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(smoke)
+        self.smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.smoke)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        output = Path(temporary.name)
-        with patch.object(smoke, "source_fingerprint", return_value={"commit": "fixture"}):
-            app = smoke.AppSmoke(output, Path("/fake/navidrome"), "/fake/chrome", Path("/fake/mpv"))
-        self.addCleanup(app.cleanup)
+        self.output = Path(temporary.name)
+        with patch.object(self.smoke, "source_fingerprint", return_value={"commit": "fixture"}):
+            self.app = self.smoke.AppSmoke(
+                self.output, Path("/fake/navidrome"), "/fake/chrome", Path("/fake/mpv"))
+        self.addCleanup(self.app.cleanup)
+
+    def test_commands_include_explicit_current_controller_scope(self):
+        with patch.object(self.app, "native", return_value=(200, {})) as native:
+            self.app.command("/api/jukebox/play")
+            native.assert_called_once_with("POST", "/api/jukebox/play", body={
+                "sessionId": self.app.session_id,
+                "clientId": self.app.client_id,
+            })
+
+    def test_observer_probe_cannot_inherit_owner_identity(self):
+        with patch.object(self.app, "native", return_value=(403, {})) as native:
+            self.app.command("/api/jukebox/volume", {"gain": 0.25}, client_id="observer")
+            native.assert_called_once_with("POST", "/api/jukebox/volume", body={
+                "gain": 0.25,
+                "sessionId": self.app.session_id,
+                "clientId": "observer",
+            })
+
+    def test_command_payload_cannot_override_controller_scope(self):
+        with patch.object(self.app, "native") as native:
+            with self.assertRaises(self.smoke.SmokeFailure):
+                self.app.command("/api/jukebox/volume", {"gain": 0.25, "clientId": "forged"})
+            native.assert_not_called()
+
+    def test_wait_trace_matches_only_owned_child_exit(self):
+        app = self.app
+        output = self.output
         app.trace_prefix = output / "process.trace"
         app.mpv_pids = {123}
         (output / "process.trace.123").write_text(

@@ -1,5 +1,18 @@
 import httpClient from '../dataProvider/httpClient'
 
+let attachedScope = null
+let attachmentVersion = 0
+
+const post = (path, payload = {}, options = {}) =>
+  httpClient(`/api/jukebox/${path}`, {
+    ...options,
+    method: 'POST',
+    ...(Object.keys(payload).length ? { body: JSON.stringify(payload) } : {}),
+  }).then(({ json }) => json)
+
+const command = (path, payload = {}, scope = attachedScope) =>
+  post(path, { ...payload, ...scope })
+
 const jukeboxClient = {
   sessionStatus: (sessionId) =>
     httpClient(
@@ -11,89 +24,59 @@ const jukeboxClient = {
       `/api/jukebox/session/snapshot?sessionId=${encodeURIComponent(sessionId)}`,
     ).then(({ json }) => json),
 
-  attachSession: (sessionId, clientId, deviceName = null) =>
-    httpClient('/api/jukebox/session/attach', {
-      method: 'POST',
-      body: JSON.stringify(
-        deviceName
-          ? { sessionId, clientId, deviceName }
-          : { sessionId, clientId },
-      ),
-    }).then(({ json }) => json),
+  attachSession: (sessionId, clientId, deviceName = null, options = {}) => {
+    const version = ++attachmentVersion
+    return post('session/attach', {
+      sessionId,
+      clientId,
+      ...(deviceName ? { deviceName } : {}),
+      ...(options.takeover === true ? { takeover: true } : {}),
+    }).then((status) => {
+      if (
+        version === attachmentVersion &&
+        status.sessionId === sessionId &&
+        status.ownerClientId === clientId &&
+        status.ownershipState === 'attached'
+      ) {
+        attachedScope = { sessionId, clientId }
+      }
+      return status
+    })
+  },
 
   heartbeatSession: (sessionId, clientId) =>
-    httpClient('/api/jukebox/session/heartbeat', {
-      method: 'POST',
-      body: JSON.stringify({ sessionId, clientId }),
-    }).then(({ json }) => json),
+    post('session/heartbeat', { sessionId, clientId }),
 
-  detachSession: (sessionId, clientId) =>
-    httpClient('/api/jukebox/session/detach', {
-      method: 'POST',
-      body: JSON.stringify({ sessionId, clientId }),
-    }).then(({ json }) => json),
+  detachSession: (sessionId, clientId, options = {}) => {
+    const retiringScope = attachedScope
+    return post('session/detach', { sessionId, clientId }, options).then(
+      (status) => {
+        if (
+          attachedScope === retiringScope &&
+          attachedScope?.sessionId === sessionId &&
+          attachedScope?.clientId === clientId
+        ) {
+          attachedScope = null
+        }
+        return status
+      },
+    )
+  },
 
-  set: (ids) =>
-    httpClient('/api/jukebox/set', {
-      method: 'POST',
-      body: JSON.stringify({ ids }),
-    }).then(({ json }) => json),
-
-  start: () =>
-    httpClient('/api/jukebox/start', { method: 'POST' }).then(
-      ({ json }) => json,
-    ),
-
-  play: () =>
-    httpClient('/api/jukebox/play', { method: 'POST' }).then(
-      ({ json }) => json,
-    ),
-
-  stop: () =>
-    httpClient('/api/jukebox/stop', { method: 'POST' }).then(
-      ({ json }) => json,
-    ),
-
-  pause: () =>
-    httpClient('/api/jukebox/pause', { method: 'POST' }).then(
-      ({ json }) => json,
-    ),
-
-  skip: (index, offset = 0) =>
-    httpClient('/api/jukebox/skip', {
-      method: 'POST',
-      body: JSON.stringify({ index, offset }),
-    }).then(({ json }) => json),
-
-  seek: (position) =>
-    httpClient('/api/jukebox/seek', {
-      method: 'POST',
-      body: JSON.stringify({ position }),
-    }).then(({ json }) => json),
-
-  volume: (gain) =>
-    httpClient('/api/jukebox/volume', {
-      method: 'POST',
-      body: JSON.stringify({ gain }),
-    }).then(({ json }) => json),
-
-  add: (ids, index = null) =>
-    httpClient('/api/jukebox/add', {
-      method: 'POST',
-      body: JSON.stringify(index === null ? { ids } : { ids, index }),
-    }).then(({ json }) => json),
-
-  remove: (index) =>
-    httpClient('/api/jukebox/remove', {
-      method: 'POST',
-      body: JSON.stringify({ index }),
-    }).then(({ json }) => json),
-
-  move: (from, to) =>
-    httpClient('/api/jukebox/move', {
-      method: 'POST',
-      body: JSON.stringify({ from, to }),
-    }).then(({ json }) => json),
+  set: (ids, scope) => command('set', { ids }, scope),
+  start: (scope) => command('start', {}, scope),
+  play: (scope) => command('play', {}, scope),
+  stop: (scope) => command('stop', {}, scope),
+  pause: (scope) => command('pause', {}, scope),
+  skip: (index, offset = 0, scope) => command('skip', { index, offset }, scope),
+  seek: (position, scope) => command('seek', { position }, scope),
+  volume: (gain, scope) => command('volume', { gain }, scope),
+  add: (ids, index = null, scope) =>
+    command('add', index === null ? { ids } : { ids, index }, scope),
+  remove: (index, scope) => command('remove', { index }, scope),
+  move: (from, to, scope) => command('move', { from, to }, scope),
+  switchDevice: (deviceName, scope) =>
+    command('devices/switch', { deviceName }, scope),
 }
 
 export default jukeboxClient

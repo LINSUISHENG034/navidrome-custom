@@ -9,19 +9,31 @@ import (
 	"github.com/navidrome/navidrome/core/playback"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
+	"github.com/navidrome/navidrome/server/subsonic/responses"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
+func subsonicMutationValidationActions() []string {
+	return []string{
+		"set&id=must-not-reach-datastore", "start", "stop", "skip&index=0", "add&id=must-not-reach-datastore",
+		"clear", "remove&index=0", "shuffle", "setGain&gain=0.25",
+	}
+}
+
 var _ = Describe("JukeboxControl", func() {
 	var (
-		ctx    context.Context
-		cancel context.CancelFunc
-		ps     playback.PlaybackServer
-		api    *Router
+		ctx           context.Context
+		cancel        context.CancelFunc
+		ps            playback.PlaybackServer
+		api           *Router
+		finished      chan error
+		restoreConfig func()
 	)
 
 	BeforeEach(func() {
+		previous := conf.Server.Jukebox
+		restoreConfig = func() { conf.Server.Jukebox = previous }
 		ctx, cancel = context.WithCancel(context.Background())
 		conf.Server.Jukebox.Enabled = true
 		conf.Server.Jukebox.AdminOnly = false
@@ -30,9 +42,8 @@ var _ = Describe("JukeboxControl", func() {
 		conf.Server.Jukebox.Devices = nil
 
 		ps = playback.GetInstance(nil)
-		go func() {
-			_ = ps.Run(ctx)
-		}()
+		finished = make(chan error, 1)
+		go func() { finished <- ps.Run(ctx) }()
 
 		Eventually(func() error {
 			_, err := ps.GetDeviceForUser("admin")
@@ -44,6 +55,8 @@ var _ = Describe("JukeboxControl", func() {
 
 	AfterEach(func() {
 		cancel()
+		Eventually(finished).Should(Receive(BeNil()))
+		restoreConfig()
 	})
 
 	It("keeps the current duplicate entry when removing an earlier song", func() {
@@ -78,6 +91,7 @@ var _ = Describe("JukeboxControl", func() {
 		device, err := ps.GetDeviceForUser("admin")
 		Expect(err).ToNot(HaveOccurred())
 		sessionID := "validation-subsonic-command-owner"
+		DeferCleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, "owner-tab") })
 		_, err = ps.AttachSession(ctx, playback.AttachRequest{
 			SessionID: sessionID, ClientID: "owner-tab", User: "admin", DeviceName: device.DeviceName,
 		})
@@ -94,6 +108,56 @@ var _ = Describe("JukeboxControl", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(commandErr).To(HaveOccurred(), "non-owner command accepted: response=%#v gain=%v->%v", resp, before.Gain, after.Gain)
 		Expect(after.Gain).To(Equal(before.Gain))
+	})
+
+	It("enforces session authority for every mutation and bare legacy bypass", func() {
+		device, err := ps.GetDeviceForUser("admin")
+		Expect(err).ToNot(HaveOccurred())
+		sessionID := "validation-all-subsonic-commands"
+		_, err = ps.AttachSession(ctx, playback.AttachRequest{
+			SessionID: sessionID, ClientID: "owner", User: "admin", DeviceName: device.DeviceName,
+		})
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, "owner") })
+		before, err := device.Status(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		serve := func(action, scope, userName string) (*responses.Subsonic, error) {
+			req := httptest.NewRequest("GET", "/rest/jukeboxControl?action="+action+scope, nil)
+			req = req.WithContext(request.WithUser(req.Context(), model.User{ID: userName, UserName: userName, IsAdmin: true}))
+			return api.JukeboxControl(req)
+		}
+		assertDenied := func(action, scope, userName string) {
+			response, err := serve(action, scope, userName)
+			Expect(err).To(HaveOccurred(), "action=%s scope=%s returned=%#v", action, scope, response)
+			Expect(response).To(BeNil())
+			after, err := device.Status(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(after).To(Equal(before), "action=%s scope=%s changed state", action, scope)
+		}
+		for _, action := range subsonicMutationValidationActions() {
+			for _, scope := range []string{"", "&sessionId=" + sessionID + "&clientId=other"} {
+				assertDenied(action, scope, "admin")
+			}
+		}
+		ownerScope := "&sessionId=" + sessionID + "&clientId=owner"
+		assertDenied("setGain&gain=0.25", ownerScope, "other-user")
+		response, err := serve("setGain&gain=0.25", ownerScope, "admin")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(response.JukeboxStatus.Gain).To(Equal(float32(0.25)))
+		_, err = ps.AttachSession(ctx, playback.AttachRequest{
+			SessionID: sessionID, ClientID: "new-owner", User: "admin", DeviceName: device.DeviceName, Takeover: true,
+		})
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, "new-owner") })
+		before, err = device.Status(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(before.Gain).To(Equal(float32(0.25)))
+		for _, action := range subsonicMutationValidationActions() {
+			assertDenied(action, ownerScope, "admin")
+		}
+		response, err = serve("setGain&gain=0.5", "&sessionId="+sessionID+"&clientId=new-owner", "admin")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(response.JukeboxStatus.Gain).To(Equal(float32(0.5)))
 	})
 
 	It("returns failed response when jukebox is disabled", func() {

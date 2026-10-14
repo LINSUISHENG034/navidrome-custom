@@ -314,6 +314,22 @@ var _ = Describe("MPV", func() {
 		})
 	})
 
+	Describe("measured position", func() {
+		It("rounds observed seconds consistently in live and terminal snapshots", func() {
+			track := &MpvTrack{}
+			for _, sample := range []struct {
+				position float64
+				seconds  int
+			}{{0, 0}, {0.499, 0}, {0.5, 1}, {0.999979, 1}, {1.2, 1}, {1.5, 2}} {
+				Expect(track.updatePosition(sample.position)).To(BeTrue())
+				Expect(track.cachedPosition()).To(Equal(sample.seconds))
+				Expect(*track.positionSnapshot()).To(Equal(sample.seconds))
+			}
+			Expect(track.updatePosition(nil)).To(BeFalse())
+			Expect(track.cachedPosition()).To(Equal(2))
+		})
+	})
+
 	Describe("mpvCommand", func() {
 		BeforeEach(func() {
 			// Reset the mpv command cache
@@ -482,6 +498,49 @@ var _ = Describe("MPV null output prototype", func() {
 		Expect(state["idle-active"]).To(BeTrue())
 		_, err = probe.command("quit")
 		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("restores a stable paused position after buffered playback through track commands", func() {
+		if os.Getenv("ND_TEST_MPV_NULL_OUTPUT") != "1" {
+			Skip("Set ND_TEST_MPV_NULL_OUTPUT=1 to run the real MPV null-output prototype")
+		}
+		tests.SkipOnWindows("prototype uses a Unix IPC socket")
+		configureNullOutputMPV()
+		dir := GinkgoT().TempDir()
+		Expect(writeNullOutputWAV(filepath.Join(dir, "paused-seek.wav"))).To(Succeed())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		DeferCleanup(cancel)
+		events := make(chan model.PlaybackEvent, 2)
+		track, err := NewTrack(ctx, events, 46, "auto", model.MediaFile{
+			ID: "paused-seek", LibraryPath: dir, Path: "paused-seek.wav", Suffix: "wav",
+		})
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(track.Close)
+		conn, err := net.DialTimeout("unix", track.IPCSocketName, 100*time.Millisecond)
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func() { _ = conn.Close() })
+		probe := &nullOutputProbe{conn: conn, decoder: json.NewDecoder(conn)}
+
+		track.Unpause()
+		Eventually(func() (any, error) {
+			return probe.command("get_property", "time-pos")
+		}, time.Second, 20*time.Millisecond).Should(BeNumerically(">", 0.05))
+		for _, target := range []int{1, 1, 0} {
+			track.Pause()
+			Expect(track.SetPosition(target)).To(Succeed())
+			Eventually(func() (any, error) {
+				return probe.command("get_property", "time-pos")
+			}, time.Second, 20*time.Millisecond).Should(BeNumerically("~", target, 0.01))
+			Consistently(func() (any, error) {
+				return probe.command("get_property", "time-pos")
+			}, 300*time.Millisecond, 25*time.Millisecond).Should(BeNumerically("~", target, 0.01))
+			Expect(track.Position()).To(Equal(target))
+			Expect(track.IsPlaying()).To(BeFalse())
+			track.Unpause()
+			Eventually(func() (any, error) {
+				return probe.command("get_property", "time-pos")
+			}, time.Second, 20*time.Millisecond).Should(BeNumerically(">", float64(target)+0.1))
+		}
 	})
 
 	It("reports a transport fault with its token and position, then exits the old MPV", func() {

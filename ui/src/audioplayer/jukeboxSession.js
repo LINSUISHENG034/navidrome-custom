@@ -48,10 +48,15 @@ const attachJukeboxSession = async ({
   sessionId,
   clientId,
   deviceName = null,
+  takeover = false,
   dispatch,
 }) => {
   if (!client?.attachSession || !sessionId || !clientId) return null
-  const status = await client.attachSession(sessionId, clientId, deviceName)
+  const status = takeover
+    ? await client.attachSession(sessionId, clientId, deviceName, {
+        takeover: true,
+      })
+    : await client.attachSession(sessionId, clientId, deviceName)
   return dispatchJukeboxSessionStatus(dispatch, status)
 }
 
@@ -66,9 +71,16 @@ const refreshJukeboxSessionStatus = async ({
   return dispatchJukeboxSessionStatus(dispatch, status)
 }
 
-const detachJukeboxSession = async ({ client, sessionId, clientId }) => {
+const detachJukeboxSession = async ({
+  client,
+  sessionId,
+  clientId,
+  keepalive = false,
+}) => {
   if (!client?.detachSession || !sessionId || !clientId) return null
-  return client.detachSession(sessionId, clientId)
+  return keepalive
+    ? client.detachSession(sessionId, clientId, { keepalive: true })
+    : client.detachSession(sessionId, clientId)
 }
 
 const runJukeboxHeartbeat = async ({

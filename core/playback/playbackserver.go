@@ -7,6 +7,7 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/navidrome/navidrome/core/playback/bluetooth"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
+	"github.com/navidrome/navidrome/model/request"
 	serverevents "github.com/navidrome/navidrome/server/events"
 	"github.com/navidrome/navidrome/utils/singleton"
 )
@@ -32,7 +34,47 @@ type PlaybackServer interface {
 	DetachSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
 	SessionStatus(ctx context.Context, sessionID string) (SessionStatus, error)
 	SessionSnapshot(ctx context.Context, sessionID, user string) (SessionSnapshot, error)
+	ExecuteCommand(ctx context.Context, scope CommandScope, command PlaybackCommand) (DeviceStatus, error)
+	SwitchDeviceForCommand(ctx context.Context, scope CommandScope, deviceName string) error
 }
+
+var (
+	ErrCommandScope   = errors.New("sessionId and clientId must be supplied together")
+	ErrDeviceNotFound = errors.New("device not found")
+)
+
+type CommandScope struct {
+	User      string `json:"-"`
+	SessionID string `json:"sessionId,omitempty"`
+	ClientID  string `json:"clientId,omitempty"`
+}
+
+type PlaybackCommand struct {
+	Action   string
+	IDs      []string
+	Index    int
+	Offset   int
+	Position int
+	From     int
+	To       int
+	Gain     float32
+}
+
+const (
+	CommandSet     = "set"
+	CommandStart   = "start"
+	CommandPause   = "pause"
+	CommandStop    = "stop"
+	CommandSkip    = "skip"
+	CommandSeek    = "seek"
+	CommandAdd     = "add"
+	CommandInsert  = "insert"
+	CommandClear   = "clear"
+	CommandRemove  = "remove"
+	CommandMove    = "move"
+	CommandShuffle = "shuffle"
+	CommandGain    = "gain"
+)
 
 // DeviceInfo represents an audio output device exposed via the API.
 type DeviceInfo struct {
@@ -72,6 +114,7 @@ type playbackServer struct {
 	eventBroker         serverevents.Broker
 	onDeviceStateChange func(*playbackDevice, DeviceStatus)
 	playbackDevices     []*playbackDevice
+	shuttingDown        bool
 }
 
 var discoverAllSinks = bluetooth.DiscoverSinks
@@ -162,12 +205,21 @@ func (ps *playbackServer) ensureSessionManager() *SessionManager {
 func (ps *playbackServer) getDeviceByName(deviceName string) *playbackDevice {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	for idx := range ps.playbackDevices {
-		if ps.playbackDevices[idx].DeviceName == deviceName {
-			return ps.playbackDevices[idx]
+	return ps.deviceByNameLocked(deviceName)
+}
+
+func (ps *playbackServer) deviceByNameLocked(deviceName string) *playbackDevice {
+	for _, device := range ps.playbackDevices {
+		if device.DeviceName == deviceName {
+			return device
 		}
 	}
 	return nil
+}
+
+func sessionUserAllowed(ctx context.Context, session Session) bool {
+	user, authenticated := request.UserFrom(ctx)
+	return !authenticated || user.UserName == session.User
 }
 
 func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
@@ -227,7 +279,40 @@ func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) 
 
 	sessionManager := ps.ensureSessionManager()
 	ps.mu.Lock()
+	if ps.shuttingDown {
+		ps.mu.Unlock()
+		return SessionStatus{}, context.Canceled
+	}
+	if user, ok := request.UserFrom(ctx); ok && user.UserName != req.User {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionOwnership
+	}
+	if previous, ok := sessionManager.Get(req.SessionID); ok {
+		if previous.User != req.User || previous.DeviceName != req.DeviceName ||
+			(previous.OwnerClientID != req.ClientID && previous.OwnershipState != SessionOwnershipRecovering && !req.Takeover) {
+			ps.mu.Unlock()
+			return SessionStatus{}, ErrSessionOwnership
+		}
+	}
+	device := ps.deviceByNameLocked(req.DeviceName)
+	if device == nil {
+		ps.mu.Unlock()
+		return SessionStatus{}, fmt.Errorf("%w: %s", ErrDeviceNotFound, req.DeviceName)
+	}
+	for _, attached := range sessionManager.FindByDevice(req.DeviceName) {
+		if attached.SessionID != req.SessionID {
+			ps.mu.Unlock()
+			return SessionStatus{}, ErrSessionOwnership
+		}
+	}
+	// Session ownership and binding cannot change between command admission and
+	// its first state mutation. Supersede pending work when the owner changes.
+	device.mu.Lock()
+	if previous, ok := sessionManager.Get(req.SessionID); !ok || previous.OwnerClientID != req.ClientID {
+		device.cancelPreparationLocked()
+	}
 	session := sessionManager.Attach(req)
+	device.mu.Unlock()
 	ps.mu.Unlock()
 	return ps.statusFromSession(session), nil
 }
@@ -235,6 +320,10 @@ func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) 
 func (ps *playbackServer) HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error) {
 	sessionManager := ps.ensureSessionManager()
 	ps.mu.Lock()
+	if session, ok := sessionManager.Get(sessionID); ok && !sessionUserAllowed(ctx, session) {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionOwnership
+	}
 	err := sessionManager.Heartbeat(sessionID, clientID)
 	ps.mu.Unlock()
 	if err != nil {
@@ -243,10 +332,26 @@ func (ps *playbackServer) HeartbeatSession(ctx context.Context, sessionID, clien
 	return ps.SessionStatus(ctx, sessionID)
 }
 
-func (ps *playbackServer) DetachSession(_ context.Context, sessionID, clientID string) (SessionStatus, error) {
+func (ps *playbackServer) DetachSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error) {
 	sessionManager := ps.ensureSessionManager()
 	ps.mu.Lock()
+	previous, exists := sessionManager.Get(sessionID)
+	if exists && !sessionUserAllowed(ctx, previous) {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionOwnership
+	}
+	var device *playbackDevice
+	if exists && previous.OwnerClientID == clientID {
+		device = ps.deviceByNameLocked(previous.DeviceName)
+		if device != nil {
+			device.mu.Lock()
+			device.cancelPreparationLocked()
+		}
+	}
 	session, err := sessionManager.DetachSnapshot(sessionID, clientID)
+	if device != nil {
+		device.mu.Unlock()
+	}
 	ps.mu.Unlock()
 	if err != nil {
 		return SessionStatus{}, err
@@ -258,15 +363,18 @@ func (ps *playbackServer) DetachSession(_ context.Context, sessionID, clientID s
 	return status, nil
 }
 
-func (ps *playbackServer) SessionStatus(_ context.Context, sessionID string) (SessionStatus, error) {
+func (ps *playbackServer) SessionStatus(ctx context.Context, sessionID string) (SessionStatus, error) {
 	session, ok := ps.ensureSessionManager().Get(sessionID)
 	if !ok {
 		return SessionStatus{}, ErrSessionNotFound
 	}
+	if !sessionUserAllowed(ctx, session) {
+		return SessionStatus{}, ErrSessionOwnership
+	}
 	return ps.statusFromSession(session), nil
 }
 
-func (ps *playbackServer) SessionSnapshot(_ context.Context, sessionID, user string) (SessionSnapshot, error) {
+func (ps *playbackServer) SessionSnapshot(ctx context.Context, sessionID, user string) (SessionSnapshot, error) {
 	sessionManager := ps.ensureSessionManager()
 	ps.mu.Lock()
 	session, ok := sessionManager.Get(sessionID)
@@ -274,7 +382,7 @@ func (ps *playbackServer) SessionSnapshot(_ context.Context, sessionID, user str
 		ps.mu.Unlock()
 		return SessionSnapshot{}, ErrSessionNotFound
 	}
-	if session.User != user {
+	if session.User != user || !sessionUserAllowed(ctx, session) {
 		ps.mu.Unlock()
 		return SessionSnapshot{}, ErrSessionOwnership
 	}
@@ -351,6 +459,7 @@ func (ps *playbackServer) Run(ctx context.Context) error {
 	}
 	ps.mu.Lock()
 	ps.playbackDevices = devices
+	ps.shuttingDown = false
 	ps.mu.Unlock()
 
 	if conf.Server.Jukebox.AutoDiscoverBluetooth {
@@ -373,12 +482,18 @@ func (ps *playbackServer) Run(ctx context.Context) error {
 	<-ctx.Done()
 
 	ps.mu.Lock()
+	ps.shuttingDown = true
 	devices = append([]*playbackDevice(nil), ps.playbackDevices...)
 	ps.mu.Unlock()
 	for _, device := range devices {
-		if _, err := device.Shutdown(context.WithoutCancel(ctx)); err != nil {
+		if err := device.retireServiceOutput(context.WithoutCancel(ctx)); err != nil {
 			log.Warn(ctx, "Could not retire playback device during shutdown", "device", device.Name, err)
 		}
+	}
+	// Cancel and close every device before joining any preparing factory. No
+	// new preparation is admitted; completion includes actual late-output Close.
+	for _, device := range devices {
+		device.preparing.Wait()
 	}
 	return nil
 }
@@ -502,12 +617,68 @@ func (ps *playbackServer) GetDeviceForUser(user string) (*playbackDevice, error)
 	// README: here we might plug-in the user-device mapping one fine day
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+	if ps.shuttingDown {
+		return nil, context.Canceled
+	}
 	device, err := ps.getDefaultDeviceLocked()
 	if err != nil {
 		return nil, err
 	}
-	device.User = user
 	return device, nil
+}
+
+// authorizeCommandLocked resolves authority and target while ps.mu is held.
+// Missing scope is legacy access, and cannot bypass a device's attached session.
+func (ps *playbackServer) authorizeCommandLocked(ctx context.Context, scope CommandScope) (*playbackDevice, error) {
+	if ps.shuttingDown || ctx.Err() != nil {
+		return nil, context.Canceled
+	}
+	if user, ok := request.UserFrom(ctx); ok && user.UserName != scope.User {
+		return nil, ErrSessionOwnership
+	}
+	if (scope.SessionID == "") != (scope.ClientID == "") {
+		return nil, ErrCommandScope
+	}
+	if scope.SessionID == "" {
+		device, err := ps.getDefaultDeviceLocked()
+		if err != nil {
+			return nil, err
+		}
+		if ps.sessionManager != nil && (ps.sessionManager.HasUserSession(scope.User) || len(ps.sessionManager.FindByDevice(device.DeviceName)) > 0) {
+			return nil, ErrSessionOwnership
+		}
+		return device, nil
+	}
+	if ps.sessionManager == nil {
+		return nil, ErrSessionNotFound
+	}
+	session, exists := ps.sessionManager.Get(scope.SessionID)
+	if !exists {
+		return nil, ErrSessionNotFound
+	}
+	if session.User != scope.User || session.OwnerClientID != scope.ClientID {
+		return nil, ErrSessionOwnership
+	}
+	device := ps.deviceByNameLocked(session.DeviceName)
+	if device == nil {
+		return nil, fmt.Errorf("%w: %s", ErrDeviceNotFound, session.DeviceName)
+	}
+	return device, nil
+}
+
+func (ps *playbackServer) ExecuteCommand(ctx context.Context, scope CommandScope, command PlaybackCommand) (DeviceStatus, error) {
+	ps.mu.Lock()
+	device, err := ps.authorizeCommandLocked(ctx, scope)
+	if err != nil {
+		ps.mu.Unlock()
+		return DeviceStatus{}, err
+	}
+	// Acquire the state lock before releasing the authority/binding lock. Slow
+	// preparation releases only device.mu, leaving Stop free to supersede it.
+	device.mu.Lock()
+	device.User = scope.User
+	ps.mu.Unlock()
+	return device.finishCommandLocked(ctx, command)
 }
 
 // mergeBluetoothDevices discovers Bluetooth sinks and appends any new ones to playbackDevices.
@@ -520,6 +691,9 @@ func (ps *playbackServer) mergeBluetoothDevicesFromSinks(ctx context.Context, si
 	deviceCtx := ps.playbackDeviceContext(ctx)
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+	if ps.shuttingDown || ctx.Err() != nil {
+		return
+	}
 	for _, sink := range btSinks {
 		devName := sink.MPVDeviceName()
 		if ps.hasDeviceLocked(devName) {
@@ -583,7 +757,39 @@ func (ps *playbackServer) ListDevices() []DeviceInfo {
 // playing, the queue and playback state are migrated to the new device and playback
 // resumes at the same position.
 func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) error {
+	return ps.switchDevice(ctx, deviceName, nil)
+}
+
+func (ps *playbackServer) SwitchDeviceForCommand(ctx context.Context, scope CommandScope, deviceName string) error {
+	return ps.switchDevice(ctx, deviceName, &scope)
+}
+
+func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, scope *CommandScope) error {
 	ps.mu.Lock()
+	if ps.shuttingDown || ctx.Err() != nil {
+		ps.mu.Unlock()
+		return context.Canceled
+	}
+	if scope != nil {
+		owned, err := ps.authorizeCommandLocked(ctx, *scope)
+		if err != nil {
+			ps.mu.Unlock()
+			return err
+		}
+		defaultDevice, err := ps.getDefaultDeviceLocked()
+		if err != nil || owned != defaultDevice {
+			ps.mu.Unlock()
+			return ErrSessionOwnership
+		}
+		if ps.sessionManager != nil {
+			for _, attached := range ps.sessionManager.FindByDevice(deviceName) {
+				if attached.SessionID != scope.SessionID {
+					ps.mu.Unlock()
+					return ErrSessionOwnership
+				}
+			}
+		}
+	}
 	var newDev *playbackDevice
 	for idx := range ps.playbackDevices {
 		if ps.playbackDevices[idx].DeviceName == deviceName {
@@ -593,7 +799,7 @@ func (ps *playbackServer) SwitchDevice(ctx context.Context, deviceName string) e
 	}
 	if newDev == nil {
 		ps.mu.Unlock()
-		return fmt.Errorf("device not found: %s", deviceName)
+		return fmt.Errorf("%w: %s", ErrDeviceNotFound, deviceName)
 	}
 
 	var oldDev *playbackDevice

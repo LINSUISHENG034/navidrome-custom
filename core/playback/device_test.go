@@ -20,6 +20,7 @@ type mockTrack struct {
 	position         int
 	positionSetCalls int
 	volumeValues     []float32
+	onSetVolume      func(float32)
 	onUnpause        func()
 	onClose          func()
 }
@@ -27,6 +28,9 @@ type mockTrack struct {
 func (m *mockTrack) IsPlaying() bool { return m.playing }
 func (m *mockTrack) SetVolume(value float32) {
 	m.volumeValues = append(m.volumeValues, value)
+	if m.onSetVolume != nil {
+		m.onSetVolume(value)
+	}
 }
 func (m *mockTrack) Pause() {
 	m.pauseCalls++

@@ -88,13 +88,26 @@ const deferred = () => {
 
 const makeTransport = (
   snapshots = [snapshot()],
-  { attachReply = null, heartbeatReply = null, commandReply = null } = {},
+  {
+    attachReply = null,
+    heartbeatReply = null,
+    commandReply = null,
+    takeoverReply = null,
+  } = {},
 ) => {
   const requests = []
   let snapshotIndex = 0
   const fetch = vi.fn((url, options = {}) => {
     const path = new URL(url, 'http://localhost').pathname
     requests.push({ path, options, url })
+    if (
+      path.endsWith('/session/attach') &&
+      options.body &&
+      JSON.parse(options.body).takeover &&
+      takeoverReply
+    ) {
+      return Promise.resolve(takeoverReply).then((reply) => reply.clone())
+    }
     if (path.endsWith('/session/attach') && attachReply) {
       return Promise.resolve(attachReply).then((reply) => reply.clone())
     }
@@ -105,7 +118,14 @@ const makeTransport = (
       path.endsWith('/session/attach') ||
       path.endsWith('/session/heartbeat')
     ) {
-      return Promise.resolve(response(snapshot().sessionStatus))
+      const identity = JSON.parse(options.body)
+      return Promise.resolve(
+        response({
+          ...snapshot().sessionStatus,
+          sessionId: identity.sessionId,
+          ownerClientId: identity.clientId,
+        }),
+      )
     }
     if (path.endsWith('/session/snapshot')) {
       const reply = snapshots[Math.min(snapshotIndex++, snapshots.length - 1)]
@@ -452,7 +472,7 @@ describe('<RemotePlayerControllerPrototype />', () => {
       action: () =>
         fireEvent.click(screen.getByRole('button', { name: 'Play' })),
       path: '/api/jukebox/play',
-      body: undefined,
+      body: {},
     },
     {
       label: 'skip',
@@ -495,7 +515,11 @@ describe('<RemotePlayerControllerPrototype />', () => {
         commands(transport)[0].options.body
           ? JSON.parse(commands(transport)[0].options.body)
           : undefined,
-      ).toEqual(body)
+      ).toEqual({
+        ...body,
+        sessionId: 'jukebox-session:admin',
+        clientId: 'tab-a',
+      })
       await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(2))
       expect(screen.getByText('Paused')).toBeInTheDocument()
     },
@@ -629,16 +653,251 @@ describe('<RemotePlayerControllerPrototype />', () => {
     expect(commands(transport)).toEqual([])
   })
 
-  it('exposes attachment denial without inventing a queue or issuing control commands', async () => {
-    const transport = makeTransport([], {
+  it('keeps an active owner observable after observer attachment is denied without detaching or controlling it', async () => {
+    const owner = snapshot()
+    owner.sessionStatus.ownerClientId = 'other-tab'
+    const transport = makeTransport([owner], {
       attachReply: response({ message: 'Control denied' }, 403),
     })
+    const { unmount } = renderController()
+    await screen.findByRole('heading', { name: 'Server queue' })
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Take control' })).toBeEnabled()
+    expect(
+      transport.requests.filter(
+        ({ options }) => options.body && JSON.parse(options.body).takeover,
+      ),
+    ).toHaveLength(0)
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    window.dispatchEvent(new Event('pagehide'))
+    unmount()
+    await act(async () => {})
+    expect(snapshotsRequested(transport)).toHaveLength(1)
+    expect(commands(transport)).toEqual([])
+    expect(
+      transport.requests.filter(({ path }) => path.endsWith('/session/detach')),
+    ).toHaveLength(0)
+  })
+
+  it('takes control only after an explicit observer click and sends no successful old-owner mutation', async () => {
+    let owner = 'tab-a'
+    let playing = true
+    const requests = []
+    const deniedCommands = []
+    const currentSnapshot = () => {
+      const current = snapshot()
+      current.sessionStatus.ownerClientId = owner
+      current.sessionStatus.playing = playing
+      current.jukeboxPlaylist.playing = playing
+      return current
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url, options = {}) => {
+        const path = new URL(url, 'http://localhost').pathname
+        const body = options.body ? JSON.parse(options.body) : {}
+        requests.push({ path, body })
+        if (path.endsWith('/session/attach')) {
+          if (body.clientId !== owner && body.takeover !== true) {
+            return Promise.resolve(response({ message: 'Control denied' }, 403))
+          }
+          if (body.takeover === true) owner = body.clientId
+          return Promise.resolve(response(currentSnapshot().sessionStatus))
+        }
+        if (path.endsWith('/session/snapshot'))
+          return Promise.resolve(response(currentSnapshot()))
+        if (path.endsWith('/pause')) {
+          if (body.clientId !== owner) {
+            deniedCommands.push(body)
+            return Promise.resolve(response({ message: 'Control denied' }, 403))
+          }
+          playing = false
+          return Promise.resolve(response({ playing }))
+        }
+        return Promise.resolve(response(currentSnapshot().sessionStatus))
+      }),
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    const { container, unmount } = render(
+      <Provider store={store}>
+        <RemotePlayerControllerPrototype
+          sessionId="jukebox-session:admin"
+          clientId="tab-a"
+          deviceName="pulse/test"
+        />
+        <RemotePlayerControllerPrototype
+          sessionId="jukebox-session:admin"
+          clientId="tab-b"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    const [first, second] = Array.from(
+      container.querySelectorAll('[aria-label="Remote controller prototype"]'),
+    ).map((element) => within(element))
+    await first.findByRole('heading', { name: 'Server queue' })
+    await second.findByRole('heading', { name: 'Server queue' })
+    expect(first.getByRole('button', { name: 'Pause' })).toBeEnabled()
+    expect(second.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    expect(requests.filter(({ body }) => body.takeover)).toHaveLength(0)
+    fireEvent.click(second.getByRole('button', { name: 'Take control' }))
+    await waitFor(() =>
+      expect(second.getByRole('button', { name: 'Pause' })).toBeEnabled(),
+    )
+    expect(owner).toBe('tab-b')
+    expect(requests.filter(({ body }) => body.takeover)).toEqual([
+      {
+        path: '/api/jukebox/session/attach',
+        body: {
+          sessionId: 'jukebox-session:admin',
+          clientId: 'tab-b',
+          deviceName: 'pulse/test',
+          takeover: true,
+        },
+      },
+    ])
+    fireEvent.click(first.getByRole('button', { name: 'Pause' }))
+    await first.findByRole('alert')
+    await waitFor(() =>
+      expect(first.getByRole('button', { name: 'Pause' })).toBeDisabled(),
+    )
+    expect(deniedCommands).toEqual([
+      { sessionId: 'jukebox-session:admin', clientId: 'tab-a' },
+    ])
+    expect(playing).toBe(true)
+    fireEvent.click(second.getByRole('button', { name: 'Pause' }))
+    await second.findByText('Paused', { exact: true })
+    expect(playing).toBe(false)
+    unmount()
+  })
+
+  it('retires a pending explicit takeover after page close without late heartbeat or playback resurrection', async () => {
+    const pending = deferred()
+    const owner = snapshot()
+    owner.sessionStatus.ownerClientId = 'other-tab'
+    const transport = makeTransport([owner], {
+      attachReply: response({ message: 'Control denied' }, 403),
+      takeoverReply: pending.promise,
+    })
+    const { unmount } = renderController()
+    await screen.findByRole('heading', { name: 'Server queue' })
+    fireEvent.click(screen.getByRole('button', { name: 'Take control' }))
+    await waitFor(() =>
+      expect(
+        transport.requests.filter(({ path }) =>
+          path.endsWith('/session/attach'),
+        ),
+      ).toHaveLength(2),
+    )
+    expect(screen.getByRole('button', { name: 'Take control' })).toBeDisabled()
+    window.dispatchEvent(new Event('pagehide'))
+    expect(
+      transport.requests.filter(({ path }) => path.endsWith('/session/detach')),
+    ).toHaveLength(0)
+    await act(async () => pending.resolve(response(snapshot().sessionStatus)))
+    await waitFor(() =>
+      expect(
+        transport.requests.filter(({ path }) =>
+          path.endsWith('/session/detach'),
+        ),
+      ).toHaveLength(1),
+    )
+    expect(
+      transport.requests.find(({ path }) => path.endsWith('/session/detach'))
+        .options.keepalive,
+    ).toBe(true)
+    vi.useFakeTimers()
+    await act(async () => vi.advanceTimersByTimeAsync(15000))
+    vi.useRealTimers()
+    expect(
+      transport.requests.filter(({ path }) =>
+        path.endsWith('/session/heartbeat'),
+      ),
+    ).toHaveLength(0)
+    expect(snapshotsRequested(transport)).toHaveLength(1)
+    expect(commands(transport)).toEqual([])
+    unmount()
+  })
+
+  it('does not retry a denied explicit takeover or send playback commands automatically', async () => {
+    const owner = snapshot()
+    owner.sessionStatus.ownerClientId = 'other-tab'
+    const denied = response({ message: 'Control denied' }, 403)
+    const transport = makeTransport([owner], {
+      attachReply: denied,
+      takeoverReply: denied,
+    })
+    renderController()
+    await screen.findByRole('heading', { name: 'Server queue' })
+    fireEvent.click(screen.getByRole('button', { name: 'Take control' }))
+    await waitFor(() =>
+      expect(
+        transport.requests.filter(({ path }) =>
+          path.endsWith('/session/attach'),
+        ),
+      ).toHaveLength(2),
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Take control' }),
+      ).toBeEnabled(),
+    )
+    vi.useFakeTimers()
+    await act(async () => vi.advanceTimersByTimeAsync(15000))
+    vi.useRealTimers()
+    expect(
+      transport.requests.filter(({ path }) => path.endsWith('/session/attach')),
+    ).toHaveLength(2)
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('detaches control with authenticated keepalive on actual pagehide without stopping remote playback', async () => {
+    const transport = makeTransport()
+    const { unmount } = renderController()
+    await screen.findByRole('heading', { name: 'Server queue' })
+    window.dispatchEvent(new Event('pagehide'))
+    await waitFor(() => {
+      expect(
+        transport.requests.filter(({ path }) =>
+          path.endsWith('/session/detach'),
+        ),
+      ).toHaveLength(1)
+    })
+    const request = transport.requests.find(({ path }) =>
+      path.endsWith('/session/detach'),
+    )
+    expect(request.options.keepalive).toBe(true)
+    expect(request.options.headers.get('X-ND-Authorization')).toBe(
+      'Bearer fake-jwt',
+    )
+    expect(JSON.parse(request.options.body)).toEqual({
+      sessionId: 'jukebox-session:admin',
+      clientId: 'tab-a',
+    })
+    expect(commands(transport)).toEqual([])
+    unmount()
+    await act(async () => {})
+    expect(
+      transport.requests.filter(({ path }) => path.endsWith('/session/detach')),
+    ).toHaveLength(1)
+  })
+
+  it('exposes attachment and observation denial without inventing a queue or issuing control commands', async () => {
+    const transport = makeTransport(
+      [response({ message: 'Control denied' }, 403)],
+      {
+        attachReply: response({ message: 'Control denied' }, 403),
+      },
+    )
     const { unmount } = renderController()
     expect(await screen.findByRole('alert')).toHaveTextContent('Control denied')
     expect(
       screen.queryByRole('button', { name: 'Play' }),
     ).not.toBeInTheDocument()
-    expect(snapshotsRequested(transport)).toHaveLength(0)
+    expect(snapshotsRequested(transport)).toHaveLength(1)
     expect(commands(transport)).toEqual([])
     unmount()
     expect(

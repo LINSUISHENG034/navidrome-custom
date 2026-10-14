@@ -15,6 +15,7 @@ type jukeboxSessionRequest struct {
 	SessionID  string `json:"sessionId"`
 	ClientID   string `json:"clientId"`
 	DeviceName string `json:"deviceName,omitempty"`
+	Takeover   bool   `json:"takeover,omitempty"`
 }
 
 // publishJukeboxSessionEvent intentionally uses the request context so the initiating
@@ -51,6 +52,7 @@ func (api *Router) jukeboxSessionAttach(w http.ResponseWriter, r *http.Request) 
 		User:       user.UserName,
 		ClientID:   req.ClientID,
 		DeviceName: req.DeviceName,
+		Takeover:   req.Takeover,
 	})
 	if err != nil {
 		api.writeJukeboxSessionError(w, err)
@@ -138,10 +140,12 @@ func (api *Router) jukeboxSessionSnapshot(w http.ResponseWriter, r *http.Request
 
 func (api *Router) writeJukeboxSessionError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, playback.ErrSessionNotFound):
+	case errors.Is(err, playback.ErrSessionNotFound), errors.Is(err, playback.ErrDeviceNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, playback.ErrSessionOwnership):
 		http.Error(w, err.Error(), http.StatusForbidden)
+	case errors.Is(err, playback.ErrCommandScope):
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	default:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}

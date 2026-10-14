@@ -4,6 +4,7 @@ import DeviceSelector from './DeviceSelector'
 import httpClient from '../dataProvider/httpClient'
 import jukeboxClient from './jukeboxClient'
 import { uiVolumeToRemoteGain } from './volumeProfiles'
+import { setJukeboxMode } from '../actions'
 
 const notifyMock = vi.fn()
 
@@ -24,6 +25,12 @@ vi.mock('../dataProvider/httpClient', () => ({
 
 vi.mock('./jukeboxClient', () => ({
   default: {
+    switchDevice: vi.fn((deviceName, scope) =>
+      httpClient('/api/jukebox/devices/switch', {
+        method: 'POST',
+        body: JSON.stringify({ deviceName, ...scope }),
+      }).then(({ json }) => json),
+    ),
     set: vi.fn(() => Promise.resolve({})),
     skip: vi.fn(() => Promise.resolve({})),
     volume: vi.fn(() => Promise.resolve({})),
@@ -157,18 +164,123 @@ describe('<DeviceSelector />', () => {
     await waitFor(() => {
       expect(audioInstanceMock.muted).toBe(true)
       expect(audioInstanceMock.pause).not.toHaveBeenCalled()
-      expect(jukeboxClient.set).toHaveBeenCalledWith(['t1'])
-      expect(jukeboxClient.skip).toHaveBeenCalledWith(0, 42)
+      const scope = {
+        sessionId: 'jukebox-session:admin',
+        clientId: expect.any(String),
+      }
+      expect(jukeboxClient.set).toHaveBeenCalledWith(['t1'], scope)
+      expect(jukeboxClient.skip).toHaveBeenCalledWith(0, 42, scope)
       expect(jukeboxClient.volume).toHaveBeenCalledWith(
         uiVolumeToRemoteGain(0.6, {
           deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
         }),
+        scope,
       )
       expect(jukeboxClient.play).toHaveBeenCalled()
       expect(jukeboxClient.volume.mock.invocationCallOrder[0]).toBeLessThan(
         jukeboxClient.play.mock.invocationCallOrder[0],
       )
     })
+  })
+
+  it('waits for owner attachment before sending remote queue or playback commands', async () => {
+    playerStateMock.queue = [{ trackId: 't1' }]
+    let finishAttach
+    jukeboxClient.attachSession.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishAttach = resolve
+        }),
+    )
+    render(<DeviceSelector isDesktop buttonClass="" />)
+    fireEvent.click(await screen.findByTestId('device-selector-button'))
+    fireEvent.click(await screen.findByText('Bluetooth 24:C4:06:FA:00:37'))
+    await waitFor(() => expect(jukeboxClient.attachSession).toHaveBeenCalled())
+    expect(jukeboxClient.set).not.toHaveBeenCalled()
+    expect(jukeboxClient.play).not.toHaveBeenCalled()
+    expect(audioInstanceMock.muted).toBe(false)
+    finishAttach({ sessionId: 'jukebox-session:admin' })
+    await waitFor(() => expect(jukeboxClient.play).toHaveBeenCalled())
+    expect(
+      jukeboxClient.attachSession.mock.invocationCallOrder[0],
+    ).toBeLessThan(jukeboxClient.set.mock.invocationCallOrder[0])
+  })
+
+  it('keeps local audio and playback commands unchanged when remote attachment is denied', async () => {
+    playerStateMock.queue = [{ trackId: 't1' }]
+    jukeboxClient.attachSession.mockRejectedValueOnce(
+      new Error('Control denied'),
+    )
+    render(<DeviceSelector isDesktop buttonClass="" />)
+    fireEvent.click(await screen.findByTestId('device-selector-button'))
+    fireEvent.click(await screen.findByText('Bluetooth 24:C4:06:FA:00:37'))
+    await waitFor(() =>
+      expect(notifyMock).toHaveBeenCalledWith(
+        'Failed to switch audio device',
+        'warning',
+      ),
+    )
+    expect(jukeboxClient.set).not.toHaveBeenCalled()
+    expect(jukeboxClient.play).not.toHaveBeenCalled()
+    expect(audioInstanceMock.muted).toBe(false)
+    expect(dispatchMock).not.toHaveBeenCalledWith(
+      setJukeboxMode(true, 'Bluetooth 24:C4:06:FA:00:37'),
+    )
+  })
+
+  it('stops the owned remote output before switching, detaching, and resuming local audio', async () => {
+    playerStateMock.jukeboxMode = true
+    audioInstanceMock.muted = true
+    let finishStop
+    jukeboxClient.stop.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishStop = resolve
+        }),
+    )
+    render(<DeviceSelector isDesktop buttonClass="" />)
+    fireEvent.click(await screen.findByTestId('device-selector-button'))
+    fireEvent.click(await screen.findByText('Local'))
+    await waitFor(() => expect(jukeboxClient.stop).toHaveBeenCalled())
+    try {
+      expect(jukeboxClient.detachSession).not.toHaveBeenCalled()
+      expect(jukeboxClient.switchDevice).not.toHaveBeenCalled()
+      expect(audioInstanceMock.play).not.toHaveBeenCalled()
+    } finally {
+      finishStop({})
+    }
+    await waitFor(() => expect(jukeboxClient.detachSession).toHaveBeenCalled())
+    await waitFor(() => expect(audioInstanceMock.play).toHaveBeenCalled())
+    expect(jukeboxClient.stop.mock.invocationCallOrder[0]).toBeLessThan(
+      jukeboxClient.switchDevice.mock.invocationCallOrder[0],
+    )
+    expect(jukeboxClient.switchDevice.mock.invocationCallOrder[0]).toBeLessThan(
+      jukeboxClient.detachSession.mock.invocationCallOrder[0],
+    )
+    expect(
+      jukeboxClient.detachSession.mock.invocationCallOrder[0],
+    ).toBeLessThan(audioInstanceMock.play.mock.invocationCallOrder[0])
+    expect(audioInstanceMock.muted).toBe(false)
+  })
+
+  it('does not release ownership or resume local audio after the remote stop is denied', async () => {
+    playerStateMock.jukeboxMode = true
+    audioInstanceMock.muted = true
+    jukeboxClient.stop.mockRejectedValueOnce(new Error('Control denied'))
+    render(<DeviceSelector isDesktop buttonClass="" />)
+    fireEvent.click(await screen.findByTestId('device-selector-button'))
+    fireEvent.click(await screen.findByText('Local'))
+    await waitFor(() =>
+      expect(notifyMock).toHaveBeenCalledWith(
+        'Failed to switch audio device',
+        'warning',
+      ),
+    )
+    expect(jukeboxClient.switchDevice).not.toHaveBeenCalled()
+    expect(jukeboxClient.detachSession).not.toHaveBeenCalled()
+    expect(audioInstanceMock.play).not.toHaveBeenCalled()
+    expect(audioInstanceMock.muted).toBe(true)
+    expect(dispatchMock).not.toHaveBeenCalledWith(setJukeboxMode(false))
   })
 
   it('renders Dividers between menu sections', async () => {

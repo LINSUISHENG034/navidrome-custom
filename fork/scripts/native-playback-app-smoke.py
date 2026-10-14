@@ -34,6 +34,8 @@ LOCAL_DEVICE = "Validation Local Null"
 REMOTE_DEVICE = "Validation Remote Null"
 LOCAL_DEVICE_ID = "validation-null-local"
 REMOTE_DEVICE_ID = "validation-null-remote"
+BROWSER_DEVICE = "Validation Browser Local"
+BROWSER_DEVICE_ID = "auto"
 
 
 class SmokeFailure(RuntimeError):
@@ -99,7 +101,7 @@ def write_scratch_config(path):
         """[jukebox]
 enabled = true
 default = "Validation Remote Null"
-devices = [["Validation Local Null", "validation-null-local"], ["Validation Remote Null", "validation-null-remote"]]
+devices = [["Validation Local Null", "validation-null-local"], ["Validation Remote Null", "validation-null-remote"], ["Validation Browser Local", "auto"]]
 adminonly = true
 autodiscoverbluetooth = false
 bluetoothmanagement = false
@@ -340,7 +342,14 @@ class AppSmoke:
     def native(self, method, path, *, body=None):
         return self.request(method, self.server_url + path, path, body=body, token=self.token)
 
-    def subsonic(self, path):
+    def command(self, path, body=None, *, client_id=None):
+        payload = dict(body or {})
+        if "sessionId" in payload or "clientId" in payload:
+            raise SmokeFailure("command payload must not override controller scope")
+        payload.update(sessionId=self.session_id, clientId=client_id or self.client_id)
+        return self.native("POST", path, body=payload)
+
+    def subsonic(self, path, *, parameters=None):
         params = {
             "u": self.username,
             "t": self.subsonic_token,
@@ -348,6 +357,7 @@ class AppSmoke:
             "v": "1.16.1",
             "c": "native-playback-app-smoke",
             "f": "json",
+            **(parameters or {}),
         }
         url = self.server_url + "/rest/" + path + "?" + urlencode(params)
         return self.request("GET", url, "/rest/" + path)
@@ -446,11 +456,11 @@ class AppSmoke:
     def jukebox_api(self, ids):
         code, devices = self.native("GET", "/api/jukebox/devices/")
         self.require(code, 200, "/api/jukebox/devices/")
-        if not isinstance(devices, list) or len(devices) != 2:
-            raise SmokeFailure("expected exactly two scratch null-output devices")
-        expected = {LOCAL_DEVICE_ID, REMOTE_DEVICE_ID}
+        if not isinstance(devices, list) or len(devices) != 3:
+            raise SmokeFailure("expected two scratch remote devices and one browser Local route")
+        expected = {LOCAL_DEVICE_ID, REMOTE_DEVICE_ID, BROWSER_DEVICE_ID}
         if {item.get("deviceName") for item in devices} != expected:
-            raise SmokeFailure("device list did not match the two validation-only null outputs")
+            raise SmokeFailure("device list did not match the validation-only routes")
         if not any(item.get("isDefault") and item.get("deviceName") == REMOTE_DEVICE_ID for item in devices):
             raise SmokeFailure("scratch remote null output is not the configured default")
         self.summary["phases"]["devices"] = {"status": "pass", "devices": self.sanitize(devices)}
@@ -463,11 +473,11 @@ class AppSmoke:
         if attached.get("ownershipState") != "attached":
             raise SmokeFailure("session attach did not return attached ownership")
 
-        code, set_status = self.native("POST", "/api/jukebox/set", body={"ids": ids})
+        code, set_status = self.command("/api/jukebox/set", {"ids": ids})
         self.require(code, 200, "/api/jukebox/set")
-        code, gain_status = self.native("POST", "/api/jukebox/volume", body={"gain": 0.375})
+        code, gain_status = self.command("/api/jukebox/volume", {"gain": 0.375})
         self.require(code, 200, "/api/jukebox/volume")
-        code, started = self.native("POST", "/api/jukebox/start", body={})
+        code, started = self.command("/api/jukebox/start")
         self.require(code, 200, "/api/jukebox/start")
         mpv = self.wait_for_mpv()
         if not all(flag in mpv["cmdline"] for flag in ("--no-config", "--load-scripts=no", "--no-video", "--vo=null", "--ao=null", "--audio-fallback-to-null=no")):
@@ -486,11 +496,11 @@ class AppSmoke:
         if playlist.get("currentIndex") != 0 or playlist.get("gain") != 0.375:
             raise SmokeFailure("session snapshot index/gain did not match current device state")
 
-        code, paused = self.native("POST", "/api/jukebox/pause", body={})
+        code, paused = self.command("/api/jukebox/pause")
         self.require(code, 200, "/api/jukebox/pause")
         if paused.get("playing"):
             raise SmokeFailure("pause response still reports playing")
-        code, seek = self.native("POST", "/api/jukebox/seek", body={"position": 2})
+        code, seek = self.command("/api/jukebox/seek", {"position": 2})
         self.require(code, 200, "/api/jukebox/seek")
         if seek.get("position") != 2:
             raise SmokeFailure(f"seek response reported position {seek.get('position')}, expected 2")
@@ -525,6 +535,11 @@ class AppSmoke:
             "mpv_exit_observation": self.mpv_stop_observations[-1],
         }
         self.summary["fixture_ids"] = ids
+        code, _ = self.native("POST", "/api/jukebox/session/detach", body={
+            "sessionId": self.session_id,
+            "clientId": self.client_id,
+        })
+        self.require(code, 200, "/api/jukebox/session/detach (API phase release)")
 
     def wait_for_playing(self, timeout=20):
         deadline = time.monotonic() + timeout
@@ -633,7 +648,7 @@ class AppSmoke:
         before = {str(pid): self.process_snapshot(pid) for pid in pids}
         started_at = utc_now_precise()
         started = time.monotonic()
-        code, response = self.native("POST", "/api/jukebox/stop", body={})
+        code, response = self.command("/api/jukebox/stop")
         response_at = utc_now_precise()
         self.require(code, 200, f"/api/jukebox/stop ({phase})")
         exits = [
@@ -775,7 +790,8 @@ class AppSmoke:
                     raise SmokeFailure("browser-started MPV did not use the required null-only safety flags")
                 fixture_ids = self.summary.get("fixture_ids", [])
                 if len(fixture_ids) > 1:
-                    code, added = self.native("POST", "/api/jukebox/add", body={"ids": [fixture_ids[1]]})
+                    app_client_id = app_page.evaluate("sessionStorage.getItem('jukebox-client-id')")
+                    code, added = self.command("/api/jukebox/add", {"ids": [fixture_ids[1]]}, client_id=app_client_id)
                     self.require(code, 200, "/api/jukebox/add (browser queue fixture)")
                 browser_checks["default_app_device_switch"] = {
                     "status": 200,
@@ -786,11 +802,43 @@ class AppSmoke:
                 switched_image = browser_dir / "default-app-jukebox.png"
                 app_page.screenshot(path=str(switched_image), full_page=True)
                 browser_checks["jukebox_screenshot"] = str(switched_image)
+
+                selector.click()
+                browser_local = app_page.locator('[role="menuitem"]').filter(has_text=BROWSER_DEVICE).first
+                with app_page.expect_response(
+                    lambda response: response.request.method == "POST"
+                    and response.url.split("?", 1)[0].endswith("/api/jukebox/session/detach"),
+                    timeout=15000,
+                ) as detach_info:
+                    browser_local.click()
+                if detach_info.value.status != 200:
+                    raise SmokeFailure("Local return did not release the controller session")
+                app_page.wait_for_function(
+                    "(() => { const a = document.querySelector('audio'); return a && !a.muted && !a.paused })()"
+                )
+                before_local = app_page.evaluate("document.querySelector('audio').currentTime")
+                app_page.wait_for_function(
+                    "previous => document.querySelector('audio').currentTime > previous + 0.2", arg=before_local,
+                )
+                if self.active_mpv_processes():
+                    raise SmokeFailure("remote output survived explicit Local return")
+                browser_checks["default_app_local_return"] = {
+                    "session_detach_http": 200, "unmuted": True,
+                    "browser_time_advances": True, "remote_mpv_released": True,
+                }
             except Exception as error:
                 browser_errors.append(self.redact(f"default app: {type(error).__name__}: {error}"))
             finally:
                 app_page.close()
 
+            for path, payload in (
+                ("/api/jukebox/devices/switch", {"deviceName": LOCAL_DEVICE_ID}),
+                ("/api/jukebox/set", {"ids": self.summary.get("fixture_ids", [])}),
+                ("/api/jukebox/volume", {"gain": 0.375}),
+            ):
+                code, _ = self.native("POST", path, body=payload)
+                self.require(code, 200, path + " (independent-controller setup)")
+            self.client_id = "browser-controller-1"
             fixture_page = context.new_page()
             self._track_page_errors(fixture_page, browser_errors, browser_console_details)
             seed = json.dumps({
@@ -801,7 +849,7 @@ class AppSmoke:
                 "subsonicSalt": self.subsonic_salt,
                 "subsonicToken": self.subsonic_token,
             }, separators=(",", ":"))
-            fixture_page.add_init_script(
+            seed_script = (
                 "(() => { const auth = " + seed + "; "
                 "localStorage.setItem('token', auth.token); "
                 "localStorage.setItem('username', auth.username); "
@@ -812,6 +860,21 @@ class AppSmoke:
                 "localStorage.setItem('subsonic-token', auth.subsonicToken); "
                 "localStorage.setItem('is-authenticated', 'true'); })()"
             )
+            fixture_page.add_init_script(seed_script)
+
+            def open_controller(client_id):
+                page = context.new_page()
+                self._track_page_errors(page, browser_errors, browser_console_details)
+                page.add_init_script(seed_script)
+                page.goto(
+                    self.vite_url + "/validation/remote-player.html?"
+                    + urlencode({"sessionId": self.session_id, "clientId": client_id}),
+                    wait_until="domcontentloaded", timeout=30000,
+                )
+                page.get_by_role("heading", name="Remote player prototype").wait_for(timeout=30000)
+                page.wait_for_function("document.querySelectorAll('audio').length === 0")
+                return page
+
             try:
                 fixture_url = (
                     self.vite_url + "/validation/remote-player.html?"
@@ -841,31 +904,66 @@ class AppSmoke:
                 browser_checks["prototype_user_play"] = "pass"
                 browser_checks["prototype_playing_screenshot"] = str(playing_image)
 
-                code, changed_gain = self.native("POST", "/api/jukebox/volume", body={"gain": 0.375})
+                code, changed_gain = self.command("/api/jukebox/volume", {"gain": 0.375})
                 self.require(code, 200, "/api/jukebox/volume (SSE probe)")
                 fixture_page.get_by_text("Gain: 0.375", exact=True).wait_for(timeout=15000)
                 browser_checks["sse_snapshot_refresh"] = "pass"
 
+                observer_page = open_controller("browser-controller-2")
+                observer_page.wait_for_function("document.querySelector('fieldset')?.disabled === true")
                 code, observer_heartbeat = self.native("POST", "/api/jukebox/session/heartbeat", body={
-                    "sessionId": self.session_id,
+                    "sessionId": self.session_id, "clientId": "browser-controller-2",
+                })
+                self.require(code, 403, "/api/jukebox/session/heartbeat (observer)")
+                code, observer_mutation = self.command(
+                    "/api/jukebox/volume", {"gain": 0.25}, client_id="browser-controller-2",
+                )
+                self.require(code, 403, "/api/jukebox/volume (observer attack)")
+                code, _ = self.native("POST", "/api/jukebox/volume", body={"gain": 0.25})
+                self.require(code, 403, "/api/jukebox/volume (unscoped attack)")
+                code, subsonic_attack = self.subsonic("jukeboxControl", parameters={
+                    "action": "setGain", "gain": "0.25", "sessionId": self.session_id,
                     "clientId": "browser-controller-2",
                 })
-                if code != 403:
-                    raise SmokeFailure(f"non-owner browser heartbeat returned HTTP {code}, expected 403")
+                self.require(code, 200, "/rest/jukeboxControl (observer protocol response)")
+                attack_root = subsonic_attack.get("subsonic-response") or subsonic_attack.get("subsonicResponse") or {}
+                if attack_root.get("status") != "failed":
+                    raise SmokeFailure("Subsonic observer mutation bypassed ownership")
                 code, observer_snapshot = self.native(
-                    "GET", f"/api/jukebox/session/snapshot?sessionId={quote(self.session_id)}"
+                    "GET", f"/api/jukebox/session/snapshot?sessionId={quote(self.session_id)}",
                 )
                 self.require(code, 200, "/api/jukebox/session/snapshot (read-only observer)")
-                if observer_snapshot.get("sessionStatus", {}).get("ownerClientId") != "browser-controller-1":
-                    raise SmokeFailure("read-only browser probe unexpectedly changed session ownership")
+                before_takeover = observer_snapshot.get("sessionStatus", {})
+                if before_takeover.get("ownerClientId") != "browser-controller-1" or before_takeover.get("gain") != 0.375:
+                    raise SmokeFailure("observer attempts changed ownership or gain")
                 browser_checks["controller2_read_only_probe"] = {
-                    "snapshot_http": 200,
-                    "heartbeat_http": 403,
-                    "owner_unchanged": True,
-                    "controls_sent": False,
+                    "snapshot_http": 200, "heartbeat_http": 403, "mutation_http": 403,
+                    "unscoped_mutation_http": 403, "subsonic_status": "failed",
+                    "owner_unchanged": True, "actual_second_page": True,
                 }
 
+                observer_page.get_by_role("button", name="Take control", exact=True).click()
+                observer_page.wait_for_function("document.querySelector('fieldset')?.disabled === false")
+                code, takeover_snapshot = self.native(
+                    "GET", f"/api/jukebox/session/snapshot?sessionId={quote(self.session_id)}",
+                )
+                self.require(code, 200, "/api/jukebox/session/snapshot (explicit takeover)")
+                takeover_status = takeover_snapshot.get("sessionStatus", {})
+                if takeover_status.get("ownerClientId") != "browser-controller-2":
+                    raise SmokeFailure("explicit Take control did not change owner")
+                if (takeover_snapshot.get("jukeboxPlaylist", {}).get("entry") != observer_snapshot.get("jukeboxPlaylist", {}).get("entry")
+                        or takeover_status.get("currentIndex") != before_takeover.get("currentIndex")
+                        or takeover_status.get("position", 0) < before_takeover.get("position", 0) - 1):
+                    raise SmokeFailure("explicit takeover reset queue/index/position")
+                code, _ = self.command("/api/jukebox/pause", client_id="browser-controller-1")
+                self.require(code, 403, "/api/jukebox/pause (retired owner attack)")
+                self.client_id = "browser-controller-2"
+                browser_checks["explicit_takeover"] = {
+                    "owner": self.client_id, "old_owner_mutation_http": 403,
+                    "queue_preserved": True, "position_not_rewound": True,
+                }
                 fixture_page.close()
+                observer_page.close()
                 session_code, detached_status = self.native(
                     "GET", f"/api/jukebox/session/status?sessionId={quote(self.session_id)}"
                 )
@@ -886,20 +984,7 @@ class AppSmoke:
                     "session_exists_after_close": session_code == 200,
                 }
 
-                restored_page = context.new_page()
-                self._track_page_errors(restored_page, browser_errors, browser_console_details)
-                restored_page.add_init_script(
-                    "(() => { const auth = " + seed + "; "
-                    "localStorage.setItem('token', auth.token); "
-                    "localStorage.setItem('username', auth.username); "
-                    "localStorage.setItem('is-authenticated', 'true'); })()"
-                )
-                restored_page.goto(
-                    self.vite_url + "/validation/remote-player.html?"
-                    + urlencode({"sessionId": self.session_id, "clientId": "browser-controller-2"}),
-                    wait_until="domcontentloaded", timeout=30000,
-                )
-                restored_page.get_by_role("heading", name="Remote player prototype").wait_for(timeout=30000)
+                restored_page = open_controller(self.client_id)
                 restored_page.get_by_text("Playing", exact=True).wait_for(timeout=15000)
                 restored_page.get_by_text("Smoke One", exact=False).first.wait_for(timeout=10000)
                 restored_page.wait_for_function("document.querySelectorAll('audio').length === 0")
@@ -909,12 +994,14 @@ class AppSmoke:
                 browser_checks["restored_screenshot"] = str(restored_image)
                 restored_page.close()
 
-                final_stop = self.stop_jukebox_and_observe("browser-final-cleanup", active_pids)
+                self.client_id = "final-verifier"
                 code, final_attach = self.native("POST", "/api/jukebox/session/attach", body={
                     "sessionId": self.session_id,
-                    "clientId": "final-verifier",
+                    "clientId": self.client_id,
+                    "takeover": True,
                 })
-                self.require(code, 200, "/api/jukebox/session/attach (final verifier)")
+                self.require(code, 200, "/api/jukebox/session/attach (explicit final verifier)")
+                final_stop = self.stop_jukebox_and_observe("browser-final-cleanup", active_pids)
                 code, final_snapshot = self.native("GET", f"/api/jukebox/session/snapshot?sessionId={quote(self.session_id)}")
                 self.require(code, 200, "/api/jukebox/session/snapshot (final verifier)")
                 final_playlist = final_snapshot.get("jukeboxPlaylist") or {}

@@ -96,84 +96,72 @@ const DeviceSelector = ({ isDesktop, buttonClass }) => {
   const handleSwitch = useCallback(
     (device) => {
       const isLocalDevice = device.deviceName === 'auto'
+      const scope = {
+        sessionId: getJukeboxSessionId(),
+        clientId: getOrCreateJukeboxClientId(),
+      }
       handleClose()
 
-      // Switch the server-side output device
-      httpClient('/api/jukebox/devices/switch', {
-        method: 'POST',
-        body: JSON.stringify({ deviceName: device.deviceName }),
-      })
-        .then(({ json }) => {
-          setDevices(json)
+      enqueueJukeboxCommand(async () => {
+        if (isLocalDevice && jukeboxMode) await jukeboxClient.stop(scope)
+        const nextDevices = await jukeboxClient.switchDevice(
+          device.deviceName,
+          jukeboxMode ? scope : undefined,
+        )
+        setDevices(nextDevices)
 
-          if (isLocalDevice) {
-            const sessionId = getJukeboxSessionId()
-            const clientId = getOrCreateJukeboxClientId()
-            if (jukeboxMode) {
-              detachJukeboxSession({
-                client: jukeboxClient,
-                sessionId,
-                clientId,
-              }).catch(() => {})
-            }
-            enqueueJukeboxCommand(() => jukeboxClient.stop()).catch(() => {})
-            dispatch(setJukeboxMode(false))
-            if (audioInstance) {
-              audioInstance.muted = false
-              if (audioInstance.paused) {
-                audioInstance.play().catch(() => {})
-              }
-            }
-          } else {
-            // Switching to remote device — enter Jukebox mode
-            const trackIds = playerState.queue.map((item) => item.trackId)
-            const currentIndex = playerState.savedPlayIndex || 0
-            const currentTime = audioInstance
-              ? Math.floor(audioInstance.currentTime || 0)
-              : 0
-            const currentGain = audioInstance
-              ? audioVolumeToRemoteGain(clamp01(audioInstance.volume), {
-                  deviceName: device.deviceName,
-                  jukeboxDevice: device.name,
-                })
-              : 1
-
-            // Mute browser audio — keeps element "playing" so UI stays correct
-            if (audioInstance) {
-              suppressJukeboxMediaEvents()
-              audioInstance.muted = true
-            }
-
-            if (trackIds.length > 0) {
-              enqueueJukeboxCommand(() =>
-                jukeboxClient
-                  .set(trackIds)
-                  .then(() => jukeboxClient.skip(currentIndex, currentTime))
-                  .then(() => jukeboxClient.volume(currentGain))
-                  .then(() => jukeboxClient.play()),
-              ).catch(() => {
-                notify('Failed to start playback on remote device', 'warning')
-              })
-            }
-
-            if (jukeboxMode) {
-              attachJukeboxSession({
-                client: jukeboxClient,
-                sessionId: getJukeboxSessionId(),
-                clientId: getOrCreateJukeboxClientId(),
-                deviceName: device.deviceName,
-                dispatch,
-              }).catch(() => {})
-            }
-
-            dispatch(setJukeboxMode(true, device.name))
+        if (isLocalDevice) {
+          if (jukeboxMode) {
+            await detachJukeboxSession({ client: jukeboxClient, ...scope })
           }
+          dispatch(setJukeboxMode(false))
+          if (audioInstance) {
+            suppressJukeboxMediaEvents()
+            audioInstance.muted = false
+            if (audioInstance.paused) audioInstance.play().catch(() => {})
+          }
+          return
+        }
+
+        await attachJukeboxSession({
+          client: jukeboxClient,
+          ...scope,
+          deviceName: device.deviceName,
+          dispatch,
         })
-        .catch(() => {
-          notify('Failed to switch audio device', 'warning')
-        })
+        const trackIds = playerState.queue.map((item) => item.trackId)
+        const currentIndex = playerState.savedPlayIndex || 0
+        const currentTime = audioInstance
+          ? Math.floor(audioInstance.currentTime || 0)
+          : 0
+        const currentGain = audioInstance
+          ? audioVolumeToRemoteGain(clamp01(audioInstance.volume), {
+              deviceName: device.deviceName,
+              jukeboxDevice: device.name,
+            })
+          : 1
+
+        // The default player still uses the legacy muted browser path.
+        if (audioInstance) {
+          suppressJukeboxMediaEvents()
+          audioInstance.muted = true
+        }
+        if (trackIds.length > 0) {
+          try {
+            await jukeboxClient.set(trackIds, scope)
+            await jukeboxClient.skip(currentIndex, currentTime, scope)
+            await jukeboxClient.volume(currentGain, scope)
+            await jukeboxClient.play(scope)
+          } catch {
+            notify('Failed to start playback on remote device', 'warning')
+          }
+        }
+        dispatch(setJukeboxMode(true, device.name))
+      }).catch(() => {
+        notify('Failed to switch audio device', 'warning')
+      })
     },
-    [handleClose, audioInstance, playerState, dispatch, notify],
+    [handleClose, audioInstance, playerState, dispatch, notify, jukeboxMode],
   )
 
   const handleRefresh = useCallback(() => {

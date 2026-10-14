@@ -40,6 +40,12 @@ func (s *sessionStatusStubServer) SessionStatus(context.Context, string) (Sessio
 func (s *sessionStatusStubServer) SessionSnapshot(context.Context, string, string) (SessionSnapshot, error) {
 	return SessionSnapshot{}, nil
 }
+func (s *sessionStatusStubServer) ExecuteCommand(context.Context, CommandScope, PlaybackCommand) (DeviceStatus, error) {
+	return DeviceStatus{}, nil
+}
+func (s *sessionStatusStubServer) SwitchDeviceForCommand(context.Context, CommandScope, string) error {
+	return nil
+}
 
 func TestPlaybackServerDetachSessionReturnsSnapshot(t *testing.T) {
 	ctx := context.Background()

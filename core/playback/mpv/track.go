@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -302,12 +303,12 @@ func (t *MpvTrack) reportCommandFailure(err error) {
 	t.emitTerminal(model.PlaybackEventFailure, err)
 }
 
-// Position returns the playback position in seconds.
+// Position returns the measured playback position rounded to the nearest second.
 func (t *MpvTrack) Position() int {
 	position, err := t.call("get_property", "time-pos")
 	if err == nil {
 		if t.updatePosition(position) {
-			return int(position.(float64))
+			return int(math.Round(position.(float64)))
 		}
 	} else if !strings.Contains(err.Error(), "mpv error: property unavailable") {
 		log.Error("Error getting position in track", "track", t, err)
@@ -316,17 +317,42 @@ func (t *MpvTrack) Position() int {
 	return t.cachedPosition()
 }
 
-func (t *MpvTrack) SetPosition(offset int) error {
+func (t *MpvTrack) SetPosition(offset int) (err error) {
 	log.Debug("Setting position", "offset", offset, "track", t)
-	if current, known := t.positionSnapshotValue(); known && current == offset {
-		return nil
-	}
-	if _, err := t.call("set_property", "time-pos", float64(offset)); err != nil {
-		log.Error("Could not set the position in track", "track", t, "offset", offset, err)
-		t.reportCommandFailure(err)
+	defer func() {
+		if err != nil {
+			log.Error("Could not set the position in track", "track", t, "offset", offset, err)
+			t.reportCommandFailure(err)
+		}
+	}()
+	current, err := t.call("get_property", "time-pos")
+	if err != nil {
 		return err
 	}
-	return nil
+	if current == float64(offset) {
+		return nil
+	}
+	if err = t.preparePausedSeek(); err != nil {
+		return err
+	}
+	_, err = t.call("seek", float64(offset), "absolute+exact")
+	return err
+}
+
+func (t *MpvTrack) preparePausedSeek() error {
+	paused, err := t.call("get_property", "pause")
+	if err != nil {
+		return err
+	}
+	if paused != true {
+		return nil
+	}
+	// A paused output can retain pre-seek buffered delay in its position report.
+	// Reopen it while still paused; this costs output preparation, not audible playback.
+	if _, err := t.call("ao-reload"); err != nil {
+		return err
+	}
+	return t.waitForReady()
 }
 
 func (t *MpvTrack) IsPlaying() bool {
@@ -350,7 +376,7 @@ func (t *MpvTrack) updatePosition(value any) bool {
 		return false
 	}
 	t.positionMu.Lock()
-	t.lastPosition = int(position)
+	t.lastPosition = int(math.Round(position))
 	t.hasLastPosition = true
 	t.positionMu.Unlock()
 	return true
