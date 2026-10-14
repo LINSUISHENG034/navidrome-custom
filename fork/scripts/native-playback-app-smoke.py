@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -119,36 +120,24 @@ enabled = false
     )
 
 
+def validation_module():
+    script = Path(__file__).with_name("native-playback-validation.py")
+    spec = importlib.util.spec_from_file_location("native_playback_validation", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def source_fingerprint():
-    git = shutil.which("git")
-    if not git:
-        return {"commit": None, "worktree_sha256": None}
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home())}
-    commit_result = subprocess.run(
-        [git, "rev-parse", "HEAD"], cwd=REPO, env=env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
-    )
-    diff_result = subprocess.run(
-        [git, "diff", "--binary", "HEAD"], cwd=REPO, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
-    )
-    digest = hashlib.sha256()
-    if diff_result.returncode == 0:
-        digest.update(diff_result.stdout)
-    untracked = subprocess.run(
-        [git, "ls-files", "--others", "--exclude-standard", "--", "core", "server", "cmd", "ui/src", "ui/validation", "fork/scripts/native-playback-app-smoke.py"],
-        cwd=REPO, env=env, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, check=False,
-    )
-    if untracked.returncode == 0:
-        for relative in sorted(untracked.stdout.splitlines()):
-            path = REPO / relative
-            if path.is_file() and path.suffix in {".go", ".js", ".jsx", ".ts", ".tsx", ".py"}:
-                digest.update(relative.encode("utf-8") + b"\0")
-                digest.update(path.read_bytes())
+    validation = validation_module()
+    commit, provenance = validation.capture_source_commit(REPO, validation.isolated_run)
+    content = validation.capture_source_content_fingerprint(REPO, validation.isolated_run)
     return {
-        "commit": commit_result.stdout.strip() if commit_result.returncode == 0 else None,
-        "worktree_sha256": digest.hexdigest(),
+        "commit": commit,
+        "worktree_sha256": content["sha256"],
+        "worktree_sha256_algorithm": content["algorithm"],
+        "source_content_fingerprint": content,
+        "provenance": provenance,
     }
 
 
@@ -1092,7 +1081,13 @@ class AppSmoke:
             for line in lines:
                 if not any(token in line for token in ("wait4(", "waitid(", "waitpid(")):
                     continue
-                if any(re.search(rf"\\bwait(?:4|id|pid)\\([^)]*\\b{pid}\\b", line) for pid in self.mpv_pids):
+                if any(
+                    f"si_pid={pid}," in line
+                    or f"wait4({pid}," in line
+                    or f"waitpid({pid}," in line
+                    or f"waitid(P_PID, {pid}," in line
+                    for pid in self.mpv_pids
+                ):
                     wait_calls.append({"traced_parent_pid": traced_pid, "line": line.strip()})
         return {
             "enabled": True,

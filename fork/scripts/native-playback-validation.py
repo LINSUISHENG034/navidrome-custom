@@ -3,6 +3,7 @@
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,16 @@ import time
 
 
 SCHEMA_VERSION = 1
+SOURCE_PATHS = (
+    "go.mod", "go.sum", "main.go", "Makefile", ".nvmrc", "core", "server", "cmd",
+    "model", "conf", "utils", "api", "consts", "db", "log", "scheduler",
+    "persistence", "adapters", "scanner", "plugins", "resources", "tests",
+    "ui/src", "ui/validation", "ui/public", "ui/embed.go", "ui/index.html",
+    "ui/package.json", "ui/package-lock.json", "ui/vite.config.js",
+    "ui/tsconfig.json", "ui/tsconfig.app.json", "ui/tsconfig.node.json",
+    "ui/prettier.config.js", "ui/.eslintrc", "ui/.eslintignore", "fork/scripts",
+)
+SOURCE_EXTENSIONS = {".go", ".js", ".jsx", ".ts", ".tsx", ".py", ".html", ".json", ".toml"}
 PLAYBACK_PACKAGES = ["./core/playback/..."]
 BUILD_TAGS = "netgo,sqlite_fts5"
 NULL_MPV_SPECS = {
@@ -331,7 +342,8 @@ def write_json(path, value):
 
 class ValidationRunner:
     def __init__(self, repo, output, *, go_binary, go_details, timeout, phase_timeouts,
-                 stress_count, mpv_null, run=isolated_run, source_commit=None, provenance=None):
+                 stress_count, mpv_null, run=isolated_run, source_commit=None, provenance=None,
+                 dirty_scope_fingerprint=None, source_content_fingerprint=None):
         self.repo = Path(repo).resolve()
         self.output = Path(output).resolve()
         self.go_binary = go_binary
@@ -343,6 +355,8 @@ class ValidationRunner:
         self.run = run
         self.source_commit = source_commit
         self.provenance = provenance or {}
+        self.dirty_scope_fingerprint = dirty_scope_fingerprint or {}
+        self.source_content_fingerprint = source_content_fingerprint or {}
         self.results = []
         self.started_at = utc_now()
         self.run_directory = None
@@ -458,6 +472,16 @@ class ValidationRunner:
             blocked_reason=go_error,
             timeout=self.phase_timeout("playback-race", 2400),
         )
+        retirement_test = "TestPlaybackServerRunWaitsForPendingOutputRetirement"
+        self._phase(
+            "playback-pending-service-retirement", "Service shutdown waits for pending output retirement",
+            commands=[go_command(self.go_binary, "test", "-race", tags, "-count=1", "-timeout=60s", "-v",
+                                 "./core/playback", "-run", "^" + retirement_test + "$")] if self.go_binary else None,
+            blocked_reason=go_error,
+            env={"ND_TEST_PENDING_SERVICE_RETIREMENT": "1"},
+            timeout=self.phase_timeout("playback-pending-service-retirement", 180),
+            output_check=lambda output: go_execution_check(output, retirement_test),
+        )
         stress_commands = [
             go_command(self.go_binary, "test", tags, "-count=1", "-timeout=45m", *PLAYBACK_PACKAGES)
             for _ in range(self.stress_count)
@@ -474,6 +498,31 @@ class ValidationRunner:
                                  "./server/nativeapi/...", "./server/subsonic/...")] if self.go_binary else None,
             blocked_reason=go_error,
             timeout=self.phase_timeout("nativeapi-subsonic", 2400),
+        )
+
+        authority_test = "TestJukeboxSessionCommandAuthorityValidation"
+        self._phase(
+            "nativeapi-command-authority", "Native session-bound command authority contract",
+            commands=[go_command(self.go_binary, "test", tags, "-count=1", "-timeout=60s", "-v",
+                                 "./server/nativeapi", "-run", "^" + authority_test + "$")] if self.go_binary else None,
+            blocked_reason=go_error,
+            env={"ND_TEST_SESSION_COMMAND_AUTHORITY": "1"},
+            timeout=self.phase_timeout("nativeapi-command-authority", 180),
+            output_check=lambda output: go_execution_check(output, authority_test, (
+                "non-owner_cannot_mutate_after_heartbeat_denial",
+                "owner_command_targets_session-bound_non-default_device",
+            )),
+        )
+        authority_spec = "rejects non-owner mutation after session heartbeat denial"
+        self._phase(
+            "nativeapi-subsonic-command-authority", "Subsonic non-owner command authority contract",
+            commands=[go_command(self.go_binary, "test", tags, "-count=1", "-timeout=60s", "-v",
+                                 "./server/subsonic", "-run", "^TestSubsonicApi$",
+                                 "-ginkgo.focus=" + authority_spec, "-ginkgo.v")] if self.go_binary else None,
+            blocked_reason=go_error,
+            env={"ND_TEST_SESSION_COMMAND_AUTHORITY": "1"},
+            timeout=self.phase_timeout("nativeapi-subsonic-command-authority", 180),
+            output_check=lambda output: ginkgo_execution_check(output, authority_spec),
         )
 
         if not self.mpv_null:
@@ -641,6 +690,7 @@ class ValidationRunner:
         not_run = [phase["id"] for phase in self.results
                    if phase["critical"] and phase["status"] == "not_run"]
         provenance_missing = self.source_commit is None
+        dirty_scope_missing = not self.dirty_scope_fingerprint.get("sha256")
         reasons = []
         if hard_failures:
             reasons.append("critical_failures=" + ",".join(hard_failures))
@@ -650,6 +700,10 @@ class ValidationRunner:
             reasons.append("critical_not_run=" + ",".join(not_run))
         if provenance_missing:
             reasons.append("source_commit_unavailable")
+        if dirty_scope_missing:
+            reasons.append("dirty_scope_fingerprint_unavailable")
+        if not self.source_content_fingerprint.get("sha256"):
+            reasons.append("source_content_fingerprint_unavailable")
         accepted = not reasons
         return {
             "schema_version": SCHEMA_VERSION,
@@ -657,6 +711,8 @@ class ValidationRunner:
             "finished_at": utc_now(),
             "repository": str(self.repo),
             "source_commit": self.source_commit,
+            "dirty_scope_fingerprint": self.dirty_scope_fingerprint,
+            "source_content_fingerprint": self.source_content_fingerprint,
             "provenance": self.provenance,
             "go_toolchain": self.go_details,
             "gate": {
@@ -672,6 +728,13 @@ class ValidationRunner:
         }
 
 
+def go_execution_check(output, expected_test, subtests=()):
+    for name in (expected_test, *(expected_test + "/" + name for name in subtests)):
+        if not re.search(r"^\s*--- PASS: " + re.escape(name) + r"\s", output, re.MULTILINE):
+            return "blocked", f"required test not executed successfully: {name}"
+    return None, None
+
+
 def capture_source_commit(repo, run):
     git = resolve_executable("git")
     if not git:
@@ -684,6 +747,81 @@ def capture_source_commit(repo, run):
     return commit, {"command": record, "error": None if commit else "could not capture source commit"}
 
 
+def capture_dirty_scope_fingerprint(repo, run):
+    git = resolve_executable("git")
+    if not git:
+        return {"sha256": None, "entries": [], "command": None, "error": "git executable is unavailable"}
+    env = safe_environment()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    record = run_record(run, [git, "status", "--porcelain=v1", "--untracked-files=normal"], repo, env, 15)
+    if record["exit_code"] != 0:
+        return {"sha256": None, "entries": [], "command": record, "error": "could not capture dirty worktree scope"}
+    status = record["stdout"]
+    return {
+        "sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "meaning": "hash of git status text only; not a source-content fingerprint",
+        "entries": status.splitlines(),
+        "command": record,
+        "error": None,
+    }
+
+
+def capture_source_content_fingerprint(repo, run):
+    """Hash ordered source paths and bytes, not git status or private untracked files."""
+    result = {
+        "sha256": None, "entries": [], "commands": [], "error": None,
+        "scope": list(SOURCE_PATHS),
+        "assumption": "source remains frozen during the run; this is not a machine, dependency-cache or generated-build-output fingerprint",
+        "algorithm": "sha256 of ordered length-prefixed path, entry kind and file bytes or symlink target text",
+    }
+    git = resolve_executable("git")
+    if not git:
+        result["error"] = "git executable is unavailable"
+        return result
+    env = safe_environment()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    paths = set()
+    for flags in (["--cached"], ["--others", "--exclude-standard"]):
+        record = run_record(run, [git, "ls-files", "-z", *flags, "--", *SOURCE_PATHS], repo, env, 15)
+        result["commands"].append(record)
+        if record["exit_code"] != 0:
+            result["error"] = "could not enumerate source files"
+            return result
+        for relative in record["stdout"].split("\0"):
+            if relative and (flags == ["--cached"] or Path(relative).suffix in SOURCE_EXTENSIONS):
+                paths.add(relative)
+    digest = hashlib.sha256()
+    root = Path(repo).resolve()
+    try:
+        for relative in sorted(paths):
+            path = root / relative
+            if not path.resolve().is_relative_to(root):
+                raise ValueError(f"source path or symlink escapes repository: {relative}")
+            if any(parent.is_symlink() for parent in path.parents if parent != root and parent.is_relative_to(root)):
+                raise ValueError(f"source parent is a symlink: {relative}")
+            kind = "file"
+            if path.is_symlink():
+                target = path.resolve().relative_to(root).as_posix()
+                if not any(target == scope or target.startswith(scope + "/") for scope in SOURCE_PATHS):
+                    raise ValueError(f"symlink targets a path outside source scope: {relative}")
+                kind = "symlink"
+                content = os.fsencode(os.readlink(path))
+            else:
+                content = path.read_bytes()
+            name = relative.encode("utf-8")
+            for value in (name, kind.encode("ascii"), content):
+                digest.update(len(value).to_bytes(8, "big"))
+                digest.update(value)
+            result["entries"].append({"path": relative, "kind": kind, "sha256": hashlib.sha256(content).hexdigest()})
+        if not paths:
+            raise ValueError("no source files were enumerated")
+    except (OSError, ValueError) as error:
+        result["error"] = str(error)
+        return result
+    result["sha256"] = digest.hexdigest()
+    return result
+
+
 def parse_phase_timeout(value):
     match = re.fullmatch(r"([a-z][a-z0-9-]*)=([1-9][0-9]*)", value)
     if match is None:
@@ -694,6 +832,7 @@ def parse_phase_timeout(value):
 def phase_timeout_values(overrides):
     phase_ids = {
         "playback-normal", "playback-race", "playback-stress", "nativeapi-subsonic",
+        "nativeapi-command-authority", "nativeapi-subsonic-command-authority", "playback-pending-service-retirement",
         "mpv-null-lifecycle", "mpv-null-transport-recovery", "mpv-null-natural-eof",
         "mpv-null-explicit-close", "mpv-null-context-cancel", "ui-full-suite", "ui-audioplayer",
         "ui-eventstream", "diff-check", "go-formatting", "ui-formatting",
@@ -764,6 +903,8 @@ def main(argv=None, *, run=isolated_run, stdout=None, stderr=None):
         return 2
 
     source_commit, provenance = capture_source_commit(repo, run)
+    dirty_scope_fingerprint = capture_dirty_scope_fingerprint(repo, run)
+    source_content_fingerprint = capture_source_content_fingerprint(repo, run)
     go_binary, go_details = discover_go(repo, run, args.go_binary)
     runner = ValidationRunner(
         repo, output,
@@ -776,6 +917,8 @@ def main(argv=None, *, run=isolated_run, stdout=None, stderr=None):
         run=run,
         source_commit=source_commit,
         provenance=provenance,
+        dirty_scope_fingerprint=dirty_scope_fingerprint,
+        source_content_fingerprint=source_content_fingerprint,
     )
     try:
         report = runner.run_all()
@@ -788,6 +931,7 @@ def main(argv=None, *, run=isolated_run, stdout=None, stderr=None):
     summary = {
         "decision": report["gate"]["decision"],
         "source_commit": source_commit,
+        "dirty_scope_sha256": dirty_scope_fingerprint["sha256"],
         "report": str(report_path),
         "phases": {phase["id"]: phase["status"] for phase in report["phases"]},
     }

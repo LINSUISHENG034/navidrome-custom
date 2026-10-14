@@ -32,6 +32,19 @@ class FakeProcess:
                 argv, 0, f"{version}\n/tmp/gomodcache\nlinux\namd64\n", ""
             )
         if executable == "go" and "test" in argv:
+            if "^TestPlaybackServerRunWaitsForPendingOutputRetirement$" in argv:
+                return subprocess.CompletedProcess(argv, 0,
+                    "--- PASS: TestPlaybackServerRunWaitsForPendingOutputRetirement (0.01s)\n", "")
+            if "^TestJukeboxSessionCommandAuthorityValidation$" in argv:
+                return subprocess.CompletedProcess(argv, 0,
+                    "=== RUN   TestJukeboxSessionCommandAuthorityValidation\n"
+                    "--- PASS: TestJukeboxSessionCommandAuthorityValidation (0.01s)\n"
+                    "    --- PASS: TestJukeboxSessionCommandAuthorityValidation/non-owner_cannot_mutate_after_heartbeat_denial (0.00s)\n"
+                    "    --- PASS: TestJukeboxSessionCommandAuthorityValidation/owner_command_targets_session-bound_non-default_device (0.00s)\n", "")
+            if any("rejects non-owner mutation after session heartbeat denial" in arg for arg in argv):
+                return subprocess.CompletedProcess(argv, 0,
+                    "• [It] rejects non-owner mutation after session heartbeat denial\n"
+                    "Ran 1 of 359 Specs in 1s\n", "")
             focus = next((value.removeprefix("-ginkgo.focus=") for value in argv
                           if value.startswith("-ginkgo.focus=")), "")
             for phase_id, spec_name in validation.NULL_MPV_SPECS.items():
@@ -48,6 +61,8 @@ class FakeProcess:
         if executable == "git":
             if "rev-parse" in argv:
                 return subprocess.CompletedProcess(argv, 0, "a" * 40 + "\n", "")
+            if "ls-files" in argv and "-z" in argv:
+                return subprocess.CompletedProcess(argv, 0, "go.mod\0", "")
             if "status" in argv:
                 return subprocess.CompletedProcess(
                     argv, 0,
@@ -142,13 +157,68 @@ class ValidationRunnerTests(unittest.TestCase):
         self.assertEqual(phases["mpv-null-transport-recovery"]["status"], "fail")
         self.assertIn("mpv-null-transport-recovery", report["gate"]["critical_failures"])
         self.assertEqual(report["gate"]["decision"], "not_accepted")
-        null_commands = [call for call in process.calls if any(arg.startswith("-ginkgo.focus=") for arg in call[0])]
+        null_commands = [call for call in process.calls if "./core/playback/mpv" in call[0]
+                         and any(arg.startswith("-ginkgo.focus=") for arg in call[0])]
         self.assertEqual(len(null_commands), 5)
         for command, kwargs in null_commands:
             self.assertEqual(kwargs["env"]["ND_TEST_MPV_NULL_OUTPUT"], "1")
             self.assertEqual(kwargs["env"]["ND_ENABLEINSIGHTSCOLLECTOR"], "false")
             self.assertEqual(kwargs["env"]["ND_JUKEBOX_AUTODISCOVERBLUETOOTH"], "false")
             self.assertLess(command.index("-v"), command.index("./core/playback/mpv"))
+
+    def test_command_authority_contracts_are_explicit_and_critical(self):
+        runner = self.make_runner()
+        report = self.run_with_fake_tools(runner)
+        phases = {phase["id"]: phase for phase in report["phases"]}
+        for phase_id in ("nativeapi-command-authority", "nativeapi-subsonic-command-authority"):
+            self.assertEqual(phases[phase_id]["status"], "pass")
+            self.assertTrue(phases[phase_id]["critical"])
+        commands = [call for call in self.process.calls
+                    if call[1]["env"].get("ND_TEST_SESSION_COMMAND_AUTHORITY") == "1"]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all(call[1]["env"]["GOTOOLCHAIN"] == "local" for call in commands))
+
+    def test_pending_service_retirement_is_explicit_and_critical(self):
+        def pending_retirement(argv, **kwargs):
+            if kwargs["env"].get("ND_TEST_PENDING_SERVICE_RETIREMENT") == "1":
+                self.assertIn("-race", argv)
+                return subprocess.CompletedProcess(argv, 1, "Run returned with unretired preparing output", "")
+            return self.process(argv, **kwargs)
+
+        report = self.run_with_fake_tools(self.make_runner(process=pending_retirement))
+        self.assertIn("playback-pending-service-retirement", report["gate"]["critical_failures"])
+        phase = next(phase for phase in report["phases"] if phase["id"] == "playback-pending-service-retirement")
+        self.assertEqual(phase["status"], "fail")
+        self.assertTrue(phase["critical"])
+
+    def test_command_authority_failures_are_not_waived(self):
+        def denied_contract(argv, **kwargs):
+            if kwargs["env"].get("ND_TEST_SESSION_COMMAND_AUTHORITY") == "1":
+                return subprocess.CompletedProcess(argv, 1, "contract RED: mutation accepted", "")
+            return self.process(argv, **kwargs)
+
+        report = self.run_with_fake_tools(self.make_runner(process=denied_contract))
+        self.assertIn("nativeapi-command-authority", report["gate"]["critical_failures"])
+        self.assertIn("nativeapi-subsonic-command-authority", report["gate"]["critical_failures"])
+        self.assertEqual(report["gate"]["decision"], "not_accepted")
+
+    def test_native_contract_missing_subtest_is_not_pass(self):
+        status, reason = validation.go_execution_check(
+            "--- PASS: TestContract (0.01s)\n"
+            "    --- SKIP: TestContract/required_behavior (0.00s)\n",
+            "TestContract", ("required_behavior",),
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("required_behavior", reason)
+
+    def test_native_contract_default_skip_is_not_pass(self):
+        status, reason = validation.go_execution_check(
+            "=== RUN   TestJukeboxSessionCommandAuthorityValidation\n"
+            "--- SKIP: TestJukeboxSessionCommandAuthorityValidation (0.00s)\n",
+            "TestJukeboxSessionCommandAuthorityValidation",
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("not executed", reason)
 
     def test_transport_failure_is_not_reclassified_as_expected_failure(self):
         runner = self.make_runner(process=FakeProcess(fail_transport=True))
@@ -267,9 +337,69 @@ class ValidationRunnerTests(unittest.TestCase):
         )
         self.assertEqual(dirty_scope["sha256"], hashlib.sha256(status_text.encode()).hexdigest())
         self.assertIn("07-playback-route-selection.md", dirty_scope["entries"][0])
+        self.assertIn("not a source-content fingerprint", dirty_scope["meaning"])
+        content = report["source_content_fingerprint"]
+        self.assertIsNone(content["error"])
+        self.assertEqual(content["entries"][0]["sha256"], hashlib.sha256(
+            (self.root / "go.mod").read_bytes()
+        ).hexdigest())
         self.assertEqual(report["gate"]["decision"], "not_accepted")
         self.assertIn("physical-output-hardware", report["gate"]["critical_not_run"])
         self.assertEqual(errors.getvalue(), "")
+
+    def test_source_content_fingerprint_changes_without_status_change(self):
+        with patch.object(validation.shutil, "which", side_effect=self.which):
+            before = validation.capture_source_content_fingerprint(self.root, self.process)
+            (self.root / "go.mod").write_text("module fixture\ngo 1.27.0\n", encoding="utf-8")
+            after = validation.capture_source_content_fingerprint(self.root, self.process)
+        self.assertIsNone(before["error"])
+        self.assertIsNone(after["error"])
+        self.assertNotEqual(before["sha256"], after["sha256"])
+        self.assertEqual(before["entries"][0]["path"], "go.mod")
+        self.assertEqual(before["entries"][0]["sha256"], hashlib.sha256(
+            b"module fixture\ngo 1.25.0\n"
+        ).hexdigest())
+
+    def test_real_git_fingerprint_ignores_private_untracked_files_and_doc_changes(self):
+        subprocess.run(["git", "init", "--quiet", str(self.root)], check=True,
+                       env=validation.safe_environment(), capture_output=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "go.mod"], check=True,
+                       env=validation.safe_environment(), capture_output=True)
+        private = self.root / ".claude/private.py"
+        private.parent.mkdir()
+        private.write_text("private content", encoding="utf-8")
+        with patch.object(validation.shutil, "which", wraps=validation.shutil.which):
+            before = validation.capture_source_content_fingerprint(self.root, validation.isolated_run)
+            private.write_text("changed secret", encoding="utf-8")
+            docs = self.root / "fork/docs/issues"
+            docs.mkdir(parents=True)
+            (docs / "fixture.md").write_text("unrelated", encoding="utf-8")
+            after = validation.capture_source_content_fingerprint(self.root, validation.isolated_run)
+        self.assertIsNone(before["error"])
+        self.assertEqual(before["sha256"], after["sha256"])
+        self.assertEqual([entry["path"] for entry in before["entries"]], ["go.mod"])
+
+    def test_in_scope_symlink_hashes_link_text_without_reading_target(self):
+        target = self.root / "core/fixture"
+        target.parent.mkdir()
+        target.mkdir()
+        (self.root / "go.mod").unlink()
+        (self.root / "go.mod").symlink_to("core/fixture")
+        with patch.object(validation.shutil, "which", side_effect=self.which):
+            result = validation.capture_source_content_fingerprint(self.root, self.process)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["entries"][0]["kind"], "symlink")
+        self.assertEqual(result["entries"][0]["sha256"], hashlib.sha256(b"core/fixture").hexdigest())
+
+    def test_source_content_fingerprint_does_not_follow_symlinks(self):
+        outside = self.root / "private"
+        outside.write_text("must not be read", encoding="utf-8")
+        (self.root / "go.mod").unlink()
+        (self.root / "go.mod").symlink_to(outside)
+        with patch.object(validation.shutil, "which", side_effect=self.which):
+            result = validation.capture_source_content_fingerprint(self.root, self.process)
+        self.assertIsNone(result["sha256"])
+        self.assertIn("symlink", result["error"])
 
     def test_isolated_process_captures_command_output(self):
         result = validation.isolated_run(
@@ -296,6 +426,33 @@ class ValidationRunnerTests(unittest.TestCase):
         selected, details = validation.discover_go(self.root, probe, str(self.go))
         self.assertEqual(selected, str(self.go))
         self.assertIsNone(details["error"])
+
+
+class AppSmokeEvidenceTests(unittest.TestCase):
+    def test_wait_trace_matches_only_owned_child_exit(self):
+        script = SCRIPT.with_name("native-playback-app-smoke.py")
+        spec = importlib.util.spec_from_file_location("native_playback_app_smoke", script)
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        output = Path(temporary.name)
+        with patch.object(smoke, "source_fingerprint", return_value={"commit": "fixture"}):
+            app = smoke.AppSmoke(output, Path("/fake/navidrome"), "/fake/chrome", Path("/fake/mpv"))
+        self.addCleanup(app.cleanup)
+        app.trace_prefix = output / "process.trace"
+        app.mpv_pids = {123}
+        (output / "process.trace.123").write_text(
+            "1791888057.233 exit_group(0) = ?\n+++ exited with 0 +++\n", encoding="utf-8")
+        (output / "process.trace.456").write_text(
+            "waitid(P_ALL, 0, {si_pid=123, si_code=CLD_EXITED, si_status=0}, WEXITED) = 0\n"
+            "wait4(123, [{WIFEXITED(s)}], 0, NULL) = 123\n"
+            "wait4(1234, [{WIFEXITED(s)}], 0, NULL) = 1234\n", encoding="utf-8")
+        report = app.process_trace_summary()
+        self.assertEqual(len(report["wait_calls"]), 2)
+        self.assertTrue(all(row["traced_parent_pid"] == 456 for row in report["wait_calls"]))
+        self.assertEqual(report["mpv_processes"][0]["pid"], 123)
+        self.assertIn("exited with 0", report["mpv_processes"][0]["lifecycle_events"][1])
 
 
 if __name__ == "__main__":
