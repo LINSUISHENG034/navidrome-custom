@@ -1107,7 +1107,11 @@ class AppSmoke:
                     child_ids = [payload.get("clientId") for page, payload in clone_requests if page == clone_child]
                     parent_identity = parent_ids[-1] if parent_ids else None
                     child_identity = child_ids[-1] if child_ids else None
-                    child_readonly = clone_child.locator("fieldset").is_disabled()
+                    child_readonly = clone_child.locator("fieldset").evaluate(
+                        """element => element.disabled &&
+                          Array.from(element.querySelectorAll('button,input,select,textarea'))
+                            .every(control => control.matches(':disabled'))"""
+                    )
                     clone_image = browser_dir / "opener-cloned-controller.png"
                     clone_child.screenshot(path=str(clone_image), full_page=True)
                     browser_checks["opener_cloned_identity"] = {
