@@ -1,7 +1,26 @@
 import httpClient from '../dataProvider/httpClient'
 
 let attachedScope = null
+let attachedLease = null
 let attachmentVersion = 0
+let confirmedAttachmentVersion = 0
+const sessionTransitions = new Map()
+
+const transitionSession = (sessionId, clientId, operation) => {
+  const key = JSON.stringify([sessionId, clientId])
+  const previous = sessionTransitions.get(key)
+  const pending = (previous || Promise.resolve())
+    .catch(() => {})
+    .then(operation)
+  sessionTransitions.set(key, pending)
+  pending
+    .finally(() => {
+      if (sessionTransitions.get(key) === pending)
+        sessionTransitions.delete(key)
+    })
+    .catch(() => {})
+  return pending
+}
 
 const post = (path, payload = {}, options = {}) =>
   httpClient(`/api/jukebox/${path}`, {
@@ -26,42 +45,52 @@ const jukeboxClient = {
 
   attachSession: (sessionId, clientId, deviceName = null, options = {}) => {
     const version = ++attachmentVersion
-    return post('session/attach', {
-      sessionId,
-      clientId,
-      ...(deviceName ? { deviceName } : {}),
-      ...(options.takeover === true ? { takeover: true } : {}),
-    }).then((status) => {
-      if (
-        version === attachmentVersion &&
-        status.sessionId === sessionId &&
-        status.ownerClientId === clientId &&
-        status.ownershipState === 'attached'
-      ) {
-        attachedScope = { sessionId, clientId }
-      }
-      return status
-    })
+    return transitionSession(sessionId, clientId, () =>
+      post('session/attach', {
+        sessionId,
+        clientId,
+        ...(deviceName ? { deviceName } : {}),
+        ...(options.takeover === true ? { takeover: true } : {}),
+      }).then((status) => {
+        if (
+          version >= confirmedAttachmentVersion &&
+          status.sessionId === sessionId &&
+          status.ownerClientId === clientId &&
+          status.ownershipState === 'attached'
+        ) {
+          confirmedAttachmentVersion = version
+          attachedScope = { sessionId, clientId }
+          attachedLease = status
+        }
+        return status
+      }),
+    )
   },
 
   heartbeatSession: (sessionId, clientId) =>
     post('session/heartbeat', { sessionId, clientId }),
 
-  detachSession: (sessionId, clientId, options = {}) => {
-    const retiringScope = attachedScope
-    return post('session/detach', { sessionId, clientId }, options).then(
-      (status) => {
+  detachSession: (sessionId, clientId, options = {}) =>
+    transitionSession(sessionId, clientId, () => {
+      const { attachment, ...requestOptions } = options
+      if (attachment && attachment !== attachedLease) return null
+      const retiringScope = attachedScope
+      return post(
+        'session/detach',
+        { sessionId, clientId },
+        requestOptions,
+      ).then((status) => {
         if (
           attachedScope === retiringScope &&
           attachedScope?.sessionId === sessionId &&
           attachedScope?.clientId === clientId
         ) {
           attachedScope = null
+          attachedLease = null
         }
         return status
-      },
-    )
-  },
+      })
+    }),
 
   set: (ids, scope) => command('set', { ids }, scope),
   start: (scope) => command('start', {}, scope),

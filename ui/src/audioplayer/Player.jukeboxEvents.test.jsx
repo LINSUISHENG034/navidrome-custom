@@ -1,6 +1,21 @@
 /* global globalThis */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import React from 'react'
+import { act, render, waitFor } from '@testing-library/react'
+import { Provider } from 'react-redux'
+import { combineReducers, createStore } from 'redux'
+import { playerReducer } from '../reducers/playerReducer'
+import { setJukeboxMode, updateJukeboxSessionStatus } from '../actions'
+
+vi.mock('react-admin', async (importOriginal) => ({
+  ...(await importOriginal()),
+  useAuthState: () => ({ authenticated: true }),
+  useTranslate: () => (key) => key,
+  useDataProvider: () => ({
+    getOne: vi.fn(() => Promise.resolve({ data: {} })),
+  }),
+}))
 
 vi.mock('navidrome-music-player', () => ({
   default: () => null,
@@ -41,6 +56,7 @@ import {
   syncJukeboxTrackChangeAfterQueueSync,
 } from './jukeboxSync'
 import {
+  Player,
   applyOptimisticUserSkip,
   canControlJukebox,
   getJukeboxSessionId,
@@ -914,5 +930,169 @@ describe('jukebox session authority refresh helpers', () => {
     })
 
     expect(jukeboxClient.detachSession).toHaveBeenCalledWith('s1', 'tab-1')
+  })
+})
+
+describe('fresh-document control identity', () => {
+  it('does not adopt a copied storage identity and creates a fresh identity for a new document module', async () => {
+    sessionStorage.setItem('jukebox-client-id', 'copied-owner-from-opener')
+    vi.resetModules()
+    const firstDocument = await import('./jukeboxSession')
+    const first = firstDocument.getOrCreateJukeboxClientId()
+    expect(first).not.toBe('copied-owner-from-opener')
+    expect(firstDocument.getOrCreateJukeboxClientId()).toBe(first)
+    expect(sessionStorage.getItem('jukebox-client-id')).toBe(first)
+    vi.resetModules()
+    const nextDocument = await import('./jukeboxSession')
+    const next = nextDocument.getOrCreateJukeboxClientId()
+    expect(next).not.toBe(first)
+    expect(nextDocument.getOrCreateJukeboxClientId()).toBe(next)
+    expect(sessionStorage.getItem('jukebox-client-id')).toBe(next)
+    sessionStorage.clear()
+  })
+})
+
+describe('mounted Player control-session episodes', () => {
+  const originalDevice = 'pulse/original'
+  const deferred = () => {
+    let resolve
+    let reject
+    const promise = new Promise((complete, fail) => {
+      resolve = complete
+      reject = fail
+    })
+    return { promise, resolve, reject }
+  }
+  const status = (deviceName = originalDevice) => ({
+    sessionId: 'jukebox-session:admin',
+    ownerClientId: getOrCreateJukeboxClientId(),
+    ownershipState: 'attached',
+    deviceName,
+    playing: false,
+    currentIndex: -1,
+    position: 0,
+    gain: 0.25,
+  })
+  const renderPlayer = () => {
+    const store = createStore(
+      combineReducers({
+        player: playerReducer,
+        activity: () => ({ streamReconnected: false }),
+        settings: () => ({ notifications: false }),
+        replayGain: () => ({ gainMode: 'none' }),
+        theme: () => 'DarkTheme',
+      }),
+    )
+    store.dispatch(setJukeboxMode(true, 'Validation output'))
+    store.dispatch(updateJukeboxSessionStatus(status()))
+    vi.spyOn(store, 'dispatch')
+    const view = render(
+      <Provider store={store}>
+        <Player />
+      </Provider>,
+    )
+    return { ...view, store }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.setItem('username', 'admin')
+    sessionStorage.clear()
+    jukeboxClient.attachSession.mockImplementation(() =>
+      Promise.resolve(status()),
+    )
+    jukeboxClient.heartbeatSession.mockImplementation(() =>
+      Promise.resolve(status()),
+    )
+    jukeboxClient.detachSession.mockImplementation(() => Promise.resolve({}))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    localStorage.clear()
+    sessionStorage.clear()
+  })
+
+  it('does not detach or attach when only the authoritative output device migrates', async () => {
+    const { store, unmount } = renderPlayer()
+    await waitFor(() =>
+      expect(jukeboxClient.attachSession).toHaveBeenCalledTimes(1),
+    )
+    await act(async () =>
+      store.dispatch(updateJukeboxSessionStatus(status('auto'))),
+    )
+    expect(jukeboxClient.detachSession).not.toHaveBeenCalled()
+    expect(jukeboxClient.attachSession).toHaveBeenCalledTimes(1)
+    await act(async () => store.dispatch(setJukeboxMode(false)))
+    await waitFor(() =>
+      expect(jukeboxClient.detachSession).toHaveBeenCalledTimes(1),
+    )
+    unmount()
+  })
+
+  it('retires a canceled pending attachment only after it settles without dispatching stale state', async () => {
+    const pending = deferred()
+    jukeboxClient.attachSession.mockReturnValueOnce(pending.promise)
+    const { store, unmount } = renderPlayer()
+    await waitFor(() =>
+      expect(jukeboxClient.attachSession).toHaveBeenCalledTimes(1),
+    )
+    const dispatch = store.dispatch
+    dispatch.mockClear()
+    unmount()
+    try {
+      expect(jukeboxClient.detachSession).not.toHaveBeenCalled()
+    } finally {
+      await act(async () => pending.resolve(status()))
+    }
+    await waitFor(() =>
+      expect(jukeboxClient.detachSession).toHaveBeenCalledTimes(1),
+    )
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('waits for an already-started heartbeat reattachment and retires its late result without stale state', async () => {
+    const pending = deferred()
+    vi.useFakeTimers()
+    const { store, unmount } = renderPlayer()
+    await act(async () => vi.advanceTimersByTimeAsync(0))
+    jukeboxClient.heartbeatSession.mockRejectedValueOnce(
+      Object.assign(new Error('Missing'), { status: 404 }),
+    )
+    jukeboxClient.attachSession.mockReturnValueOnce(pending.promise)
+    await act(async () => vi.advanceTimersByTimeAsync(15000))
+    expect(jukeboxClient.attachSession).toHaveBeenCalledTimes(2)
+    await act(async () => store.dispatch(setJukeboxMode(false)))
+    expect(jukeboxClient.detachSession).not.toHaveBeenCalled()
+    store.dispatch.mockClear()
+    const late = status()
+    await act(async () => pending.resolve(late))
+    expect(jukeboxClient.detachSession).toHaveBeenCalledTimes(1)
+    expect(jukeboxClient.detachSession).toHaveBeenCalledWith(
+      late.sessionId,
+      late.ownerClientId,
+      { attachment: late },
+    )
+    expect(store.dispatch).not.toHaveBeenCalled()
+    vi.useRealTimers()
+    unmount()
+  })
+
+  it('does not reattach after a canceled in-flight heartbeat reports a missing session', async () => {
+    const pending = deferred()
+    vi.useFakeTimers()
+    const { store, unmount } = renderPlayer()
+    await act(async () => vi.advanceTimersByTimeAsync(0))
+    expect(jukeboxClient.attachSession).toHaveBeenCalledTimes(1)
+    jukeboxClient.heartbeatSession.mockReturnValueOnce(pending.promise)
+    await act(async () => vi.advanceTimersByTimeAsync(15000))
+    expect(jukeboxClient.heartbeatSession).toHaveBeenCalledTimes(1)
+    await act(async () => store.dispatch(setJukeboxMode(false)))
+    await act(async () =>
+      pending.reject(Object.assign(new Error('Missing'), { status: 404 })),
+    )
+    expect(jukeboxClient.attachSession).toHaveBeenCalledTimes(1)
+    expect(store.getState().player.jukeboxMode).toBe(false)
+    vi.useRealTimers()
+    unmount()
   })
 })

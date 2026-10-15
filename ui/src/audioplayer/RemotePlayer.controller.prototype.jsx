@@ -3,13 +3,10 @@ import { useDispatch, useSelector } from 'react-redux'
 import RemotePlayerPrototype from './RemotePlayer.prototype'
 import jukeboxClient from './jukeboxClient'
 import {
-  attachJukeboxSession,
   canControlJukebox,
-  detachJukeboxSession,
+  createJukeboxSessionEpisode,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
-  runJukeboxHeartbeat,
-  startJukeboxHeartbeatLoop,
 } from './jukeboxSession'
 
 const snapshotAllowsControl = (snapshot, clientId) =>
@@ -47,9 +44,7 @@ const RemotePlayerControllerPrototype = ({
 
   useEffect(() => {
     let active = true
-    let retired
     let requestVersion = 0
-    let cleanupHeartbeat = () => {}
     const scope = { sessionId, clientId }
     const record = {
       attached: false,
@@ -106,34 +101,28 @@ const RemotePlayerControllerPrototype = ({
     setError(null)
     setControlAvailable(false)
     setTakingControl(false)
-    let attachment = retirement.current.then(() =>
-      active
-        ? attachJukeboxSession({
-            client: jukeboxClient,
-            sessionId,
-            clientId,
-            deviceName,
-          })
-        : null,
-    )
-    const retire = (keepalive = false) => {
-      if (!retired) {
-        const detach = () =>
-          detachJukeboxSession({
-            client: jukeboxClient,
-            sessionId,
-            clientId,
-            keepalive,
-          })
-        retired = attachment
-          .then(
-            (status) => status && detach(),
-            () => record.attached && detach(),
-          )
-          .catch(() => {})
-      }
-      return retired
-    }
+    const episode = createJukeboxSessionEpisode({
+      client: jukeboxClient,
+      sessionId,
+      clientId,
+      dispatch,
+      getDeviceName: () => deviceName,
+      previousRetirement: retirement.current,
+      onHeartbeat: async (status) => {
+        if (!active) return
+        record.heartbeatAllowsControl = snapshotAllowsControl(
+          { sessionStatus: status },
+          clientId,
+        )
+        if (!record.heartbeatAllowsControl) {
+          requestVersion++
+          record.controlAvailable = false
+          setControlAvailable(false)
+        }
+        await record.refresh()
+      },
+    })
+    const attachment = episode.attach({ deviceName, dispatch: null })
     const acceptAttachment = (status) => {
       if (!active || !status) return
       record.attached = snapshotAllowsControl(
@@ -143,35 +132,6 @@ const RemotePlayerControllerPrototype = ({
       record.observing = true
       record.attachmentError = null
       record.heartbeatAllowsControl = record.attached
-      cleanupHeartbeat()
-      cleanupHeartbeat = startJukeboxHeartbeatLoop({
-        jukeboxMode: record.attached,
-        sessionId,
-        clientId,
-        onHeartbeat: async () => {
-          const status = await runJukeboxHeartbeat({
-            client: jukeboxClient,
-            sessionId,
-            clientId,
-            deviceName,
-            dispatch: (action) => {
-              if (active) dispatch(action)
-            },
-          })
-          if (!active) return
-          record.heartbeatAllowsControl = snapshotAllowsControl(
-            { sessionStatus: status },
-            clientId,
-          )
-          if (!record.heartbeatAllowsControl) {
-            requestVersion++
-            record.controlAvailable = false
-            setControlAvailable(false)
-            return record.refresh()
-          }
-          await record.refresh()
-        },
-      })
       return record.refresh()
     }
     const rejectAttachment = (err) => {
@@ -189,20 +149,8 @@ const RemotePlayerControllerPrototype = ({
       if (!active || !record.observing || record.takeoverPending) return
       record.takeoverPending = true
       setTakingControl(true)
-      attachment = attachment
-        .catch(() => {})
-        .then(() =>
-          active
-            ? attachJukeboxSession({
-                client: jukeboxClient,
-                sessionId,
-                clientId,
-                deviceName,
-                takeover: true,
-              })
-            : null,
-        )
-      attachment
+      episode
+        .attach({ deviceName, takeover: true, dispatch: null })
         .then(acceptAttachment)
         .catch(rejectAttachment)
         .finally(() => {
@@ -213,17 +161,15 @@ const RemotePlayerControllerPrototype = ({
     const handlePageHide = (event) => {
       if (event.persisted) return
       active = false
-      cleanupHeartbeat()
       record.controlAvailable = false
-      retirement.current = retire(true)
+      retirement.current = episode.retire({ keepalive: true })
     }
     window.addEventListener('pagehide', handlePageHide)
     return () => {
       active = false
-      cleanupHeartbeat()
       window.removeEventListener('pagehide', handlePageHide)
       if (current.current === record) current.current = null
-      retirement.current = retire()
+      retirement.current = episode.retire()
     }
   }, [dispatch, sessionId, clientId, deviceName])
 

@@ -3,6 +3,7 @@ import { updateJukeboxSessionStatus } from '../actions'
 const JUKEBOX_SESSION_ID_PREFIX = 'jukebox-session:'
 const JUKEBOX_CLIENT_ID_KEY = 'jukebox-client-id'
 const JUKEBOX_HEARTBEAT_INTERVAL_MS = 15000
+let documentClientId = null
 
 const startJukeboxHeartbeatLoop = ({
   jukeboxMode,
@@ -21,13 +22,14 @@ const getJukeboxSessionId = () => {
 }
 
 const getOrCreateJukeboxClientId = () => {
-  const existing = sessionStorage.getItem(JUKEBOX_CLIENT_ID_KEY)
-  if (existing) return existing
-  const next =
-    globalThis.crypto?.randomUUID?.() ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`
-  sessionStorage.setItem(JUKEBOX_CLIENT_ID_KEY, next)
-  return next
+  if (!documentClientId) {
+    documentClientId =
+      window.crypto?.randomUUID?.() ||
+      `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  }
+  // Storage is diagnostic only: a cloned document must not inherit control.
+  sessionStorage.setItem(JUKEBOX_CLIENT_ID_KEY, documentClientId)
+  return documentClientId
 }
 
 const dispatchJukeboxSessionStatus = (dispatch, status) => {
@@ -76,10 +78,15 @@ const detachJukeboxSession = async ({
   sessionId,
   clientId,
   keepalive = false,
+  attachment = null,
 }) => {
   if (!client?.detachSession || !sessionId || !clientId) return null
-  return keepalive
-    ? client.detachSession(sessionId, clientId, { keepalive: true })
+  const options = {
+    ...(keepalive ? { keepalive: true } : {}),
+    ...(attachment ? { attachment } : {}),
+  }
+  return Object.keys(options).length
+    ? client.detachSession(sessionId, clientId, options)
     : client.detachSession(sessionId, clientId)
 }
 
@@ -89,27 +96,36 @@ const runJukeboxHeartbeat = async ({
   clientId,
   deviceName = null,
   dispatch,
+  isActive = () => true,
+  onAttachment,
 }) => {
-  if (!client?.heartbeatSession || !sessionId || !clientId) return null
+  if (!client?.heartbeatSession || !sessionId || !clientId || !isActive())
+    return null
 
   try {
     const status = await client.heartbeatSession(sessionId, clientId)
-    return dispatchJukeboxSessionStatus(dispatch, status)
-  } catch (err) {
-    if (err?.status === 404 && client?.attachSession) {
+    return isActive() ? dispatchJukeboxSessionStatus(dispatch, status) : null
+  } catch (heartbeatError) {
+    if (!isActive()) return null
+    let error = heartbeatError
+    if (error?.status === 404 && client?.attachSession) {
       try {
         const status = await client.attachSession(
           sessionId,
           clientId,
           deviceName,
         )
-        return dispatchJukeboxSessionStatus(dispatch, status)
-      } catch (attachErr) {
-        err = attachErr
+        onAttachment?.(status)
+        return isActive()
+          ? dispatchJukeboxSessionStatus(dispatch, status)
+          : status
+      } catch (attachError) {
+        error = attachError
       }
     }
+    if (!isActive()) return null
 
-    if (err?.status === 403) {
+    if (error?.status === 403) {
       return dispatchJukeboxSessionStatus(dispatch, {
         sessionId,
         ownerClientId: clientId,
@@ -118,7 +134,7 @@ const runJukeboxHeartbeat = async ({
       })
     }
 
-    if (err?.status === 404) {
+    if (error?.status === 404) {
       return dispatchJukeboxSessionStatus(dispatch, {
         sessionId,
         ownerClientId: clientId,
@@ -136,9 +152,109 @@ const runJukeboxHeartbeat = async ({
   }
 }
 
+const createJukeboxSessionEpisode = ({
+  client,
+  sessionId,
+  clientId,
+  dispatch,
+  getDeviceName = () => null,
+  onHeartbeat,
+  previousRetirement = Promise.resolve(),
+}) => {
+  let active = true
+  let attachment = null
+  let retired
+  let cleanupHeartbeat = () => {}
+  const pending = new Set()
+  const guardDispatch = (callback) => (action) => {
+    if (active) callback?.(action)
+  }
+  const rememberAttachment = (status) => {
+    attachment = status
+    return status
+  }
+  const track = (operation) => {
+    pending.add(operation)
+    operation.finally(() => pending.delete(operation)).catch(() => {})
+    return operation
+  }
+  const heartbeat = () =>
+    track(
+      runJukeboxHeartbeat({
+        client,
+        sessionId,
+        clientId,
+        deviceName: getDeviceName(),
+        dispatch: guardDispatch(dispatch),
+        isActive: () => active,
+        onAttachment: rememberAttachment,
+      }).then((status) => {
+        if (!active || !status) return status
+        if (status.ownershipState === 'taken_over') cleanupHeartbeat()
+        return Promise.resolve(onHeartbeat?.(status)).then(() => status)
+      }),
+    ).catch(() => null)
+
+  return {
+    attach: ({
+      deviceName = null,
+      takeover = false,
+      dispatch: attachDispatch = dispatch,
+    } = {}) =>
+      track(
+        previousRetirement
+          .catch(() => {})
+          .then(() => {
+            if (!active) return null
+            return attachJukeboxSession({
+              client,
+              sessionId,
+              clientId,
+              deviceName,
+              takeover,
+              dispatch: guardDispatch(attachDispatch),
+            }).then((status) => {
+              rememberAttachment(status)
+              if (active && status) {
+                cleanupHeartbeat()
+                cleanupHeartbeat = startJukeboxHeartbeatLoop({
+                  jukeboxMode: true,
+                  sessionId,
+                  clientId,
+                  onHeartbeat: heartbeat,
+                })
+              }
+              return status
+            })
+          }),
+      ),
+    retire: ({ keepalive = false } = {}) => {
+      if (!retired) {
+        active = false
+        cleanupHeartbeat()
+        retired = Promise.allSettled([...pending])
+          .then(
+            () =>
+              attachment &&
+              detachJukeboxSession({
+                client,
+                sessionId,
+                clientId,
+                keepalive,
+                attachment,
+              }),
+          )
+          .catch(() => {})
+      }
+      return retired
+    },
+  }
+}
+
 export {
   attachJukeboxSession,
   canControlJukebox,
+  createJukeboxSessionEpisode,
   detachJukeboxSession,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,

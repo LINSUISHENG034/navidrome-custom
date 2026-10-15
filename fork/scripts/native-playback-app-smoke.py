@@ -56,6 +56,34 @@ def write_json(path, value):
     os.replace(temporary, path)
 
 
+def classify_browser_console(details, expected_observers):
+    expected, unexpected = [], []
+    events = [event for event in details.get("playwright", []) if event.get("type") == "error"]
+    forbidden_text = "Failed to load resource: the server responded with a status of 403 (Forbidden)"
+    for event in events:
+        source = event.get("location", {}).get("url")
+        matches = [row for row in details.get("jukebox_http", [])
+                   if row.get("method") == "POST" and row.get("status") == 403
+                   and row.get("url") == source and row.get("page") == event.get("page")]
+        same_events = [row for row in events if row.get("text") == forbidden_text
+                       and row.get("location", {}).get("url") == source
+                       and row.get("page") == event.get("page")]
+        payloads = [row.get("body") or {} for row in matches]
+        confirmed = (
+            event.get("text") == forbidden_text and source
+            and source.endswith("/api/jukebox/session/attach")
+            and matches and len(matches) == len(same_events)
+            and all((payload.get("sessionId"), payload.get("clientId")) in expected_observers
+                    and not payload.get("takeover") for payload in payloads)
+        )
+        if confirmed:
+            expected.append({"console": event, "matched_http_group": matches})
+        else:
+            unexpected.append(event)
+    return {"expected_http_denials": expected, "unexpected_errors": unexpected,
+            "page_errors": details.get("page_errors", [])}
+
+
 def reserve_port_pair():
     for _ in range(100):
         first = socket.socket()
@@ -706,6 +734,16 @@ class AppSmoke:
             time.sleep(0.25)
         raise SmokeFailure("Vite did not serve the independent validation fixture")
 
+    def begin_browser_evidence(self):
+        errors, checks = [], {}
+        details = {"playwright": [], "cdp": [], "page_errors": [], "jukebox_http": []}
+        self.summary["browser"].update({
+            "status": "running", "functional_contract_status": "not_run",
+            "console_errors": errors, "confirmed_observers": [],
+            "checks": checks, "console_details": details,
+        })
+        return errors, checks, details
+
     def run_browser(self):
         try:
             from playwright.sync_api import sync_playwright
@@ -721,9 +759,7 @@ class AppSmoke:
 
         browser_dir = self.output / "browser"
         browser_dir.mkdir(exist_ok=True)
-        browser_errors = []
-        browser_checks = {}
-        browser_console_details = {"playwright": [], "cdp": [], "page_errors": []}
+        browser_errors, browser_checks, browser_console_details = self.begin_browser_evidence()
         context = None
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
@@ -828,6 +864,22 @@ class AppSmoke:
                 }
             except Exception as error:
                 browser_errors.append(self.redact(f"default app: {type(error).__name__}: {error}"))
+                self.summary["browser"]["status"] = "fail"
+                self.summary["browser"]["functional_contract_status"] = "fail"
+                failure_image = browser_dir / "default-app-failure.png"
+                app_page.screenshot(path=str(failure_image), full_page=True)
+                browser_checks["default_app_failure_screenshot"] = str(failure_image)
+                browser_checks["default_app_failure_state"] = app_page.evaluate(
+                    """() => {
+                      const audio = document.querySelector('audio')
+                      return {controllerId: sessionStorage.getItem('jukebox-client-id'),
+                        audio: audio ? {muted: audio.muted, paused: audio.paused, position: audio.currentTime} : null}
+                    }"""
+                )
+                code, failed_snapshot = self.native(
+                    "GET", f"/api/jukebox/session/snapshot?sessionId={quote(self.session_id)}",
+                )
+                browser_checks["default_app_failure_snapshot"] = {"status": code, "body": failed_snapshot}
             finally:
                 app_page.close()
 
@@ -862,16 +914,18 @@ class AppSmoke:
             )
             fixture_page.add_init_script(seed_script)
 
-            def open_controller(client_id):
+            def open_controller(client_id, session_id=None):
                 page = context.new_page()
                 self._track_page_errors(page, browser_errors, browser_console_details)
                 page.add_init_script(seed_script)
+                parameters = {"sessionId": session_id or self.session_id}
+                if client_id is not None:
+                    parameters["clientId"] = client_id
                 page.goto(
-                    self.vite_url + "/validation/remote-player.html?"
-                    + urlencode({"sessionId": self.session_id, "clientId": client_id}),
+                    self.vite_url + "/validation/remote-player.html?" + urlencode(parameters),
                     wait_until="domcontentloaded", timeout=30000,
                 )
-                page.get_by_role("heading", name="Remote player prototype").wait_for(timeout=30000)
+                page.get_by_role("heading", name="Remote player prototype", exact=True).wait_for(timeout=30000)
                 page.wait_for_function("document.querySelectorAll('audio').length === 0")
                 return page
 
@@ -881,7 +935,7 @@ class AppSmoke:
                     + urlencode({"sessionId": self.session_id, "clientId": "browser-controller-1"})
                 )
                 fixture_page.goto(fixture_url, wait_until="domcontentloaded", timeout=30000)
-                fixture_page.get_by_role("heading", name="Remote player prototype").wait_for(timeout=30000)
+                fixture_page.get_by_role("heading", name="Remote player prototype", exact=True).wait_for(timeout=30000)
                 fixture_page.locator("fieldset").wait_for(timeout=10000)
                 fixture_page.wait_for_function("document.querySelectorAll('audio').length === 0")
                 initial = browser_dir / "remote-controller-initial.png"
@@ -936,6 +990,9 @@ class AppSmoke:
                 before_takeover = observer_snapshot.get("sessionStatus", {})
                 if before_takeover.get("ownerClientId") != "browser-controller-1" or before_takeover.get("gain") != 0.375:
                     raise SmokeFailure("observer attempts changed ownership or gain")
+                self.summary["browser"]["confirmed_observers"].append({
+                    "session_id": self.session_id, "client_id": "browser-controller-2",
+                })
                 browser_checks["controller2_read_only_probe"] = {
                     "snapshot_http": 200, "heartbeat_http": 403, "mutation_http": 403,
                     "unscoped_mutation_http": 403, "subsonic_status": "failed",
@@ -1017,10 +1074,80 @@ class AppSmoke:
                     "mpv_pids_closed": True,
                     "mpv_exit_observations": self.mpv_stop_observations[-1]["exit_observations"],
                 }
-                self.native("POST", "/api/jukebox/session/detach", body={
+                code, _ = self.native("POST", "/api/jukebox/session/detach", body={
                     "sessionId": self.session_id,
                     "clientId": "final-verifier",
                 })
+                self.require(code, 200, "/api/jukebox/session/detach (final verifier)")
+
+                clone_session = self.session_id + "-opener-clone"
+                clone_requests = []
+
+                def record_clone_attachment(request):
+                    if (request.method == "POST"
+                            and request.url.split("?", 1)[0].endswith("/api/jukebox/session/attach")):
+                        payload = request.post_data_json or {}
+                        if payload.get("sessionId") == clone_session:
+                            clone_requests.append((request.frame.page, payload))
+
+                context.on("request", record_clone_attachment)
+                clone_parent = clone_child = None
+                try:
+                    clone_parent = open_controller(None, session_id=clone_session)
+                    clone_parent.wait_for_function("document.querySelector('fieldset')?.disabled === false")
+                    clone_url = self.vite_url + "/validation/remote-player.html?" + urlencode({"sessionId": clone_session})
+                    with context.expect_page() as popup_info:
+                        clone_parent.evaluate("url => window.open(url, '_blank')", clone_url)
+                    clone_child = popup_info.value
+                    self._track_page_errors(clone_child, browser_errors, browser_console_details)
+                    clone_child.get_by_role("heading", name="Remote player prototype", exact=True).wait_for(timeout=30000)
+                    clone_child.wait_for_function("Boolean(document.querySelector('fieldset'))")
+                    clone_child.wait_for_timeout(500)
+                    parent_ids = [payload.get("clientId") for page, payload in clone_requests if page == clone_parent]
+                    child_ids = [payload.get("clientId") for page, payload in clone_requests if page == clone_child]
+                    parent_identity = parent_ids[-1] if parent_ids else None
+                    child_identity = child_ids[-1] if child_ids else None
+                    child_readonly = clone_child.locator("fieldset").is_disabled()
+                    clone_image = browser_dir / "opener-cloned-controller.png"
+                    clone_child.screenshot(path=str(clone_image), full_page=True)
+                    browser_checks["opener_cloned_identity"] = {
+                        "parent_controller_id": parent_identity,
+                        "child_controller_id": child_identity,
+                        "parent_session_storage_id": clone_parent.evaluate("sessionStorage.getItem('jukebox-client-id')"),
+                        "child_session_storage_id": clone_child.evaluate("sessionStorage.getItem('jukebox-client-id')"),
+                        "child_readonly": child_readonly,
+                        "child_has_real_opener": clone_child.evaluate("Boolean(window.opener)"),
+                        "screenshot": str(clone_image),
+                        "attach_requests": [payload for _, payload in clone_requests],
+                    }
+                    if not parent_identity or not child_identity or parent_identity == child_identity or not child_readonly:
+                        raise SmokeFailure("opener-cloned tab did not receive a distinct read-only controller identity")
+                    self.summary["browser"]["confirmed_observers"].append({
+                        "session_id": clone_session, "client_id": child_identity,
+                    })
+                finally:
+                    context.remove_listener("request", record_clone_attachment)
+                    for page in (clone_child, clone_parent):
+                        if page and not page.is_closed():
+                            page.close()
+                    code, _ = self.native("POST", "/api/jukebox/session/attach", body={
+                        "sessionId": clone_session, "clientId": "clone-cleanup", "takeover": True,
+                    })
+                    self.require(code, 200, "/api/jukebox/session/attach (clone cleanup)")
+                    code, _ = self.native("POST", "/api/jukebox/session/detach", body={
+                        "sessionId": clone_session, "clientId": "clone-cleanup",
+                    })
+                    self.require(code, 200, "/api/jukebox/session/detach (clone cleanup)")
+                required_checks = {
+                    "default_app_login", "default_app_device_switch", "default_app_local_return",
+                    "prototype_audio_elements", "prototype_user_play", "sse_snapshot_refresh",
+                    "controller2_read_only_probe", "explicit_takeover",
+                    "page_close_preserves_remote_playback", "reopen_restores_snapshot",
+                    "final_stop_release", "opener_cloned_identity",
+                }
+                if required_checks.difference(browser_checks):
+                    raise SmokeFailure("not all real browser functional contracts completed")
+                self.summary["browser"]["functional_contract_status"] = "pass"
                 if not browser_errors:
                     self.summary["browser"]["status"] = "pass"
                 else:
@@ -1028,6 +1155,7 @@ class AppSmoke:
             except Exception as error:
                 browser_errors.append(self.redact(f"browser flow: {type(error).__name__}: {error}"))
                 self.summary["browser"]["status"] = "fail"
+                self.summary["browser"]["functional_contract_status"] = "fail"
             finally:
                 self.summary["browser"]["console_errors"] = browser_errors
                 self.summary["browser"]["console_details"] = browser_console_details
@@ -1052,6 +1180,24 @@ class AppSmoke:
                 return json.dumps(value, sort_keys=True, ensure_ascii=False)
             return argument.get("description") or argument.get("type", "unknown")
 
+        def record_jukebox_response(response):
+            request = response.request
+            route = response.url.split("?", 1)[0]
+            if "/api/jukebox/" not in route and not route.endswith("/api/jukebox/status"):
+                return
+            payload = None
+            if request.method == "POST":
+                try:
+                    payload = request.post_data_json
+                except Exception:
+                    payload = {"parse_error": True}
+            details["jukebox_http"].append({
+                "at": utc_now_precise(), "page": page_url(),
+                "method": request.method, "url": self.redact(response.url),
+                "status": response.status, "body": self.sanitize(payload),
+            })
+
+        page.on("response", record_jukebox_response)
         cdp = page.context.new_cdp_session(page)
         cdp.send("Runtime.enable")
 
@@ -1213,6 +1359,10 @@ class AppSmoke:
             str(pid): self.process_snapshot(pid) for pid in sorted(self.mpv_pids)
         }
         self.summary["process_trace"] = self.process_trace_summary()
+        browser = self.summary["browser"]
+        browser["screenshots"] = [str(path) for path in sorted((self.output / "browser").glob("*.png"))]
+        expected_observers = {(item["session_id"], item["client_id"]) for item in browser.get("confirmed_observers", [])}
+        browser["console_classification"] = classify_browser_console(browser.get("console_details", {}), expected_observers)
         write_json(self.output / "api-transcript.json", self.transcript)
         write_json(self.output / "report.json", self.summary)
 
@@ -1227,6 +1377,9 @@ class AppSmoke:
         except Exception as error:
             self.errors.append(self.redact(f"{type(error).__name__}: {error}"))
             self.summary["status"] = "fail"
+            if self.summary["browser"].get("status") in {"running", "fail"}:
+                self.summary["browser"]["status"] = "fail"
+                self.summary["browser"]["functional_contract_status"] = "fail"
         else:
             self.summary["status"] = (
                 "pass" if self.summary["browser"].get("status") == "pass" else self.summary["browser"].get("status", "not_run")

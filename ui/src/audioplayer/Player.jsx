@@ -54,6 +54,7 @@ import { audioVolumeToRemoteGain } from './volumeProfiles'
 import {
   attachJukeboxSession,
   canControlJukebox,
+  createJukeboxSessionEpisode,
   detachJukeboxSession,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
@@ -210,6 +211,8 @@ const Player = () => {
   const lastPositionMsRef = useRef(0)
   const currentTrackIdRef = useRef(null)
   const stoppedRef = useRef(false)
+  const sessionRetirementRef = useRef(Promise.resolve())
+  const remoteDeviceRef = useRef(null)
 
   const handleAudioInstance = useCallback(
     (instance) => {
@@ -432,6 +435,7 @@ const Player = () => {
   const effectiveRemoteSession = selectEffectiveJukeboxRemoteSession({
     player: playerState,
   })
+  remoteDeviceRef.current = effectiveRemoteSession?.deviceName || null
   const canControl = canControlJukebox(playerState)
   let controlledPlayIndex = resolveControlledJukeboxPlayIndex({
     jukeboxMode: playerState.jukeboxMode,
@@ -777,45 +781,19 @@ const Player = () => {
     const clientId = getOrCreateJukeboxClientId()
     if (!sessionId || !clientId) return
 
-    let cancelled = false
-    let cleanupHeartbeat = () => {}
-
-    const heartbeat = () =>
-      runJukeboxHeartbeat({
-        client: jukeboxClient,
-        sessionId,
-        clientId,
-        deviceName: effectiveRemoteSession?.deviceName || null,
-        dispatch: cancelled ? null : dispatch,
-      }).catch(() => {})
-
-    attachJukeboxSession({
+    const episode = createJukeboxSessionEpisode({
       client: jukeboxClient,
       sessionId,
       clientId,
       dispatch,
+      getDeviceName: () => remoteDeviceRef.current,
+      previousRetirement: sessionRetirementRef.current,
     })
-      .then((status) => {
-        if (cancelled || !status) return
-        cleanupHeartbeat = startJukeboxHeartbeatLoop({
-          jukeboxMode: true,
-          sessionId,
-          clientId,
-          onHeartbeat: heartbeat,
-        })
-      })
-      .catch(() => {})
-
+    episode.attach().catch(() => {})
     return () => {
-      cancelled = true
-      cleanupHeartbeat()
-      detachJukeboxSession({
-        client: jukeboxClient,
-        sessionId,
-        clientId,
-      }).catch(() => {})
+      sessionRetirementRef.current = episode.retire()
     }
-  }, [dispatch, effectiveRemoteSession?.deviceName, playerState.jukeboxMode])
+  }, [dispatch, playerState.jukeboxMode])
 
   useEffect(() => {
     if (!playerState.jukeboxMode || !streamReconnected) return

@@ -30,6 +30,7 @@ PLAYBACK_PACKAGES = ["./core/playback/..."]
 BUILD_TAGS = "netgo,sqlite_fts5"
 NULL_MPV_SPECS = {
     "mpv-null-lifecycle": "observes paused output without advancing and distinguishes file lifecycle events",
+    "mpv-null-paused-seek-candidate": "restores a stable paused position after buffered playback through track commands",
     "mpv-null-transport-recovery": "reports a transport fault with its token and position, then exits the old MPV",
     "mpv-null-natural-eof": "reports natural EOF with the active token while null MPV remains idle",
     "mpv-null-explicit-close": "reports explicit close as retirement, never as natural EOF",

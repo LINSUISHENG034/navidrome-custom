@@ -112,6 +112,35 @@ class ValidationRunnerTests(unittest.TestCase):
             report = runner.run_all()
         return report
 
+    def test_paused_seek_candidate_is_an_additional_executed_phase(self):
+        report = self.run_with_fake_tools(self.make_runner(mpv_null=True))
+        phases = {phase["id"]: phase for phase in report["phases"]}
+        candidate = phases["mpv-null-paused-seek-candidate"]
+        self.assertEqual(candidate["status"], "pass")
+        self.assertIn(
+            "-ginkgo.focus=restores a stable paused position after buffered playback through track commands",
+            candidate["commands"][0]["command"],
+        )
+        self.assertEqual(phases["mpv-null-lifecycle"]["status"], "pass")
+        self.assertIn(
+            "-ginkgo.focus=observes paused output without advancing and distinguishes file lifecycle events",
+            phases["mpv-null-lifecycle"]["commands"][0]["command"],
+        )
+        self.assertFalse(phases["mpv-null-lifecycle"].get("expected_failure", False))
+
+    def test_raw_paused_seek_failure_is_not_hidden_by_candidate_success(self):
+        def raw_failure(argv, **kwargs):
+            result = self.process(argv, **kwargs)
+            if "-ginkgo.focus=observes paused output without advancing and distinguishes file lifecycle events" in argv:
+                return subprocess.CompletedProcess(argv, 1, result.stdout, "raw paused seek remains unstable")
+            return result
+
+        report = self.run_with_fake_tools(self.make_runner(mpv_null=True, process=raw_failure))
+        phases = {phase["id"]: phase for phase in report["phases"]}
+        self.assertEqual(phases["mpv-null-lifecycle"]["status"], "fail")
+        self.assertEqual(phases["mpv-null-paused-seek-candidate"]["status"], "pass")
+        self.assertEqual(report["gate"]["decision"], "not_accepted")
+
     def test_collects_all_phases_after_a_failure_and_preserves_output(self):
         process = FakeProcess(fail_first_playback=True)
         runner = self.make_runner(process=process)
@@ -151,7 +180,11 @@ class ValidationRunnerTests(unittest.TestCase):
 
         phases = {phase["id"]: phase for phase in report["phases"]}
         null_phases = [phase_id for phase_id in validation.NULL_MPV_SPECS]
-        self.assertEqual(len(null_phases), 5)
+        self.assertEqual(set(null_phases), {
+            "mpv-null-lifecycle", "mpv-null-paused-seek-candidate",
+            "mpv-null-transport-recovery", "mpv-null-natural-eof",
+            "mpv-null-explicit-close", "mpv-null-context-cancel",
+        })
         self.assertTrue(all(phases[phase_id]["status"] == "pass" for phase_id in null_phases
                             if phase_id != "mpv-null-transport-recovery"))
         self.assertEqual(phases["mpv-null-transport-recovery"]["status"], "fail")
@@ -159,7 +192,7 @@ class ValidationRunnerTests(unittest.TestCase):
         self.assertEqual(report["gate"]["decision"], "not_accepted")
         null_commands = [call for call in process.calls if "./core/playback/mpv" in call[0]
                          and any(arg.startswith("-ginkgo.focus=") for arg in call[0])]
-        self.assertEqual(len(null_commands), 5)
+        self.assertEqual(len(null_commands), len(null_phases))
         for command, kwargs in null_commands:
             self.assertEqual(kwargs["env"]["ND_TEST_MPV_NULL_OUTPUT"], "1")
             self.assertEqual(kwargs["env"]["ND_ENABLEINSIGHTSCOLLECTOR"], "false")
@@ -441,6 +474,54 @@ class AppSmokeEvidenceTests(unittest.TestCase):
             self.app = self.smoke.AppSmoke(
                 self.output, Path("/fake/navidrome"), "/fake/chrome", Path("/fake/mpv"))
         self.addCleanup(self.app.cleanup)
+
+    def test_confirmed_observer_denial_is_classified_without_hiding_raw_console(self):
+        details = {
+            "playwright": [{"type": "error", "text": "Failed to load resource: the server responded with a status of 403 (Forbidden)",
+                            "page": "http://fixture/controller", "location": {"url": "http://fixture/api/jukebox/session/attach"}}],
+            "jukebox_http": [{"method": "POST", "status": 403, "page": "http://fixture/controller",
+                              "url": "http://fixture/api/jukebox/session/attach",
+                              "body": {"sessionId": "s", "clientId": "observer"}}],
+        }
+        result = self.smoke.classify_browser_console(details, {("s", "observer")})
+        self.assertEqual(len(result["expected_http_denials"]), 1)
+        self.assertEqual(result["unexpected_errors"], [])
+        self.assertEqual(len(details["playwright"]), 1)
+
+    def test_unconfirmed_same_route_denial_prevents_ambiguous_console_classification(self):
+        details = {
+            "playwright": [{"type": "error", "text": "Failed to load resource: the server responded with a status of 403 (Forbidden)",
+                            "page": "http://fixture/controller", "location": {"url": "http://fixture/api/jukebox/session/attach"}}],
+            "jukebox_http": [
+                {"method": "POST", "status": 403, "page": "http://fixture/controller",
+                 "url": "http://fixture/api/jukebox/session/attach", "body": {"sessionId": "s", "clientId": client}}
+                for client in ("observer", "owner")
+            ],
+        }
+        result = self.smoke.classify_browser_console(details, {("s", "observer")})
+        self.assertEqual(result["expected_http_denials"], [])
+        self.assertEqual(len(result["unexpected_errors"]), 1)
+
+    def test_root_and_unsolicited_404_console_errors_remain_unexpected(self):
+        details = {"playwright": [
+            {"type": "error", "text": "undefined", "page": "http://fixture/", "location": {"url": "http://fixture/app.js"}},
+            {"type": "error", "text": "Failed to load resource: the server responded with a status of 404 (Not Found)",
+             "page": "http://fixture/controller", "location": {"url": "http://fixture/api/jukebox/session/detach"}},
+        ]}
+        result = self.smoke.classify_browser_console(details, {("s", "observer")})
+        self.assertEqual(result["expected_http_denials"], [])
+        self.assertEqual(result["unexpected_errors"], details["playwright"])
+
+    def test_browser_evidence_remains_available_on_outer_setup_failure(self):
+        errors, checks, details = self.app.begin_browser_evidence()
+        errors.append("preserved browser failure")
+        checks["default_app_local_return"] = {"status": "fail"}
+        details["jukebox_http"].append({"route": "/api/jukebox/session/detach", "status": 404})
+        browser = self.app.summary["browser"]
+        self.assertIs(browser["console_errors"], errors)
+        self.assertIs(browser["checks"], checks)
+        self.assertIs(browser["console_details"], details)
+        self.assertEqual(browser["status"], "running")
 
     def test_commands_include_explicit_current_controller_scope(self):
         with patch.object(self.app, "native", return_value=(200, {})) as native:

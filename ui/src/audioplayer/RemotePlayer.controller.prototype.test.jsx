@@ -109,7 +109,11 @@ const makeTransport = (
       return Promise.resolve(takeoverReply).then((reply) => reply.clone())
     }
     if (path.endsWith('/session/attach') && attachReply) {
-      return Promise.resolve(attachReply).then((reply) => reply.clone())
+      const reply =
+        typeof attachReply === 'function'
+          ? attachReply(JSON.parse(options.body))
+          : attachReply
+      return Promise.resolve(reply).then((value) => value.clone())
     }
     if (path.endsWith('/session/heartbeat') && heartbeatReply) {
       return Promise.resolve(heartbeatReply).then((reply) => reply.clone())
@@ -333,7 +337,12 @@ describe('<RemotePlayerControllerPrototype />', () => {
     shared.sessionStatus.ownerClientId = 'tab-b'
     const advanced = snapshot('Shared server successor', 21)
     advanced.sessionStatus.ownerClientId = 'tab-b'
-    const transport = makeTransport([shared, shared, advanced, advanced])
+    const transport = makeTransport([shared, shared, advanced, advanced], {
+      attachReply: ({ clientId }) =>
+        clientId === 'tab-b'
+          ? response(shared.sessionStatus)
+          : response({ message: 'Control denied' }, 403),
+    })
     const store = createStore(
       combineReducers({ player: playerReducer, activity: activityReducer }),
     )
@@ -380,8 +389,14 @@ describe('<RemotePlayerControllerPrototype />', () => {
         transport.requests.filter(({ path }) =>
           path.endsWith('/session/detach'),
         ),
-      ).toHaveLength(2),
+      ).toHaveLength(1),
     )
+    expect(
+      JSON.parse(
+        transport.requests.find(({ path }) => path.endsWith('/session/detach'))
+          .options.body,
+      ),
+    ).toEqual({ sessionId: 'jukebox-session:admin', clientId: 'tab-b' })
     expect(commands(transport)).toEqual([])
   })
 

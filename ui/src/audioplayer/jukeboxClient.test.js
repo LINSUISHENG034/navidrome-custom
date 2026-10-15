@@ -143,18 +143,64 @@ describe('jukeboxClient command authority', () => {
     })
   })
 
-  it('does not let a late detach clear a newer attachment with the same identity', async () => {
+  it('finishes an older detach before enrolling the same identity again', async () => {
     httpClient.mockResolvedValueOnce({ json: attached() })
     await client.attachSession(scope.sessionId, scope.clientId)
     const retirement = deferred()
     httpClient.mockReturnValueOnce(retirement.promise)
     const oldDetach = client.detachSession(scope.sessionId, scope.clientId)
     httpClient.mockResolvedValueOnce({ json: attached() })
-    await client.attachSession(scope.sessionId, scope.clientId)
-    retirement.resolve({ json: {} })
-    await oldDetach
+    const replacement = client.attachSession(scope.sessionId, scope.clientId)
+    await Promise.resolve()
+    try {
+      expect(
+        httpClient.mock.calls.filter(([url]) =>
+          url.endsWith('/session/attach'),
+        ),
+      ).toHaveLength(1)
+    } finally {
+      retirement.resolve({ json: {} })
+    }
+    await Promise.all([oldDetach, replacement])
     await client.pause()
     expect(JSON.parse(httpClient.mock.calls.at(-1)[1].body)).toEqual(scope)
+  })
+
+  it('does not send old cleanup after a newer attachment of the same identity', async () => {
+    httpClient.mockResolvedValueOnce({ json: attached() })
+    const oldAttachment = await client.attachSession(
+      scope.sessionId,
+      scope.clientId,
+    )
+    httpClient.mockResolvedValueOnce({ json: attached() })
+    await client.attachSession(scope.sessionId, scope.clientId)
+    httpClient.mockClear()
+    await client.detachSession(scope.sessionId, scope.clientId, {
+      attachment: oldAttachment,
+      keepalive: true,
+    })
+    expect(httpClient).not.toHaveBeenCalled()
+    await client.pause()
+    expect(JSON.parse(httpClient.mock.calls.at(-1)[1].body)).toEqual(scope)
+  })
+
+  it('rechecks old cleanup after an in-flight newer attachment completes', async () => {
+    httpClient.mockResolvedValueOnce({ json: attached() })
+    const oldAttachment = await client.attachSession(
+      scope.sessionId,
+      scope.clientId,
+    )
+    const next = deferred()
+    httpClient.mockReturnValueOnce(next.promise)
+    const replacement = client.attachSession(scope.sessionId, scope.clientId)
+    const oldCleanup = client.detachSession(scope.sessionId, scope.clientId, {
+      attachment: oldAttachment,
+    })
+    next.resolve({ json: attached() })
+    await Promise.all([replacement, oldCleanup])
+    expect(
+      httpClient.mock.calls.filter(([url]) => url.endsWith('/session/detach')),
+    ).toHaveLength(0)
   })
 
   it('does not replace a newer confirmed scope when an old attach completes late', async () => {

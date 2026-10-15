@@ -143,7 +143,9 @@ describe('<Player />', () => {
       expect.anything(),
     )
     expect(jukeboxClient.stop).not.toHaveBeenCalled()
-    expect(jukeboxClient.detachSession).toHaveBeenCalled()
+    await waitFor(() =>
+      expect(jukeboxClient.detachSession).toHaveBeenCalledTimes(1),
+    )
   })
 
   it('maps outgoing jukebox volume changes through the Bluetooth profile', async () => {
