@@ -12,11 +12,13 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 )
@@ -36,6 +38,7 @@ type MpvTrack struct {
 	Exe            *Executor
 
 	ctx             context.Context
+	output          *pipeWireOutput
 	closeOnce       sync.Once
 	eventOnce       sync.Once
 	retireRequested atomic.Bool
@@ -67,7 +70,21 @@ func NewTrack(ctx context.Context, events chan<- model.PlaybackEvent, token mode
 	if len(args) == 0 {
 		return nil, fmt.Errorf("no mpv command arguments provided")
 	}
-	exe, err := start(ctx, args)
+	target := pipeWireBluetoothTarget(deviceName)
+	outputName := "navidrome-output-" + filepath.Base(tmpSocketName)
+	var environment []string
+	prepareCtx := ctx
+	if target != "" {
+		if conf.Server.Jukebox.OutputPreparationTimeout <= 0 || conf.Server.Jukebox.OutputPollInterval <= 0 {
+			return nil, errors.New("Jukebox output preparation timeout and poll interval must be positive")
+		}
+		var cancel context.CancelFunc
+		prepareCtx, cancel = context.WithTimeout(ctx, conf.Server.Jukebox.OutputPreparationTimeout)
+		defer cancel()
+		environment = pipeWireEnvironment(outputName)
+		args = append(args, "--no-config", "--load-scripts=no", "--pause=yes", "--ao=pulse", "--audio-device="+deviceName, "--audio-fallback-to-null=no")
+	}
+	exe, err := start(ctx, args, environment...)
 	if err != nil {
 		log.Error("Error starting mpv process", err)
 		return nil, err
@@ -84,11 +101,11 @@ func NewTrack(ctx context.Context, events chan<- model.PlaybackEvent, token mode
 		removeSocket(tmpSocketName)
 	}
 
-	if err := waitForSocket(ctx, tmpSocketName, trackReadyTimeout, 25*time.Millisecond); err != nil {
+	if err := waitForSocket(prepareCtx, tmpSocketName, trackReadyTimeout, 25*time.Millisecond); err != nil {
 		cleanup()
 		return nil, err
 	}
-	conn, err := dialIPC(ctx, tmpSocketName)
+	conn, err := dialIPC(prepareCtx, tmpSocketName)
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -102,15 +119,34 @@ func NewTrack(ctx context.Context, events chan<- model.PlaybackEvent, token mode
 		Exe:            &exe,
 		ctx:            ctx,
 	}
-	if err := track.waitForReady(); err != nil {
-		_ = conn.Close()
-		cleanup()
+	if target != "" {
+		// Pulse stream creation waits for a peer, so establish links before AO readiness.
+		track.output, err = preparePipeWireOutput(prepareCtx, ctx, exe.cmd.Process.Pid, outputName, target)
+		if err != nil {
+			track.terminate(false)
+			return nil, err
+		}
+	}
+	if err := track.waitForReadyContext(prepareCtx); err != nil {
+		track.terminate(false)
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
+	if track.output != nil {
+		paused, err := conn.Call(prepareCtx, "get_property", "pause")
+		if err == nil && paused != true {
+			err = errors.New("Bluetooth output was not prepared paused")
+		}
+		if err == nil {
+			err = track.output.verify(prepareCtx)
+		}
+		if err != nil {
+			track.terminate(false)
+			return nil, err
+		}
+	}
+	if err := prepareCtx.Err(); err != nil {
 		track.retireRequested.Store(true)
-		_ = conn.Close()
-		cleanup()
+		track.terminate(false)
 		return nil, err
 	}
 	go track.monitorEvents()
@@ -118,7 +154,11 @@ func NewTrack(ctx context.Context, events chan<- model.PlaybackEvent, token mode
 }
 
 func (t *MpvTrack) waitForReady() error {
-	ctx, cancel := context.WithTimeout(t.ctx, trackReadyTimeout)
+	return t.waitForReadyContext(t.ctx)
+}
+
+func (t *MpvTrack) waitForReadyContext(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(parent, trackReadyTimeout)
 	defer cancel()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
@@ -127,8 +167,13 @@ func (t *MpvTrack) waitForReady() error {
 		output, outputErr := t.Conn.Call(ctx, "get_property", "current-ao")
 		params, paramsErr := t.Conn.Call(ctx, "get_property", "audio-out-params")
 		outputName, outputReady := output.(string)
-		_, paramsReady := params.(map[string]any)
+		format, paramsReady := params.(map[string]any)
 		if outputErr == nil && paramsErr == nil && outputReady && outputName != "" && paramsReady {
+			if t.output != nil {
+				if err := t.output.verifyFormat(format); err != nil {
+					return err
+				}
+			}
 			position, err := t.Conn.Call(ctx, "get_property", "time-pos")
 			if err == nil {
 				t.updatePosition(position)
@@ -213,6 +258,11 @@ func (t *MpvTrack) emitTerminal(kind model.PlaybackEventKind, err error) {
 
 func (t *MpvTrack) terminate(graceful bool) {
 	t.closeOnce.Do(func() {
+		if t.output != nil {
+			if err := t.output.close(); err != nil {
+				log.Error("Error retiring PipeWire output links", err)
+			}
+		}
 		if graceful && t.Conn != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			_, err := t.Conn.Call(ctx, "quit")

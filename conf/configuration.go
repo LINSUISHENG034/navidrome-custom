@@ -257,12 +257,14 @@ type prometheusOptions struct {
 type AudioDeviceDefinition []string
 
 type jukeboxOptions struct {
-	Enabled               bool
-	Devices               []AudioDeviceDefinition
-	Default               string
-	AdminOnly             bool
-	AutoDiscoverBluetooth bool
-	BluetoothManagement   bool
+	Enabled                  bool
+	Devices                  []AudioDeviceDefinition
+	Default                  string
+	AdminOnly                bool
+	AutoDiscoverBluetooth    bool
+	BluetoothManagement      bool
+	OutputPreparationTimeout time.Duration
+	OutputPollInterval       time.Duration
 }
 
 type backupOptions struct {
@@ -1063,6 +1065,8 @@ func setViperDefaults() {
 	viper.SetDefault("jukebox.adminonly", true)
 	viper.SetDefault("jukebox.autodiscoverbluetooth", false)
 	viper.SetDefault("jukebox.bluetoothmanagement", false)
+	viper.SetDefault("jukebox.outputpreparationtimeout", 15*time.Second)
+	viper.SetDefault("jukebox.outputpollinterval", 100*time.Millisecond)
 	viper.SetDefault("scanner.enabled", true)
 	viper.SetDefault("scanner.schedule", "0")
 	viper.SetDefault("scanner.extractor", consts.DefaultScannerExtractor)

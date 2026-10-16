@@ -15,12 +15,16 @@ import (
 	"github.com/navidrome/navidrome/utils/shellquote"
 )
 
-func start(ctx context.Context, args []string) (Executor, error) {
+func start(ctx context.Context, args []string, environment ...string) (Executor, error) {
+	return startWithInput(ctx, args, nil, environment...)
+}
+
+func startWithInput(ctx context.Context, args []string, input io.Reader, environment ...string) (Executor, error) {
 	if len(args) == 0 {
 		return Executor{}, fmt.Errorf("no command arguments provided")
 	}
 	log.Debug("Executing mpv command", "cmd", args)
-	j := Executor{args: args, done: make(chan struct{})}
+	j := Executor{args: args, input: input, environment: environment, done: make(chan struct{})}
 	j.PipeReader, j.out = io.Pipe()
 	err := j.start(ctx)
 	if err != nil {
@@ -63,14 +67,20 @@ func (j *Executor) Wait(ctx context.Context) error {
 
 type Executor struct {
 	*io.PipeReader
-	out  *io.PipeWriter
-	args []string
-	cmd  *exec.Cmd
-	done chan struct{}
+	out         *io.PipeWriter
+	args        []string
+	input       io.Reader
+	environment []string
+	cmd         *exec.Cmd
+	done        chan struct{}
 }
 
 func (j *Executor) start(ctx context.Context) error {
 	cmd := exec.CommandContext(ctx, j.args[0], j.args[1:]...) // #nosec
+	if len(j.environment) != 0 {
+		cmd.Env = append(cmd.Environ(), j.environment...)
+	}
+	cmd.Stdin = j.input
 	cmd.Stdout = j.out
 	if log.IsGreaterOrEqualTo(log.LevelTrace) {
 		cmd.Stderr = os.Stderr

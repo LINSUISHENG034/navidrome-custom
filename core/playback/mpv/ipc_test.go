@@ -133,7 +133,12 @@ func TestIPCClientHonorsCallDeadlineWithoutReply(t *testing.T) {
 
 func listenIPC(t *testing.T) net.Listener {
 	t.Helper()
-	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "mpv.socket"))
+	return listenIPCAt(t, filepath.Join(t.TempDir(), "mpv.socket"))
+}
+
+func listenIPCAt(t *testing.T, socket string) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatalf("listen IPC: %v", err)
 	}
