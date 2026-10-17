@@ -16,15 +16,15 @@ import (
 )
 
 func start(ctx context.Context, args []string, environment ...string) (Executor, error) {
-	return startWithInput(ctx, args, nil, environment...)
+	return startWithInput(ctx, args, nil, nil, environment...)
 }
 
-func startWithInput(ctx context.Context, args []string, input io.Reader, environment ...string) (Executor, error) {
+func startWithInput(ctx context.Context, args []string, input io.Reader, errorOutput io.Writer, environment ...string) (Executor, error) {
 	if len(args) == 0 {
 		return Executor{}, fmt.Errorf("no command arguments provided")
 	}
 	log.Debug("Executing mpv command", "cmd", args)
-	j := Executor{args: args, input: input, environment: environment, done: make(chan struct{})}
+	j := Executor{args: args, input: input, errorOutput: errorOutput, environment: environment, done: make(chan struct{})}
 	j.PipeReader, j.out = io.Pipe()
 	err := j.start(ctx)
 	if err != nil {
@@ -70,6 +70,7 @@ type Executor struct {
 	out         *io.PipeWriter
 	args        []string
 	input       io.Reader
+	errorOutput io.Writer
 	environment []string
 	cmd         *exec.Cmd
 	done        chan struct{}
@@ -82,7 +83,9 @@ func (j *Executor) start(ctx context.Context) error {
 	}
 	cmd.Stdin = j.input
 	cmd.Stdout = j.out
-	if log.IsGreaterOrEqualTo(log.LevelTrace) {
+	if j.errorOutput != nil {
+		cmd.Stderr = j.errorOutput
+	} else if log.IsGreaterOrEqualTo(log.LevelTrace) {
 		cmd.Stderr = os.Stderr
 	} else {
 		cmd.Stderr = io.Discard

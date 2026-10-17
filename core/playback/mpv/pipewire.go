@@ -17,7 +17,22 @@ import (
 	"github.com/navidrome/navidrome/conf"
 )
 
-const pipeWireOutputToken = "navidrome.output-token"
+const (
+	pipeWireOutputToken        = "navidrome.output-token"
+	maxPipeWireDiagnosticBytes = 4 * 1024
+)
+
+type pipeWireDiagnostic struct {
+	data []byte
+}
+
+func (diagnostic *pipeWireDiagnostic) Write(data []byte) (int, error) {
+	remaining := maxPipeWireDiagnosticBytes - len(diagnostic.data)
+	if remaining > 0 {
+		diagnostic.data = append(diagnostic.data, data[:min(len(data), remaining)]...)
+	}
+	return len(data), nil
+}
 
 var errPipeWirePending = errors.New("PipeWire output is still preparing")
 
@@ -47,6 +62,9 @@ type pipeWireOutput struct {
 	ports     []pipeWirePortPair
 	token     string
 	owner     *Executor
+	stdout    pipeWireDiagnostic
+	stderr    pipeWireDiagnostic
+	drained   chan struct{}
 	input     *os.File
 	cancel    context.CancelFunc
 	closeOnce sync.Once
@@ -327,6 +345,13 @@ func preparePipeWireOutput(ctx, lifetime context.Context, pid int, name, target 
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, output.close())
+			if output.owner != nil {
+				select {
+				case <-output.owner.done:
+					err = errors.Join(err, output.exitError("while retiring rejected output"))
+				default:
+				}
+			}
 		}
 	}()
 	ownerCtx, cancel := context.WithCancel(lifetime)
@@ -336,13 +361,17 @@ func preparePipeWireOutput(ctx, lifetime context.Context, pid int, name, target 
 		return nil, err
 	}
 	output.input = writer
-	owner, err := startWithInput(ownerCtx, []string{"pw-cli"}, reader)
+	owner, err := startWithInput(ownerCtx, []string{"pw-cli"}, reader, &output.stderr)
 	_ = reader.Close()
 	if err != nil {
 		return nil, fmt.Errorf("start PipeWire link owner: %w", err)
 	}
 	output.owner = &owner
-	go func() { _, _ = io.Copy(io.Discard, &owner) }()
+	output.drained = make(chan struct{})
+	go func() {
+		defer close(output.drained)
+		_, _ = io.Copy(&output.stdout, &owner)
+	}()
 	properties, err := json.Marshal(map[string]any{
 		"object.linger": false, "link.passive": false, pipeWireOutputToken: output.token,
 	})
@@ -378,6 +407,13 @@ func preparePipeWireOutput(ctx, lifetime context.Context, pid int, name, target 
 	}
 }
 
+func (output *pipeWireOutput) exitError(when string) error {
+	// Wait for the stdout consumer as well as Cmd.Wait before reading diagnostics.
+	<-output.drained
+	return fmt.Errorf("PipeWire link owner exited %s (%s); stdout=%q; stderr=%q", when,
+		output.owner.cmd.ProcessState, output.stdout.data, output.stderr.data)
+}
+
 func (output *pipeWireOutput) verifyFormat(format map[string]any) error {
 	channels, ok := format["channel-count"].(float64)
 	if !ok || channels != float64(len(output.ports)) {
@@ -389,7 +425,7 @@ func (output *pipeWireOutput) verifyFormat(format map[string]any) error {
 func (output *pipeWireOutput) verify(ctx context.Context) error {
 	select {
 	case <-output.owner.done:
-		return errors.New("PipeWire link owner has exited")
+		return output.exitError("after output admission")
 	default:
 	}
 	graph, err := pipeWireSnapshot(ctx)

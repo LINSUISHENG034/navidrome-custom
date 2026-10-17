@@ -201,7 +201,11 @@ func TestPipeWirePrivateOutput(t *testing.T) {
 		t.Skip("private PipeWire protocol integration requires Linux")
 	}
 	t.Cleanup(configtest.SetupConfig())
-	root := t.TempDir()
+	// TempDir's numbered leaf does not promise mode 0700.
+	root := filepath.Join(t.TempDir(), "p")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	for _, relative := range []string{"h", "c", "s", "k", "r", "r/p", "t", "l"} {
 		if err := os.Mkdir(privatePipeWirePath(t, root, relative), 0o700); err != nil {
 			t.Fatal(err)
@@ -226,6 +230,8 @@ func TestPipeWirePrivateOutput(t *testing.T) {
 	}
 	clientModules := []string{"libpipewire-module-protocol-native", "libpipewire-module-client-node", "libpipewire-module-adapter"}
 	pulseModules := append(append([]string(nil), clientModules...), fmt.Sprintf("libpipewire-module-protocol-pulse args = { server.address = [ %q ] }", "unix:"+pulseSocket))
+	// pw-cli binds Metadata globals even though this fixture creates none.
+	clientModules = append(clientModules, "libpipewire-module-metadata")
 	const target = "bluez_output.private_validation.a2dp-sink"
 	coreObjects := fmt.Sprintf(`context.objects = [
     { factory = spa-node-factory args = {
@@ -541,9 +547,10 @@ func assertPrivatePipeWireChannelLinks(t *testing.T, graph []map[string]any, tar
 			if fmt.Sprint(props["node.autoconnect"]) != "false" || fmt.Sprint(props["node.dont-reconnect"]) != "true" {
 				t.Fatal("private MPV stream does not independently prohibit automatic connections")
 			}
-			pid, err := strconv.Atoi(fmt.Sprint(props["application.process.id"]))
-			if err != nil || pid <= 0 || pid == os.Getpid() {
-				t.Fatal("private MPV stream has no independently observed child identity")
+			pidValue := privatePipeWireID(props["application.process.id"])
+			pid := int(pidValue)
+			if pidValue != float64(pid) || pid <= 0 || pid == os.Getpid() {
+				t.Fatalf("private MPV stream has no independently observed child identity: %T %v", props["application.process.id"], props["application.process.id"])
 			}
 			stream, _ = object["id"].(float64)
 			streamName = name
