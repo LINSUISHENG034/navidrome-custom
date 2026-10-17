@@ -195,7 +195,7 @@ ARG ALPINE_MIRROR=https://mirrors.aliyun.com/alpine
 # otherwise the deleted bytes still ship in the image.
 RUN alpine_version="v$(cut -d. -f1,2 /etc/alpine-release)" && \
     printf "%s/%s/main\n%s/%s/community\n" "${ALPINE_MIRROR}" "${alpine_version}" "${ALPINE_MIRROR}" "${alpine_version}" > /etc/apk/repositories && \
-    apk add -U --no-cache curl ffmpeg mpv sqlite pulseaudio-utils dbus libwebp libwebpdemux libwebpmux && \
+    apk add -U --no-cache curl ffmpeg mpv sqlite pulseaudio-utils pipewire-tools dbus libwebp libwebpdemux libwebpmux && \
     for lib in libwebp libwebpdemux libwebpmux; do \
         target=$(ls /usr/lib/$lib.so.* 2>/dev/null | head -1) && \
         [ -n "$target" ] && ln -sf "$target" /usr/lib/$lib.so; \

@@ -101,7 +101,30 @@ vi.mock('./jukeboxClient', () => ({
     volume: vi.fn(() => Promise.resolve({})),
     stop: vi.fn(() => Promise.resolve({})),
     attachSession: vi.fn(() =>
-      Promise.resolve({ sessionId: 'jukebox-session:admin' }),
+      Promise.resolve({
+        sessionId: 'jukebox-session:admin',
+        ownerClientId:
+          sessionStorage.getItem('jukebox-client-id') || 'test-client',
+        ownershipState: 'attached',
+        deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+      }),
+    ),
+    sessionSnapshot: vi.fn(() =>
+      Promise.resolve({
+        sessionStatus: {
+          sessionId: 'jukebox-session:admin',
+          ownerClientId:
+            sessionStorage.getItem('jukebox-client-id') || 'test-client',
+          ownershipState: 'attached',
+          deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+          gain: 0.5,
+          position: 10,
+        },
+        jukeboxPlaylist: {
+          currentIndex: 0,
+          entry: [{ id: 't1', title: 'Song 1', artist: 'Artist 1' }],
+        },
+      }),
     ),
     detachSession: vi.fn(() => Promise.resolve({})),
     heartbeatSession: vi.fn(() => Promise.resolve({})),
@@ -151,13 +174,15 @@ describe('<Player />', () => {
   it('maps outgoing jukebox volume changes through the Bluetooth profile', async () => {
     render(<Player />)
 
-    fireEvent.click(screen.getByTestId('trigger-volume-change'))
+    const slider = await screen.findByRole('slider', { name: 'Volume' })
+    fireEvent.change(slider, { target: { value: '0.6' } })
 
     await waitFor(() => {
       expect(jukeboxClient.volume).toHaveBeenCalledWith(
         uiVolumeToRemoteGain(0.6, {
           deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
         }),
+        expect.anything(),
       )
     })
   })

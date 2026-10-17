@@ -925,7 +925,7 @@ class AppSmoke:
                     self.vite_url + "/validation/remote-player.html?" + urlencode(parameters),
                     wait_until="domcontentloaded", timeout=30000,
                 )
-                page.get_by_role("heading", name="Remote player prototype", exact=True).wait_for(timeout=30000)
+                page.get_by_role("heading", name="Remote player", exact=True).wait_for(timeout=30000)
                 page.wait_for_function("document.querySelectorAll('audio').length === 0")
                 return page
 
@@ -935,7 +935,7 @@ class AppSmoke:
                     + urlencode({"sessionId": self.session_id, "clientId": "browser-controller-1"})
                 )
                 fixture_page.goto(fixture_url, wait_until="domcontentloaded", timeout=30000)
-                fixture_page.get_by_role("heading", name="Remote player prototype", exact=True).wait_for(timeout=30000)
+                fixture_page.get_by_role("heading", name="Remote player", exact=True).wait_for(timeout=30000)
                 fixture_page.locator("fieldset").wait_for(timeout=10000)
                 fixture_page.wait_for_function("document.querySelectorAll('audio').length === 0")
                 initial = browser_dir / "remote-controller-initial.png"
@@ -1100,7 +1100,7 @@ class AppSmoke:
                         clone_parent.evaluate("url => window.open(url, '_blank')", clone_url)
                     clone_child = popup_info.value
                     self._track_page_errors(clone_child, browser_errors, browser_console_details)
-                    clone_child.get_by_role("heading", name="Remote player prototype", exact=True).wait_for(timeout=30000)
+                    clone_child.get_by_role("heading", name="Remote player", exact=True).wait_for(timeout=30000)
                     clone_child.wait_for_function("Boolean(document.querySelector('fieldset'))")
                     clone_child.wait_for_timeout(500)
                     parent_ids = [payload.get("clientId") for page, payload in clone_requests if page == clone_parent]

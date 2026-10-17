@@ -1,6 +1,7 @@
 import React from 'react'
+import { remoteGainToUiVolume, uiVolumeToRemoteGain } from './volumeProfiles'
 
-const RemotePlayerPrototype = ({ snapshot, onCommand }) => {
+const RemotePlayer = ({ snapshot, onCommand }) => {
   const sessionStatus = snapshot?.sessionStatus || {}
   const playlist = snapshot?.jukeboxPlaylist || {}
   const queue = playlist.entry || []
@@ -15,9 +16,9 @@ const RemotePlayerPrototype = ({ snapshot, onCommand }) => {
   const playing = sessionStatus.playing ?? false
 
   return (
-    <section aria-label="Remote player prototype">
-      <h2>Remote player prototype</h2>
-      <p>Prototype view — state comes from server snapshots.</p>
+    <section aria-label="Remote player">
+      <h2>Remote player</h2>
+      <p>State comes from server snapshots.</p>
       <p>{playing ? 'Playing' : 'Paused'}</p>
       <p>Device: {sessionStatus.deviceName || 'Unknown'}</p>
       <p>Ownership: {sessionStatus.ownershipState || 'Unknown'}</p>
@@ -53,9 +54,15 @@ const RemotePlayerPrototype = ({ snapshot, onCommand }) => {
           min="0"
           max="1"
           step="0.01"
-          value={gain}
+          value={remoteGainToUiVolume(gain, sessionStatus)}
           onChange={(event) =>
-            onCommand({ type: 'volume', gain: Number(event.target.value) })
+            onCommand({
+              type: 'volume',
+              gain: uiVolumeToRemoteGain(
+                Number(event.target.value),
+                sessionStatus,
+              ),
+            })
           }
         />
       </label>
@@ -102,4 +109,4 @@ const RemotePlayerPrototype = ({ snapshot, onCommand }) => {
   )
 }
 
-export default RemotePlayerPrototype
+export default RemotePlayer

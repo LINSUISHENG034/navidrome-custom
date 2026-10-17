@@ -17,6 +17,7 @@ import useCurrentTheme from '../themes/useCurrentTheme'
 import config from '../config'
 import useStyle from './styles'
 import AudioTitle from './AudioTitle'
+import RemotePlayerController from './RemotePlayerController'
 import {
   clearQueue,
   currentPlaying,
@@ -189,7 +190,7 @@ const resolvePlayerUiState = (playerState) => {
   }
 }
 
-const Player = () => {
+const LocalPlayer = () => {
   const theme = useCurrentTheme()
   const translate = useTranslate()
   const playerTheme = theme.player?.theme || 'dark'
@@ -213,6 +214,13 @@ const Player = () => {
   const stoppedRef = useRef(false)
   const sessionRetirementRef = useRef(Promise.resolve())
   const remoteDeviceRef = useRef(null)
+
+  useEffect(
+    () => () => {
+      dispatch(setAudioInstanceAction(null))
+    },
+    [dispatch],
+  )
 
   const handleAudioInstance = useCallback(
     (instance) => {
@@ -879,6 +887,13 @@ const Player = () => {
       <GlobalHotKeys handlers={handlers} keyMap={keyMap} allowChanges />
     </ThemeProvider>
   )
+}
+
+const Player = () => {
+  const jukeboxMode = useSelector((state) => state.player.jukeboxMode)
+
+  // The default controller follows the server-bound session, not a target request.
+  return jukeboxMode ? <RemotePlayerController /> : <LocalPlayer />
 }
 
 export {

@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useDispatch, useSelector } from 'react-redux'
-import RemotePlayerPrototype from './RemotePlayer.prototype'
+import RemotePlayer from './RemotePlayer'
 import jukeboxClient from './jukeboxClient'
 import {
   canControlJukebox,
@@ -24,8 +24,8 @@ const commandHandlers = {
   volume: ({ gain }, scope) => jukeboxClient.volume(gain, scope),
 }
 
-// Validation-only controller; not registered in the application routes.
-const RemotePlayerControllerPrototype = ({
+// Snapshot-driven controller; default-route integration is handled separately.
+const RemotePlayerController = ({
   sessionId = getJukeboxSessionId(),
   clientId = getOrCreateJukeboxClientId(),
   deviceName = null,
@@ -178,7 +178,7 @@ const RemotePlayerControllerPrototype = ({
   }, [remoteEvent, reconnectEvent])
 
   return (
-    <section aria-label="Remote controller prototype">
+    <section aria-label="Remote controller">
       {error && <p role="alert">{error}</p>}
       {snapshot &&
         (!controlAvailable || !snapshotAllowsControl(snapshot, clientId)) && (
@@ -198,7 +198,7 @@ const RemotePlayerControllerPrototype = ({
             !controlAvailable || !snapshotAllowsControl(snapshot, clientId)
           }
         >
-          <RemotePlayerPrototype
+          <RemotePlayer
             snapshot={snapshot}
             onCommand={(command) => current.current?.command(command)}
           />
@@ -208,4 +208,4 @@ const RemotePlayerControllerPrototype = ({
   )
 }
 
-export default RemotePlayerControllerPrototype
+export default RemotePlayerController

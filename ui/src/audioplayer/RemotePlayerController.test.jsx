@@ -10,11 +10,62 @@ import {
   within,
 } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import RemotePlayerControllerPrototype from './RemotePlayer.controller.prototype'
+import RemotePlayerController from './RemotePlayerController'
 import { playerReducer } from '../reducers/playerReducer'
 import { activityReducer } from '../reducers/activityReducer'
+import { replayGainReducer } from '../reducers/replayGainReducer'
+import { settingsReducer } from '../reducers/settingsReducer'
+import { themeReducer } from '../reducers/themeReducer'
+import { setJukeboxMode, updateJukeboxSessionStatus } from '../actions'
 import { startEventStream } from '../eventStream'
 import config from '../config'
+import { Player } from './Player'
+import { getOrCreateJukeboxClientId } from './jukeboxSession'
+import { uiVolumeToRemoteGain } from './volumeProfiles'
+
+const browserPlayback = vi.hoisted(() => ({ mounts: 0, streamUrls: [] }))
+
+vi.mock('react-admin', async (importOriginal) => ({
+  ...(await importOriginal()),
+  useAuthState: () => ({ authenticated: true }),
+  useTranslate: () => (key) => key,
+  useDataProvider: () => ({
+    getOne: () => Promise.resolve({ data: {} }),
+  }),
+}))
+
+vi.mock('navidrome-music-player', () => ({
+  default: function BrowserPlaybackBoundary({
+    audioLists = [],
+    playIndex = 0,
+    getAudioInstance,
+  }) {
+    const audio = React.useRef(null)
+    const source = audioLists[playIndex ?? 0]?.musicSrc
+    React.useEffect(() => {
+      browserPlayback.mounts++
+      getAudioInstance?.(audio.current)
+      return () => getAudioInstance?.(null)
+    }, [getAudioInstance])
+    React.useEffect(() => {
+      let active = true
+      if (source) {
+        Promise.resolve(typeof source === 'function' ? source() : source).then(
+          (url) => {
+            if (active && audio.current) {
+              browserPlayback.streamUrls.push(url)
+              audio.current.src = url
+            }
+          },
+        )
+      }
+      return () => {
+        active = false
+      }
+    }, [source])
+    return <audio ref={audio} data-testid="browser-playback-engine" />
+  },
+}))
 
 const snapshot = (title = 'Server queue', position = 12) => ({
   sessionStatus: {
@@ -140,6 +191,13 @@ const makeTransport = (
     if (!path.includes('/session/') && commandReply) {
       return Promise.resolve(commandReply).then((reply) => reply.clone())
     }
+    if (path.startsWith('/rest/')) {
+      return Promise.resolve(
+        response({
+          'subsonic-response': { status: 'ok', transcodeDecision: {} },
+        }),
+      )
+    }
     return Promise.resolve(response({}))
   })
   vi.stubGlobal('fetch', fetch)
@@ -154,12 +212,55 @@ const renderController = (
 ) => {
   const view = render(
     <Provider store={store}>
-      <RemotePlayerControllerPrototype
+      <RemotePlayerController
         sessionId="jukebox-session:admin"
         clientId="tab-a"
         deviceName="pulse/test"
         {...props}
       />
+    </Provider>,
+  )
+  return { ...view, store }
+}
+
+const renderDefaultPlayer = (
+  status,
+  { remote = true, replayGainMode = 'track' } = {},
+) => {
+  const localTrack = {
+    trackId: 'retained-local',
+    uuid: 'retained-local-occurrence',
+    name: 'Retained local song',
+    song: { id: 'retained-local', title: 'Retained local song' },
+    musicSrc: '/rest/stream?id=retained-local',
+  }
+  const store = createStore(
+    combineReducers({
+      player: playerReducer,
+      activity: activityReducer,
+      settings: settingsReducer,
+      replayGain: replayGainReducer,
+      theme: themeReducer,
+    }),
+    {
+      player: {
+        ...playerReducer(undefined, { type: '@@INIT' }),
+        queue: [localTrack],
+        current: localTrack,
+        savedPlayIndex: 0,
+        playIndex: 0,
+      },
+      replayGain: {
+        ...replayGainReducer(undefined, { type: '@@INIT' }),
+        gainMode: replayGainMode,
+      },
+    },
+  )
+  if (remote) store.dispatch(setJukeboxMode(true, 'Validation output'))
+  if (status) store.dispatch(updateJukeboxSessionStatus(status))
+  const view = render(
+    <Provider store={store}>
+      <Player />
     </Provider>,
   )
   return { ...view, store }
@@ -189,7 +290,7 @@ afterEach(() => {
   sessionStorage.clear()
 })
 
-describe('<RemotePlayerControllerPrototype />', () => {
+describe('<RemotePlayerController />', () => {
   it('rejects a previous attachment episode snapshot after the session and device change', async () => {
     const old = deferred()
     const next = snapshot('Different session queue', 9)
@@ -200,7 +301,7 @@ describe('<RemotePlayerControllerPrototype />', () => {
     await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(1))
     rerender(
       <Provider store={store}>
-        <RemotePlayerControllerPrototype
+        <RemotePlayerController
           sessionId="jukebox-session:admin:new"
           clientId="tab-a"
           deviceName="pulse/other"
@@ -349,12 +450,12 @@ describe('<RemotePlayerControllerPrototype />', () => {
     await startEventStream(store.dispatch)
     const { unmount } = render(
       <Provider store={store}>
-        <RemotePlayerControllerPrototype
+        <RemotePlayerController
           sessionId="jukebox-session:admin"
           clientId="tab-a"
           deviceName="pulse/test"
         />
-        <RemotePlayerControllerPrototype
+        <RemotePlayerController
           sessionId="jukebox-session:admin"
           clientId="tab-b"
           deviceName="pulse/test"
@@ -512,7 +613,7 @@ describe('<RemotePlayerControllerPrototype />', () => {
           target: { value: '0.4' },
         }),
       path: '/api/jukebox/volume',
-      body: { gain: 0.4 },
+      body: { gain: uiVolumeToRemoteGain(0.4, { deviceName: 'pulse/test' }) },
     },
   ])(
     'routes only explicit $label intents to their existing endpoint',
@@ -640,7 +741,7 @@ describe('<RemotePlayerControllerPrototype />', () => {
     await waitFor(() => expect(transport.requests).toHaveLength(1))
     rerender(
       <Provider store={store}>
-        <RemotePlayerControllerPrototype
+        <RemotePlayerController
           sessionId="jukebox-session:admin"
           clientId="tab-a"
           deviceName="pulse/other"
@@ -737,12 +838,12 @@ describe('<RemotePlayerControllerPrototype />', () => {
     )
     const { container, unmount } = render(
       <Provider store={store}>
-        <RemotePlayerControllerPrototype
+        <RemotePlayerController
           sessionId="jukebox-session:admin"
           clientId="tab-a"
           deviceName="pulse/test"
         />
-        <RemotePlayerControllerPrototype
+        <RemotePlayerController
           sessionId="jukebox-session:admin"
           clientId="tab-b"
           deviceName="pulse/test"
@@ -750,7 +851,7 @@ describe('<RemotePlayerControllerPrototype />', () => {
       </Provider>,
     )
     const [first, second] = Array.from(
-      container.querySelectorAll('[aria-label="Remote controller prototype"]'),
+      container.querySelectorAll('[aria-label="Remote controller"]'),
     ).map((element) => within(element))
     await first.findByRole('heading', { name: 'Server queue' })
     await second.findByRole('heading', { name: 'Server queue' })
@@ -963,5 +1064,125 @@ describe('<RemotePlayerControllerPrototype />', () => {
         'sessionId',
       ),
     ).toBe('jukebox-session:admin')
+  })
+})
+
+describe('default Player Remote route', () => {
+  it('renders the authoritative Remote snapshot without mounting or feeding a browser playback engine', async () => {
+    localStorage.setItem('subsonic-token', '0123456789abcdef0123456789abcdef')
+    localStorage.setItem('subsonic-salt', 'remote-route-fixture')
+    const server = snapshot('Authoritative remote queue', 27)
+    server.sessionStatus.ownerClientId = getOrCreateJukeboxClientId()
+    const transport = makeTransport([server])
+    const localTrack = {
+      trackId: 'retained-local',
+      uuid: 'retained-local-occurrence',
+      name: 'Retained local song',
+      song: { id: 'retained-local', title: 'Retained local song' },
+      musicSrc: '/rest/stream?id=retained-local',
+    }
+    const store = createStore(
+      combineReducers({
+        player: playerReducer,
+        activity: activityReducer,
+        settings: settingsReducer,
+        replayGain: replayGainReducer,
+        theme: themeReducer,
+      }),
+      {
+        player: {
+          ...playerReducer(undefined, { type: '@@INIT' }),
+          queue: [localTrack],
+          current: localTrack,
+          savedPlayIndex: 0,
+          playIndex: 0,
+        },
+        replayGain: {
+          ...replayGainReducer(undefined, { type: '@@INIT' }),
+          gainMode: 'track',
+        },
+      },
+    )
+    store.dispatch(setJukeboxMode(true, 'Validation output'))
+    store.dispatch(updateJukeboxSessionStatus(server.sessionStatus))
+    const audioContext = vi.fn(function AudioContextBoundary() {
+      return {
+        currentTime: 0,
+        destination: {},
+        createMediaElementSource: () => ({ connect: vi.fn() }),
+        createGain: () => ({
+          connect: vi.fn(),
+          gain: { setValueAtTime: vi.fn() },
+        }),
+        close: () => Promise.resolve(),
+      }
+    })
+    vi.stubGlobal('AudioContext', audioContext)
+    expect('AudioContext' in window).toBe(true)
+    const originalReplayGain = config.enableReplayGain
+    config.enableReplayGain = true
+    browserPlayback.mounts = 0
+    browserPlayback.streamUrls = []
+    const { container, unmount } = render(
+      <Provider store={store}>
+        <Player />
+      </Provider>,
+    )
+    try {
+      await waitFor(() =>
+        expect(
+          transport.requests.filter(({ path }) =>
+            path.endsWith('/session/attach'),
+          ),
+        ).toHaveLength(1),
+      )
+      const attachment = transport.requests.find(({ path }) =>
+        path.endsWith('/session/attach'),
+      )
+      expect(attachment.options.headers.get('X-ND-Authorization')).toBe(
+        'Bearer fake-jwt',
+      )
+      await act(async () => {})
+      expect({
+        audioElements: container.querySelectorAll('audio').length,
+        browserEngineMounts: browserPlayback.mounts,
+        audioContexts: audioContext.mock.calls.length,
+        consumedStreamUrls: browserPlayback.streamUrls,
+        browserStreamRequests: transport.requests
+          .filter(({ path }) =>
+            /^\/rest\/(stream|getTranscodeStream|getTranscodeDecision)$/.test(
+              path,
+            ),
+          )
+          .map(({ path }) => path),
+      }).toEqual({
+        audioElements: 0,
+        browserEngineMounts: 0,
+        audioContexts: 0,
+        consumedStreamUrls: [],
+        browserStreamRequests: [],
+      })
+      expect(
+        await screen.findByRole('heading', {
+          name: 'Authoritative remote queue',
+        }),
+      ).toBeInTheDocument()
+      expect(screen.getByText('Position: 27 seconds')).toBeInTheDocument()
+      expect(screen.getByText('Next song — Test artist')).toBeInTheDocument()
+      expect(snapshotsRequested(transport)).toHaveLength(1)
+      expect(
+        screen.queryByRole('heading', { name: 'Retained local song' }),
+      ).not.toBeInTheDocument()
+      expect(
+        transport.requests.filter(
+          ({ path }) =>
+            path.startsWith('/api/jukebox/') && !path.includes('/session/'),
+        ),
+      ).toEqual([])
+    } finally {
+      unmount()
+      await act(async () => {})
+      config.enableReplayGain = originalReplayGain
+    }
   })
 })

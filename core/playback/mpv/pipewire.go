@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/navidrome/navidrome/conf"
@@ -56,6 +57,11 @@ type pipeWirePortPair struct {
 	input  pipeWireObject
 }
 
+type pipeWireFault struct {
+	generation string
+	err        error
+}
+
 type pipeWireOutput struct {
 	stream    pipeWireObject
 	sink      pipeWireObject
@@ -69,6 +75,14 @@ type pipeWireOutput struct {
 	cancel    context.CancelFunc
 	closeOnce sync.Once
 	closeErr  error
+
+	checkTimeout   time.Duration
+	checkGate      chan struct{}
+	observerCancel context.CancelFunc
+	observerDone   chan struct{}
+	expected       atomic.Bool
+	faultMu        sync.Mutex
+	fault          error
 }
 
 func pipeWireBluetoothTarget(deviceName string) string {
@@ -452,8 +466,148 @@ func (output *pipeWireOutput) write(ctx context.Context, command string) error {
 	return err
 }
 
+func (output *pipeWireOutput) arm(preparation, lifetime context.Context, faults chan<- pipeWireFault) error {
+	interval := conf.Server.Jukebox.OutputCheckInterval
+	output.checkTimeout = conf.Server.Jukebox.OutputCheckTimeout
+	if interval <= 0 || output.checkTimeout <= 0 {
+		return errors.New("Jukebox output check interval and timeout must be positive")
+	}
+	output.checkGate = make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(lifetime)
+	output.observerCancel = cancel
+	output.observerDone = make(chan struct{})
+	if err := output.checkSink(preparation); err != nil {
+		cancel()
+		close(output.observerDone)
+		return err
+	}
+	go func() {
+		defer close(output.observerDone)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := output.checkSink(ctx); err != nil {
+					if ctx.Err() != nil || output.expected.Load() {
+						return
+					}
+					select {
+					case faults <- pipeWireFault{generation: output.token, err: err}:
+					case <-ctx.Done():
+					}
+					return
+				}
+			}
+		}
+	}()
+	return nil
+}
+
+func (output *pipeWireOutput) latchFault(err error) {
+	output.faultMu.Lock()
+	defer output.faultMu.Unlock()
+	if output.fault == nil && !output.expected.Load() {
+		output.fault = err
+	}
+}
+
+func (output *pipeWireOutput) latchedFault() error {
+	output.faultMu.Lock()
+	defer output.faultMu.Unlock()
+	return output.fault
+}
+
+func (output *pipeWireOutput) ownerError() error {
+	select {
+	case <-output.owner.done:
+		return output.exitError("while owning the selected output")
+	default:
+		return nil
+	}
+}
+
+func (output *pipeWireOutput) checkSink(parent context.Context) (err error) {
+	ctx, cancel := context.WithTimeout(parent, output.checkTimeout)
+	defer cancel()
+	select {
+	case output.checkGate <- struct{}{}:
+	case <-ctx.Done():
+		if parent.Err() == nil {
+			output.latchFault(ctx.Err())
+		}
+		return ctx.Err()
+	}
+	defer func() { <-output.checkGate }()
+	// Latch before releasing the check gate so EOF cannot overtake a failed observation.
+	defer func() {
+		if err != nil && parent.Err() == nil {
+			output.latchFault(err)
+		}
+	}()
+	if output.expected.Load() {
+		return context.Canceled
+	}
+	if err := output.latchedFault(); err != nil {
+		return err
+	}
+	if err := output.ownerError(); err != nil {
+		return err
+	}
+	graph, err := pipeWireSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	sink, err := pipeWireNamedNode(graph, pipeWireProperty(output.sink, "node.name"), "Audio/Sink")
+	if err != nil {
+		return err
+	}
+	if sink.ID != output.sink.ID || pipeWireProperty(sink, "object.serial") != pipeWireProperty(output.sink, "object.serial") {
+		return errors.New("selected PipeWire output generation was replaced")
+	}
+	if sink.Info.State == "error" || sink.Info.Error != "" {
+		return fmt.Errorf("selected PipeWire output failed: %s", sink.Info.Error)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := output.ownerError(); err != nil {
+		return err
+	}
+	return output.latchedFault()
+}
+
+func (output *pipeWireOutput) acceptNaturalEnd(ctx context.Context) error {
+	if err := output.checkSink(ctx); err != nil {
+		return err
+	}
+	output.faultMu.Lock()
+	defer output.faultMu.Unlock()
+	if output.expected.Load() {
+		return context.Canceled
+	}
+	if output.fault != nil {
+		return output.fault
+	}
+	if err := output.ownerError(); err != nil {
+		output.fault = err
+		return err
+	}
+	output.expected.Store(true)
+	return nil
+}
+
 func (output *pipeWireOutput) close() error {
 	output.closeOnce.Do(func() {
+		output.expected.Store(true)
+		if output.observerCancel != nil {
+			output.observerCancel()
+		}
+		if output.observerDone != nil {
+			<-output.observerDone
+		}
 		defer func() {
 			if output.cancel != nil {
 				output.cancel()

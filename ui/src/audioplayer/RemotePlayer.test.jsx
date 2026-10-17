@@ -1,7 +1,8 @@
 import React from 'react'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import RemotePlayerPrototype from './RemotePlayer.prototype'
+import RemotePlayer from './RemotePlayer'
+import { remoteGainToUiVolume, uiVolumeToRemoteGain } from './volumeProfiles'
 
 const snapshot = {
   sessionStatus: {
@@ -43,15 +44,15 @@ const snapshot = {
   },
 }
 
-describe('<RemotePlayerPrototype />', () => {
+describe('<RemotePlayer />', () => {
   it('renders current track, queue, position, and gain from server snapshots', () => {
     const { container } = render(
-      <RemotePlayerPrototype snapshot={snapshot} onCommand={vi.fn()} />,
+      <RemotePlayer snapshot={snapshot} onCommand={vi.fn()} />,
     )
 
     expect(container.querySelector('audio')).toBeNull()
     expect(
-      screen.getByRole('heading', { name: 'Remote player prototype' }),
+      screen.getByRole('heading', { name: 'Remote player' }),
     ).toBeInTheDocument()
     expect(screen.getByText('Playing')).toBeInTheDocument()
     expect(
@@ -71,7 +72,9 @@ describe('<RemotePlayerPrototype />', () => {
     expect(screen.getByText('Position: 42 seconds')).toBeInTheDocument()
     expect(screen.getByText('Gain: 0.73')).toBeInTheDocument()
     expect(screen.getByRole('slider', { name: 'Seek' })).toHaveValue('42')
-    expect(screen.getByRole('slider', { name: 'Volume' })).toHaveValue('0.73')
+    expect(screen.getByRole('slider', { name: 'Volume' })).toHaveValue(
+      String(remoteGainToUiVolume(0.73, snapshot.sessionStatus)),
+    )
   })
 
   it('uses the server index when a media ID appears more than once in the queue', () => {
@@ -100,12 +103,7 @@ describe('<RemotePlayerPrototype />', () => {
     }
     const onCommand = vi.fn()
 
-    render(
-      <RemotePlayerPrototype
-        snapshot={repeatedSnapshot}
-        onCommand={onCommand}
-      />,
-    )
+    render(<RemotePlayer snapshot={repeatedSnapshot} onCommand={onCommand} />)
 
     const queueItems = within(
       screen.getByRole('list', { name: 'Queue' }),
@@ -141,12 +139,7 @@ describe('<RemotePlayerPrototype />', () => {
 
     const onCommand = vi.fn()
     const invalidSnapshot = { ...snapshot, sessionStatus }
-    render(
-      <RemotePlayerPrototype
-        snapshot={invalidSnapshot}
-        onCommand={onCommand}
-      />,
-    )
+    render(<RemotePlayer snapshot={invalidSnapshot} onCommand={onCommand} />)
 
     expect(
       screen.getByRole('heading', { name: 'Nothing playing' }),
@@ -167,7 +160,7 @@ describe('<RemotePlayerPrototype />', () => {
   it('sends explicit user playback and level commands without changing authority', () => {
     const onCommand = vi.fn()
     const { rerender } = render(
-      <RemotePlayerPrototype snapshot={snapshot} onCommand={onCommand} />,
+      <RemotePlayer snapshot={snapshot} onCommand={onCommand} />,
     )
 
     expect(onCommand).not.toHaveBeenCalled()
@@ -186,16 +179,17 @@ describe('<RemotePlayerPrototype />', () => {
       { type: 'pause' },
       { type: 'skip', index: 2, offset: 0 },
       { type: 'seek', position: 90 },
-      { type: 'volume', gain: 0.61 },
+      {
+        type: 'volume',
+        gain: uiVolumeToRemoteGain(0.61, snapshot.sessionStatus),
+      },
     ])
 
     const pausedSnapshot = {
       ...snapshot,
       sessionStatus: { ...snapshot.sessionStatus, playing: false },
     }
-    rerender(
-      <RemotePlayerPrototype snapshot={pausedSnapshot} onCommand={onCommand} />,
-    )
+    rerender(<RemotePlayer snapshot={pausedSnapshot} onCommand={onCommand} />)
     expect(onCommand).toHaveBeenCalledTimes(5)
     fireEvent.click(screen.getByRole('button', { name: 'Play' }))
     expect(onCommand).toHaveBeenNthCalledWith(6, { type: 'play' })
@@ -204,7 +198,7 @@ describe('<RemotePlayerPrototype />', () => {
   it('changes displayed playback state only when a server snapshot changes', () => {
     const onCommand = vi.fn()
     const { rerender } = render(
-      <RemotePlayerPrototype snapshot={snapshot} onCommand={onCommand} />,
+      <RemotePlayer snapshot={snapshot} onCommand={onCommand} />,
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Next' }))
@@ -223,7 +217,9 @@ describe('<RemotePlayerPrototype />', () => {
     expect(screen.getByText('Position: 42 seconds')).toBeInTheDocument()
     expect(screen.getByText('Gain: 0.73')).toBeInTheDocument()
     expect(screen.getByRole('slider', { name: 'Seek' })).toHaveValue('42')
-    expect(screen.getByRole('slider', { name: 'Volume' })).toHaveValue('0.73')
+    expect(screen.getByRole('slider', { name: 'Volume' })).toHaveValue(
+      String(remoteGainToUiVolume(0.73, snapshot.sessionStatus)),
+    )
 
     const nextSnapshot = {
       ...snapshot,
@@ -243,16 +239,16 @@ describe('<RemotePlayerPrototype />', () => {
         gain: 0.4,
       },
     }
-    rerender(
-      <RemotePlayerPrototype snapshot={nextSnapshot} onCommand={onCommand} />,
-    )
+    rerender(<RemotePlayer snapshot={nextSnapshot} onCommand={onCommand} />)
 
     expect(screen.getByText('Paused')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'So What' })).toBeInTheDocument()
     expect(screen.getByText('Position: 18 seconds')).toBeInTheDocument()
     expect(screen.getByText('Gain: 0.4')).toBeInTheDocument()
     expect(screen.getByRole('slider', { name: 'Seek' })).toHaveValue('18')
-    expect(screen.getByRole('slider', { name: 'Volume' })).toHaveValue('0.4')
+    expect(screen.getByRole('slider', { name: 'Volume' })).toHaveValue(
+      String(remoteGainToUiVolume(0.4, nextSnapshot.sessionStatus)),
+    )
     expect(onCommand).toHaveBeenCalledTimes(4)
   })
 
@@ -260,19 +256,13 @@ describe('<RemotePlayerPrototype />', () => {
     const onCommand = vi.fn()
     const renderPair = (currentSnapshot) => (
       <>
-        <RemotePlayerPrototype
-          snapshot={currentSnapshot}
-          onCommand={onCommand}
-        />
-        <RemotePlayerPrototype
-          snapshot={currentSnapshot}
-          onCommand={onCommand}
-        />
+        <RemotePlayer snapshot={currentSnapshot} onCommand={onCommand} />
+        <RemotePlayer snapshot={currentSnapshot} onCommand={onCommand} />
       </>
     )
     const { rerender, unmount } = render(renderPair(snapshot))
     const initialViews = screen.getAllByRole('region', {
-      name: 'Remote player prototype',
+      name: 'Remote player',
     })
 
     expect(initialViews).toHaveLength(2)
@@ -301,13 +291,11 @@ describe('<RemotePlayerPrototype />', () => {
       jukeboxPlaylist: { ...snapshot.jukeboxPlaylist, currentIndex: 2 },
     }
     rerender(renderPair(nextSnapshot))
-    screen
-      .getAllByRole('region', { name: 'Remote player prototype' })
-      .forEach((view) => {
-        expect(
-          within(view).getByRole('heading', { name: 'So What' }),
-        ).toBeInTheDocument()
-      })
+    screen.getAllByRole('region', { name: 'Remote player' }).forEach((view) => {
+      expect(
+        within(view).getByRole('heading', { name: 'So What' }),
+      ).toBeInTheDocument()
+    })
     expect(onCommand).toHaveBeenCalledTimes(1)
 
     window.dispatchEvent(new Event('pagehide'))
@@ -342,7 +330,7 @@ describe('<RemotePlayerPrototype />', () => {
       },
     }
     const remounted = render(
-      <RemotePlayerPrototype snapshot={freshSnapshot} onCommand={onCommand} />,
+      <RemotePlayer snapshot={freshSnapshot} onCommand={onCommand} />,
     )
 
     expect(

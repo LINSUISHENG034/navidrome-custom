@@ -38,10 +38,12 @@ type MpvTrack struct {
 	Exe            *Executor
 
 	ctx             context.Context
-	output          *pipeWireOutput
+	output          atomic.Pointer[pipeWireOutput]
+	outputFaults    chan pipeWireFault
 	closeOnce       sync.Once
 	eventOnce       sync.Once
 	retireRequested atomic.Bool
+	eofPending      atomic.Bool
 	positionMu      sync.RWMutex
 	lastPosition    int
 	hasLastPosition bool
@@ -77,6 +79,9 @@ func NewTrack(ctx context.Context, events chan<- model.PlaybackEvent, token mode
 	if target != "" {
 		if conf.Server.Jukebox.OutputPreparationTimeout <= 0 || conf.Server.Jukebox.OutputPollInterval <= 0 {
 			return nil, errors.New("Jukebox output preparation timeout and poll interval must be positive")
+		}
+		if conf.Server.Jukebox.OutputCheckInterval <= 0 || conf.Server.Jukebox.OutputCheckTimeout <= 0 {
+			return nil, errors.New("Jukebox output check interval and timeout must be positive")
 		}
 		var cancel context.CancelFunc
 		prepareCtx, cancel = context.WithTimeout(ctx, conf.Server.Jukebox.OutputPreparationTimeout)
@@ -118,26 +123,31 @@ func NewTrack(ctx context.Context, events chan<- model.PlaybackEvent, token mode
 		IPCSocketName:  tmpSocketName,
 		Exe:            &exe,
 		ctx:            ctx,
+		outputFaults:   make(chan pipeWireFault, 1),
 	}
 	if target != "" {
 		// Pulse stream creation waits for a peer, so establish links before AO readiness.
-		track.output, err = preparePipeWireOutput(prepareCtx, ctx, exe.cmd.Process.Pid, outputName, target)
+		output, err := preparePipeWireOutput(prepareCtx, ctx, exe.cmd.Process.Pid, outputName, target)
 		if err != nil {
 			track.terminate(false)
 			return nil, err
 		}
+		track.output.Store(output)
 	}
 	if err := track.waitForReadyContext(prepareCtx); err != nil {
 		track.terminate(false)
 		return nil, err
 	}
-	if track.output != nil {
+	if output := track.output.Load(); output != nil {
 		paused, err := conn.Call(prepareCtx, "get_property", "pause")
 		if err == nil && paused != true {
 			err = errors.New("Bluetooth output was not prepared paused")
 		}
 		if err == nil {
-			err = track.output.verify(prepareCtx)
+			err = output.verify(prepareCtx)
+		}
+		if err == nil {
+			err = output.arm(prepareCtx, ctx, track.outputFaults)
 		}
 		if err != nil {
 			track.terminate(false)
@@ -169,8 +179,8 @@ func (t *MpvTrack) waitForReadyContext(parent context.Context) error {
 		outputName, outputReady := output.(string)
 		format, paramsReady := params.(map[string]any)
 		if outputErr == nil && paramsErr == nil && outputReady && outputName != "" && paramsReady {
-			if t.output != nil {
-				if err := t.output.verifyFormat(format); err != nil {
+			if output := t.output.Load(); output != nil {
+				if err := output.verifyFormat(format); err != nil {
 					return err
 				}
 			}
@@ -200,29 +210,68 @@ func (t *MpvTrack) waitForReadyContext(parent context.Context) error {
 }
 
 func (t *MpvTrack) monitorEvents() {
-	for event := range t.Conn.Events() {
-		switch event.Name {
-		case "property-change":
-			if event.ID == positionObserver {
-				t.updatePosition(event.Data)
+	for {
+		output := t.output.Load()
+		var ownerDone <-chan struct{}
+		if output != nil {
+			ownerDone = output.owner.done
+		}
+		select {
+		case event, open := <-t.Conn.Events():
+			if !open {
+				err := t.Conn.Err()
+				if err == nil {
+					err = errors.New("mpv IPC closed without an end-file event")
+				}
+				t.finishFailure(err)
+				return
 			}
-		case "end-file":
-			t.handleEndFile(event)
+			switch event.Name {
+			case "property-change":
+				if event.ID == positionObserver {
+					t.updatePosition(event.Data)
+				}
+			case "end-file":
+				t.handleEndFile(event)
+				return
+			}
+		case fault := <-t.outputFaults:
+			current := t.output.Load()
+			if current == nil || fault.generation != current.token {
+				continue
+			}
+			t.finishFailure(fault.err)
+			return
+		case <-ownerDone:
+			if output != t.output.Load() {
+				continue
+			}
+			if t.retireRequested.Load() || t.ctx.Err() != nil {
+				t.finishFailure(nil)
+				return
+			}
+			err := output.ownerError()
+			output.latchFault(err)
+			t.finishFailure(err)
+			return
+		case <-t.ctx.Done():
+			t.finishFailure(t.ctx.Err())
 			return
 		}
 	}
+}
 
-	if t.retireRequested.Load() || t.ctx.Err() != nil {
-		t.terminate(false)
-		t.emitTerminal(model.PlaybackEventRetired, nil)
-		return
-	}
-	err := t.Conn.Err()
-	if err == nil {
-		err = errors.New("mpv IPC closed without an end-file event")
+func (t *MpvTrack) finishFailure(err error) {
+	retired := t.retireRequested.Load() || t.ctx.Err() != nil
+	if retired {
+		t.retireRequested.Store(true)
 	}
 	t.terminate(false)
-	t.emitTerminal(model.PlaybackEventFailure, err)
+	if retired {
+		t.emitTerminal(model.PlaybackEventRetired, nil)
+	} else {
+		t.emitTerminal(model.PlaybackEventFailure, err)
+	}
 }
 
 func (t *MpvTrack) handleEndFile(event ipcEvent) {
@@ -233,11 +282,23 @@ func (t *MpvTrack) handleEndFile(event ipcEvent) {
 		return
 	}
 	if event.Reason == "eof" {
+		if output := t.output.Load(); output != nil {
+			t.eofPending.Store(true)
+			if err := output.acceptNaturalEnd(t.ctx); err != nil {
+				t.finishFailure(err)
+				return
+			}
+			t.retireRequested.Store(true)
+			t.emitTerminal(model.PlaybackEventNaturalEnd, nil)
+			if err := output.close(); err != nil {
+				log.Error("Error retiring PipeWire output after natural end", err)
+			}
+			return
+		}
 		t.emitTerminal(model.PlaybackEventNaturalEnd, nil)
 		return
 	}
-	t.terminate(false)
-	t.emitTerminal(model.PlaybackEventFailure, fmt.Errorf("mpv ended track: %s", event.Reason))
+	t.finishFailure(fmt.Errorf("mpv ended track: %s", event.Reason))
 }
 
 func (t *MpvTrack) emitTerminal(kind model.PlaybackEventKind, err error) {
@@ -258,8 +319,8 @@ func (t *MpvTrack) emitTerminal(kind model.PlaybackEventKind, err error) {
 
 func (t *MpvTrack) terminate(graceful bool) {
 	t.closeOnce.Do(func() {
-		if t.output != nil {
-			if err := t.output.close(); err != nil {
+		if output := t.output.Load(); output != nil {
+			if err := output.close(); err != nil {
 				log.Error("Error retiring PipeWire output links", err)
 			}
 		}
@@ -339,18 +400,27 @@ func (t *MpvTrack) call(command ...any) (any, error) {
 	return t.Conn.Call(ctx, command...)
 }
 
+func (t *MpvTrack) reportProbeFailure(err error) {
+	if err == nil || strings.Contains(err.Error(), "mpv error: property unavailable") || t.retireRequested.Load() || t.eofPending.Load() {
+		return
+	}
+	if output := t.output.Load(); output != nil && output.expected.Load() {
+		return
+	}
+	t.finishFailure(err)
+}
+
 func (t *MpvTrack) reportCommandFailure(err error) {
-	if err == nil || strings.Contains(err.Error(), "mpv error: property unavailable") {
+	if err == nil || t.retireRequested.Load() {
 		return
 	}
-	if t.ctx.Err() != nil {
-		t.retireRequested.Store(true)
-		t.terminate(false)
-		t.emitTerminal(model.PlaybackEventRetired, nil)
-		return
+	if output := t.output.Load(); output != nil {
+		if output.expected.Load() {
+			return
+		}
+		output.latchFault(err)
 	}
-	t.terminate(false)
-	t.emitTerminal(model.PlaybackEventFailure, err)
+	t.finishFailure(err)
 }
 
 // Position returns the measured playback position rounded to the nearest second.
@@ -362,7 +432,7 @@ func (t *MpvTrack) Position() int {
 		}
 	} else if !strings.Contains(err.Error(), "mpv error: property unavailable") {
 		log.Error("Error getting position in track", "track", t, err)
-		t.reportCommandFailure(err)
+		t.reportProbeFailure(err)
 	}
 	return t.cachedPosition()
 }
@@ -409,7 +479,7 @@ func (t *MpvTrack) IsPlaying() bool {
 	pausing, err := t.call("get_property", "pause")
 	if err != nil {
 		log.Error("Problem getting paused status", "track", t, err)
-		t.reportCommandFailure(err)
+		t.reportProbeFailure(err)
 		return false
 	}
 	pause, ok := pausing.(bool)

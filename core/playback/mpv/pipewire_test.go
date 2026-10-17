@@ -23,6 +23,9 @@ import (
 )
 
 const pipewireFixtureTarget = "bluez_output.validation.a2dp-sink"
+const pipewireFixturePlaybackToken model.PlaybackToken = 71
+const pipewireFixtureRemovedTargetFile = "target-removed"
+const privatePipeWirePlaybackToken model.PlaybackToken = 91
 
 func TestMain(m *testing.M) {
 	if os.Getenv("ND_TEST_PIPEWIRE_DIRECTORY") != "" {
@@ -47,7 +50,7 @@ func TestPipeWireNewTrackRejectsUnlinkedTargetDespiteReadyDriver(t *testing.T) {
 }
 
 func TestPipeWireNewTrackCreatesOwnedChannelLinksBeforeReadyAndReleasesOnClose(t *testing.T) {
-	track, err, dir := newPipeWireFixtureTrack(t, "bindable-target")
+	track, err, dir, _ := newPipeWireFixtureTrack(t, "bindable-target")
 	if err != nil {
 		t.Fatalf("NewTrack could not prepare the available target through the external link executor: %v", err)
 	}
@@ -67,9 +70,72 @@ func TestPipeWireNewTrackRejectsStaticPartialStereoLayout(t *testing.T) {
 	assertPipeWireFixtureNeverPartiallyReady(t, "static-partial-channel")
 }
 
+func TestPipeWireNewTrackReportsPausedTargetLossAndRetiresOutput(t *testing.T) {
+	track, err, dir, events := newPipeWireFixtureTrack(t, "bindable-target")
+	if err != nil || track == nil {
+		t.Fatalf("prepare loaded paused output: track=%v error=%v", track, err)
+	}
+	if track.IsPlaying() {
+		t.Fatal("runtime-loss precondition requires a paused output")
+	}
+	assertPipeWireFixtureCompleteChannelLinks(t, dir)
+	original := map[string]int{}
+	for _, name := range []string{"mpv.pid", "pw-cli.pid"} {
+		pid := readPipeWireFixturePIDFile(t, dir, name)
+		if _, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid))); err != nil {
+			t.Fatalf("runtime-loss precondition requires the original %s process alive: %v", name, err)
+		}
+		original[name] = pid
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("output emitted a terminal event before the graph change: %+v", event)
+	default:
+	}
+	if err := os.WriteFile(filepath.Join(dir, pipewireFixtureRemovedTargetFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observation := time.NewTimer(time.Second)
+	defer observation.Stop()
+	for _, object := range readPipeWireFixtureGraph(t, dir) {
+		info, _ := object["info"].(map[string]any)
+		props, _ := info["props"].(map[string]any)
+		if object["type"] == "PipeWire:Interface:Node" && props["node.name"] == pipewireFixtureTarget {
+			t.Fatal("external graph fixture did not remove the selected target")
+		}
+	}
+	failed := false
+	for {
+		select {
+		case event := <-events:
+			if event.Token != pipewireFixturePlaybackToken {
+				t.Fatalf("output loss reported another generation's token: %+v", event)
+			}
+			if event.Kind == model.PlaybackEventNaturalEnd {
+				t.Fatal("selected target loss was incorrectly reported as natural end")
+			}
+			if event.Kind != model.PlaybackEventFailure {
+				t.Fatalf("selected target loss did not report an output failure: %+v", event)
+			}
+			failed = true
+		case <-observation.C:
+			if !failed {
+				t.Fatal("selected target loss was not reported as a playback failure within 1s")
+			}
+			for name, pid := range original {
+				if actual := readPipeWireFixturePIDFile(t, dir, name); actual != pid {
+					t.Fatalf("output loss autonomously restarted %s: original=%d replacement=%d", name, pid, actual)
+				}
+			}
+			assertPipeWireFixtureReleased(t, dir, true)
+			return
+		}
+	}
+}
+
 func assertPipeWireFixtureNeverPartiallyReady(t *testing.T, scenario string) {
 	t.Helper()
-	track, err, dir := newPipeWireFixtureTrack(t, scenario)
+	track, err, dir, _ := newPipeWireFixtureTrack(t, scenario)
 	if err != nil {
 		if track != nil {
 			t.Fatal("failed partial-stereo preparation returned an active track")
@@ -126,7 +192,7 @@ func assertPipeWireFixtureReleased(t *testing.T, dir string, requireOwner bool) 
 
 func assertPipeWirePreparationRejected(t *testing.T, scenario, admissionFailure string) {
 	t.Helper()
-	track, err, dir := newPipeWireFixtureTrack(t, scenario)
+	track, err, dir, _ := newPipeWireFixtureTrack(t, scenario)
 	if err == nil {
 		if track != nil {
 			track.Close()
@@ -139,7 +205,7 @@ func assertPipeWirePreparationRejected(t *testing.T, scenario, admissionFailure 
 	assertPipeWireFixtureProcessRetired(t, dir, "mpv.pid")
 }
 
-func newPipeWireFixtureTrack(t *testing.T, scenario string) (*MpvTrack, error, string) {
+func newPipeWireFixtureTrack(t *testing.T, scenario string) (*MpvTrack, error, string, <-chan model.PlaybackEvent) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("PipeWire output and process retirement observations require Linux")
@@ -147,20 +213,22 @@ func newPipeWireFixtureTrack(t *testing.T, scenario string) (*MpvTrack, error, s
 	t.Cleanup(configtest.SetupConfig())
 	conf.Server.Jukebox.OutputPreparationTimeout = 3 * time.Second
 	conf.Server.Jukebox.OutputPollInterval = 10 * time.Millisecond
+	conf.Server.Jukebox.OutputCheckInterval = 10 * time.Millisecond
+	conf.Server.Jukebox.OutputCheckTimeout = 100 * time.Millisecond
 	dir := configurePipeWireFixture(t, scenario)
 	conf.Server.MPVCmdTemplate = "mpv --no-config --ao=pulse --audio-device=%d --pause --input-ipc-server=%s %f"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 	events := make(chan model.PlaybackEvent, 4)
-	track, err := NewTrack(ctx, events, 71, "pulse/"+pipewireFixtureTarget, model.MediaFile{
+	track, err := NewTrack(ctx, events, pipewireFixturePlaybackToken, "pulse/"+pipewireFixtureTarget, model.MediaFile{
 		ID: "missing-output", Path: filepath.Join(dir, "not-decoded.wav"),
 	})
 	if track != nil {
 		t.Cleanup(track.Close)
 	}
 	t.Cleanup(func() { assertPipeWireFixtureSafeCommands(t, dir) })
-	return track, err, dir
+	return track, err, dir, events
 }
 
 func configurePipeWireFixture(t *testing.T, scenario string) string {
@@ -194,6 +262,57 @@ func resetPipeWireTestMPVCache(t *testing.T) {
 }
 
 func TestPipeWirePrivateOutput(t *testing.T) {
+	fixture := newPrivatePipeWireFixture(t)
+	fixture.closeAndAssertRetired(t)
+}
+
+func TestPipeWirePrivateEOF(t *testing.T) {
+	fixture := newPrivatePipeWireFixture(t)
+	fixture.track.SetVolume(0.05)
+	fixture.track.Unpause()
+	started := time.Now()
+	deadline := time.NewTimer(8 * time.Second)
+	defer deadline.Stop()
+	progress := time.NewTicker(50 * time.Millisecond)
+	defer progress.Stop()
+	maxPosition := 0
+	for {
+		select {
+		case event := <-fixture.events:
+			if event.Token != privatePipeWirePlaybackToken {
+				t.Fatalf("private EOF reported another playback token: %+v", event)
+			}
+			if event.Kind != model.PlaybackEventNaturalEnd {
+				t.Fatalf("normal private playback was not reported as natural EOF: %+v", event)
+			}
+			if position := fixture.track.Position(); position > maxPosition {
+				maxPosition = position
+			}
+			if maxPosition < 1 || time.Since(started) < time.Second {
+				t.Fatalf("private EOF lacks meaningful public clock progress: position=%d elapsed=%v", maxPosition, time.Since(started))
+			}
+			fixture.closeAndAssertRetired(t)
+			return
+		case <-progress.C:
+			if position := fixture.track.Position(); position > maxPosition {
+				maxPosition = position
+			}
+		case <-deadline.C:
+			t.Fatalf("private playback did not reach natural EOF within 8s: position=%d", maxPosition)
+		}
+	}
+}
+
+type privatePipeWireFixture struct {
+	root        string
+	track       *MpvTrack
+	events      <-chan model.PlaybackEvent
+	streamName  string
+	outputToken string
+}
+
+func newPrivatePipeWireFixture(t *testing.T) *privatePipeWireFixture {
+	t.Helper()
 	if os.Getenv("ND_TEST_PRIVATE_PIPEWIRE") != "1" {
 		t.Skip("set ND_TEST_PRIVATE_PIPEWIRE=1 only after reviewing the private-daemon safety contract")
 	}
@@ -285,11 +404,13 @@ func TestPipeWirePrivateOutput(t *testing.T) {
 	conf.Server.MPVCmdTemplate = "mpv --no-config --load-scripts=no --no-video --vo=null --ao=pulse --audio-device=%d --pause --audio-channels=stereo --audio-samplerate=48000 --input-ipc-server=%s %f"
 	conf.Server.Jukebox.OutputPreparationTimeout = 3 * time.Second
 	conf.Server.Jukebox.OutputPollInterval = 10 * time.Millisecond
+	conf.Server.Jukebox.OutputCheckInterval = 500 * time.Millisecond
+	conf.Server.Jukebox.OutputCheckTimeout = time.Second
 	resetPipeWireTestMPVCache(t)
 	ctx, cancel := context.WithTimeout(lifetime, 10*time.Second)
 	t.Cleanup(cancel)
 	events := make(chan model.PlaybackEvent, 4)
-	track, err := NewTrack(ctx, events, 91, "pulse/"+target, model.MediaFile{ID: "private-output", Path: wav})
+	track, err := NewTrack(ctx, events, privatePipeWirePlaybackToken, "pulse/"+target, model.MediaFile{ID: "private-output", Path: wav})
 	if err != nil {
 		t.Fatalf("private protocol preparation failed: %v", err)
 	}
@@ -312,15 +433,20 @@ func TestPipeWirePrivateOutput(t *testing.T) {
 			}
 		}
 	}
-	track.Close()
+	return &privatePipeWireFixture{root: root, track: track, events: events, streamName: streamName, outputToken: token}
+}
+
+func (fixture *privatePipeWireFixture) closeAndAssertRetired(t *testing.T) {
+	t.Helper()
+	fixture.track.Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		retired := true
-		for _, object := range privatePipeWireGraph(t, root) {
+		for _, object := range privatePipeWireGraph(t, fixture.root) {
 			info, _ := object["info"].(map[string]any)
 			props, _ := info["props"].(map[string]any)
-			if (object["type"] == "PipeWire:Interface:Node" && props["node.name"] == streamName) ||
-				(object["type"] == "PipeWire:Interface:Link" && props["navidrome.output-token"] == token) {
+			if (object["type"] == "PipeWire:Interface:Node" && props["node.name"] == fixture.streamName) ||
+				(object["type"] == "PipeWire:Interface:Link" && props["navidrome.output-token"] == fixture.outputToken) {
 				retired = false
 			}
 		}
@@ -716,7 +842,11 @@ func TestPipeWireProcessFixture(t *testing.T) {
 		for index, channel := range outputChannels {
 			graph = append(graph, pipewireFixturePort(11+index, 10, "output", "output_"+channel, channel))
 		}
-		if scenario != "missing-target" {
+		_, removedErr := os.Stat(filepath.Join(dir, pipewireFixtureRemovedTargetFile))
+		if removedErr != nil && !errors.Is(removedErr, os.ErrNotExist) {
+			t.Fatal(removedErr)
+		}
+		if scenario != "missing-target" && errors.Is(removedErr, os.ErrNotExist) {
 			graph = append(graph, map[string]any{
 				"id": 30, "type": "PipeWire:Interface:Node", "info": map[string]any{"props": map[string]any{
 					"object.serial": 130, "node.name": pipewireFixtureTarget, "media.class": "Audio/Sink",
@@ -725,8 +855,8 @@ func TestPipeWireProcessFixture(t *testing.T) {
 			for index, channel := range []string{"FL", "FR"} {
 				graph = append(graph, pipewireFixturePort(31+index, 30, "input", "playback_"+channel, channel))
 			}
+			graph = append(graph, readPipeWireFixtureLinks(t, dir)...)
 		}
-		graph = append(graph, readPipeWireFixtureLinks(t, dir)...)
 		if err := json.NewEncoder(os.Stdout).Encode(graph); err != nil {
 			t.Fatal(err)
 		}

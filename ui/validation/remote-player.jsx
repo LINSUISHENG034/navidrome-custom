@@ -4,7 +4,7 @@ import { Provider } from 'react-redux'
 import { combineReducers, createStore } from 'redux'
 import { activityReducer } from '../src/reducers/activityReducer'
 import { playerReducer } from '../src/reducers/playerReducer'
-import RemotePlayerControllerPrototype from '../src/audioplayer/RemotePlayer.controller.prototype'
+import RemotePlayerController from '../src/audioplayer/RemotePlayerController'
 import { startEventStream } from '../src/eventStream'
 import config from '../src/config'
 
@@ -32,9 +32,11 @@ if (!localStorage.getItem('is-authenticated')) {
       ReactDOM.render(
         <Provider store={store}>
           <main>
-            <h1>Remote player prototype validation</h1>
-            <p>Validation-only entry; the default application route is unchanged.</p>
-            <RemotePlayerControllerPrototype
+            <h1>Remote player validation</h1>
+            <p>
+              Validation-only entry; the default application route is unchanged.
+            </p>
+            <RemotePlayerController
               sessionId={sessionId}
               clientId={clientId}
               deviceName={deviceName}
