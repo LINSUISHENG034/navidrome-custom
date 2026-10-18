@@ -466,6 +466,19 @@ var _ = Describe("Configuration", func() {
 		})
 	})
 
+	Describe("Jukebox Bluetooth Management", func() {
+		It("defaults to disabled", func() {
+			conf.Load(true)
+			Expect(conf.Server.Jukebox.BluetoothManagement).To(BeFalse())
+		})
+
+		It("loads explicit bluetooth management setting", func() {
+			viper.Set("jukebox.bluetoothmanagement", true)
+			conf.Load(true)
+			Expect(conf.Server.Jukebox.BluetoothManagement).To(BeTrue())
+		})
+	})
+
 	DescribeTable("should load configuration from",
 		func(format string) {
 			filename := filepath.Join("testdata", "cfg."+format)
