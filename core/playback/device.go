@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/navidrome/navidrome/core/playback/mpv"
 	"github.com/navidrome/navidrome/log"
@@ -46,6 +47,7 @@ type playbackDevice struct {
 	preparing             sync.WaitGroup
 	retiring              bool
 	recoveryPosition      *int
+	failureReason         string
 }
 
 type DeviceStatus struct {
@@ -96,6 +98,12 @@ func (pd *playbackDevice) getStatus() DeviceStatus {
 		Position:     pos,
 		QueueVersion: pd.queueVersion,
 	}
+}
+
+func (pd *playbackDevice) FailureReason() string {
+	pd.mu.Lock()
+	defer pd.mu.Unlock()
+	return pd.failureReason
 }
 
 // NewPlaybackDevice creates a new playback device which implements all the basic Jukebox mode commands defined here:
@@ -527,17 +535,51 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 	switch event.Kind {
 	case model.PlaybackEventNaturalEnd:
 		pd.recoveryPosition = nil
+		pd.failureReason = ""
 		pd.retireActiveTrackLocked()
 		if !pd.PlaybackQueue.IsAtLastElement() {
 			pd.PlaybackQueue.IncreaseIndex()
 			idx := pd.PlaybackQueue.Index
 			log.Debug("Switching to next song", "index", idx)
-			track, token, current, err := pd.loadTrackLocked(pd.serviceCtx, idx)
+
+			var (
+				track   Track
+				token   model.PlaybackToken
+				current bool
+				err     error
+			)
+			const maxNaturalEndRetries = 2
+			for attempt := 0; attempt <= maxNaturalEndRetries; attempt++ {
+				if attempt > 0 {
+					pd.mu.Unlock()
+					select {
+					case <-time.After(time.Duration(attempt*250) * time.Millisecond):
+					case <-pd.serviceCtx.Done():
+						pd.mu.Lock()
+						break
+					}
+					pd.mu.Lock()
+					if pd.retiring || pd.serviceCtx.Err() != nil || pd.PlaybackQueue.Index != idx {
+						break
+					}
+				}
+				track, token, current, err = pd.loadTrackLocked(pd.serviceCtx, idx)
+				if err == nil && current {
+					break
+				}
+				if errors.Is(err, context.Canceled) || !current {
+					break
+				}
+				log.Warn("Transient error switching track on natural end, will retry", "attempt", attempt+1, "error", err)
+			}
+
 			if err != nil || !current {
-				if err != nil {
-					log.Error("Error switching track", err)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Error("Error switching track after retries", err)
+					pd.failureReason = "track_switch_failed"
 				}
 			} else {
+				pd.failureReason = ""
 				pd.assignTrack(track, token)
 				if pd.ActiveTrack != nil {
 					pd.ActiveTrack.Unpause()
@@ -554,6 +596,7 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 		}
 		if event.Kind == model.PlaybackEventFailure {
 			log.Error("Playback output failed", "token", event.Token, "positionKnown", event.Position != nil, event.Err)
+			pd.failureReason = "output_failed"
 		}
 		pd.retireActiveTrackLocked()
 		notify = pd.stateChangeNotifierLocked()

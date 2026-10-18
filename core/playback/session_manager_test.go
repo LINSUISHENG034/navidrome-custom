@@ -50,8 +50,12 @@ func TestSessionManager_DetachSuccess(t *testing.T) {
 		t.Fatalf("detach failed: %v", err)
 	}
 
-	if _, ok := mgr.Get("s1"); ok {
-		t.Fatal("session should not exist after detach")
+	sess, ok := mgr.Get("s1")
+	if !ok {
+		t.Fatal("session should still exist in detached state after client detach for recovery")
+	}
+	if sess.OwnershipState != SessionOwnershipDetached || sess.OwnerClientID != "" {
+		t.Fatalf("unexpected detached session state: %#v", sess)
 	}
 }
 

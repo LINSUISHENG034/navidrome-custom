@@ -131,8 +131,19 @@ func (sm *SessionManager) DetachSnapshot(sessionID, clientID string) (Session, e
 		return Session{}, ErrSessionOwnership
 	}
 
+	snapshot := session
+	now := sm.now().UTC()
+	session.OwnerClientID = ""
+	session.OwnershipState = SessionOwnershipDetached
+	session.StaleSince = &now
+	sm.sessions[sessionID] = session
+	return snapshot, nil
+}
+
+func (sm *SessionManager) Delete(sessionID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	delete(sm.sessions, sessionID)
-	return session, nil
 }
 
 func (sm *SessionManager) Get(sessionID string) (Session, bool) {
@@ -211,7 +222,7 @@ func (sm *SessionManager) ReapExpired() (transitioned []Session, expired []Sessi
 			continue
 		}
 
-		if session.OwnershipState == SessionOwnershipRecovering && session.StaleSince != nil && sm.maxStale > 0 && now.Sub(*session.StaleSince) > sm.maxStale {
+		if (session.OwnershipState == SessionOwnershipRecovering || session.OwnershipState == SessionOwnershipDetached) && session.StaleSince != nil && sm.maxStale > 0 && now.Sub(*session.StaleSince) > sm.maxStale {
 			delete(sm.sessions, id)
 			expired = append(expired, session)
 		}

@@ -607,6 +607,100 @@ func TestPlaybackDeviceCancelledStartDoesNotDisplaceSuccessor(t *testing.T) {
 	testPlaybackDeviceCancelsPendingStart(t, (*playbackDevice).Stop, true)
 }
 
+func TestPlaybackDeviceNaturalAdvanceRetriesTransientErrorAndSucceeds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mediaFiles := map[string]model.MediaFile{
+		"1": {ID: "1", Path: "/1.mp3"},
+		"2": {ID: "2", Path: "/2.mp3"},
+	}
+	stub := &sessionStatusStubServer{mediaFiles: mediaFiles}
+	device := NewPlaybackDevice(ctx, stub, "Speaker", "auto")
+	if _, err := device.Add(ctx, []string{"1", "2"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	previousNewTrack := newTrack
+	attempts := 0
+	newTrack = func(ctx context.Context, events chan<- model.PlaybackEvent, token model.PlaybackToken, deviceName string, mf model.MediaFile) (Track, error) {
+		if mf.ID == "2" {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("transient PipeWire link error")
+			}
+		}
+		return &mockTrack{playing: true}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+
+	if status, err := device.Start(ctx); err != nil || !status.Playing {
+		t.Fatalf("initial start failed: %#v, %v", status, err)
+	}
+
+	// Trigger natural end of track 1
+	device.PlaybackEvents <- model.PlaybackEvent{
+		Token: device.activePlaybackToken,
+		Kind:  model.PlaybackEventNaturalEnd,
+	}
+
+	// Wait for retry to succeed and device to advance to track 2
+	waitDeviceStatus(t, device, ctx, DeviceStatus{
+		CurrentIndex: 1,
+		Playing:      true,
+		Gain:         DefaultGain,
+		Position:     0,
+		QueueVersion: 1,
+	})
+	if attempts < 2 {
+		t.Fatalf("expected at least 2 attempts for track 2 (retry), got %d", attempts)
+	}
+}
+
+func TestPlaybackDeviceNaturalAdvanceReportsFailureAfterRetriesExhausted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mediaFiles := map[string]model.MediaFile{
+		"1": {ID: "1", Path: "/1.mp3"},
+		"2": {ID: "2", Path: "/2.mp3"},
+	}
+	stub := &sessionStatusStubServer{mediaFiles: mediaFiles}
+	device := NewPlaybackDevice(ctx, stub, "Speaker", "auto")
+	if _, err := device.Add(ctx, []string{"1", "2"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	previousNewTrack := newTrack
+	newTrack = func(ctx context.Context, events chan<- model.PlaybackEvent, token model.PlaybackToken, deviceName string, mf model.MediaFile) (Track, error) {
+		if mf.ID == "2" {
+			return nil, errors.New("persistent output error")
+		}
+		return &mockTrack{playing: true}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+
+	if status, err := device.Start(ctx); err != nil || !status.Playing {
+		t.Fatalf("initial start failed: %#v, %v", status, err)
+	}
+
+	// Trigger natural end of track 1
+	device.PlaybackEvents <- model.PlaybackEvent{
+		Token: device.activePlaybackToken,
+		Kind:  model.PlaybackEventNaturalEnd,
+	}
+
+	// Wait for retries to be exhausted and device to report failure
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := device.Status(ctx)
+		if err == nil && status.CurrentIndex == 1 && !status.Playing && device.FailureReason() == "track_switch_failed" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	status, _ := device.Status(ctx)
+	t.Fatalf("expected track_switch_failed after retries exhausted, got: %#v, reason=%s", status, device.FailureReason())
+}
+
 var _ = Describe("playbackDevice concurrency", func() {
 	It("handles concurrent Status and Clear calls without panic", func() {
 		pd := &playbackDevice{
