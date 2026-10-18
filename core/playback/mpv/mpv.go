@@ -15,12 +15,16 @@ import (
 	"github.com/navidrome/navidrome/utils/shellquote"
 )
 
-func start(ctx context.Context, args []string) (Executor, error) {
+func start(ctx context.Context, args []string, environment ...string) (Executor, error) {
+	return startWithInput(ctx, args, nil, nil, environment...)
+}
+
+func startWithInput(ctx context.Context, args []string, input io.Reader, errorOutput io.Writer, environment ...string) (Executor, error) {
 	if len(args) == 0 {
 		return Executor{}, fmt.Errorf("no command arguments provided")
 	}
 	log.Debug("Executing mpv command", "cmd", args)
-	j := Executor{args: args}
+	j := Executor{args: args, input: input, errorOutput: errorOutput, environment: environment, done: make(chan struct{})}
 	j.PipeReader, j.out = io.Pipe()
 	err := j.start(ctx)
 	if err != nil {
@@ -37,17 +41,51 @@ func (j *Executor) Cancel() error {
 	return fmt.Errorf("there is non command to cancel")
 }
 
+// Stop cancels the subprocess and waits for it to exit or for ctx to expire.
+func (j *Executor) Stop(ctx context.Context) error {
+	if j.cmd == nil {
+		return fmt.Errorf("there is no command to stop")
+	}
+	if err := j.Cancel(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return j.Wait(ctx)
+}
+
+// Wait blocks until the subprocess exits or ctx expires.
+func (j *Executor) Wait(ctx context.Context) error {
+	if j.done == nil {
+		return fmt.Errorf("there is no command to wait for")
+	}
+	select {
+	case <-j.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 type Executor struct {
 	*io.PipeReader
-	out  *io.PipeWriter
-	args []string
-	cmd  *exec.Cmd
+	out         *io.PipeWriter
+	args        []string
+	input       io.Reader
+	errorOutput io.Writer
+	environment []string
+	cmd         *exec.Cmd
+	done        chan struct{}
 }
 
 func (j *Executor) start(ctx context.Context) error {
 	cmd := exec.CommandContext(ctx, j.args[0], j.args[1:]...) // #nosec
+	if len(j.environment) != 0 {
+		cmd.Env = append(cmd.Environ(), j.environment...)
+	}
+	cmd.Stdin = j.input
 	cmd.Stdout = j.out
-	if log.IsGreaterOrEqualTo(log.LevelTrace) {
+	if j.errorOutput != nil {
+		cmd.Stderr = j.errorOutput
+	} else if log.IsGreaterOrEqualTo(log.LevelTrace) {
 		cmd.Stderr = os.Stderr
 	} else {
 		cmd.Stderr = io.Discard
@@ -61,6 +99,7 @@ func (j *Executor) start(ctx context.Context) error {
 }
 
 func (j *Executor) wait() {
+	defer close(j.done)
 	if err := j.cmd.Wait(); err != nil {
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			_ = j.out.CloseWithError(fmt.Errorf("%s exited with non-zero status code: %d", j.args[0], exitErr.ExitCode()))

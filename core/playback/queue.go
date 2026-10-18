@@ -3,6 +3,7 @@ package playback
 import (
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 
 	"github.com/navidrome/navidrome/log"
@@ -44,7 +45,7 @@ func (pd *Queue) Current() *model.MediaFile {
 
 // returns the whole queue
 func (pd *Queue) Get() model.MediaFiles {
-	return pd.Items
+	return slices.Clone(pd.Items)
 }
 
 func (pd *Queue) Size() int {
@@ -69,45 +70,104 @@ func (pd *Queue) Add(items model.MediaFiles) {
 	}
 }
 
+// Insert adds mediafiles at a specific index while keeping the current track pointer stable.
+func (pd *Queue) Insert(index int, items model.MediaFiles) {
+	if len(items) == 0 {
+		return
+	}
+
+	index = max(0, min(index, len(pd.Items)))
+	newItems := make(model.MediaFiles, 0, len(pd.Items)+len(items))
+	newItems = append(newItems, pd.Items[:index]...)
+	newItems = append(newItems, items...)
+	newItems = append(newItems, pd.Items[index:]...)
+	pd.Items = newItems
+
+	if pd.Index == -1 {
+		pd.Index = 0
+		return
+	}
+	if pd.Index >= index {
+		pd.Index += len(items)
+	}
+}
+
 // empties whole queue
 func (pd *Queue) Clear() {
 	pd.Index = -1
 	pd.Items = nil
 }
 
+// Move moves a track from fromIndex to toIndex, adjusting the current index
+// to continue pointing at the same track instance even when IDs repeat.
+func (pd *Queue) Move(fromIndex, toIndex int) {
+	if fromIndex == toIndex {
+		return
+	}
+	if fromIndex < 0 || fromIndex >= len(pd.Items) || toIndex < 0 || toIndex >= len(pd.Items) {
+		return
+	}
+
+	currentIndex := pd.Index
+	item := pd.Items[fromIndex]
+	remaining := make(model.MediaFiles, 0, len(pd.Items)-1)
+	remaining = append(remaining, pd.Items[:fromIndex]...)
+	remaining = append(remaining, pd.Items[fromIndex+1:]...)
+
+	newItems := make(model.MediaFiles, 0, len(pd.Items))
+	newItems = append(newItems, remaining[:toIndex]...)
+	newItems = append(newItems, item)
+	newItems = append(newItems, remaining[toIndex:]...)
+	pd.Items = newItems
+
+	switch {
+	case currentIndex == fromIndex:
+		pd.Index = toIndex
+	case fromIndex < currentIndex && currentIndex <= toIndex:
+		pd.Index = currentIndex - 1
+	case toIndex <= currentIndex && currentIndex < fromIndex:
+		pd.Index = currentIndex + 1
+	}
+}
+
 // idx Zero-based index of the song to skip to or remove.
 func (pd *Queue) Remove(idx int) {
-	current := pd.Current()
-	backupID := ""
-	if current != nil {
-		backupID = current.ID
+	if idx < 0 || idx >= len(pd.Items) {
+		return
 	}
 
 	pd.Items = append(pd.Items[:idx], pd.Items[idx+1:]...)
 
-	var err error
-	pd.Index, err = pd.getMediaFileIndexByID(backupID)
-	if err != nil {
-		// we seem to have deleted the current id, setting to default:
+	switch {
+	case pd.Index == idx:
 		pd.Index = -1
+	case pd.Index > idx:
+		pd.Index--
 	}
 }
 
 func (pd *Queue) Shuffle() {
+	currentIndex := pd.Index
 	current := pd.Current()
-	backupID := ""
+	currentPath := ""
 	if current != nil {
-		backupID = current.ID
+		currentPath = current.Path
 	}
 
 	//nolint:gosec // shuffle order is not a security decision
 	rand.Shuffle(len(pd.Items), func(i, j int) { pd.Items[i], pd.Items[j] = pd.Items[j], pd.Items[i] })
 
-	var err error
-	pd.Index, err = pd.getMediaFileIndexByID(backupID)
-	if err != nil {
-		log.Error("Could not find ID while shuffling: %s", backupID)
+	if currentIndex == -1 || currentPath == "" {
+		return
 	}
+	for idx, item := range pd.Items {
+		if item.Path == currentPath {
+			pd.Index = idx
+			return
+		}
+	}
+	log.Error("Could not find current track while shuffling", "path", currentPath)
+	pd.Index = -1
 }
 
 func (pd *Queue) getMediaFileIndexByID(id string) (int, error) {

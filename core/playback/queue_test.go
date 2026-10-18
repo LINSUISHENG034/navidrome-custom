@@ -118,4 +118,107 @@ var _ = Describe("Queues", func() {
 		})
 	})
 
+	Describe("Move operation", func() {
+		BeforeEach(func() {
+			mfs := model.MediaFiles{
+				{ID: "1", Path: "/a.mp3"},
+				{ID: "2", Path: "/b.mp3"},
+				{ID: "3", Path: "/c.mp3"},
+				{ID: "4", Path: "/d.mp3"},
+			}
+			queue.Add(mfs)
+			queue.SetIndex(1) // currently playing ID "2"
+		})
+
+		It("moves a track forward without affecting current", func() {
+			queue.Move(0, 2) // move ID "1" from 0 to 2
+			Expect(queue.Items[0].ID).To(Equal("2"))
+			Expect(queue.Items[1].ID).To(Equal("3"))
+			Expect(queue.Items[2].ID).To(Equal("1"))
+			Expect(queue.Items[3].ID).To(Equal("4"))
+			Expect(queue.Index).To(Equal(0))
+		})
+
+		It("moves a track backward without affecting current", func() {
+			queue.Move(3, 0) // move ID "4" from 3 to 0
+			Expect(queue.Items[0].ID).To(Equal("4"))
+			Expect(queue.Items[1].ID).To(Equal("1"))
+			Expect(queue.Items[2].ID).To(Equal("2"))
+			Expect(queue.Items[3].ID).To(Equal("3"))
+			Expect(queue.Index).To(Equal(2))
+		})
+
+		It("moves the current track itself", func() {
+			queue.Move(1, 3) // move current ID "2" from 1 to 3
+			Expect(queue.Items[3].ID).To(Equal("2"))
+			Expect(queue.Index).To(Equal(3))
+		})
+	})
+
+	Describe("Remove with index adjustment", func() {
+		BeforeEach(func() {
+			mfs := model.MediaFiles{
+				{ID: "1", Path: "/a.mp3"},
+				{ID: "2", Path: "/b.mp3"},
+				{ID: "3", Path: "/c.mp3"},
+			}
+			queue.Add(mfs)
+			queue.SetIndex(2) // currently playing ID "3"
+		})
+
+		It("adjusts index when removing before current", func() {
+			queue.Remove(0) // remove ID "1"
+			Expect(queue.Size()).To(Equal(2))
+			Expect(queue.Index).To(Equal(1))
+			Expect(queue.Current().ID).To(Equal("3"))
+		})
+
+		It("sets index to -1 when removing the current track", func() {
+			queue.Remove(2) // remove current ID "3"
+			Expect(queue.Size()).To(Equal(2))
+			Expect(queue.Index).To(Equal(-1))
+		})
+	})
+
+})
+
+var _ = Describe("Queue operations with duplicate IDs", func() {
+	var queue *Queue
+
+	BeforeEach(func() {
+		queue = NewQueue()
+	})
+
+	It("inserts tracks at a requested index", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a.mp3"}, {ID: "c", Path: "/c.mp3"}})
+
+		queue.Insert(1, model.MediaFiles{{ID: "b", Path: "/b.mp3"}})
+
+		Expect(queue.Items).To(HaveLen(3))
+		Expect(queue.Items[0].ID).To(Equal("a"))
+		Expect(queue.Items[1].ID).To(Equal("b"))
+		Expect(queue.Items[2].ID).To(Equal("c"))
+	})
+
+	It("keeps the current duplicate instance when removing before it", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a1.mp3"}, {ID: "b", Path: "/b.mp3"}, {ID: "a", Path: "/a2.mp3"}})
+		queue.SetIndex(2)
+
+		queue.Remove(1)
+
+		Expect(queue.Index).To(Equal(1))
+		Expect(queue.Current()).ToNot(BeNil())
+		Expect(queue.Current().Path).To(Equal("/a2.mp3"))
+	})
+
+	It("keeps the current duplicate instance when moving another track", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a1.mp3"}, {ID: "b", Path: "/b.mp3"}, {ID: "a", Path: "/a2.mp3"}, {ID: "c", Path: "/c.mp3"}})
+		queue.SetIndex(2)
+
+		queue.Move(3, 1)
+
+		Expect(queue.Index).To(Equal(3))
+		Expect(queue.Current()).ToNot(BeNil())
+		Expect(queue.Current().Path).To(Equal("/a2.mp3"))
+	})
 })
