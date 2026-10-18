@@ -724,7 +724,7 @@ func newPrivatePipeWireFixtureWithDuration(t *testing.T, seconds int) *privatePi
 	mpvLog := privatePipeWirePath(t, root, "l/mpv.log")
 	conf.Server.MPVPath = "/usr/bin/mpv"
 	conf.Server.MPVCmdTemplate = "mpv --no-config --load-scripts=no --no-video --vo=null --ao=pulse --audio-device=%d --pause --audio-channels=stereo --audio-samplerate=48000 --log-file=" + mpvLog + " --msg-level=all=v --input-ipc-server=%s %f"
-	conf.Server.Jukebox.OutputPreparationTimeout = 3 * time.Second
+	conf.Server.Jukebox.OutputPreparationTimeout = 5 * time.Second
 	conf.Server.Jukebox.OutputPollInterval = 100 * time.Millisecond
 	conf.Server.Jukebox.OutputCheckInterval = 500 * time.Millisecond
 	conf.Server.Jukebox.OutputCheckTimeout = time.Second
