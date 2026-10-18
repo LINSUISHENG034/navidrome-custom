@@ -308,7 +308,11 @@ const RemotePlayer = ({ snapshot, onCommand }) => {
             <span className={classes.trackArtist}>No track selected</span>
           )}
           <span className={classes.remoteBadge}>
-            Remote • {sessionStatus.deviceName || 'Bluetooth'}
+            {sessionStatus.terminationReason === 'track_switch_failed'
+              ? 'Error • Track switch failed'
+              : sessionStatus.terminationReason === 'output_failed'
+                ? 'Error • Playback output failed'
+                : `Remote • ${sessionStatus.deviceName || 'Bluetooth'}`}
           </span>
         </div>
       </div>

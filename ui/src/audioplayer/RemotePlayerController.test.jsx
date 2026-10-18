@@ -1431,4 +1431,69 @@ describe('P0-B frontend control closure and session rehydration', () => {
       config.jukeboxEnabled = origJukebox
     }
   })
+
+  it('prevents local engine mount and audio requests when rehydration fails with network error', async () => {
+    const origJukebox = config.jukeboxEnabled
+    config.jukeboxEnabled = true
+    browserPlayback.mounts = 0
+    browserPlayback.streamUrls = []
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+
+    const localTrack = {
+      trackId: 'persisted-local',
+      uuid: 'persisted-local-uuid',
+      name: 'Persisted local song',
+      song: { id: 'persisted-local', title: 'Persisted local song' },
+      musicSrc: '/rest/stream?id=persisted-local',
+    }
+    const store = createStore(
+      combineReducers({
+        player: playerReducer,
+        activity: activityReducer,
+        settings: settingsReducer,
+        replayGain: replayGainReducer,
+        theme: themeReducer,
+      }),
+      {
+        player: {
+          ...playerReducer(undefined, { type: '@@INIT' }),
+          jukeboxMode: false,
+          queue: [localTrack],
+          current: localTrack,
+          savedPlayIndex: 0,
+          playIndex: 0,
+        },
+      },
+    )
+
+    const { container, unmount } = render(
+      <Provider store={store}>
+        <Player />
+      </Provider>,
+    )
+
+    try {
+      await act(async () => {})
+      expect(browserPlayback.mounts).toBe(0)
+      expect(container.querySelectorAll('audio').length).toBe(0)
+      expect(browserPlayback.streamUrls).toEqual([])
+      expect(await screen.findByRole('alert')).toHaveTextContent(/failed|error/i)
+    } finally {
+      unmount()
+      config.jukeboxEnabled = origJukebox
+    }
+  })
+
+  it('displays backend playback failure reason in remote player controller alert', async () => {
+    const failedSnapshot = snapshot()
+    failedSnapshot.sessionStatus.playing = false
+    failedSnapshot.sessionStatus.terminationReason = 'track_switch_failed'
+    failedSnapshot.jukeboxPlaylist.playing = false
+    makeTransport([failedSnapshot])
+    const { unmount } = renderController()
+    await screen.findByRole('heading', { name: 'Server queue' })
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/track switch failed|failed/i)
+    unmount()
+  })
 })

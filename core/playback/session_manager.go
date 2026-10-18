@@ -198,7 +198,7 @@ func (sm *SessionManager) RebindDevice(oldDeviceName, newDeviceName string) []Se
 	return rebound
 }
 
-func (sm *SessionManager) ReapExpired() (transitioned []Session, expired []Session) {
+func (sm *SessionManager) ReapExpired(isActive ...func(Session) bool) (transitioned []Session, expired []Session) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -223,6 +223,9 @@ func (sm *SessionManager) ReapExpired() (transitioned []Session, expired []Sessi
 		}
 
 		if (session.OwnershipState == SessionOwnershipRecovering || session.OwnershipState == SessionOwnershipDetached) && session.StaleSince != nil && sm.maxStale > 0 && now.Sub(*session.StaleSince) > sm.maxStale {
+			if len(isActive) > 0 && isActive[0] != nil && isActive[0](session) {
+				continue
+			}
 			delete(sm.sessions, id)
 			expired = append(expired, session)
 		}

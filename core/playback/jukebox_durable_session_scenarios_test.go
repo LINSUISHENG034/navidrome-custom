@@ -275,3 +275,27 @@ func TestDurableSessionSuspendResumeReattachesToCurrentRemoteSnapshot(t *testing
 		t.Fatalf("expected suspend/resume re-attach to recover current remote snapshot, got %#v", status)
 	}
 }
+
+func TestDurableSessionPreservesSessionPastTier2ExpiryWhileDeviceIsPlaying(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	h.startPlayback(t)
+	h.attach(t, "tab-1")
+
+	// Advance past TTL (50ms) -> recovering
+	h.advance(80 * time.Millisecond)
+	h.server.reapExpiredSessions()
+
+	// Advance past maxStale (100ms) -> tier 2 expiry window, BUT device is playing!
+	h.advance(120 * time.Millisecond)
+	h.server.reapExpiredSessions()
+
+	// Session should NOT be deleted; status should be queryable
+	status, err := h.server.SessionStatus(h.ctx, "s1")
+	if err != nil {
+		t.Fatalf("expected session to be preserved while device is playing, got error: %v", err)
+	}
+	if !status.Playing {
+		t.Fatalf("expected session to report playing=true, got %#v", status)
+	}
+}

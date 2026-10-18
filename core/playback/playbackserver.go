@@ -157,7 +157,18 @@ func (ps *playbackServer) reapExpiredSessions() {
 		ps.mu.Unlock()
 		return
 	}
-	transitioned, expired := sessionManager.ReapExpired()
+	activeDevices := make(map[string]bool)
+	for _, dev := range ps.playbackDevices {
+		dev.mu.Lock()
+		active := dev.isPlaying()
+		dev.mu.Unlock()
+		if active {
+			activeDevices[dev.DeviceName] = true
+		}
+	}
+	transitioned, expired := sessionManager.ReapExpired(func(session Session) bool {
+		return activeDevices[session.DeviceName]
+	})
 	ps.mu.Unlock()
 
 	for _, session := range transitioned {

@@ -27,6 +27,7 @@ import {
   setTranscodingProfile,
   setVolume,
   syncQueue,
+  setJukeboxMode,
   setAudioInstance as setAudioInstanceAction,
 } from '../actions'
 import PlayerToolbar from './PlayerToolbar'
@@ -894,33 +895,104 @@ const Player = () => {
   const [bootstrapping, setBootstrapping] = useState(
     Boolean(config.jukeboxEnabled && !jukeboxMode),
   )
+  const [rehydrationError, setRehydrationError] = useState(null)
+  const rehydrationAttempt = useRef(0)
 
   const handlers = useMemo(
     () => keyHandlers(audioInstance, playerState),
     [audioInstance, playerState],
   )
 
-  useEffect(() => {
+  const performRehydration = useCallback(async () => {
     if (!config.jukeboxEnabled) {
       setBootstrapping(false)
       return
     }
-    let active = true
-    rehydrateJukeboxSession({ client: jukeboxClient, dispatch })
-      .catch(() => {})
-      .finally(() => {
-        if (active) setBootstrapping(false)
+    const attempt = ++rehydrationAttempt.current
+    setBootstrapping(true)
+    setRehydrationError(null)
+
+    try {
+      const result = await rehydrateJukeboxSession({
+        client: jukeboxClient,
+        dispatch,
       })
-    return () => {
-      active = false
+      if (attempt !== rehydrationAttempt.current) return
+
+      if (result?.outcome === 'error') {
+        setRehydrationError(
+          result.error || new Error('Failed to reconnect to playback server'),
+        )
+      } else {
+        setRehydrationError(null)
+        setBootstrapping(false)
+      }
+    } catch (err) {
+      if (attempt !== rehydrationAttempt.current) return
+      setRehydrationError(
+        err || new Error('Failed to reconnect to playback server'),
+      )
     }
   }, [dispatch])
+
+  useEffect(() => {
+    performRehydration()
+    const attemptRef = rehydrationAttempt
+    return () => {
+      attemptRef.current++
+    }
+  }, [performRehydration])
 
   // The default controller follows the server-bound session, not a target request.
   return (
     <ThemeProvider theme={createMuiTheme(theme)}>
       <GlobalHotKeys handlers={handlers} keyMap={keyMap} allowChanges />
-      {bootstrapping ? null : jukeboxMode ? (
+      {rehydrationError ? (
+        <section
+          aria-label="Playback recovery error"
+          role="alert"
+          style={{
+            position: 'fixed',
+            bottom: 0,
+            left: 0,
+            right: 0,
+            zIndex: 1000,
+            padding: '12px 16px',
+            backgroundColor: '#2b1d1d',
+            color: '#f8d7da',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 16,
+          }}
+        >
+          <span>
+            {rehydrationError.message ||
+              'Failed to reconnect to playback server'}
+          </span>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              type="button"
+              onClick={performRehydration}
+              style={{ padding: '6px 12px', cursor: 'pointer' }}
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                rehydrationAttempt.current++
+                setRehydrationError(null)
+                setBootstrapping(false)
+                dispatch(setJukeboxMode(false))
+              }}
+              style={{ padding: '6px 12px', cursor: 'pointer' }}
+            >
+              Switch to Local
+            </button>
+          </div>
+        </section>
+      ) : bootstrapping ? null : jukeboxMode ? (
         <RemotePlayerController />
       ) : (
         <LocalPlayer />

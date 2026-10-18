@@ -257,7 +257,7 @@ const createJukeboxSessionEpisode = ({
 
 const rehydrateJukeboxSession = async ({ client, dispatch }) => {
   const sessionId = getJukeboxSessionId()
-  if (!client?.sessionStatus || !sessionId) return null
+  if (!client?.sessionStatus || !sessionId) return { outcome: 'local' }
 
   try {
     const status = await client.sessionStatus(sessionId)
@@ -276,8 +276,18 @@ const rehydrateJukeboxSession = async ({ client, dispatch }) => {
       if (dispatch) {
         dispatch(setJukeboxMode(true, status.deviceName))
       }
+      Object.defineProperty(status, 'outcome', {
+        value: 'remote',
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      })
       return status
     }
+    if (dispatch) {
+      dispatch(setJukeboxMode(false))
+    }
+    return { outcome: 'local', status }
   } catch (err) {
     if (err?.status === 403) {
       if (dispatch) {
@@ -292,9 +302,14 @@ const rehydrateJukeboxSession = async ({ client, dispatch }) => {
       }
       return { outcome: 'conflict', error: err }
     }
-    // Session not found or network error: stay in local mode
+    if (err?.status === 404) {
+      if (dispatch) {
+        dispatch(setJukeboxMode(false))
+      }
+      return { outcome: 'local', error: err }
+    }
+    return { outcome: 'error', error: err }
   }
-  return null
 }
 
 export {
