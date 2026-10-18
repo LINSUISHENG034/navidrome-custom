@@ -48,3 +48,5 @@ zz_*_test.go
 # wazero compilation cache for the plugins test suite
 /plugins/testdata/.wazero-cache/
 /plugins/testdata/*.stage/
+__pycache__/
+*.pyc
