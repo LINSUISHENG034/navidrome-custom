@@ -10,8 +10,8 @@ services:
       - /run/user/${UID:-1000}/pipewire-0:/tmp/pipewire/pipewire-0:ro
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
       - /dev/snd:/dev/snd
-      - ./data:/data
-      - ./music:/music:ro
+      - ${DATA_FOLDER:-./data}:/data
+      - ${MUSIC_FOLDER:-/mnt/sda3/Music}:/music:ro
     environment:
       - ND_JUKEBOX_ENABLED=true
       - ND_JUKEBOX_AUTODISCOVERBLUETOOTH=true
@@ -21,6 +21,6 @@ services:
       - PIPEWIRE_RUNTIME_DIR=/tmp/pipewire
       - PIPEWIRE_REMOTE=pipewire-0
     ports:
-      - "127.0.0.1:${ND_PORT:-4534}:${ND_PORT:-4534}"
+      - "${ND_BIND_ADDR:-0.0.0.0}:${ND_PORT:-4534}:${ND_PORT:-4534}"
     group_add:
       - audio
