@@ -14,10 +14,22 @@
 Navidrome is an open source web-based music collection server and streamer. It gives you freedom to listen to your
 music collection from any browser or mobile device. It's like your personal Spotify!
 
+> 🚀 **Navidrome Beam**: This branch features **Navidrome Beam** (`beam/main`), adding native, fail-closed server-side Bluetooth and hardware audio streaming via PipeWire/PulseAudio. Stream directly to Bluetooth speakers (e.g. Aura Studio 5, soundbars) with server-side queue authority and zero audio leakage. See the [Navidrome Beam Architecture & Quickstart Guide](docs/beam/README.md) and [Upstream Sync Runbook](docs/beam/UPSTREAM_SYNC.md).
+
 
 **Note**: The `master` branch may be in an unstable or even broken state during development. 
 Please use [releases](https://github.com/navidrome/navidrome/releases) instead of 
 the `master` branch in order to get a stable set of binaries.
+
+## Navidrome Beam Edition
+
+Navidrome Beam eliminates the need for external bridge containers (such as Music Assistant or `sendspin-bt-bridge`) by implementing native server-side streaming:
+
+- **Direct PipeWire Stream Pinning**: Audio nodes are pinned directly to the selected Bluetooth sink (`node.autoconnect=false`). If the speaker powers off or drops connection, playback halts immediately—guaranteeing zero audio leakage to motherboard sound cards.
+- **Dual-Track Web Console**: Web UI decouples from browser audio during remote playback, turning into a low-overhead remote control console with persistent hotkeys and multi-tab session synchronization.
+- **Single Container Simplicity**: Runs via standard Docker Compose (`contrib/docker-compose/docker-compose.bluetooth.yml`) with host audio and D-Bus sockets mounted.
+
+For architecture details, setup instructions, and configuration options, see **[docs/beam/README.md](docs/beam/README.md)**.
 
 ## [Check out our Live Demo!](https://www.navidrome.org/demo/)
 
