@@ -242,3 +242,25 @@ python3 fork/scripts/native-playback-validation.py --stress-count 2 --mpv-null
 
 ### Performing an Upstream Rebase
 Refer to `docs/beam/UPSTREAM_SYNC.md` for detailed instructions on rebasing `beam/main` against `upstream/master`.
+
+---
+
+## 7. Key Post-Validation Records & Benchmark Baseline
+
+The following baseline metrics were formally verified and accepted on release `v0.64.2-beam.1.0.0`:
+
+### 7.1 Automated Software Test Suite
+- **Go Backend Core & API**: 100% PASS across `./core/playback/...`, `./server/nativeapi/...`, `./server/subsonic/...`, `./server/events/...`, and `./conf/...`.
+- **Concurrency & Race Detection**: Executed via `GORACE="atexit_sleep_ms=0" go test -race -count=1 ./core/playback/... ./server/nativeapi/...`. Completed in 32.6s with **0 data race warnings and 0 errors**.
+- **Frontend Dual-Track Web UI**: Executed via `npm test -- --run` in `ui/`. **104 test files passed (100%), 1,032 tests passed (0 failures)**. ESLint passed with 0 errors and 0 warnings.
+- **Validation Runner Gate**: Executed via `fork/scripts/native-playback-validation.py`. Preserved in `/tmp/native-playback-validation/run-beam-final/` confirming **`critical_failures: []`**.
+
+### 7.2 Physical Bluetooth Hardware Acceptance (Aura Studio 5)
+Tested against physical Aura Studio 5 (`24:C4:06:FA:00:37`, `bluez_output.24_C4_06_FA_00_37.a2dp-sink`):
+1. **H01 (Missing Target Fail-Closed)**: Requesting playback while the speaker is powered off was rejected in 0.00s with HTTP 404. Host default sink remained locked to `alsa_output.pci-0000_00_1f.3.iec958-stereo`. **Zero sound played on internal soundcards**.
+2. **H02 (Initial Playback & Safe Gain)**: Pinned stereo links formed cleanly. Playback clamped to safe 15% gain (`0.15`). Audible sound played without initial clicks or pop bursts.
+3. **H03 (Paused Seek & Resume)**: Paused at 0s, sought to offset 3s while remaining paused, and resumed cleanly from 3s through completion without stream destruction or audio glitch.
+4. **H04 (Disconnect during Pause)**: Bluetooth disconnected while paused; server preserved queue and track position. Host default sink was unaffected.
+5. **H05 (Live Disconnect during Audible Playback)**: Disconnected during audible playback; disconnect detected in 2.29s, all links and MPV processes retired cleanly, **zero audio spilled over to motherboard soundcards**.
+6. **H06 (Natural EOF & Queue Advancement)**: Two consecutive short tracks played sequentially; Track 1 reached natural EOF, Track 2 seamlessly advanced on the same Bluetooth link, and queue completed cleanly.
+
