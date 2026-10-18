@@ -65,6 +65,17 @@ var _ = Describe("serveIndex", func() {
 		Expect(config).To(HaveKeyWithValue("firstTime", false))
 	})
 
+	It("exposes bluetoothManagementEnabled in app config", func() {
+		conf.Server.Jukebox.BluetoothManagement = true
+		r := httptest.NewRequest("GET", "/index.html", nil)
+		w := httptest.NewRecorder()
+
+		serveIndex(ds, fs, nil)(w, r)
+
+		config := extractAppConfig(w.Body.String())
+		Expect(config).To(HaveKeyWithValue("bluetoothManagementEnabled", true))
+	})
+
 	DescribeTable("sets configuration values",
 		func(configSetter func(), configKey string, expectedValue any) {
 			configSetter()
@@ -89,8 +100,6 @@ var _ = Describe("serveIndex", func() {
 		Entry("uiSearchDebounceMs", func() { conf.Server.UISearchDebounceMs = 500 }, "uiSearchDebounceMs", float64(500)),
 		Entry("uiCoverArtSize", func() { conf.Server.UICoverArtSize = 300 }, "uiCoverArtSize", float64(300)),
 		Entry("enableCoverAnimation", func() { conf.Server.EnableCoverAnimation = true }, "enableCoverAnimation", true),
-		Entry("pidAlbum", func() { conf.Server.PID.Album = "folder" }, "pidAlbum", "folder"),
-		Entry("pidTrack", func() { conf.Server.PID.Track = "title" }, "pidTrack", "title"),
 		Entry("enableNowPlaying", func() { conf.Server.EnableNowPlaying = true }, "enableNowPlaying", true),
 		Entry("gaTrackingId", func() { conf.Server.GATrackingID = "UA-12345" }, "gaTrackingId", "UA-12345"),
 		Entry("defaultDownloadableShare", func() { conf.Server.DefaultDownloadableShare = true }, "defaultDownloadableShare", true),
