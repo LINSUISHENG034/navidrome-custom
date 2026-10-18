@@ -891,21 +891,40 @@ const Player = () => {
   const playerState = useSelector((state) => state.player)
   const audioInstance = playerState.audioInstance
 
+  const [bootstrapping, setBootstrapping] = useState(
+    Boolean(config.jukeboxEnabled && !jukeboxMode),
+  )
+
   const handlers = useMemo(
     () => keyHandlers(audioInstance, playerState),
     [audioInstance, playerState],
   )
 
   useEffect(() => {
-    if (!config.jukeboxEnabled) return
-    rehydrateJukeboxSession({ client: jukeboxClient, dispatch }).catch(() => {})
+    if (!config.jukeboxEnabled) {
+      setBootstrapping(false)
+      return
+    }
+    let active = true
+    rehydrateJukeboxSession({ client: jukeboxClient, dispatch })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setBootstrapping(false)
+      })
+    return () => {
+      active = false
+    }
   }, [dispatch])
 
   // The default controller follows the server-bound session, not a target request.
   return (
     <ThemeProvider theme={createMuiTheme(theme)}>
       <GlobalHotKeys handlers={handlers} keyMap={keyMap} allowChanges />
-      {jukeboxMode ? <RemotePlayerController /> : <LocalPlayer />}
+      {bootstrapping ? null : jukeboxMode ? (
+        <RemotePlayerController />
+      ) : (
+        <LocalPlayer />
+      )}
     </ThemeProvider>
   )
 }

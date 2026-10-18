@@ -278,7 +278,20 @@ const rehydrateJukeboxSession = async ({ client, dispatch }) => {
       }
       return status
     }
-  } catch {
+  } catch (err) {
+    if (err?.status === 403) {
+      if (dispatch) {
+        dispatch(setJukeboxMode(true, null))
+        dispatch(
+          updateJukeboxSessionStatus({
+            sessionId,
+            ownershipState: 'taken_over',
+            terminationReason: 'taken_over',
+          }),
+        )
+      }
+      return { outcome: 'conflict', error: err }
+    }
     // Session not found or network error: stay in local mode
   }
   return null

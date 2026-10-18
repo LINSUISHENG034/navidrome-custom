@@ -1297,6 +1297,67 @@ describe('P0-B frontend control closure and session rehydration', () => {
     expect(setSpy).not.toHaveBeenCalled()
   })
 
+  it('bootstrap gate prevents local engine mount and audio autoplay on page reload before rehydration completes', async () => {
+    const origJukebox = config.jukeboxEnabled
+    config.jukeboxEnabled = true
+    browserPlayback.mounts = 0
+    browserPlayback.streamUrls = []
+    const server = snapshot('Authoritative reload queue', 45)
+    server.sessionStatus.ownerClientId = getOrCreateJukeboxClientId()
+    makeTransport([server])
+
+    const localTrack = {
+      trackId: 'persisted-local',
+      uuid: 'persisted-local-uuid',
+      name: 'Persisted local song',
+      song: { id: 'persisted-local', title: 'Persisted local song' },
+      musicSrc: '/rest/stream?id=persisted-local',
+    }
+    const store = createStore(
+      combineReducers({
+        player: playerReducer,
+        activity: activityReducer,
+        settings: settingsReducer,
+        replayGain: replayGainReducer,
+        theme: themeReducer,
+      }),
+      {
+        player: {
+          ...playerReducer(undefined, { type: '@@INIT' }),
+          jukeboxMode: false,
+          queue: [localTrack],
+          current: localTrack,
+          savedPlayIndex: 0,
+          playIndex: 0,
+        },
+      },
+    )
+
+    const { container, unmount } = render(
+      <Provider store={store}>
+        <Player />
+      </Provider>,
+    )
+
+    try {
+      expect(browserPlayback.mounts).toBe(0)
+      expect(container.querySelectorAll('audio').length).toBe(0)
+
+      expect(
+        await screen.findByRole('heading', {
+          name: 'Authoritative reload queue',
+        }),
+      ).toBeInTheDocument()
+
+      expect(browserPlayback.mounts).toBe(0)
+      expect(container.querySelectorAll('audio').length).toBe(0)
+      expect(browserPlayback.streamUrls).toEqual([])
+    } finally {
+      unmount()
+      config.jukeboxEnabled = origJukebox
+    }
+  })
+
   it('renders DeviceSelector in remote mode controller', async () => {
     const origJukebox = config.jukeboxEnabled
     const origBluetooth = config.bluetoothManagementEnabled
