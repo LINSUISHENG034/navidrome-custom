@@ -10,6 +10,7 @@ import { all, fork } from 'redux-saga/effects'
 import { adminReducer, adminSaga, USER_LOGOUT } from 'react-admin'
 import throttle from 'lodash.throttle'
 import { loadState, saveState } from './persistState'
+import jukeboxQueueSaga from '../audioplayer/jukeboxQueueSaga'
 
 const createAdminStore = ({
   authProvider,
@@ -26,7 +27,9 @@ const createAdminStore = ({
     reducer(action.type !== USER_LOGOUT ? state : undefined, action)
 
   const saga = function* rootSaga() {
-    yield all([adminSaga(dataProvider, authProvider)].map(fork))
+    yield all(
+      [adminSaga(dataProvider, authProvider), jukeboxQueueSaga()].map(fork),
+    )
   }
   const sagaMiddleware = createSagaMiddleware()
 

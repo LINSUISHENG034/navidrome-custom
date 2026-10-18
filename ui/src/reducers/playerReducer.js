@@ -12,8 +12,13 @@ import {
   PLAYER_SYNC_QUEUE,
   PLAYER_SET_MODE,
   PLAYER_REFRESH_QUEUE,
+  PLAYER_SET_JUKEBOX_MODE,
+  PLAYER_JUKEBOX_SESSION_STATUS,
+  PLAYER_SET_AUDIO_INSTANCE,
 } from '../actions'
 import config from '../config'
+import { audioVolumeToUiVolume } from '../audioplayer/volumeMapping'
+import { remoteGainToUiVolume } from '../audioplayer/volumeProfiles'
 
 const initialState = {
   queue: [],
@@ -21,6 +26,11 @@ const initialState = {
   clear: false,
   volume: config.defaultUIVolume / 100,
   savedPlayIndex: 0,
+  jukeboxMode: false,
+  jukeboxDevice: null,
+  jukeboxControl: null,
+  jukeboxRemote: null,
+  audioInstance: null,
 }
 
 const pad = (value) => {
@@ -126,11 +136,12 @@ const reduceSetTrack = (state, { data }) => {
 }
 
 const reduceAddTracks = (state, { data }) => {
-  const queue = state.queue
-  Object.keys(data).forEach((id) => {
-    queue.push(mapToAudioLists(data[id]))
-  })
-  return { ...state, queue, clear: false }
+  const appended = Object.keys(data).map((id) => mapToAudioLists(data[id]))
+  return {
+    ...state,
+    queue: [...state.queue, ...appended],
+    clear: false,
+  }
 }
 
 const reducePlayNext = (state, { data }) => {
@@ -175,7 +186,7 @@ const reduceSyncQueue = (state, { data: { audioInfo, audioLists } }) => {
     (state.clear || state.playIndex !== state.savedPlayIndex)
   return {
     ...state,
-    queue: audioLists,
+    queue: audioLists.map((item) => ({ ...item })),
     clear: hasPendingSwitch ? state.clear : false,
     playIndex: hasPendingSwitch ? state.playIndex : undefined,
   }
@@ -205,6 +216,55 @@ const reduceMode = (state, { data: { mode } }) => {
   return {
     ...state,
     mode,
+  }
+}
+
+const buildJukeboxControlState = (previousControl, nextStatus) => ({
+  sessionId: nextStatus.sessionId ?? previousControl.sessionId ?? null,
+  ownerClientId:
+    nextStatus.ownerClientId ?? previousControl.ownerClientId ?? null,
+  ownershipState:
+    nextStatus.ownershipState ?? previousControl.ownershipState ?? 'attached',
+  terminationReason:
+    nextStatus.terminationReason !== undefined
+      ? nextStatus.terminationReason
+      : nextStatus.ownershipState === 'attached'
+        ? null
+        : (previousControl.terminationReason ?? null),
+  lastHeartbeat:
+    nextStatus.lastHeartbeat ?? previousControl.lastHeartbeat ?? null,
+  staleSince: nextStatus.staleSince ?? previousControl.staleSince ?? null,
+})
+
+const buildJukeboxRemoteState = (previousRemote, nextStatus) => ({
+  currentIndex: nextStatus.currentIndex ?? previousRemote.currentIndex ?? null,
+  trackId: nextStatus.trackId ?? previousRemote.trackId ?? null,
+  playing: nextStatus.playing ?? previousRemote.playing ?? false,
+  position: nextStatus.position ?? previousRemote.position ?? 0,
+  gain: nextStatus.gain ?? previousRemote.gain ?? 0.5,
+  queueVersion: nextStatus.queueVersion ?? previousRemote.queueVersion ?? null,
+  attached: nextStatus.attached ?? previousRemote.attached ?? false,
+  deviceName: nextStatus.deviceName ?? previousRemote.deviceName ?? null,
+})
+
+const reduceJukeboxSessionStatus = (previousState, payload) => {
+  const previousControl = previousState.jukeboxControl || {}
+  const previousRemote = previousState.jukeboxRemote || {}
+  const nextStatus = payload.data || {}
+  const nextControl = buildJukeboxControlState(previousControl, nextStatus)
+  const nextRemote = buildJukeboxRemoteState(previousRemote, nextStatus)
+
+  return {
+    ...previousState,
+    jukeboxControl: nextControl,
+    jukeboxRemote: nextRemote,
+    volume:
+      previousState.jukeboxMode && typeof nextStatus?.gain === 'number'
+        ? remoteGainToUiVolume(nextStatus.gain, {
+            deviceName: nextRemote.deviceName,
+            jukeboxDevice: previousState.jukeboxDevice,
+          })
+        : previousState.volume,
   }
 }
 
@@ -245,6 +305,25 @@ export const playerReducer = (previousState = initialState, payload) => {
           previousState.savedPlayIndex >= 0 ? previousState.savedPlayIndex : 0,
       }
     }
+    case PLAYER_SET_JUKEBOX_MODE:
+      return {
+        ...previousState,
+        jukeboxMode: payload.data.enabled,
+        jukeboxDevice: payload.data.device,
+        jukeboxControl: payload.data.enabled
+          ? previousState.jukeboxControl
+          : null,
+        jukeboxRemote: payload.data.enabled
+          ? previousState.jukeboxRemote
+          : null,
+      }
+    case PLAYER_JUKEBOX_SESSION_STATUS:
+      return reduceJukeboxSessionStatus(previousState, payload)
+    case PLAYER_SET_AUDIO_INSTANCE:
+      return {
+        ...previousState,
+        audioInstance: payload.data,
+      }
     default:
       return previousState
   }

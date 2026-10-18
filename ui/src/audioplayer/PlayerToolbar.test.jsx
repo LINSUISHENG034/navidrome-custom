@@ -41,6 +41,10 @@ vi.mock('react-hotkeys', () => ({
   GlobalHotKeys: () => <div data-testid="global-hotkeys" />,
 }))
 
+vi.mock('./DeviceSelector', () => ({
+  default: () => <div data-testid="device-selector" />,
+}))
+
 describe('<PlayerToolbar />', () => {
   const mockToggleLove = vi.fn()
   const mockDispatch = vi.fn()
@@ -69,6 +73,7 @@ describe('<PlayerToolbar />', () => {
       expect(listItems).toHaveLength(1)
 
       // Verify both buttons are rendered
+      expect(screen.getByTestId('device-selector')).toBeInTheDocument()
       expect(screen.getByTestId('save-queue-button')).toBeInTheDocument()
       expect(screen.getByTestId('love-button')).toBeInTheDocument()
 
@@ -114,9 +119,10 @@ describe('<PlayerToolbar />', () => {
 
       // Each button should be in its own list item
       const listItems = screen.getAllByRole('listitem')
-      expect(listItems).toHaveLength(2)
+      expect(listItems).toHaveLength(3)
 
       // Verify both buttons are rendered
+      expect(screen.getByTestId('device-selector')).toBeInTheDocument()
       expect(screen.getByTestId('save-queue-button')).toBeInTheDocument()
       expect(screen.getByTestId('love-button')).toBeInTheDocument()
 
