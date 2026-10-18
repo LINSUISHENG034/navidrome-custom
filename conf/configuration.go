@@ -267,6 +267,8 @@ type jukeboxOptions struct {
 	OutputPollInterval       time.Duration
 	OutputCheckInterval      time.Duration
 	OutputCheckTimeout       time.Duration
+	NaturalEndRetries        int
+	NaturalEndBackoff        time.Duration
 }
 
 type backupOptions struct {
@@ -1071,6 +1073,8 @@ func setViperDefaults() {
 	viper.SetDefault("jukebox.outputpollinterval", 100*time.Millisecond)
 	viper.SetDefault("jukebox.outputcheckinterval", time.Second)
 	viper.SetDefault("jukebox.outputchecktimeout", 2*time.Second)
+	viper.SetDefault("jukebox.naturalendretries", 2)
+	viper.SetDefault("jukebox.naturalendbackoff", 250*time.Millisecond)
 	viper.SetDefault("scanner.enabled", true)
 	viper.SetDefault("scanner.schedule", "0")
 	viper.SetDefault("scanner.extractor", consts.DefaultScannerExtractor)

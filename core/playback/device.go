@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core/playback/mpv"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
@@ -44,6 +45,7 @@ type playbackDevice struct {
 	pendingPlaybackTokens map[model.PlaybackToken]chan struct{}
 	pendingPrepareCancels map[model.PlaybackToken]context.CancelFunc
 	activePrepareCancel   context.CancelFunc
+	backoffCancel         context.CancelFunc
 	preparing             sync.WaitGroup
 	retiring              bool
 	recoveryPosition      *int
@@ -179,6 +181,7 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, bool, 
 		if pd.isPlaying() {
 			log.Debug("trying to start an already playing track")
 		} else {
+			pd.failureReason = ""
 			pd.ActiveTrack.Unpause()
 			changed = true
 		}
@@ -195,6 +198,7 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, bool, 
 					return pd.getStatus(), false, err
 				}
 			}
+			pd.failureReason = ""
 			pd.assignTrack(track, token)
 			if pd.ActiveTrack != nil {
 				pd.recoveryPosition = nil
@@ -515,6 +519,21 @@ func (pd *playbackDevice) trackSwitcherGoroutine() {
 	}
 }
 
+func (pd *playbackDevice) naturalEndRetryPolicy() (int, time.Duration) {
+	retries := conf.Server.Jukebox.NaturalEndRetries
+	backoff := conf.Server.Jukebox.NaturalEndBackoff
+	if retries == 0 && backoff == 0 {
+		return 2, 250 * time.Millisecond
+	}
+	if retries < 0 {
+		retries = 0
+	}
+	if backoff < 0 {
+		backoff = 0
+	}
+	return retries, backoff
+}
+
 func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 	pd.mu.Lock()
 	if ready := pd.pendingPlaybackTokens[event.Token]; ready != nil {
@@ -543,24 +562,41 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 			log.Debug("Switching to next song", "index", idx)
 
 			var (
-				track   Track
-				token   model.PlaybackToken
-				current bool
-				err     error
+				track     Track
+				token     model.PlaybackToken
+				current   bool
+				err       error
+				cancelled bool
 			)
-			const maxNaturalEndRetries = 2
+			maxNaturalEndRetries, baseBackoff := pd.naturalEndRetryPolicy()
+
 			for attempt := 0; attempt <= maxNaturalEndRetries; attempt++ {
 				if attempt > 0 {
-					pd.mu.Unlock()
-					select {
-					case <-time.After(time.Duration(attempt*250) * time.Millisecond):
-					case <-pd.serviceCtx.Done():
+					if baseBackoff > 0 {
+						delay := min(time.Duration(attempt)*baseBackoff, 5*time.Second)
+						expectedVersion := pd.preparationVersion
+						backoffCtx, cancel := context.WithCancel(pd.serviceCtx)
+						pd.backoffCancel = cancel
+						pd.mu.Unlock()
+
+						timer := time.NewTimer(delay)
+						select {
+						case <-timer.C:
+						case <-backoffCtx.Done():
+							timer.Stop()
+						}
+
 						pd.mu.Lock()
-						break
-					}
-					pd.mu.Lock()
-					if pd.retiring || pd.serviceCtx.Err() != nil || pd.PlaybackQueue.Index != idx {
-						break
+						pd.backoffCancel = nil
+						if pd.retiring || pd.serviceCtx.Err() != nil || pd.preparationVersion != expectedVersion || pd.PlaybackQueue.Index != idx {
+							cancelled = true
+							break
+						}
+					} else {
+						if pd.retiring || pd.serviceCtx.Err() != nil || pd.PlaybackQueue.Index != idx {
+							cancelled = true
+							break
+						}
 					}
 				}
 				track, token, current, err = pd.loadTrackLocked(pd.serviceCtx, idx)
@@ -568,13 +604,14 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 					break
 				}
 				if errors.Is(err, context.Canceled) || !current {
+					cancelled = true
 					break
 				}
 				log.Warn("Transient error switching track on natural end, will retry", "attempt", attempt+1, "error", err)
 			}
 
-			if err != nil || !current {
-				if err != nil && !errors.Is(err, context.Canceled) {
+			if err != nil || !current || cancelled {
+				if err != nil && !errors.Is(err, context.Canceled) && current && !cancelled {
 					log.Error("Error switching track after retries", err)
 					pd.failureReason = "track_switch_failed"
 				}
@@ -670,6 +707,7 @@ func (pd *playbackDevice) assignTrack(newTrack Track, token model.PlaybackToken)
 	pd.activePrepareCancel = pd.pendingPrepareCancels[token]
 	delete(pd.pendingPrepareCancels, token)
 	pd.discardPendingTrack(token)
+	pd.failureReason = ""
 }
 
 func (pd *playbackDevice) retireActiveTrackLocked() {
@@ -687,6 +725,10 @@ func (pd *playbackDevice) retireActiveTrackLocked() {
 
 func (pd *playbackDevice) cancelPreparationLocked() {
 	pd.preparationVersion++
+	if pd.backoffCancel != nil {
+		pd.backoffCancel()
+		pd.backoffCancel = nil
+	}
 	for _, cancel := range pd.pendingPrepareCancels {
 		cancel()
 	}
