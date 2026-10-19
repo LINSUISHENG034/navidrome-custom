@@ -1,6 +1,8 @@
 package playback
 
 import (
+	"math/rand"
+
 	"github.com/navidrome/navidrome/model"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -328,6 +330,147 @@ var _ = Describe("QueueCandidateModel with stable QueueItemID (Issue 03)", func(
 		Expect(modelQueue.IsEmpty()).To(BeTrue())
 		Expect(modelQueue.CurrentQueueItemID).To(Equal(""))
 		Expect(modelQueue.Current()).To(BeNil())
+	})
+})
+
+var _ = Describe("QueueCandidateModel playback mode contract (Issue 04)", func() {
+	var modelQueue *QueueCandidateModel
+
+	BeforeEach(func() {
+		modelQueue = NewQueueCandidateModel()
+		modelQueue.Add([]QueueCandidateItem{
+			{QueueItemID: "qitem-1", MediaFile: model.MediaFile{ID: "track-1"}},
+			{QueueItemID: "qitem-2", MediaFile: model.MediaFile{ID: "track-2"}},
+			{QueueItemID: "qitem-3", MediaFile: model.MediaFile{ID: "track-3"}},
+		})
+	})
+
+	It("TC-QC-PM-01: manual Next advances and wraps around in order, repeat_list, and singleLoop", func() {
+		// Order mode: manual Next at end wraps around to first item
+		modelQueue.SetMode(PlaybackModeOrder)
+		modelQueue.SetCurrentByQueueItemID("qitem-3")
+		nextID, cont := modelQueue.Next(true, nil)
+		Expect(cont).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-1"))
+
+		// Repeat list mode: manual Next wraps around
+		modelQueue.SetMode(PlaybackModeRepeatList)
+		modelQueue.SetCurrentByQueueItemID("qitem-3")
+		nextID, cont = modelQueue.Next(true, nil)
+		Expect(cont).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-1"))
+
+		// Single loop mode: manual Next does NOT block active skipping, advances to next
+		modelQueue.SetMode(PlaybackModeRepeatTrack)
+		modelQueue.SetCurrentByQueueItemID("qitem-2")
+		nextID, cont = modelQueue.Next(true, nil)
+		Expect(cont).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-3"))
+	})
+
+	It("TC-QC-PM-02: natural end in order mode advances but stops at queue end", func() {
+		modelQueue.SetMode(PlaybackModeOrder)
+		modelQueue.SetCurrentByQueueItemID("qitem-1")
+
+		// Natural end on item 1 -> item 2
+		nextID, cont := modelQueue.NaturalEnd(nil)
+		Expect(cont).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-2"))
+
+		// Natural end on item 2 -> item 3
+		nextID, cont = modelQueue.NaturalEnd(nil)
+		Expect(cont).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-3"))
+
+		// Natural end on item 3 (last) -> stops (cont=false, does not wrap)
+		nextID, cont = modelQueue.NaturalEnd(nil)
+		Expect(cont).To(BeFalse())
+		Expect(nextID).To(Equal("qitem-3"))
+	})
+
+	It("TC-QC-PM-03: natural end in repeat_list mode wraps from last item to first item", func() {
+		modelQueue.SetMode(PlaybackModeRepeatList)
+		modelQueue.SetCurrentByQueueItemID("qitem-3")
+
+		nextID, cont := modelQueue.NaturalEnd(nil)
+		Expect(cont).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-1"))
+	})
+
+	It("TC-QC-PM-04: natural end in repeat_track mode replays current item", func() {
+		modelQueue.SetMode(PlaybackModeRepeatTrack)
+		modelQueue.SetCurrentByQueueItemID("qitem-2")
+
+		nextID, cont := modelQueue.NaturalEnd(nil)
+		Expect(cont).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-2"))
+	})
+
+	It("TC-QC-PM-05: manual Prev rewinds when currentTime > 1.0s, otherwise moves to prev with wrap-around", func() {
+		modelQueue.SetMode(PlaybackModeOrder)
+		modelQueue.SetCurrentByQueueItemID("qitem-2")
+
+		// currentTime > 1.0s -> rewinds, stays on qitem-2
+		prevID, cont := modelQueue.Prev(15.0, nil)
+		Expect(cont).To(BeTrue())
+		Expect(prevID).To(Equal("qitem-2"))
+
+		// currentTime <= 1.0s -> moves to qitem-1
+		prevID, cont = modelQueue.Prev(0.5, nil)
+		Expect(cont).To(BeTrue())
+		Expect(prevID).To(Equal("qitem-1"))
+
+		// At item 1, currentTime <= 1.0s -> wraps around to last item (qitem-3)
+		prevID, cont = modelQueue.Prev(0.0, nil)
+		Expect(cont).To(BeTrue())
+		Expect(prevID).To(Equal("qitem-3"))
+	})
+
+	It("TC-QC-PM-06: shuffle mode preserves queue order, excludes current item, and is deterministic", func() {
+		modelQueue.SetMode(PlaybackModeShuffle)
+		modelQueue.SetCurrentByQueueItemID("qitem-2")
+
+		// Create deterministic pseudo-random source
+		r := rand.New(rand.NewSource(42))
+
+		// Random pick must exclude current item (qitem-2)
+		nextID, cont := modelQueue.Next(true, r)
+		Expect(cont).To(BeTrue())
+		Expect(nextID).ToNot(Equal("qitem-2"))
+		Expect(nextID == "qitem-1" || nextID == "qitem-3").To(BeTrue())
+
+		// Items order is preserved (NOT destructively mutated!)
+		Expect(modelQueue.Items[0].QueueItemID).To(Equal("qitem-1"))
+		Expect(modelQueue.Items[1].QueueItemID).To(Equal("qitem-2"))
+		Expect(modelQueue.Items[2].QueueItemID).To(Equal("qitem-3"))
+	})
+
+	It("TC-QC-PM-07: handles boundary cases cleanly (empty queue, single-item queue)", func() {
+		emptyQueue := NewQueueCandidateModel()
+		id, cont := emptyQueue.Next(true, nil)
+		Expect(cont).To(BeFalse())
+		Expect(id).To(Equal(""))
+
+		singleQueue := NewQueueCandidateModel()
+		singleQueue.Add([]QueueCandidateItem{{QueueItemID: "single-1"}})
+
+		// Natural end in order mode stops
+		singleQueue.SetMode(PlaybackModeOrder)
+		id, cont = singleQueue.NaturalEnd(nil)
+		Expect(cont).To(BeFalse())
+		Expect(id).To(Equal("single-1"))
+
+		// Natural end in repeat_list mode replays single item
+		singleQueue.SetMode(PlaybackModeRepeatList)
+		id, cont = singleQueue.NaturalEnd(nil)
+		Expect(cont).To(BeTrue())
+		Expect(id).To(Equal("single-1"))
+
+		// Natural end in shuffle mode replays single item
+		singleQueue.SetMode(PlaybackModeShuffle)
+		id, cont = singleQueue.NaturalEnd(nil)
+		Expect(cont).To(BeTrue())
+		Expect(id).To(Equal("single-1"))
 	})
 })
 

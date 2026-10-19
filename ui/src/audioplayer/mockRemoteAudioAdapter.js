@@ -9,6 +9,10 @@
 
 import {
   PlaybackStatus,
+  PlaybackMode,
+  normalizePlaybackMode,
+  getNextTrack,
+  getPrevTrack,
   applyQueueAdd,
   applyQueueRemove,
   applyQueueMove,
@@ -23,6 +27,10 @@ export function createMockRemoteAudioAdapter(options = {}) {
   let remoteQueue = []
   let currentQueueItemId = null
   let queueVersion = 0
+  let playMode = normalizePlaybackMode(
+    options.initialPlayMode || PlaybackMode.ORDER,
+  )
+  const randomFn = options.randomFn || Math.random
   const wireCommands = []
 
   let remoteState = {
@@ -117,14 +125,67 @@ export function createMockRemoteAudioAdapter(options = {}) {
       simulateAction('volume', () => ({
         volume: Math.max(0, Math.min(1, volumeFraction)),
       })),
-    skipNext: (epoch) =>
-      simulateAction('skipNext', () => ({
-        position: 0,
-      })),
-    skipPrev: (epoch) =>
-      simulateAction('skipPrev', () => ({
-        position: 0,
-      })),
+    setPlayMode: (epoch, mode) => {
+      const normalized = normalizePlaybackMode(mode)
+      wireCommands.push({
+        action: 'setPlayMode',
+        epoch,
+        mode: normalized,
+      })
+      return simulateAction('setPlayMode', () => {
+        playMode = normalized
+        return { playMode }
+      })
+    },
+    skipNext: (epoch) => {
+      wireCommands.push({
+        action: 'skipNext',
+        epoch,
+      })
+      return simulateAction('skipNext', () => {
+        const res = getNextTrack({
+          queue: remoteQueue,
+          currentQueueItemId,
+          mode: playMode,
+          isManual: true,
+          randomFn,
+        })
+        if (!res.queueItemId) return {}
+        currentQueueItemId = res.queueItemId
+        return {
+          currentQueueItemId,
+          position: 0,
+          status: PlaybackStatus.PLAYING,
+        }
+      })
+    },
+    skipPrev: (epoch) => {
+      wireCommands.push({
+        action: 'skipPrev',
+        epoch,
+      })
+      return simulateAction('skipPrev', () => {
+        // Authoritative server state holds remote playback position
+        const curPos = remoteState.position
+        const res = getPrevTrack({
+          queue: remoteQueue,
+          currentQueueItemId,
+          mode: playMode,
+          currentTime: curPos,
+          randomFn,
+        })
+        if (res.rewindOnly) {
+          return { position: 0 }
+        }
+        if (!res.queueItemId) return {}
+        currentQueueItemId = res.queueItemId
+        return {
+          currentQueueItemId,
+          position: 0,
+          status: PlaybackStatus.PLAYING,
+        }
+      })
+    },
     addQueueItems: (epoch, items = [], index = -1) => {
       wireCommands.push({
         action: 'add',
@@ -236,7 +297,6 @@ export function createMockRemoteAudioAdapter(options = {}) {
     },
     // Direct injection of authoritative server push (e.g. position progress or track change)
     pushServerSnapshot: (snapshot) => {
-      if (!isActive || !stateCallback) return
       if (Array.isArray(snapshot.queue)) {
         remoteQueue = [...snapshot.queue]
       }
@@ -246,8 +306,48 @@ export function createMockRemoteAudioAdapter(options = {}) {
       if (typeof snapshot.queueVersion === 'number') {
         queueVersion = snapshot.queueVersion
       }
+      if (snapshot.playMode !== undefined) {
+        playMode = normalizePlaybackMode(snapshot.playMode)
+      }
       remoteState = { ...remoteState, ...snapshot }
-      stateCallback(activeEpoch, snapshot)
+      if (isActive && stateCallback) {
+        stateCallback(activeEpoch, snapshot)
+      }
+    },
+    // Simulate autonomous server-side progression (continues even when UI is disconnected)
+    triggerNaturalEnd: () => {
+      const res = getNextTrack({
+        queue: remoteQueue,
+        currentQueueItemId,
+        mode: playMode,
+        isManual: false,
+        randomFn,
+      })
+      if (res.shouldStop) {
+        remoteState.status = PlaybackStatus.PAUSED
+        remoteState.position = remoteState.duration
+        if (isActive && stateCallback) {
+          stateCallback(activeEpoch, {
+            status: PlaybackStatus.PAUSED,
+            position: remoteState.duration,
+          })
+        }
+        return { stopped: true }
+      }
+      if (res.queueItemId) {
+        currentQueueItemId = res.queueItemId
+        remoteState.position = 0
+        remoteState.status = PlaybackStatus.PLAYING
+        if (isActive && stateCallback) {
+          stateCallback(activeEpoch, {
+            currentQueueItemId,
+            position: 0,
+            status: PlaybackStatus.PLAYING,
+          })
+        }
+        return { stopped: false, currentQueueItemId }
+      }
+      return { stopped: false }
     },
     getWireCommands: () => [...wireCommands],
     clearWireCommands: () => {
@@ -255,6 +355,7 @@ export function createMockRemoteAudioAdapter(options = {}) {
     },
     getQueue: () => [...remoteQueue],
     getCurrentQueueItemId: () => currentQueueItemId,
+    getPlayMode: () => playMode,
     setFailure,
     getRemoteState: () => ({ ...remoteState }),
   }

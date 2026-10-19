@@ -16,6 +16,139 @@ export const PlaybackStatus = {
   ERROR: 'error',
 }
 
+export const PlaybackMode = {
+  ORDER: 'order',
+  REPEAT_LIST: 'orderLoop',
+  REPEAT_TRACK: 'singleLoop',
+  SHUFFLE: 'shufflePlay',
+}
+
+export const PREV_REWIND_THRESHOLD_S = 1.0
+
+export function normalizePlaybackMode(mode) {
+  switch (mode) {
+    case 'order':
+      return PlaybackMode.ORDER
+    case 'orderLoop':
+      return PlaybackMode.REPEAT_LIST
+    case 'singleLoop':
+      return PlaybackMode.REPEAT_TRACK
+    case 'shufflePlay':
+      return PlaybackMode.SHUFFLE
+    default:
+      return PlaybackMode.ORDER
+  }
+}
+
+/**
+ * Shared, deterministic mode transitions for track selection.
+ * Reused by both BrowserAudioAdapter and MockRemoteAudioAdapter.
+ */
+export function getNextTrack({
+  queue = [],
+  currentQueueItemId = null,
+  mode = PlaybackMode.ORDER,
+  isManual = false,
+  randomFn = Math.random,
+} = {}) {
+  const normalizedMode = normalizePlaybackMode(mode)
+  if (!queue || queue.length === 0) {
+    return { queueItemId: null, shouldStop: true }
+  }
+
+  if (queue.length === 1) {
+    const onlyId = queue[0].queueItemId
+    if (isManual) {
+      return { queueItemId: onlyId, shouldStop: false }
+    }
+    // Natural end on single item:
+    // Order stops; repeat list, repeat track, and shuffle replay the single item
+    if (normalizedMode === PlaybackMode.ORDER) {
+      return { queueItemId: onlyId, shouldStop: true }
+    }
+    return { queueItemId: onlyId, shouldStop: false }
+  }
+
+  const curIdx = queue.findIndex(
+    (item) => item.queueItemId === currentQueueItemId,
+  )
+  const safeIdx = curIdx >= 0 ? curIdx : 0
+
+  if (normalizedMode === PlaybackMode.SHUFFLE) {
+    // Multi-item queue excludes current item; does not reorder visible queue
+    const candidates = queue.filter((_, idx) => idx !== safeIdx)
+    const pickIdx = Math.floor(randomFn() * candidates.length)
+    return { queueItemId: candidates[pickIdx].queueItemId, shouldStop: false }
+  }
+
+  if (normalizedMode === PlaybackMode.REPEAT_TRACK) {
+    if (isManual) {
+      // Manual skip advances even in singleLoop mode (single loop does not block active skip)
+      const nextIdx = (safeIdx + 1) % queue.length
+      return { queueItemId: queue[nextIdx].queueItemId, shouldStop: false }
+    }
+    // Natural end replays current item
+    return { queueItemId: queue[safeIdx].queueItemId, shouldStop: false }
+  }
+
+  if (normalizedMode === PlaybackMode.REPEAT_LIST) {
+    const nextIdx = (safeIdx + 1) % queue.length
+    return { queueItemId: queue[nextIdx].queueItemId, shouldStop: false }
+  }
+
+  // ORDER mode
+  if (isManual) {
+    // Manual skip in order mode wraps around at the end of queue
+    const nextIdx = (safeIdx + 1) % queue.length
+    return { queueItemId: queue[nextIdx].queueItemId, shouldStop: false }
+  }
+
+  // Natural end in order mode stops at last item
+  if (safeIdx >= queue.length - 1) {
+    return { queueItemId: queue[safeIdx].queueItemId, shouldStop: true }
+  }
+  return { queueItemId: queue[safeIdx + 1].queueItemId, shouldStop: false }
+}
+
+export function getPrevTrack({
+  queue = [],
+  currentQueueItemId = null,
+  mode = PlaybackMode.ORDER,
+  currentTime = 0,
+  threshold = PREV_REWIND_THRESHOLD_S,
+  randomFn = Math.random,
+} = {}) {
+  const normalizedMode = normalizePlaybackMode(mode)
+  if (!queue || queue.length === 0) {
+    return { queueItemId: null, rewindOnly: false }
+  }
+
+  // Threshold rule: when position > 1s, rewinds to 0s without switching tracks
+  if (currentTime > threshold) {
+    return { queueItemId: currentQueueItemId, rewindOnly: true }
+  }
+
+  if (queue.length === 1) {
+    return { queueItemId: queue[0].queueItemId, rewindOnly: false }
+  }
+
+  const curIdx = queue.findIndex(
+    (item) => item.queueItemId === currentQueueItemId,
+  )
+  const safeIdx = curIdx >= 0 ? curIdx : 0
+
+  if (normalizedMode === PlaybackMode.SHUFFLE) {
+    // Multi-item queue random selection excluding current item
+    const candidates = queue.filter((_, idx) => idx !== safeIdx)
+    const pickIdx = Math.floor(randomFn() * candidates.length)
+    return { queueItemId: candidates[pickIdx].queueItemId, rewindOnly: false }
+  }
+
+  // Non-random modes (ORDER, REPEAT_LIST, REPEAT_TRACK) switch to previous item with wrap-around
+  const prevIdx = (safeIdx - 1 + queue.length) % queue.length
+  return { queueItemId: queue[prevIdx].queueItemId, rewindOnly: false }
+}
+
 /**
  * Shared, deterministic queue state transitions.
  * Reused by both BrowserAudioAdapter and MockRemoteAudioAdapter to prevent
@@ -144,6 +277,9 @@ export function createPlaybackControlModule(config = {}) {
     queue: [],
     currentQueueItemId: null,
     queueVersion: 0,
+    playMode: normalizePlaybackMode(
+      config.initialPlayMode || PlaybackMode.ORDER,
+    ),
   }
 
   const listeners = new Set()
@@ -157,6 +293,7 @@ export function createPlaybackControlModule(config = {}) {
       volume: 0,
       skipNext: 0,
       skipPrev: 0,
+      setPlayMode: 0,
       addQueueItems: 0,
       removeQueueItem: 0,
       moveQueueItem: 0,
@@ -277,6 +414,13 @@ export function createPlaybackControlModule(config = {}) {
       nextState.queueVersion = update.queueVersion
       hasChange = true
     }
+    if (update.playMode !== undefined) {
+      const normalized = normalizePlaybackMode(update.playMode)
+      if (normalized !== state.playMode) {
+        nextState.playMode = normalized
+        hasChange = true
+      }
+    }
     if (update.error !== undefined) {
       nextState.error = update.error
       if (update.error) {
@@ -368,7 +512,15 @@ export function createPlaybackControlModule(config = {}) {
     skipNext: () =>
       dispatchCommand('skipNext', (epoch) => activeAdapter.skipNext(epoch)),
     skipPrev: () =>
-      dispatchCommand('skipPrev', (epoch) => activeAdapter.skipPrev(epoch)),
+      dispatchCommand('skipPrev', (epoch) =>
+        activeAdapter.skipPrev(epoch, state.position),
+      ),
+    setPlayMode: (mode) => {
+      const normalized = normalizePlaybackMode(mode)
+      return dispatchCommand('setPlayMode', (epoch) =>
+        activeAdapter.setPlayMode(epoch, normalized),
+      )
+    },
     // Queue editing contract intents
     addQueueItems: (items, index = -1) =>
       dispatchCommand('addQueueItems', (epoch) =>

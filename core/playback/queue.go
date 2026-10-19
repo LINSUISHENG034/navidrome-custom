@@ -197,6 +197,21 @@ func (pd *Queue) IncreaseIndex() {
 	}
 }
 
+// PlaybackMode represents the 4 mutually exclusive playback modes.
+// Values match the wire format used by the upstream native player ('order', 'orderLoop', 'singleLoop', 'shufflePlay').
+type PlaybackMode string
+
+const (
+	PlaybackModeOrder       PlaybackMode = "order"
+	PlaybackModeRepeatList  PlaybackMode = "orderLoop"
+	PlaybackModeRepeatTrack PlaybackMode = "singleLoop"
+	PlaybackModeShuffle     PlaybackMode = "shufflePlay"
+)
+
+// PrevRewindThresholdSeconds is the threshold above which skipPrev rewinds to 0s
+// instead of switching to the previous track.
+const PrevRewindThresholdSeconds = 1.0
+
 // QueueCandidateItem represents a candidate server-side queue entry with a stable
 // instance identity, strictly separating track/media identity from queue instance identity.
 type QueueCandidateItem struct {
@@ -205,16 +220,18 @@ type QueueCandidateItem struct {
 }
 
 // QueueCandidateModel provides candidate server-side queue operations tracking items
-// by stable QueueItemID across duplicate tracks, reordering, and deletions.
+// by stable QueueItemID across duplicate tracks, reordering, deletions, and playback modes.
 type QueueCandidateModel struct {
 	CurrentQueueItemID string
 	Items              []QueueCandidateItem
+	Mode               PlaybackMode
 }
 
 func NewQueueCandidateModel() *QueueCandidateModel {
 	return &QueueCandidateModel{
 		CurrentQueueItemID: "",
 		Items:              nil,
+		Mode:               PlaybackModeOrder,
 	}
 }
 
@@ -343,5 +360,140 @@ func (m *QueueCandidateModel) SetCurrentByQueueItemID(queueItemID string) bool {
 func (m *QueueCandidateModel) Clear() {
 	m.Items = nil
 	m.CurrentQueueItemID = ""
+}
+
+func (m *QueueCandidateModel) SetMode(mode PlaybackMode) {
+	switch mode {
+	case PlaybackModeOrder, PlaybackModeRepeatList, PlaybackModeRepeatTrack, PlaybackModeShuffle:
+		m.Mode = mode
+	default:
+		m.Mode = PlaybackModeOrder
+	}
+}
+
+func randInt(r *rand.Rand, n int) int {
+	if n <= 1 {
+		return 0
+	}
+	if r != nil {
+		return r.Intn(n)
+	}
+	//nolint:gosec // mode selection in tests and candidate model
+	return rand.Intn(n)
+}
+
+func (m *QueueCandidateModel) pickRandomOther(curIdx int, r *rand.Rand) int {
+	candidates := make([]int, 0, len(m.Items)-1)
+	for i := range m.Items {
+		if i != curIdx {
+			candidates = append(candidates, i)
+		}
+	}
+	return candidates[randInt(r, len(candidates))]
+}
+
+// Next selects the next queue item based on the active playback mode.
+// In order, repeat_list, and repeat_track, manual next advances to the next track,
+// wrapping around at the end of the queue. Single-repeat does not block manual skip.
+// In natural end:
+// - order stops at the end of the queue
+// - repeat_list wraps around at the end
+// - repeat_track replays the current track
+// - shuffle selects randomly from remaining items (excluding current item) without reordering Items.
+func (m *QueueCandidateModel) Next(manual bool, r *rand.Rand) (string, bool) {
+	if len(m.Items) == 0 {
+		return "", false
+	}
+
+	if len(m.Items) == 1 {
+		if manual {
+			m.CurrentQueueItemID = m.Items[0].QueueItemID
+			return m.CurrentQueueItemID, true
+		}
+		if m.Mode == PlaybackModeOrder {
+			return m.CurrentQueueItemID, false // stopped
+		}
+		m.CurrentQueueItemID = m.Items[0].QueueItemID
+		return m.CurrentQueueItemID, true
+	}
+
+	curIdx := m.findIndexByID(m.CurrentQueueItemID)
+	if curIdx == -1 {
+		curIdx = 0
+	}
+
+	if m.Mode == PlaybackModeShuffle {
+		pick := m.pickRandomOther(curIdx, r)
+		m.CurrentQueueItemID = m.Items[pick].QueueItemID
+		return m.CurrentQueueItemID, true
+	}
+
+	if m.Mode == PlaybackModeRepeatTrack {
+		if manual {
+			nextIdx := (curIdx + 1) % len(m.Items)
+			m.CurrentQueueItemID = m.Items[nextIdx].QueueItemID
+			return m.CurrentQueueItemID, true
+		}
+		// Natural end replays current item
+		return m.CurrentQueueItemID, true
+	}
+
+	if m.Mode == PlaybackModeRepeatList {
+		nextIdx := (curIdx + 1) % len(m.Items)
+		m.CurrentQueueItemID = m.Items[nextIdx].QueueItemID
+		return m.CurrentQueueItemID, true
+	}
+
+	// ORDER mode
+	if manual {
+		nextIdx := (curIdx + 1) % len(m.Items)
+		m.CurrentQueueItemID = m.Items[nextIdx].QueueItemID
+		return m.CurrentQueueItemID, true
+	}
+
+	if curIdx >= len(m.Items)-1 {
+		return m.CurrentQueueItemID, false // stopped at end
+	}
+	m.CurrentQueueItemID = m.Items[curIdx+1].QueueItemID
+	return m.CurrentQueueItemID, true
+}
+
+// Prev handles previous song intent.
+// When currentTime > PrevRewindThresholdSeconds, it rewinds to 0 without switching tracks.
+// When currentTime <= PrevRewindThresholdSeconds, non-random modes switch to previous track with wrap-around,
+// and shuffle mode picks randomly from remaining items (excluding current item).
+func (m *QueueCandidateModel) Prev(currentTime float64, r *rand.Rand) (string, bool) {
+	if len(m.Items) == 0 {
+		return "", false
+	}
+
+	if currentTime > PrevRewindThresholdSeconds {
+		return m.CurrentQueueItemID, true // rewind only
+	}
+
+	if len(m.Items) == 1 {
+		m.CurrentQueueItemID = m.Items[0].QueueItemID
+		return m.CurrentQueueItemID, true
+	}
+
+	curIdx := m.findIndexByID(m.CurrentQueueItemID)
+	if curIdx == -1 {
+		curIdx = 0
+	}
+
+	if m.Mode == PlaybackModeShuffle {
+		pick := m.pickRandomOther(curIdx, r)
+		m.CurrentQueueItemID = m.Items[pick].QueueItemID
+		return m.CurrentQueueItemID, true
+	}
+
+	prevIdx := (curIdx - 1 + len(m.Items)) % len(m.Items)
+	m.CurrentQueueItemID = m.Items[prevIdx].QueueItemID
+	return m.CurrentQueueItemID, true
+}
+
+// NaturalEnd advances the queue upon track natural completion.
+func (m *QueueCandidateModel) NaturalEnd(r *rand.Rand) (string, bool) {
+	return m.Next(false, r)
 }
 

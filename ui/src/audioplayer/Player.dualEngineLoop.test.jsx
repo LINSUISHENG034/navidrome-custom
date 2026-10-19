@@ -35,6 +35,10 @@ vi.mock('sortablejs', async () => {
 import {
   createPlaybackControlModule,
   PlaybackStatus,
+  PlaybackMode,
+  normalizePlaybackMode,
+  getNextTrack,
+  getPrevTrack,
 } from './playbackControlModule'
 import { createBrowserAudioAdapter } from './browserAudioAdapter'
 import { createMockRemoteAudioAdapter } from './mockRemoteAudioAdapter'
@@ -1129,6 +1133,603 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(localResult.currentId).toBe('q-dup-1') // Successor at index 0
       expect(remoteResult.queueIds).toEqual(localResult.queueIds)
       expect(remoteResult.currentId).toEqual(localResult.currentId)
+    })
+  })
+
+  describe('Playback Mode Contract and Natural End Progression (Issue 04)', () => {
+    const modeTracks = [
+      {
+        queueItemId: 'mode-1',
+        trackId: 'track-1',
+        name: 'First Mode Song',
+        singer: 'Artist 1',
+        musicSrc: 'http://localhost/song1.mp3',
+        id: 'track-1',
+      },
+      {
+        queueItemId: 'mode-2',
+        trackId: 'track-2',
+        name: 'Second Mode Song',
+        singer: 'Artist 2',
+        musicSrc: 'http://localhost/song2.mp3',
+        id: 'track-2',
+      },
+      {
+        queueItemId: 'mode-3',
+        trackId: 'track-3',
+        name: 'Third Mode Song',
+        singer: 'Artist 3',
+        musicSrc: 'http://localhost/song3.mp3',
+        id: 'track-3',
+      },
+    ]
+
+    /**
+     * Case: TC-PM-01
+     * Requirement: US-10, Issue 04 lines 11, 12
+     * Scenario: Manual Next under order, orderLoop, and singleLoop modes across both engines
+     * Expected State: All advance to next track; at queue end, all wrap around to index 0;
+     *                 singleLoop does NOT prevent active song skipping.
+     */
+    it('TC-PM-01: manual Next advances and wraps around under order, orderLoop, and singleLoop on both engines', async () => {
+      const testManualNext = async (adapter, isRemote = false) => {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+
+        await controller.addQueueItems(modeTracks)
+        expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+        // 1. ORDER mode: advance, then wrap at end
+        await controller.setPlayMode(PlaybackMode.ORDER)
+        await controller.skipNext()
+        expect(controller.getState().currentQueueItemId).toBe('mode-2')
+
+        await controller.skipNext()
+        expect(controller.getState().currentQueueItemId).toBe('mode-3')
+
+        // Manual Next at last item wraps around to first item
+        await controller.skipNext()
+        expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+        // 2. ORDER_LOOP mode: wrap at end
+        await controller.setPlayMode(PlaybackMode.REPEAT_LIST)
+        await controller.skipToQueueItem('mode-3')
+        await controller.skipNext()
+        expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+        // 3. SINGLE_LOOP mode: does NOT block active skip!
+        await controller.setPlayMode(PlaybackMode.REPEAT_TRACK)
+        await controller.skipToQueueItem('mode-2')
+        await controller.skipNext()
+        expect(controller.getState().currentQueueItemId).toBe('mode-3')
+
+        await controller.skipNext()
+        expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+        if (isRemote) {
+          const wireCmds = adapter.getWireCommands()
+          const nextCmds = wireCmds.filter((c) => c.action === 'skipNext')
+          expect(nextCmds.length).toBe(6)
+        }
+      }
+
+      await testManualNext(createBrowserAudioAdapter(), false)
+      await testManualNext(createMockRemoteAudioAdapter(), true)
+    })
+
+    /**
+     * Case: TC-PM-02
+     * Requirement: US-10, Issue 04 line 13
+     * Scenario: Natural End in order mode across both engines
+     * Expected State: Natural end advances before queue end, stops at queue end (does not loop)
+     */
+    it('TC-PM-02: natural end in order mode advances before end and stops at end of queue across both engines', async () => {
+      // 1. Local Browser Audio Adapter: real DOM ended event
+      const localAdapter = createBrowserAudioAdapter()
+      const localController = createPlaybackControlModule()
+      localController.setAdapter(localAdapter)
+      await localController.addQueueItems(modeTracks)
+      await localController.setPlayMode(PlaybackMode.ORDER)
+
+      const audioEl = localAdapter.getAudioElement()
+
+      // Natural end on mode-1 -> advances to mode-2
+      act(() => {
+        audioEl.dispatchEvent(new Event('ended'))
+      })
+      expect(localController.getState().currentQueueItemId).toBe('mode-2')
+      expect(localController.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      // Natural end on mode-2 -> advances to mode-3
+      act(() => {
+        audioEl.dispatchEvent(new Event('ended'))
+      })
+      expect(localController.getState().currentQueueItemId).toBe('mode-3')
+      expect(localController.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      // Natural end on mode-3 (last) -> stops! Does NOT wrap around
+      act(() => {
+        audioEl.dispatchEvent(new Event('ended'))
+      })
+      expect(localController.getState().currentQueueItemId).toBe('mode-3')
+      expect(localController.getState().status).toBe(PlaybackStatus.PAUSED)
+
+      // 2. Mock Remote Audio Adapter: autonomous server natural end
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      const remoteController = createPlaybackControlModule()
+      remoteController.setAdapter(remoteAdapter)
+      await remoteController.addQueueItems(modeTracks)
+      await remoteController.setPlayMode(PlaybackMode.ORDER)
+
+      remoteAdapter.triggerNaturalEnd()
+      expect(remoteController.getState().currentQueueItemId).toBe('mode-2')
+      expect(remoteController.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      remoteAdapter.triggerNaturalEnd()
+      expect(remoteController.getState().currentQueueItemId).toBe('mode-3')
+      expect(remoteController.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      const stopResult = remoteAdapter.triggerNaturalEnd()
+      expect(stopResult.stopped).toBe(true)
+      expect(remoteController.getState().currentQueueItemId).toBe('mode-3')
+      expect(remoteController.getState().status).toBe(PlaybackStatus.PAUSED)
+    })
+
+    /**
+     * Case: TC-PM-03
+     * Requirement: US-10, Issue 04 line 13
+     * Scenario: Natural End in orderLoop mode across both engines
+     * Expected State: Natural end on last item wraps around to first item and continues playing
+     */
+    it('TC-PM-03: natural end in orderLoop mode wraps from last item to first item across both engines', async () => {
+      // 1. Local Browser Audio Adapter
+      const localAdapter = createBrowserAudioAdapter()
+      const localController = createPlaybackControlModule()
+      localController.setAdapter(localAdapter)
+      await localController.addQueueItems(modeTracks)
+      await localController.setPlayMode(PlaybackMode.REPEAT_LIST)
+      await localController.skipToQueueItem('mode-3')
+
+      const audioEl = localAdapter.getAudioElement()
+      act(() => {
+        audioEl.dispatchEvent(new Event('ended'))
+      })
+      expect(localController.getState().currentQueueItemId).toBe('mode-1')
+      expect(localController.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      // 2. Mock Remote Audio Adapter
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      const remoteController = createPlaybackControlModule()
+      remoteController.setAdapter(remoteAdapter)
+      await remoteController.addQueueItems(modeTracks)
+      await remoteController.setPlayMode(PlaybackMode.REPEAT_LIST)
+      await remoteController.skipToQueueItem('mode-3')
+
+      const res = remoteAdapter.triggerNaturalEnd()
+      expect(res.stopped).toBe(false)
+      expect(remoteController.getState().currentQueueItemId).toBe('mode-1')
+      expect(remoteController.getState().status).toBe(PlaybackStatus.PLAYING)
+    })
+
+    /**
+     * Case: TC-PM-04
+     * Requirement: US-10, Issue 04 line 13
+     * Scenario: Natural End in singleLoop mode across both engines
+     * Expected State: Replays current item from 0s, remains PLAYING
+     */
+    it('TC-PM-04: natural end in singleLoop mode replays current item across both engines', async () => {
+      // 1. Local Browser Audio Adapter
+      const localAdapter = createBrowserAudioAdapter()
+      const localController = createPlaybackControlModule()
+      localController.setAdapter(localAdapter)
+      await localController.addQueueItems(modeTracks)
+      await localController.setPlayMode(PlaybackMode.REPEAT_TRACK)
+      await localController.skipToQueueItem('mode-2')
+
+      const audioEl = localAdapter.getAudioElement()
+      act(() => {
+        audioEl.dispatchEvent(new Event('ended'))
+      })
+      expect(localController.getState().currentQueueItemId).toBe('mode-2')
+      expect(audioEl.currentTime).toBe(0)
+      expect(localController.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      // 2. Mock Remote Audio Adapter
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      const remoteController = createPlaybackControlModule()
+      remoteController.setAdapter(remoteAdapter)
+      await remoteController.addQueueItems(modeTracks)
+      await remoteController.setPlayMode(PlaybackMode.REPEAT_TRACK)
+      await remoteController.skipToQueueItem('mode-2')
+
+      const res = remoteAdapter.triggerNaturalEnd()
+      expect(res.stopped).toBe(false)
+      expect(remoteController.getState().currentQueueItemId).toBe('mode-2')
+      expect(remoteController.getState().position).toBe(0)
+      expect(remoteController.getState().status).toBe(PlaybackStatus.PLAYING)
+    })
+
+    /**
+     * Case: TC-PM-05
+     * Requirement: US-3, US-10, Issue 04 line 15
+     * Scenario: Manual Prev threshold (>1.0s rewinds to 0s; <=1.0s moves to prev with wrap-around)
+     * Expected State: Threshold behavior honored on both engines
+     */
+    it('TC-PM-05: manual Prev rewinds when currentTime > 1.0s, otherwise moves to previous with wrap-around', async () => {
+      // 1. Local Browser Audio Adapter
+      const localAdapter = createBrowserAudioAdapter()
+      const localController = createPlaybackControlModule()
+      localController.setAdapter(localAdapter)
+      await localController.addQueueItems(modeTracks)
+      await localController.skipToQueueItem('mode-2')
+
+      const audioEl = localAdapter.getAudioElement()
+
+      // Progress > 1s -> rewind only
+      audioEl.currentTime = 15.0
+      await localController.skipPrev()
+      expect(audioEl.currentTime).toBe(0)
+      expect(localController.getState().currentQueueItemId).toBe('mode-2')
+
+      // Progress <= 1s -> switches to previous track (mode-1)
+      audioEl.currentTime = 0.5
+      await localController.skipPrev()
+      expect(localController.getState().currentQueueItemId).toBe('mode-1')
+
+      // At mode-1, progress <= 1s -> wraps around to last item (mode-3)
+      audioEl.currentTime = 0.0
+      await localController.skipPrev()
+      expect(localController.getState().currentQueueItemId).toBe('mode-3')
+
+      // 2. Mock Remote Audio Adapter
+      const remoteAdapter = createMockRemoteAudioAdapter({
+        initialPosition: 20.0,
+      })
+      const remoteController = createPlaybackControlModule()
+      remoteController.setAdapter(remoteAdapter)
+      await remoteController.addQueueItems(modeTracks)
+      await remoteController.skipToQueueItem('mode-2')
+
+      // Position > 1s -> rewind
+      remoteAdapter.pushServerSnapshot({ position: 20.0 })
+      await remoteController.skipPrev()
+      expect(remoteController.getState().position).toBe(0)
+      expect(remoteController.getState().currentQueueItemId).toBe('mode-2')
+
+      // Position <= 1s -> previous track
+      remoteAdapter.pushServerSnapshot({ position: 0.5 })
+      await remoteController.skipPrev()
+      expect(remoteController.getState().currentQueueItemId).toBe('mode-1')
+
+      // Wrap around at first track
+      remoteAdapter.pushServerSnapshot({ position: 0.0 })
+      await remoteController.skipPrev()
+      expect(remoteController.getState().currentQueueItemId).toBe('mode-3')
+    })
+
+    /**
+     * Case: TC-PM-06
+     * Requirement: US-11, US-12, Issue 04 lines 16, 17
+     * Scenario: Shuffle mode selection without reordering visible queue, excluding current item
+     * Expected State: Deterministic selection via PRNG, zero visible queue mutation, no history stack
+     */
+    it('TC-PM-06: random mode does not mutate visible queue order, excludes current item, and uses deterministic PRNG', async () => {
+      // Deterministic PRNG: returns 0 (picks first candidate)
+      const mockRandom = vi.fn().mockReturnValue(0)
+
+      const adapter = createMockRemoteAudioAdapter({ randomFn: mockRandom })
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(adapter)
+
+      await controller.addQueueItems(modeTracks)
+      await controller.setPlayMode(PlaybackMode.SHUFFLE)
+      await controller.skipToQueueItem('mode-2')
+
+      // Current is mode-2. Candidates are [mode-1, mode-3].
+      // mockRandom returns 0 -> picks candidates[0] = mode-1.
+      await controller.skipNext()
+      expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+      // Crucial: visible queue sequence and length must NOT be mutated!
+      const currentQueueIds = controller
+        .getState()
+        .queue.map((item) => item.queueItemId)
+      expect(currentQueueIds).toEqual(['mode-1', 'mode-2', 'mode-3'])
+
+      // Next pick: current is mode-1. Candidates are [mode-2, mode-3].
+      // Return 0.99 -> picks candidates[1] = mode-3.
+      mockRandom.mockReturnValue(0.99)
+      await controller.skipNext()
+      expect(controller.getState().currentQueueItemId).toBe('mode-3')
+      expect(
+        controller.getState().queue.map((item) => item.queueItemId),
+      ).toEqual(['mode-1', 'mode-2', 'mode-3'])
+
+      // Prev threshold in shuffle mode: > 1s rewinds, does not pick random
+      adapter.pushServerSnapshot({ position: 5.0 })
+      await controller.skipPrev()
+      expect(controller.getState().position).toBe(0)
+      expect(controller.getState().currentQueueItemId).toBe('mode-3')
+
+      // Prev threshold <= 1s: picks random from candidates [mode-1, mode-2]
+      mockRandom.mockReturnValue(0)
+      adapter.pushServerSnapshot({ position: 0.2 })
+      await controller.skipPrev()
+      expect(controller.getState().currentQueueItemId).toBe('mode-1')
+    })
+
+    /**
+     * Case: TC-PM-07
+     * Requirement: US-10, US-18, Issue 04 line 18
+     * Scenario: Four mutually exclusive modes and native UI mode toggle cycling
+     * Expected State: Cycles order -> orderLoop -> singleLoop -> shufflePlay -> order;
+     *                 backfill updates UI without echoing commands.
+     */
+    it('TC-PM-07: four mutually exclusive modes and native UI mode toggle cycling', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      let playerRef = null
+      render(
+        <UnifiedNativePlayer
+          ref={(r) => {
+            playerRef = r
+          }}
+          controller={controller}
+          engineMode="remote"
+          audioLists={modeTracks}
+          playIndex={0}
+          mode="full"
+          autoPlay={false}
+        />,
+      )
+
+      await waitFor(() => {
+        expect(playerRef).not.toBeNull()
+      })
+
+      expect(controller.getState().playMode).toBe(PlaybackMode.ORDER)
+      expect(playerRef.state.playMode).toBe(PlaybackMode.ORDER)
+
+      // Cycle 1: order -> orderLoop
+      await act(async () => {
+        playerRef.togglePlayMode()
+      })
+      await waitFor(() => {
+        expect(controller.getState().playMode).toBe(PlaybackMode.REPEAT_LIST)
+      })
+      expect(playerRef.state.playMode).toBe(PlaybackMode.REPEAT_LIST)
+
+      // Cycle 2: orderLoop -> singleLoop
+      await act(async () => {
+        playerRef.togglePlayMode()
+      })
+      await waitFor(() => {
+        expect(controller.getState().playMode).toBe(PlaybackMode.REPEAT_TRACK)
+      })
+      expect(playerRef.state.playMode).toBe(PlaybackMode.REPEAT_TRACK)
+
+      // Cycle 3: singleLoop -> shufflePlay
+      await act(async () => {
+        playerRef.togglePlayMode()
+      })
+      await waitFor(() => {
+        expect(controller.getState().playMode).toBe(PlaybackMode.SHUFFLE)
+      })
+      expect(playerRef.state.playMode).toBe(PlaybackMode.SHUFFLE)
+
+      // Cycle 4: shufflePlay -> order (full wrap-around)
+      await act(async () => {
+        playerRef.togglePlayMode()
+      })
+      await waitFor(() => {
+        expect(controller.getState().playMode).toBe(PlaybackMode.ORDER)
+      })
+      expect(playerRef.state.playMode).toBe(PlaybackMode.ORDER)
+
+      // External snapshot backfill: updates playerRef state without echoing commands
+      const commandsBefore = controller.getMetrics().intentsIssued
+      act(() => {
+        controller.backfillState({ playMode: PlaybackMode.REPEAT_TRACK })
+      })
+      expect(playerRef.state.playMode).toBe(PlaybackMode.REPEAT_TRACK)
+      expect(controller.getMetrics().intentsIssued).toBe(commandsBefore)
+    })
+
+    /**
+     * Case: TC-PM-08
+     * Requirement: US-13, Issue 04 line 19
+     * Scenario: Autonomous remote progression continues when UI disconnects; reconnects cleanly
+     * Expected State: Server advances autonomously; reconnected UI recovers state; zero browser ended compensation
+     */
+    it('TC-PM-08: autonomous remote progression continues when UI disconnects; reconnects cleanly with zero ended compensation commands', async () => {
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(remoteAdapter)
+
+      await controller.addQueueItems(modeTracks)
+      await controller.setPlayMode(PlaybackMode.REPEAT_LIST)
+      expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+      // Step 1: UI mounts and binds to controller
+      const { unmount } = render(
+        <UnifiedNativePlayer
+          controller={controller}
+          engineMode="remote"
+          audioLists={modeTracks}
+          playIndex={0}
+          mode="full"
+          autoPlay={false}
+        />,
+      )
+
+      await waitFor(() => {
+        expect(document.querySelector('.play-btn')).not.toBeNull()
+      })
+
+      // Step 2: User closes tab / disconnects UI
+      unmount()
+
+      // Step 3: Remote server finishes songs and advances autonomously without browser being online
+      remoteAdapter.triggerNaturalEnd() // mode-1 -> mode-2
+      remoteAdapter.triggerNaturalEnd() // mode-2 -> mode-3
+      expect(remoteAdapter.getCurrentQueueItemId()).toBe('mode-3')
+
+      // Step 4: UI reconnects
+      remoteAdapter.clearWireCommands()
+      let reconnectedPlayer = null
+      render(
+        <UnifiedNativePlayer
+          ref={(r) => {
+            reconnectedPlayer = r
+          }}
+          controller={controller}
+          engineMode="remote"
+          audioLists={modeTracks}
+          mode="full"
+          autoPlay={false}
+        />,
+      )
+
+      await waitFor(() => {
+        expect(reconnectedPlayer).not.toBeNull()
+      })
+
+      // UI immediately displays remote authority's current track (mode-3)
+      expect(reconnectedPlayer.state.playId).toBe('mode-3')
+
+      // Guarantee: zero <audio> elements in DOM, zero ended compensation commands sent
+      expect(document.querySelector('audio')).toBeNull()
+      const endedCommands = remoteAdapter
+        .getWireCommands()
+        .filter((c) => c.action === 'ended')
+      expect(endedCommands.length).toBe(0)
+    })
+
+    /**
+     * Case: TC-PM-09
+     * Requirement: US-10, Issue 04 line 21
+     * Scenario: Boundary conditions for empty queue and single-item queue
+     * Expected State: Safe no-ops on empty queue; single-item replay/stop rules respected
+     */
+    it('TC-PM-09: handles boundary cases cleanly (empty queue & single-item queue) across both engines', async () => {
+      // 1. Empty queue boundary
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      await controller.clearQueue()
+      await expect(controller.skipNext()).resolves.toBeUndefined()
+      await expect(controller.skipPrev()).resolves.toBeUndefined()
+      expect(controller.getState().status).toBe(PlaybackStatus.IDLE)
+
+      // 2. Single-item queue boundary
+      await controller.addQueueItems([modeTracks[0]])
+      expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+      // Manual skip wraps/stays on single item
+      await controller.skipNext()
+      expect(controller.getState().currentQueueItemId).toBe('mode-1')
+      await controller.skipPrev()
+      expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+      // Natural end on single item:
+      // In ORDER mode -> stops
+      await controller.setPlayMode(PlaybackMode.ORDER)
+      const stopRes = remoteAdapter.triggerNaturalEnd()
+      expect(stopRes.stopped).toBe(true)
+
+      // In REPEAT_LIST mode -> replays
+      await controller.setPlayMode(PlaybackMode.REPEAT_LIST)
+      const listRes = remoteAdapter.triggerNaturalEnd()
+      expect(listRes.stopped).toBe(false)
+      expect(controller.getState().currentQueueItemId).toBe('mode-1')
+
+      // In SHUFFLE mode -> replays (single item allows replay)
+      await controller.setPlayMode(PlaybackMode.SHUFFLE)
+      const shuffleRes = remoteAdapter.triggerNaturalEnd()
+      expect(shuffleRes.stopped).toBe(false)
+      expect(controller.getState().currentQueueItemId).toBe('mode-1')
+    })
+
+    /**
+     * Case: TC-PM-10
+     * Requirement: US-24, Issue 04 lines 11, 23
+     * Scenario: Common behavioral mode contract sequence executed across both engines
+     * Expected State: Both engines produce 100% identical state transitions and final track ID
+     */
+    it('TC-PM-10: common behavioral mode contract produces identical state on both adapters', async () => {
+      const deterministicRandom = () => 0
+
+      const runModeSequence = async (adapter) => {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+
+        await controller.addQueueItems(modeTracks)
+
+        // 1. Order mode next
+        await controller.setPlayMode(PlaybackMode.ORDER)
+        await controller.skipNext() // mode-2
+        const s1 = controller.getState().currentQueueItemId
+
+        // 2. Order loop next past end
+        await controller.setPlayMode(PlaybackMode.REPEAT_LIST)
+        await controller.skipNext() // mode-3
+        await controller.skipNext() // mode-1 (wrapped)
+        const s2 = controller.getState().currentQueueItemId
+
+        // 3. Single loop manual skip (must not be blocked)
+        await controller.setPlayMode(PlaybackMode.REPEAT_TRACK)
+        await controller.skipNext() // mode-2
+        const s3 = controller.getState().currentQueueItemId
+
+        // 4. Skip prev > 1s threshold (rewind only)
+        if (adapter.getAudioElement) {
+          adapter.getAudioElement().currentTime = 10.0
+        } else {
+          adapter.pushServerSnapshot({ position: 10.0 })
+        }
+        await controller.skipPrev()
+        const s4 = controller.getState().currentQueueItemId
+        const pos4 = controller.getState().position
+
+        // 5. Skip prev <= 1s threshold (moves to mode-1)
+        if (adapter.getAudioElement) {
+          adapter.getAudioElement().currentTime = 0.2
+        } else {
+          adapter.pushServerSnapshot({ position: 0.2 })
+        }
+        await controller.skipPrev()
+        const s5 = controller.getState().currentQueueItemId
+
+        return {
+          steps: [s1, s2, s3, s4, s5],
+          pos4,
+          finalMode: controller.getState().playMode,
+        }
+      }
+
+      const localRes = await runModeSequence(
+        createBrowserAudioAdapter({ randomFn: deterministicRandom }),
+      )
+      const remoteRes = await runModeSequence(
+        createMockRemoteAudioAdapter({ randomFn: deterministicRandom }),
+      )
+
+      expect(localRes.steps).toEqual([
+        'mode-2',
+        'mode-1',
+        'mode-2',
+        'mode-2',
+        'mode-1',
+      ])
+      expect(localRes.pos4).toBe(0)
+      expect(localRes.finalMode).toBe(PlaybackMode.REPEAT_TRACK)
+
+      expect(remoteRes.steps).toEqual(localRes.steps)
+      expect(remoteRes.pos4).toBe(localRes.pos4)
+      expect(remoteRes.finalMode).toBe(localRes.finalMode)
     })
   })
 })

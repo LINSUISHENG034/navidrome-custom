@@ -20,7 +20,11 @@
 import React from 'react'
 import ReactDOM from 'react-dom'
 import ReactJkMusicPlayer from 'navidrome-music-player/es/index.js'
-import { PlaybackStatus } from './playbackControlModule'
+import {
+  PlaybackStatus,
+  PlaybackMode,
+  normalizePlaybackMode,
+} from './playbackControlModule'
 
 /**
  * Shared helper to resolve stable queue item identity across UI and drawer representations.
@@ -40,10 +44,15 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   constructor(props) {
     super(props)
 
+    const initialMode = props.controller
+      ? props.controller.getState().playMode
+      : props.playMode || props.defaultPlayMode
+
     this.state = {
       ...this.state,
       engineMode: props.engineMode || 'local',
       remoteDuration: props.duration || 0,
+      ...(initialMode ? { playMode: initialMode } : {}),
     }
 
     if (props.engineMode === 'remote') {
@@ -55,6 +64,41 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   }
 
   setupControllerOverrides() {
+    // Intercept native play mode toggle to route through unified controller
+    this.togglePlayMode = () => {
+      const { controller } = this.props
+      if (!controller) return
+      const currentMode = controller.getState().playMode || PlaybackMode.ORDER
+      const modeCycle = [
+        PlaybackMode.ORDER,
+        PlaybackMode.REPEAT_LIST,
+        PlaybackMode.REPEAT_TRACK,
+        PlaybackMode.SHUFFLE,
+      ]
+      const curIdx = modeCycle.indexOf(currentMode)
+      const nextMode =
+        modeCycle[(curIdx === -1 ? 0 : curIdx + 1) % modeCycle.length]
+      controller.setPlayMode(nextMode).catch(() => {})
+    }
+
+    // Intercept native prev and next to route through unified controller
+    this.onPlayNextAudio = () => {
+      const { controller } = this.props
+      if (controller) {
+        controller.skipNext().catch(() => {})
+      }
+    }
+
+    this.onPlayPrevAudio = () => {
+      const { controller } = this.props
+      if (controller) {
+        controller.skipPrev().catch(() => {})
+      }
+    }
+
+    // In controlled local/remote mode, natural end is handled authoritatively by the adapter
+    this.onAudioEnd = () => {}
+
     // Intercept native queue drawer actions to route through unified controller
     this.onDeleteAudioLists = (audioId) => (e) => {
       if (e && typeof e.stopPropagation === 'function') {
@@ -301,6 +345,12 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       }
       if (authoritativeState.currentQueueItemId !== undefined) {
         nextState.playId = authoritativeState.currentQueueItemId
+      }
+      if (
+        authoritativeState.playMode !== undefined &&
+        authoritativeState.playMode !== prevState.playMode
+      ) {
+        nextState.playMode = authoritativeState.playMode
       }
 
       return Object.keys(nextState).length > 0 ? nextState : null

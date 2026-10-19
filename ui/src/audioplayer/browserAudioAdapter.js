@@ -9,6 +9,10 @@
 
 import {
   PlaybackStatus,
+  PlaybackMode,
+  normalizePlaybackMode,
+  getNextTrack,
+  getPrevTrack,
   applyQueueAdd,
   applyQueueRemove,
   applyQueueMove,
@@ -25,6 +29,10 @@ export function createBrowserAudioAdapter(options = {}) {
   let queue = []
   let currentQueueItemId = null
   let queueVersion = 0
+  let playMode = normalizePlaybackMode(
+    options.initialPlayMode || PlaybackMode.ORDER,
+  )
+  const randomFn = options.randomFn || Math.random
 
   // Event handlers bound to current active instance
   const eventListeners = {}
@@ -36,6 +44,37 @@ export function createBrowserAudioAdapter(options = {}) {
       ownsElement = true
     }
     return audioElement
+  }
+
+  function playQueueItem(el, targetQueueItemId) {
+    if (!el || !targetQueueItemId) return
+
+    const isSameItem = targetQueueItemId === currentQueueItemId
+    currentQueueItemId = targetQueueItemId
+
+    // Spec compliance: only reload src if switching to a different track;
+    // same-item repeat (singleLoop) resets currentTime without reloading audio stream.
+    if (!isSameItem) {
+      const target = queue.find(
+        (item) => item.queueItemId === currentQueueItemId,
+      )
+      if (target && target.musicSrc) {
+        el.src = target.musicSrc
+      }
+    }
+
+    el.currentTime = 0
+    if (typeof el.play === 'function') {
+      el.play().catch(() => {})
+    }
+
+    if (stateCallback) {
+      stateCallback(activeEpoch, {
+        currentQueueItemId,
+        position: 0,
+        status: PlaybackStatus.PLAYING,
+      })
+    }
   }
 
   function handleMediaEvent(eventName) {
@@ -73,12 +112,24 @@ export function createBrowserAudioAdapter(options = {}) {
           isMuted: el.muted,
         })
         break
-      case 'ended':
-        stateCallback(activeEpoch, {
-          status: PlaybackStatus.PAUSED,
-          position: el.duration || el.currentTime || 0,
+      case 'ended': {
+        const res = getNextTrack({
+          queue,
+          currentQueueItemId,
+          mode: playMode,
+          isManual: false,
+          randomFn,
         })
+        if (res.shouldStop) {
+          stateCallback(activeEpoch, {
+            status: PlaybackStatus.PAUSED,
+            position: el.duration || el.currentTime || 0,
+          })
+        } else if (res.queueItemId) {
+          playQueueItem(el, res.queueItemId)
+        }
         break
+      }
       case 'error': {
         const mediaError = el.error
         stateCallback(activeEpoch, {
@@ -199,14 +250,60 @@ export function createBrowserAudioAdapter(options = {}) {
     el.volume = clamped
   }
 
-  async function skipNext() {
-    if (!isActive) return
-    // Forwarded to playlist/track manager when implemented
+  async function setPlayMode(epoch, mode) {
+    if (!isActive || epoch !== activeEpoch) return
+    playMode = normalizePlaybackMode(mode)
+    if (stateCallback) {
+      stateCallback(activeEpoch, {
+        playMode,
+      })
+    }
   }
 
-  async function skipPrev() {
-    if (!isActive) return
-    // Forwarded to playlist/track manager when implemented
+  async function skipNext(epoch) {
+    if (!isActive || epoch !== activeEpoch) return
+    const el = ensureAudioElement()
+    const res = getNextTrack({
+      queue,
+      currentQueueItemId,
+      mode: playMode,
+      isManual: true,
+      randomFn,
+    })
+    if (res.queueItemId) {
+      playQueueItem(el, res.queueItemId)
+    }
+  }
+
+  async function skipPrev(epoch, currentPos) {
+    if (!isActive || epoch !== activeEpoch) return
+    const el = ensureAudioElement()
+    const pos =
+      typeof el.currentTime === 'number' && !isNaN(el.currentTime)
+        ? el.currentTime
+        : currentPos || 0
+
+    const res = getPrevTrack({
+      queue,
+      currentQueueItemId,
+      mode: playMode,
+      currentTime: pos,
+      randomFn,
+    })
+
+    if (res.rewindOnly) {
+      el.currentTime = 0
+      if (stateCallback) {
+        stateCallback(activeEpoch, {
+          position: 0,
+        })
+      }
+      return
+    }
+
+    if (res.queueItemId) {
+      playQueueItem(el, res.queueItemId)
+    }
   }
 
   async function addQueueItems(epoch, items = [], index = -1) {
@@ -361,6 +458,7 @@ export function createBrowserAudioAdapter(options = {}) {
     setVolume,
     skipNext,
     skipPrev,
+    setPlayMode,
     addQueueItems,
     removeQueueItem,
     moveQueueItem,
@@ -368,6 +466,7 @@ export function createBrowserAudioAdapter(options = {}) {
     skipToQueueItem,
     getQueue: () => [...queue],
     getCurrentQueueItemId: () => currentQueueItemId,
+    getPlayMode: () => playMode,
     getAudioElement: () => audioElement,
   }
 }
