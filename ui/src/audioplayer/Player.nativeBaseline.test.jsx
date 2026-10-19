@@ -447,6 +447,7 @@ describe('Native Player (ReactJkMusicPlayer) Baseline Behavioral Contract', () =
     })
 
     pauseSpy.mockClear()
+    loadSpy.mockClear()
 
     // Simulate natural end at queue end in order mode
     act(() => {
@@ -463,10 +464,62 @@ describe('Native Player (ReactJkMusicPlayer) Baseline Behavioral Contract', () =
     expect(playerRef.state.playMode).toBe('singleLoop')
 
     const currentPlayId = playerRef.state.playId
+    playerRef.audio.currentTime = 45
+
     act(() => {
       playerRef.onAudioEnd()
     })
-    // In singleLoop mode, playId remains the same track
+    // In singleLoop mode, playId remains the same track and audio resets to 0s for replay
     expect(playerRef.state.playId).toBe(currentPlayId)
+    expect(playerRef.audio.currentTime).toBe(0)
+  })
+
+  it('TC-06: moving playing item preserves playing identity without resetting audio when quietUpdate=true', async () => {
+    let playerRef = null
+
+    const { rerender } = render(
+      <ReactJkMusicPlayer
+        ref={(r) => {
+          playerRef = r
+        }}
+        audioLists={sampleTracks}
+        playIndex={0}
+        quietUpdate={true}
+        mode="full"
+        autoPlay={false}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(playerRef).not.toBeNull()
+    })
+
+    const initialPlayId = playerRef.state.playId
+    expect(playerRef.getCurrentPlayIndex()).toBe(0)
+
+    loadSpy.mockClear()
+
+    // Reorder queue: move Song 0 to index 1 -> [Song 1, Song 0, Song 2]
+    const reorderedTracks = [sampleTracks[1], sampleTracks[0], sampleTracks[2]]
+
+    rerender(
+      <ReactJkMusicPlayer
+        ref={(r) => {
+          playerRef = r
+        }}
+        audioLists={reorderedTracks}
+        playIndex={1}
+        clearPriorAudioLists={true}
+        quietUpdate={true}
+        mode="full"
+        autoPlay={false}
+      />,
+    )
+
+    // With quietUpdate, audioLists state updates, but audio.load is NOT called,
+    // and playId remains identical (identity preserved without track restart).
+    expect(playerRef.state.playId).toBe(initialPlayId)
+    expect(playerRef.getCurrentPlayIndex()).toBe(1)
+    expect(loadSpy).not.toHaveBeenCalled()
   })
 })
