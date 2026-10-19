@@ -61,6 +61,7 @@ export function createBrowserAudioAdapter(options = {}) {
           position: el.currentTime || 0,
         })
         break
+      case 'seeked':
       case 'timeupdate':
         stateCallback(activeEpoch, {
           position: el.currentTime || 0,
@@ -101,6 +102,7 @@ export function createBrowserAudioAdapter(options = {}) {
       'play',
       'playing',
       'pause',
+      'seeked',
       'timeupdate',
       'volumechange',
       'ended',

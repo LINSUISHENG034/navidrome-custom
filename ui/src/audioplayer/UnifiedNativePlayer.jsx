@@ -22,6 +22,20 @@ import ReactDOM from 'react-dom'
 import ReactJkMusicPlayer from 'navidrome-music-player/es/index.js'
 import { PlaybackStatus } from './playbackControlModule'
 
+/**
+ * Shared helper to resolve stable queue item identity across UI and drawer representations.
+ */
+function resolveQueueItemId(identifier, lists = []) {
+  if (!identifier) return null
+  const item = lists.find(
+    (a) =>
+      a.queueItemId === identifier ||
+      a.uuid === identifier ||
+      a.__PLAYER_KEY__ === identifier,
+  )
+  return item?.queueItemId || item?.uuid || identifier
+}
+
 export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   constructor(props) {
     super(props)
@@ -55,14 +69,7 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       }
 
       const currentLists = this.state.audioLists || []
-      const targetItem = currentLists.find(
-        (a) =>
-          a.__PLAYER_KEY__ === audioId ||
-          a.queueItemId === audioId ||
-          a.uuid === audioId,
-      )
-      const targetQueueItemId =
-        targetItem?.queueItemId || targetItem?.uuid || audioId
+      const targetQueueItemId = resolveQueueItemId(audioId, currentLists)
       controller.removeQueueItem(targetQueueItemId).catch(() => {})
     }
 
@@ -74,7 +81,10 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       const currentLists = this.state.audioLists || []
       const item = currentLists[oldIndex]
       if (!item) return
-      const queueItemId = item.queueItemId || item.uuid || item.__PLAYER_KEY__
+      const queueItemId = resolveQueueItemId(
+        item.queueItemId || item.uuid || item.__PLAYER_KEY__,
+        currentLists,
+      )
       controller.moveQueueItem(queueItemId, newIndex).catch(() => {})
     }
 
@@ -83,14 +93,7 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       if (!controller) return
 
       const currentLists = this.state.audioLists || []
-      const targetItem = currentLists.find(
-        (a) =>
-          a.__PLAYER_KEY__ === playId ||
-          a.queueItemId === playId ||
-          a.uuid === playId,
-      )
-      const targetQueueItemId =
-        targetItem?.queueItemId || targetItem?.uuid || playId
+      const targetQueueItemId = resolveQueueItemId(playId, currentLists)
       controller.skipToQueueItem(targetQueueItemId).catch(() => {})
     }
   }
@@ -194,6 +197,14 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   componentDidMount() {
     super.componentDidMount()
 
+    if (
+      this.props.engineMode === 'local' &&
+      this.props.browserAdapter &&
+      this.audio
+    ) {
+      this.props.browserAdapter.attachElement(this.audio)
+    }
+
     if (this.props.engineMode === 'remote') {
       // In remote mode, clear loading state since there is no browser audio waiting to load
       this.setState({ loading: false })
@@ -217,6 +228,16 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     ) {
       this.setupRemoteModeOverrides()
       this.setState({ loading: false })
+    }
+
+    if (
+      (prevProps.engineMode !== this.props.engineMode ||
+        prevProps.browserAdapter !== this.props.browserAdapter) &&
+      this.props.engineMode === 'local' &&
+      this.props.browserAdapter &&
+      this.audio
+    ) {
+      this.props.browserAdapter.attachElement(this.audio)
     }
 
     if (
