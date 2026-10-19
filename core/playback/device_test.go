@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -607,6 +608,100 @@ func TestPlaybackDeviceCancelledStartDoesNotDisplaceSuccessor(t *testing.T) {
 	testPlaybackDeviceCancelsPendingStart(t, (*playbackDevice).Stop, true)
 }
 
+func TestPlaybackDeviceNaturalAdvanceRetriesTransientErrorAndSucceeds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mediaFiles := map[string]model.MediaFile{
+		"1": {ID: "1", Path: "/1.mp3"},
+		"2": {ID: "2", Path: "/2.mp3"},
+	}
+	stub := &sessionStatusStubServer{mediaFiles: mediaFiles}
+	device := NewPlaybackDevice(ctx, stub, "Speaker", "auto")
+	if _, err := device.Add(ctx, []string{"1", "2"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	previousNewTrack := newTrack
+	attempts := 0
+	newTrack = func(ctx context.Context, events chan<- model.PlaybackEvent, token model.PlaybackToken, deviceName string, mf model.MediaFile) (Track, error) {
+		if mf.ID == "2" {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("transient PipeWire link error")
+			}
+		}
+		return &mockTrack{playing: true}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+
+	if status, err := device.Start(ctx); err != nil || !status.Playing {
+		t.Fatalf("initial start failed: %#v, %v", status, err)
+	}
+
+	// Trigger natural end of track 1
+	device.PlaybackEvents <- model.PlaybackEvent{
+		Token: device.activePlaybackToken,
+		Kind:  model.PlaybackEventNaturalEnd,
+	}
+
+	// Wait for retry to succeed and device to advance to track 2
+	waitDeviceStatus(t, device, ctx, DeviceStatus{
+		CurrentIndex: 1,
+		Playing:      true,
+		Gain:         DefaultGain,
+		Position:     0,
+		QueueVersion: 1,
+	})
+	if attempts < 2 {
+		t.Fatalf("expected at least 2 attempts for track 2 (retry), got %d", attempts)
+	}
+}
+
+func TestPlaybackDeviceNaturalAdvanceReportsFailureAfterRetriesExhausted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mediaFiles := map[string]model.MediaFile{
+		"1": {ID: "1", Path: "/1.mp3"},
+		"2": {ID: "2", Path: "/2.mp3"},
+	}
+	stub := &sessionStatusStubServer{mediaFiles: mediaFiles}
+	device := NewPlaybackDevice(ctx, stub, "Speaker", "auto")
+	if _, err := device.Add(ctx, []string{"1", "2"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	previousNewTrack := newTrack
+	newTrack = func(ctx context.Context, events chan<- model.PlaybackEvent, token model.PlaybackToken, deviceName string, mf model.MediaFile) (Track, error) {
+		if mf.ID == "2" {
+			return nil, errors.New("persistent output error")
+		}
+		return &mockTrack{playing: true}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+
+	if status, err := device.Start(ctx); err != nil || !status.Playing {
+		t.Fatalf("initial start failed: %#v, %v", status, err)
+	}
+
+	// Trigger natural end of track 1
+	device.PlaybackEvents <- model.PlaybackEvent{
+		Token: device.activePlaybackToken,
+		Kind:  model.PlaybackEventNaturalEnd,
+	}
+
+	// Wait for retries to be exhausted and device to report failure
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := device.Status(ctx)
+		if err == nil && status.CurrentIndex == 1 && !status.Playing && device.FailureReason() == "track_switch_failed" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	status, _ := device.Status(ctx)
+	t.Fatalf("expected track_switch_failed after retries exhausted, got: %#v, reason=%s", status, device.FailureReason())
+}
+
 var _ = Describe("playbackDevice concurrency", func() {
 	It("handles concurrent Status and Clear calls without panic", func() {
 		pd := &playbackDevice{
@@ -668,3 +763,230 @@ var _ = Describe("playbackDevice concurrency", func() {
 		Expect(status.Position).To(Equal(0))
 	})
 })
+
+// ---------------------------------------------------------------------------
+// Adversarial regression tests for natural-end retry backoff (device.go:552-565).
+// ---------------------------------------------------------------------------
+
+func newAdversarialDevice(t *testing.T, onTwo func(attempt int) error) (context.Context, context.CancelFunc, *playbackDevice, *atomic.Int32) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	mediaFiles := map[string]model.MediaFile{
+		"1": {ID: "1", Path: "/1.mp3"},
+		"2": {ID: "2", Path: "/2.mp3"},
+	}
+	stub := &sessionStatusStubServer{mediaFiles: mediaFiles}
+	device := NewPlaybackDevice(ctx, stub, "Speaker", "auto")
+	if _, err := device.Add(ctx, []string{"1", "2"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	var attempts atomic.Int32
+	previousNewTrack := newTrack
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, _ model.PlaybackToken, _ string, mf model.MediaFile) (Track, error) {
+		if mf.ID == "2" {
+			attempt := int(attempts.Add(1))
+			if err := onTwo(attempt); err != nil {
+				return nil, err
+			}
+		}
+		return &mockTrack{}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+	if status, err := device.Start(ctx); err != nil || !status.Playing {
+		t.Fatalf("initial start: status=%#v, err=%v", status, err)
+	}
+	return ctx, cancel, device, &attempts
+}
+
+func waitAdversarialRetryBackoff(t *testing.T, device *playbackDevice, attempts *atomic.Int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		device.mu.Lock()
+		ready := device.PlaybackQueue.Index == 1 && device.ActiveTrack == nil && len(device.pendingPlaybackTokens) == 0 && attempts.Load() == 1
+		device.mu.Unlock()
+		if ready {
+			return
+		}
+		if attempts.Load() > 1 {
+			t.Fatal("missed the first retry backoff window")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("first failed preparation did not enter retry backoff")
+}
+
+func emitAdversarialNaturalEnd(device *playbackDevice) {
+	device.PlaybackEvents <- model.PlaybackEvent{
+		Token: device.activePlaybackToken,
+		Kind:  model.PlaybackEventNaturalEnd,
+	}
+}
+
+func TestAdversarialRetryBackoffDeadlocksOnContextCancel(t *testing.T) {
+	firstFailure := make(chan struct{})
+	var failOnce atomic.Int32
+	ctx, cancel, device, attempts := newAdversarialDevice(t, func(attempt int) error {
+		if failOnce.CompareAndSwap(0, 1) {
+			close(firstFailure)
+		}
+		return errors.New("persistent output error")
+	})
+	t.Cleanup(cancel)
+
+	emitAdversarialNaturalEnd(device)
+	select {
+	case <-firstFailure:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first retry failure did not happen; backoff never entered")
+	}
+	waitAdversarialRetryBackoff(t, device, attempts)
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+
+	type statusResult struct {
+		status DeviceStatus
+		err    error
+	}
+	done := make(chan statusResult, 1)
+	go func() {
+		status, err := device.Status(context.Background())
+		done <- statusResult{status: status, err: err}
+	}()
+	select {
+	case result := <-done:
+		t.Logf("Status returned after cancel during backoff: %#v, err=%v (no deadlock)", result.status, result.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("DEADLOCK: device.Status blocked >2s after context cancel during natural-end retry backoff; " +
+			"trackSwitcher self-locked pd.mu at device.go:557-561 (Lock inside Done() branch, then Lock again after select)")
+	}
+	_ = ctx
+}
+
+func TestAdversarialStopDuringBackoffRestartsAudio(t *testing.T) {
+	firstFailure := make(chan struct{})
+	var failOnce atomic.Int32
+	ctx, cancel, device, attempts := newAdversarialDevice(t, func(attempt int) error {
+		if attempt == 1 {
+			if failOnce.CompareAndSwap(0, 1) {
+				close(firstFailure)
+			}
+			return errors.New("transient PipeWire link error")
+		}
+		return nil
+	})
+	t.Cleanup(func() {
+		cancel()
+		_, _ = device.Shutdown(context.Background())
+	})
+
+	emitAdversarialNaturalEnd(device)
+	select {
+	case <-firstFailure:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first retry failure did not happen; backoff never entered")
+	}
+
+	waitAdversarialRetryBackoff(t, device, attempts)
+	stopped, err := device.Stop(ctx)
+	if err != nil || stopped.Playing {
+		t.Fatalf("stop during backoff: status=%#v, err=%v", stopped, err)
+	}
+
+	time.Sleep(600 * time.Millisecond)
+
+	if got := attempts.Load(); got > 1 {
+		status, _ := device.Status(context.Background())
+		t.Fatalf("Stop during retry backoff did not cancel the retry: newTrack attempts=%d, status=%#v; "+
+			"guard at device.go:562 checks Index but not preparationVersion, so audio restarted after Stop",
+			got, status)
+	}
+	status, err := device.Status(context.Background())
+	if err != nil {
+		t.Fatalf("status after stop: %v", err)
+	}
+	if status.Playing {
+		t.Fatalf("audio is playing after Stop during retry backoff: %#v (stale retry passed device.go:562 guard)",
+			status)
+	}
+}
+
+func TestAdversarialManualStartLeavesStaleFailureReason(t *testing.T) {
+	ctx, cancel, device, attempts := newAdversarialDevice(t, func(attempt int) error {
+		return errors.New("persistent output error")
+	})
+	t.Cleanup(func() {
+		cancel()
+		_, _ = device.Shutdown(context.Background())
+	})
+
+	emitAdversarialNaturalEnd(device)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if device.FailureReason() == "track_switch_failed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if reason := device.FailureReason(); reason != "track_switch_failed" {
+		t.Fatalf("expected retries to be exhausted with track_switch_failed, got %q (attempts=%d)", reason, attempts.Load())
+	}
+
+	previousNewTrack := newTrack
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, _ model.PlaybackToken, _ string, _ model.MediaFile) (Track, error) {
+		return &mockTrack{}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+
+	status, err := device.Start(ctx)
+	if err != nil || !status.Playing {
+		t.Fatalf("manual start after repair: status=%#v, err=%v", status, err)
+	}
+	if reason := device.FailureReason(); reason != "" {
+		t.Fatalf("manual Start succeeded but failureReason was not cleared: %q (startLocked never resets it)", reason)
+	}
+}
+
+func TestAdversarialShutdownDuringBackoffCancelsRetry(t *testing.T) {
+	firstFailure := make(chan struct{})
+	var failOnce atomic.Int32
+	ctx, cancel, device, attempts := newAdversarialDevice(t, func(attempt int) error {
+		if attempt == 1 {
+			if failOnce.CompareAndSwap(0, 1) {
+				close(firstFailure)
+			}
+			return errors.New("transient error")
+		}
+		return nil
+	})
+	t.Cleanup(func() {
+		cancel()
+		_, _ = device.Shutdown(context.Background())
+	})
+
+	emitAdversarialNaturalEnd(device)
+	select {
+	case <-firstFailure:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first retry failure did not happen; backoff never entered")
+	}
+
+	waitAdversarialRetryBackoff(t, device, attempts)
+	shutDownStatus, err := device.Shutdown(ctx)
+	if err != nil || shutDownStatus.Playing {
+		t.Fatalf("shutdown during backoff: status=%#v, err=%v", shutDownStatus, err)
+	}
+
+	time.Sleep(600 * time.Millisecond)
+
+	if got := attempts.Load(); got > 1 {
+		t.Fatalf("Shutdown during retry backoff did not cancel retry: attempts=%d", got)
+	}
+	status, err := device.Status(context.Background())
+	if err != nil {
+		t.Fatalf("status after shutdown: %v", err)
+	}
+	if status.Playing {
+		t.Fatalf("audio playing after Shutdown during retry backoff: %#v", status)
+	}
+}

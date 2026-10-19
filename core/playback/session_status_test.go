@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -80,6 +81,35 @@ func TestPlaybackServerDetachSessionReturnsSnapshot(t *testing.T) {
 	}
 	if status.DeviceName != "pulse/test" || status.TrackID != "1" || status.QueueVersion != 7 {
 		t.Fatalf("unexpected detach snapshot: %#v", status)
+	}
+
+	// Session is preserved in detached state and discoverable via SessionStatus
+	persistedStatus, err := ps.SessionStatus(ctx, "detach-snapshot")
+	if err != nil {
+		t.Fatalf("expected session to exist after detach, got err: %v", err)
+	}
+	if persistedStatus.Attached || persistedStatus.OwnershipState != SessionOwnershipDetached {
+		t.Fatalf("expected detached ownership state, got %#v", persistedStatus)
+	}
+
+	// New tab attaches cleanly without takeover flag
+	reattached, err := ps.AttachSession(ctx, AttachRequest{
+		SessionID:  "detach-snapshot",
+		User:       "admin",
+		ClientID:   "tab-2",
+		DeviceName: "pulse/test",
+		Takeover:   false,
+	})
+	if err != nil {
+		t.Fatalf("new tab attach should succeed without takeover: %v", err)
+	}
+	if !reattached.Attached || reattached.OwnerClientID != "tab-2" {
+		t.Fatalf("expected attached status for tab-2, got %#v", reattached)
+	}
+
+	// Late detach from old tab-1 must not detach the new owner's session
+	if _, err := ps.DetachSession(ctx, "detach-snapshot", "tab-1"); !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("late detach from old client should be rejected with ErrSessionOwnership, got: %v", err)
 	}
 }
 

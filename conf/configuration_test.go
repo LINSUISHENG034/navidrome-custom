@@ -477,6 +477,20 @@ var _ = Describe("Configuration", func() {
 			conf.Load(true)
 			Expect(conf.Server.Jukebox.BluetoothManagement).To(BeTrue())
 		})
+
+		It("defaults natural end retry settings", func() {
+			conf.Load(true)
+			Expect(conf.Server.Jukebox.NaturalEndRetries).To(Equal(2))
+			Expect(conf.Server.Jukebox.NaturalEndBackoff).To(Equal(250 * time.Millisecond))
+		})
+
+		It("loads explicit natural end retry settings", func() {
+			viper.Set("jukebox.naturalendretries", 4)
+			viper.Set("jukebox.naturalendbackoff", "500ms")
+			conf.Load(true)
+			Expect(conf.Server.Jukebox.NaturalEndRetries).To(Equal(4))
+			Expect(conf.Server.Jukebox.NaturalEndBackoff).To(Equal(500 * time.Millisecond))
+		})
 	})
 
 	DescribeTable("should load configuration from",

@@ -157,7 +157,18 @@ func (ps *playbackServer) reapExpiredSessions() {
 		ps.mu.Unlock()
 		return
 	}
-	transitioned, expired := sessionManager.ReapExpired()
+	activeDevices := make(map[string]bool)
+	for _, dev := range ps.playbackDevices {
+		dev.mu.Lock()
+		active := dev.isPlaying()
+		dev.mu.Unlock()
+		if active {
+			activeDevices[dev.DeviceName] = true
+		}
+	}
+	transitioned, expired := sessionManager.ReapExpired(func(session Session) bool {
+		return activeDevices[session.DeviceName]
+	})
 	ps.mu.Unlock()
 
 	for _, session := range transitioned {
@@ -234,17 +245,19 @@ func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 }
 
 func newSessionStatus(session Session) SessionStatus {
+	attached := session.OwnershipState != SessionOwnershipDetached && session.OwnerClientID != ""
 	status := SessionStatus{
 		SessionID:      session.SessionID,
 		DeviceName:     session.DeviceName,
 		OwnerClientID:  session.OwnerClientID,
-		Attached:       true,
+		Attached:       attached,
 		OwnershipState: session.OwnershipState,
 		LastHeartbeat:  session.LastHeartbeat,
 		StaleSince:     session.StaleSince,
 	}
 	if status.OwnershipState == "" {
 		status.OwnershipState = SessionOwnershipAttached
+		status.Attached = session.OwnerClientID != ""
 	}
 	if session.StaleSince != nil {
 		staleSince := *session.StaleSince
@@ -262,6 +275,9 @@ func sessionStatusFromDevice(session Session, device *playbackDevice) SessionSta
 	status.Position = deviceStatus.Position
 	status.Gain = deviceStatus.Gain
 	status.QueueVersion = device.queueVersion
+	if device.failureReason != "" && status.TerminationReason == "" {
+		status.TerminationReason = device.failureReason
+	}
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
 	}
@@ -289,7 +305,7 @@ func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) 
 	}
 	if previous, ok := sessionManager.Get(req.SessionID); ok {
 		if previous.User != req.User || previous.DeviceName != req.DeviceName ||
-			(previous.OwnerClientID != req.ClientID && previous.OwnershipState != SessionOwnershipRecovering && !req.Takeover) {
+			(previous.OwnerClientID != req.ClientID && previous.OwnershipState != SessionOwnershipRecovering && previous.OwnershipState != SessionOwnershipDetached && !req.Takeover) {
 			ps.mu.Unlock()
 			return SessionStatus{}, ErrSessionOwnership
 		}
@@ -301,14 +317,17 @@ func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) 
 	}
 	for _, attached := range sessionManager.FindByDevice(req.DeviceName) {
 		if attached.SessionID != req.SessionID {
-			ps.mu.Unlock()
-			return SessionStatus{}, ErrSessionOwnership
+			if attached.OwnershipState != SessionOwnershipDetached {
+				ps.mu.Unlock()
+				return SessionStatus{}, ErrSessionOwnership
+			}
+			sessionManager.Delete(attached.SessionID)
 		}
 	}
 	// Session ownership and binding cannot change between command admission and
-	// its first state mutation. Supersede pending work when the owner changes.
+	// its first state mutation. Supersede pending work when an active owner is taken over.
 	device.mu.Lock()
-	if previous, ok := sessionManager.Get(req.SessionID); !ok || previous.OwnerClientID != req.ClientID {
+	if previous, ok := sessionManager.Get(req.SessionID); !ok || (previous.OwnerClientID != "" && previous.OwnerClientID != req.ClientID && req.Takeover) {
 		device.cancelPreparationLocked()
 	}
 	session := sessionManager.Attach(req)
@@ -340,18 +359,7 @@ func (ps *playbackServer) DetachSession(ctx context.Context, sessionID, clientID
 		ps.mu.Unlock()
 		return SessionStatus{}, ErrSessionOwnership
 	}
-	var device *playbackDevice
-	if exists && previous.OwnerClientID == clientID {
-		device = ps.deviceByNameLocked(previous.DeviceName)
-		if device != nil {
-			device.mu.Lock()
-			device.cancelPreparationLocked()
-		}
-	}
 	session, err := sessionManager.DetachSnapshot(sessionID, clientID)
-	if device != nil {
-		device.mu.Unlock()
-	}
 	ps.mu.Unlock()
 	if err != nil {
 		return SessionStatus{}, err

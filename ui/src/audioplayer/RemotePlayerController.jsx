@@ -188,12 +188,26 @@ const RemotePlayerController = ({
     if (current.current?.observing) current.current.refresh()
   }, [remoteEvent, reconnectEvent])
 
+  const backendFailure = snapshot?.sessionStatus?.terminationReason
+  const failureMessage =
+    backendFailure === 'track_switch_failed'
+      ? 'Track switch failed'
+      : backendFailure === 'output_failed'
+        ? 'Playback output failed'
+        : backendFailure &&
+            backendFailure !== 'user_detached' &&
+            backendFailure !== 'stale_expired' &&
+            backendFailure !== 'taken_over'
+          ? backendFailure
+          : null
+  const displayError = error || failureMessage
+
   return (
     <section aria-label="Remote controller">
       <div className={classes.deviceSelectorContainer}>
         <DeviceSelector isDesktop={true} />
       </div>
-      {error && <p role="alert">{error}</p>}
+      {displayError && <p role="alert">{displayError}</p>}
       {snapshot &&
         (!controlAvailable || !snapshotAllowsControl(snapshot, clientId)) && (
           <button

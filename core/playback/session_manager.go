@@ -131,8 +131,19 @@ func (sm *SessionManager) DetachSnapshot(sessionID, clientID string) (Session, e
 		return Session{}, ErrSessionOwnership
 	}
 
+	snapshot := session
+	now := sm.now().UTC()
+	session.OwnerClientID = ""
+	session.OwnershipState = SessionOwnershipDetached
+	session.StaleSince = &now
+	sm.sessions[sessionID] = session
+	return snapshot, nil
+}
+
+func (sm *SessionManager) Delete(sessionID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	delete(sm.sessions, sessionID)
-	return session, nil
 }
 
 func (sm *SessionManager) Get(sessionID string) (Session, bool) {
@@ -187,7 +198,7 @@ func (sm *SessionManager) RebindDevice(oldDeviceName, newDeviceName string) []Se
 	return rebound
 }
 
-func (sm *SessionManager) ReapExpired() (transitioned []Session, expired []Session) {
+func (sm *SessionManager) ReapExpired(isActive ...func(Session) bool) (transitioned []Session, expired []Session) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -211,7 +222,10 @@ func (sm *SessionManager) ReapExpired() (transitioned []Session, expired []Sessi
 			continue
 		}
 
-		if session.OwnershipState == SessionOwnershipRecovering && session.StaleSince != nil && sm.maxStale > 0 && now.Sub(*session.StaleSince) > sm.maxStale {
+		if (session.OwnershipState == SessionOwnershipRecovering || session.OwnershipState == SessionOwnershipDetached) && session.StaleSince != nil && sm.maxStale > 0 && now.Sub(*session.StaleSince) > sm.maxStale {
+			if len(isActive) > 0 && isActive[0] != nil && isActive[0](session) {
+				continue
+			}
 			delete(sm.sessions, id)
 			expired = append(expired, session)
 		}

@@ -50,8 +50,12 @@ func TestSessionManager_DetachSuccess(t *testing.T) {
 		t.Fatalf("detach failed: %v", err)
 	}
 
-	if _, ok := mgr.Get("s1"); ok {
-		t.Fatal("session should not exist after detach")
+	sess, ok := mgr.Get("s1")
+	if !ok {
+		t.Fatal("session should still exist in detached state after client detach for recovery")
+	}
+	if sess.OwnershipState != SessionOwnershipDetached || sess.OwnerClientID != "" {
+		t.Fatalf("unexpected detached session state: %#v", sess)
 	}
 }
 
@@ -329,5 +333,31 @@ func TestSessionManager_FindByDevice(t *testing.T) {
 	}
 	if sessions[0].DeviceName != "pulse/test" || sessions[1].DeviceName != "pulse/test" {
 		t.Fatalf("unexpected sessions: %#v", sessions)
+	}
+}
+
+func TestSessionManager_ReapExpiredPreservesSessionWhenDeviceIsActive(t *testing.T) {
+	mgr := NewSessionManager(45*time.Second, 10*time.Minute)
+
+	now := time.Now()
+	mgr.now = func() time.Time { return now }
+	mgr.Attach(AttachRequest{SessionID: "s1", ClientID: "tab-1", User: "admin", DeviceName: "pulse/test"})
+
+	now = now.Add(2 * time.Minute)
+	transitioned, expired := mgr.ReapExpired()
+	if len(transitioned) != 1 || len(expired) != 0 {
+		t.Fatalf("expected tier 1 transition only, got transitioned=%d expired=%d", len(transitioned), len(expired))
+	}
+
+	// 15 minutes later (> maxStale 10 minutes), but device is still active/playing
+	now = now.Add(15 * time.Minute)
+	transitioned, expired = mgr.ReapExpired(func(s Session) bool {
+		return s.DeviceName == "pulse/test"
+	})
+	if len(expired) != 0 {
+		t.Fatalf("expected active device session not to be hard-expired, but expired=%v", expired)
+	}
+	if _, ok := mgr.Get("s1"); !ok {
+		t.Fatal("expected active session to remain addressable after long absence")
 	}
 }
