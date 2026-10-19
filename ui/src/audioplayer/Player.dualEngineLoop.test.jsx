@@ -627,4 +627,508 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(typeof capturedAudio.togglePlay).toBe('function')
     })
   })
+
+  describe('Native Queue Editing Contract and Stable Instance Identity (Issue 03)', () => {
+    let playSpy
+    let pauseSpy
+    let loadSpy
+
+    const duplicateQueueTracks = [
+      {
+        queueItemId: 'q-dup-1',
+        trackId: 'track-dup',
+        name: 'Duplicate Song (Instance 1)',
+        singer: 'Artist Alpha',
+        musicSrc: 'http://localhost/dup.mp3',
+        id: 'track-dup',
+      },
+      {
+        queueItemId: 'q-mid-2',
+        trackId: 'track-unique',
+        name: 'Middle Unique Song',
+        singer: 'Artist Beta',
+        musicSrc: 'http://localhost/unique.mp3',
+        id: 'track-unique',
+      },
+      {
+        queueItemId: 'q-dup-3',
+        trackId: 'track-dup',
+        name: 'Duplicate Song (Instance 2)',
+        singer: 'Artist Alpha',
+        musicSrc: 'http://localhost/dup.mp3',
+        id: 'track-dup',
+      },
+    ]
+
+    beforeEach(() => {
+      playSpy = vi
+        .spyOn(window.HTMLMediaElement.prototype, 'play')
+        .mockImplementation(() => Promise.resolve())
+      pauseSpy = vi
+        .spyOn(window.HTMLMediaElement.prototype, 'pause')
+        .mockImplementation(() => {})
+      loadSpy = vi
+        .spyOn(window.HTMLMediaElement.prototype, 'load')
+        .mockImplementation(() => {})
+    })
+
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    /**
+     * Case: TC-QC-01
+     * Requirement: US-5, Issue 03 lines 11-12
+     * Initial Scene: Remote mode with duplicate track IDs in queue
+     * Input Intent: Skip to second duplicate instance ('q-dup-3')
+     * Expected State: Disambiguated by queueItemId across UI, Adapter, and wire payload
+     */
+    it('TC-QC-01: separates track identity from queue instance identity across UI, Adapter, and wire payload', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      let playerRef = null
+      render(
+        <UnifiedNativePlayer
+          ref={(ref) => {
+            playerRef = ref
+          }}
+          controller={controller}
+          engineMode="remote"
+          mode="full"
+          autoPlay={false}
+        />,
+      )
+
+      await controller.addQueueItems(duplicateQueueTracks)
+      expect(controller.getState().queue).toHaveLength(3)
+      expect(controller.getState().queue[0].trackId).toBe('track-dup')
+      expect(controller.getState().queue[2].trackId).toBe('track-dup')
+      expect(controller.getState().queue[0].queueItemId).toBe('q-dup-1')
+      expect(controller.getState().queue[2].queueItemId).toBe('q-dup-3')
+
+      // Skip specifically to duplicate instance 2 (q-dup-3)
+      await controller.skipToQueueItem('q-dup-3')
+
+      // Assert wire payload recorded queueItemId
+      const wireCommands = remoteAdapter.getWireCommands()
+      const skipCommand = wireCommands.find((c) => c.action === 'skip')
+      expect(skipCommand).toBeDefined()
+      expect(skipCommand.queueItemId).toBe('q-dup-3')
+
+      // Assert authoritative state and UI playId
+      expect(controller.getState().currentQueueItemId).toBe('q-dup-3')
+      await waitFor(() => {
+        expect(playerRef.state.playId).toBe('q-dup-3')
+      })
+    })
+
+    /**
+     * Case: TC-QC-02
+     * Requirement: US-5, US-7, Issue 03 lines 11, 19
+     * Initial Scene: Queue with duplicate tracks [q-dup-1, q-mid-2, q-dup-3]
+     * Input Intent: Remove duplicate instance 2 ('q-dup-3')
+     * Expected State: 'q-dup-3' removed, 'q-dup-1' untouched at index 0
+     */
+    it('TC-QC-02: deleting specific duplicate instance removes only that instance, leaving other instances untouched', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      await controller.addQueueItems(duplicateQueueTracks)
+      await controller.removeQueueItem('q-dup-3')
+
+      const wireCommands = remoteAdapter.getWireCommands()
+      const removeCommand = wireCommands.find((c) => c.action === 'remove')
+      expect(removeCommand).toBeDefined()
+      expect(removeCommand.queueItemId).toBe('q-dup-3')
+
+      const currentQueue = controller.getState().queue
+      expect(currentQueue).toHaveLength(2)
+      expect(currentQueue[0].queueItemId).toBe('q-dup-1')
+      expect(currentQueue[0].trackId).toBe('track-dup')
+      expect(currentQueue[1].queueItemId).toBe('q-mid-2')
+      expect(currentQueue.some((item) => item.queueItemId === 'q-dup-3')).toBe(
+        false,
+      )
+    })
+
+    /**
+     * Case: TC-QC-03
+     * Requirement: US-7, Issue 03 line 16
+     * Initial Scene: 3 items in queue, playing middle item 'q-mid-2'
+     * Input Intent: Delete currently playing item
+     * Expected State: Successor item 'q-dup-3' is selected across both engines
+     */
+    it('TC-QC-03: deleting current item selects its successor across both engines', async () => {
+      for (const adapter of [
+        createMockRemoteAudioAdapter(),
+        createBrowserAudioAdapter(),
+      ]) {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        await controller.skipToQueueItem('q-mid-2')
+        expect(controller.getState().currentQueueItemId).toBe('q-mid-2')
+
+        await controller.removeQueueItem('q-mid-2')
+        expect(controller.getState().queue).toHaveLength(2)
+        // Successor was index 2 ('q-dup-3'), now at index 1
+        expect(controller.getState().currentQueueItemId).toBe('q-dup-3')
+      }
+    })
+
+    /**
+     * Case: TC-QC-04
+     * Requirement: US-7, Issue 03 line 16
+     * Initial Scene: 3 items in queue, playing end item 'q-dup-3'
+     * Input Intent: Delete currently playing end item
+     * Expected State: Selects remaining last item 'q-mid-2', does NOT loop to index 0 across both engines
+     */
+    it('TC-QC-04: deleting last item selects remaining last item without triggering loop across both engines', async () => {
+      for (const adapter of [
+        createMockRemoteAudioAdapter(),
+        createBrowserAudioAdapter(),
+      ]) {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        await controller.skipToQueueItem('q-dup-3')
+        expect(controller.getState().currentQueueItemId).toBe('q-dup-3')
+
+        await controller.removeQueueItem('q-dup-3')
+        expect(controller.getState().queue).toHaveLength(2)
+        // Must select remaining last item 'q-mid-2', not jump back to 'q-dup-1'
+        expect(controller.getState().currentQueueItemId).toBe('q-mid-2')
+      }
+    })
+
+    /**
+     * Case: TC-QC-05
+     * Requirement: US-8, Issue 03 lines 17, 18
+     * Initial Scene: Local mode paused on 'q-mid-2'
+     * Input Intent: Delete currently playing item while paused
+     * Expected State: Status remains PAUSED throughout; audio.play() called 0 times
+     */
+    it('TC-QC-05: deleting current item while paused remains paused throughout with 0 play calls', async () => {
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+
+      await controller.addQueueItems(duplicateQueueTracks)
+      await controller.skipToQueueItem('q-mid-2')
+      await controller.pause()
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+
+      playSpy.mockClear()
+      await controller.removeQueueItem('q-mid-2')
+
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      expect(controller.getState().currentQueueItemId).toBe('q-dup-3')
+      expect(playSpy).not.toHaveBeenCalled()
+    })
+
+    /**
+     * Case: TC-QC-06
+     * Requirement: US-6, Issue 03 lines 15, 18
+     * Initial Scene: Local mode playing 'q-dup-1' at position 45s
+     * Input Intent: Move current playing item from index 0 to index 2
+     * Expected State: Playback identity continuous, audio.load() called 0 times, currentTime preserved
+     */
+    it('TC-QC-06: moving currently playing item keeps playing identity and does not reload audio', async () => {
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+
+      await controller.addQueueItems(duplicateQueueTracks)
+      const audioEl = browserAdapter.getAudioElement()
+      audioEl.currentTime = 45
+
+      loadSpy.mockClear()
+      await controller.moveQueueItem('q-dup-1', 2)
+
+      const queue = controller.getState().queue
+      expect(queue[2].queueItemId).toBe('q-dup-1')
+      expect(controller.getState().currentQueueItemId).toBe('q-dup-1')
+      expect(loadSpy).not.toHaveBeenCalled()
+      expect(audioEl.currentTime).toBe(45)
+    })
+
+    /**
+     * Case: TC-QC-07
+     * Requirement: US-6, Issue 03 line 15
+     * Initial Scene: Remote mode with 3 tracks
+     * Input Intent: Move track 'q-dup-1' to index 2
+     * Expected State: Emits wire payload with action 'move' and queueItemId, NOT full replace 'set'
+     */
+    it('TC-QC-07: remote move emits distinct move command with queueItemId, not full queue replacement', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      await controller.addQueueItems(duplicateQueueTracks)
+      remoteAdapter.clearWireCommands()
+
+      await controller.moveQueueItem('q-dup-1', 2)
+
+      const wireCommands = remoteAdapter.getWireCommands()
+      expect(wireCommands).toHaveLength(1)
+      expect(wireCommands[0]).toMatchObject({
+        action: 'move',
+        queueItemId: 'q-dup-1',
+        toIndex: 2,
+      })
+      expect(wireCommands.some((c) => c.action === 'set')).toBe(false)
+    })
+
+    /**
+     * Case: TC-QC-08
+     * Requirement: US-9, Issue 03 line 16
+     * Initial Scene: Queue with tracks playing
+     * Input Intent: Clear queue
+     * Expected State: Queue empty, currentQueueItemId null, status IDLE across both engines
+     */
+    it('TC-QC-08: clearing queue stops playback, clears current item, and sets status to IDLE across both engines', async () => {
+      for (const adapter of [
+        createBrowserAudioAdapter(),
+        createMockRemoteAudioAdapter(),
+      ]) {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        expect(controller.getState().queue).toHaveLength(3)
+
+        await controller.clearQueue()
+        expect(controller.getState().queue).toHaveLength(0)
+        expect(controller.getState().currentQueueItemId).toBeNull()
+        expect(controller.getState().status).toBe(PlaybackStatus.IDLE)
+      }
+    })
+
+    /**
+     * Case: TC-QC-09
+     * Requirement: US-2, Issue 03 lines 13, 14
+     * Initial Scene: UnifiedNativePlayer rendered with controller in remote mode
+     * Input Intent: User interacts through native queue drawer callbacks
+     * Expected State: Intercepted and routed to controller with stable queueItemId
+     */
+    it('TC-QC-09: native drawer interactions route delete, move, skip, and clear through unified controller', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      let playerInstance = null
+      render(
+        <UnifiedNativePlayer
+          ref={(ref) => {
+            playerInstance = ref
+          }}
+          controller={controller}
+          engineMode="remote"
+          mode="full"
+          autoPlay={false}
+        />,
+      )
+
+      await controller.addQueueItems(duplicateQueueTracks)
+      remoteAdapter.clearWireCommands()
+
+      // 1. Delete item via onDeleteAudioLists
+      await act(async () => {
+        playerInstance.onDeleteAudioLists('q-dup-3')({
+          stopPropagation: vi.fn(),
+        })
+      })
+      await waitFor(() => {
+        const cmd = remoteAdapter
+          .getWireCommands()
+          .find((c) => c.action === 'remove')
+        expect(cmd).toBeDefined()
+        expect(cmd.queueItemId).toBe('q-dup-3')
+      })
+
+      // 2. Reorder item via onAudioListsSortEnd
+      await act(async () => {
+        playerInstance.onAudioListsSortEnd(0, 1)
+      })
+      await waitFor(() => {
+        const cmd = remoteAdapter
+          .getWireCommands()
+          .find((c) => c.action === 'move')
+        expect(cmd).toBeDefined()
+        expect(cmd.queueItemId).toBe('q-dup-1')
+        expect(cmd.toIndex).toBe(1)
+      })
+
+      // 3. Skip item via audioListsPlay
+      await act(async () => {
+        playerInstance.audioListsPlay('q-mid-2')
+      })
+      await waitFor(() => {
+        const cmd = remoteAdapter
+          .getWireCommands()
+          .find((c) => c.action === 'skip')
+        expect(cmd).toBeDefined()
+        expect(cmd.queueItemId).toBe('q-mid-2')
+      })
+
+      // 4. Clear queue via onDeleteAudioLists(null / undefined)
+      await act(async () => {
+        playerInstance.onDeleteAudioLists()({
+          stopPropagation: vi.fn(),
+        })
+      })
+      await waitFor(() => {
+        const cmd = remoteAdapter
+          .getWireCommands()
+          .find((c) => c.action === 'clear')
+        expect(cmd).toBeDefined()
+        expect(controller.getState().queue).toHaveLength(0)
+      })
+    })
+
+    /**
+     * Case: TC-QC-10
+     * Requirement: US-4, Issue 03 lines 13, 14
+     * Initial Scene: Host playlist actions (Play Next, Add to Queue, Play All)
+     * Input Intent: Dispatch list operations
+     * Expected State: Single intent issued per operation, correct insertion positions
+     */
+    it('TC-QC-10: host list actions dispatch unified queue intents with single-intent guarantee', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      await controller.addQueueItems([
+        duplicateQueueTracks[0],
+        duplicateQueueTracks[1],
+      ])
+      const initialIntents = controller.getMetrics().intentsIssued
+
+      // 1. Play Next
+      await controller.playNext([
+        {
+          queueItemId: 'q-next',
+          trackId: 'track-next',
+          name: 'Play Next Song',
+        },
+      ])
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+      expect(controller.getState().queue[1].queueItemId).toBe('q-next')
+
+      // 2. Add to Queue
+      await controller.addQueueItems([
+        {
+          queueItemId: 'q-end',
+          trackId: 'track-end',
+          name: 'Add To Queue Song',
+        },
+      ])
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 2)
+      const q = controller.getState().queue
+      expect(q[q.length - 1].queueItemId).toBe('q-end')
+
+      // 3. Play All (compound intent)
+      await controller.playAll(
+        [
+          { queueItemId: 'pa-1', trackId: 'pa-1', name: 'PA 1' },
+          { queueItemId: 'pa-2', trackId: 'pa-2', name: 'PA 2' },
+        ],
+        0,
+      )
+      // Compound intent counted once
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 3)
+      expect(controller.getState().queue).toHaveLength(2)
+      expect(controller.getState().currentQueueItemId).toBe('pa-1')
+    })
+
+    /**
+     * Case: TC-QC-11
+     * Requirement: US-23, Issue 03 lines 19, 20
+     * Initial Scene: Controller active, server pushes authoritative snapshot, reconnect and stale snapshot replay
+     * Input Intent: State backfill of queue, stale snapshot rejection, and reconnect replay
+     * Expected State: UI and controller update; 0 commands sent to wire, 0 intents issued, stale snapshots rejected
+     */
+    it('TC-QC-11: external snapshot backfill, reconnect replay, and stale snapshot rejection produce zero echo', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      await controller.addQueueItems([duplicateQueueTracks[0]])
+      remoteAdapter.clearWireCommands()
+      const baselineIntents = controller.getMetrics().intentsIssued
+
+      // 1. Server pushes authoritative snapshot with 3 items (including duplicate songs)
+      controller.backfillState({
+        queue: duplicateQueueTracks,
+        currentQueueItemId: 'q-dup-3',
+        queueVersion: 10,
+      })
+
+      expect(controller.getState().queue).toHaveLength(3)
+      expect(controller.getState().currentQueueItemId).toBe('q-dup-3')
+      expect(controller.getState().queueVersion).toBe(10)
+
+      // Zero echo verification
+      expect(controller.getMetrics().intentsIssued).toBe(baselineIntents)
+      expect(remoteAdapter.getWireCommands()).toHaveLength(0)
+
+      // 2. Stale snapshot rejection: an older snapshot (queueVersion: 5) is rejected
+      controller.backfillState({
+        queue: [duplicateQueueTracks[0]],
+        currentQueueItemId: 'q-dup-1',
+        queueVersion: 5,
+      })
+      // State remains at version 10 with 3 items
+      expect(controller.getState().queue).toHaveLength(3)
+      expect(controller.getState().currentQueueItemId).toBe('q-dup-3')
+      expect(controller.getState().queueVersion).toBe(10)
+
+      // 3. Reconnect replay: replayed snapshot accurately restores target duplicate item
+      controller.backfillState({
+        queue: duplicateQueueTracks,
+        currentQueueItemId: 'q-dup-3',
+        queueVersion: 11,
+      })
+      expect(controller.getState().currentQueueItemId).toBe('q-dup-3')
+      expect(controller.getMetrics().intentsIssued).toBe(baselineIntents)
+      expect(remoteAdapter.getWireCommands()).toHaveLength(0)
+    })
+
+    /**
+     * Case: TC-QC-12
+     * Requirement: US-24, Issue 03 line 21
+     * Initial Scene: Common sequence executed on both BrowserAudioAdapter and MockRemoteAudioAdapter
+     * Input Intent: add -> skip -> move -> remove
+     * Expected State: Identical resulting queue and currentQueueItemId on both adapters
+     */
+    it('TC-QC-12: common behavioral contract produces identical state on both adapters', async () => {
+      const runSequence = async (adapter) => {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        await controller.skipToQueueItem('q-mid-2')
+        await controller.moveQueueItem('q-mid-2', 0)
+        await controller.removeQueueItem('q-mid-2')
+
+        return {
+          queueIds: controller.getState().queue.map((item) => item.queueItemId),
+          currentId: controller.getState().currentQueueItemId,
+        }
+      }
+
+      const localResult = await runSequence(createBrowserAudioAdapter())
+      const remoteResult = await runSequence(createMockRemoteAudioAdapter())
+
+      expect(localResult.queueIds).toEqual(['q-dup-1', 'q-dup-3'])
+      expect(localResult.currentId).toBe('q-dup-1') // Successor at index 0
+      expect(remoteResult.queueIds).toEqual(localResult.queueIds)
+      expect(remoteResult.currentId).toEqual(localResult.currentId)
+    })
+  })
 })

@@ -16,6 +16,118 @@ export const PlaybackStatus = {
   ERROR: 'error',
 }
 
+/**
+ * Shared, deterministic queue state transitions.
+ * Reused by both BrowserAudioAdapter and MockRemoteAudioAdapter to prevent
+ * divergent behavior or copy-paste duplication.
+ */
+export function applyQueueAdd(
+  queue = [],
+  currentId = null,
+  items = [],
+  index = -1,
+) {
+  const validated = items.map((item) => {
+    const queueItemId = item.queueItemId || item.uuid
+    if (!queueItemId) {
+      throw new Error(
+        '[QueueContract] Each queue item must possess a stable queueItemId',
+      )
+    }
+    return { ...item, queueItemId }
+  })
+
+  let nextQueue
+  if (index === -1 || index >= queue.length) {
+    nextQueue = [...queue, ...validated]
+  } else {
+    const insertAt = Math.max(0, index)
+    nextQueue = [
+      ...queue.slice(0, insertAt),
+      ...validated,
+      ...queue.slice(insertAt),
+    ]
+  }
+
+  const nextCurrentId =
+    currentId || (nextQueue.length > 0 ? nextQueue[0].queueItemId : null)
+  return { queue: nextQueue, currentQueueItemId: nextCurrentId }
+}
+
+export function applyQueueRemove(
+  queue = [],
+  currentId = null,
+  queueItemId,
+  isPlaying = false,
+) {
+  const targetIdx = queue.findIndex((item) => item.queueItemId === queueItemId)
+  if (targetIdx === -1) {
+    return { queue, currentQueueItemId: currentId, removed: false }
+  }
+
+  const isCurrent = currentId === queueItemId
+  const nextQueue = queue.filter((item) => item.queueItemId !== queueItemId)
+
+  if (!isCurrent) {
+    return { queue: nextQueue, currentQueueItemId: currentId, removed: true }
+  }
+
+  if (nextQueue.length === 0) {
+    return {
+      queue: [],
+      currentQueueItemId: null,
+      status: PlaybackStatus.IDLE,
+      position: 0,
+      removed: true,
+    }
+  }
+
+  const successorIdx =
+    targetIdx < nextQueue.length ? targetIdx : nextQueue.length - 1
+  const successor = nextQueue[successorIdx]
+  const nextStatus = isPlaying ? PlaybackStatus.PLAYING : PlaybackStatus.PAUSED
+
+  return {
+    queue: nextQueue,
+    currentQueueItemId: successor.queueItemId,
+    status: nextStatus,
+    position: 0,
+    successor,
+    removed: true,
+  }
+}
+
+export function applyQueueMove(queue = [], queueItemId, toIndex) {
+  const fromIndex = queue.findIndex((item) => item.queueItemId === queueItemId)
+  if (fromIndex === -1) {
+    return { queue, moved: false }
+  }
+
+  const boundedTo = Math.max(0, Math.min(toIndex, queue.length - 1))
+  if (fromIndex === boundedTo) {
+    return { queue, moved: true }
+  }
+
+  const item = queue[fromIndex]
+  const remaining = queue.filter((_, idx) => idx !== fromIndex)
+  const nextQueue = [
+    ...remaining.slice(0, boundedTo),
+    item,
+    ...remaining.slice(boundedTo),
+  ]
+
+  return { queue: nextQueue, moved: true }
+}
+
+export function applyQueueClear() {
+  return {
+    queue: [],
+    currentQueueItemId: null,
+    status: PlaybackStatus.IDLE,
+    position: 0,
+  }
+}
+
 export function createPlaybackControlModule(config = {}) {
   let activeAdapter = null
   let currentEpoch = 0
@@ -29,6 +141,9 @@ export function createPlaybackControlModule(config = {}) {
     volume: config.initialVolume ?? 1,
     isMuted: false,
     error: null,
+    queue: [],
+    currentQueueItemId: null,
+    queueVersion: 0,
   }
 
   const listeners = new Set()
@@ -42,6 +157,11 @@ export function createPlaybackControlModule(config = {}) {
       volume: 0,
       skipNext: 0,
       skipPrev: 0,
+      addQueueItems: 0,
+      removeQueueItem: 0,
+      moveQueueItem: 0,
+      clearQueue: 0,
+      skipToQueueItem: 0,
     },
   }
 
@@ -90,6 +210,14 @@ export function createPlaybackControlModule(config = {}) {
   }
 
   function handleAuthoritativeStateUpdate(update) {
+    // Guard against stale snapshots / out-of-order replay (Spec line 20)
+    if (
+      typeof update.queueVersion === 'number' &&
+      update.queueVersion < state.queueVersion
+    ) {
+      return
+    }
+
     metrics.stateBackfills += 1
 
     let hasChange = false
@@ -129,6 +257,24 @@ export function createPlaybackControlModule(config = {}) {
       update.currentTrack !== state.currentTrack
     ) {
       nextState.currentTrack = update.currentTrack
+      hasChange = true
+    }
+    if (Array.isArray(update.queue)) {
+      nextState.queue = update.queue
+      hasChange = true
+    }
+    if (
+      update.currentQueueItemId !== undefined &&
+      update.currentQueueItemId !== state.currentQueueItemId
+    ) {
+      nextState.currentQueueItemId = update.currentQueueItemId
+      hasChange = true
+    }
+    if (
+      typeof update.queueVersion === 'number' &&
+      update.queueVersion !== state.queueVersion
+    ) {
+      nextState.queueVersion = update.queueVersion
       hasChange = true
     }
     if (update.error !== undefined) {
@@ -223,6 +369,60 @@ export function createPlaybackControlModule(config = {}) {
       dispatchCommand('skipNext', (epoch) => activeAdapter.skipNext(epoch)),
     skipPrev: () =>
       dispatchCommand('skipPrev', (epoch) => activeAdapter.skipPrev(epoch)),
+    // Queue editing contract intents
+    addQueueItems: (items, index = -1) =>
+      dispatchCommand('addQueueItems', (epoch) =>
+        activeAdapter.addQueueItems(epoch, items, index),
+      ),
+    removeQueueItem: (queueItemId) =>
+      dispatchCommand('removeQueueItem', (epoch) =>
+        activeAdapter.removeQueueItem(epoch, queueItemId),
+      ),
+    moveQueueItem: (queueItemId, toIndex) =>
+      dispatchCommand('moveQueueItem', (epoch) =>
+        activeAdapter.moveQueueItem(epoch, queueItemId, toIndex),
+      ),
+    clearQueue: () =>
+      dispatchCommand('clearQueue', (epoch) => activeAdapter.clearQueue(epoch)),
+    skipToQueueItem: (queueItemId) =>
+      dispatchCommand('skipToQueueItem', (epoch) =>
+        activeAdapter.skipToQueueItem(epoch, queueItemId),
+      ),
+    playNext: (items) => {
+      const curIdx = state.queue.findIndex(
+        (it) => it.queueItemId === state.currentQueueItemId,
+      )
+      const targetIndex = curIdx >= 0 ? curIdx + 1 : state.queue.length
+      return dispatchCommand('addQueueItems', (epoch) =>
+        activeAdapter.addQueueItems(epoch, items, targetIndex),
+      )
+    },
+    playAll: async (items, startIndex = 0) => {
+      metrics.intentsIssued += 1
+      if (!activeAdapter) {
+        throw { code: 'NO_ACTIVE_ENGINE', message: 'No playback engine active' }
+      }
+      metrics.commandsSent.clearQueue += 1
+      await executeWithTimeout(
+        activeAdapter.clearQueue(currentEpoch),
+        defaultTimeoutMs,
+      )
+      metrics.commandsSent.addQueueItems += 1
+      await executeWithTimeout(
+        activeAdapter.addQueueItems(currentEpoch, items, 0),
+        defaultTimeoutMs,
+      )
+      if (items.length > 0 && startIndex >= 0 && startIndex < items.length) {
+        metrics.commandsSent.skipToQueueItem += 1
+        await executeWithTimeout(
+          activeAdapter.skipToQueueItem(
+            currentEpoch,
+            items[startIndex].queueItemId,
+          ),
+          defaultTimeoutMs,
+        )
+      }
+    },
     // Direct backfill channel for authoritative server snapshots
     backfillState: (update) => handleAuthoritativeStateUpdate(update),
   }

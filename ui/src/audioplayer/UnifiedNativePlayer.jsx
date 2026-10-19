@@ -35,6 +35,64 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     if (props.engineMode === 'remote') {
       this.setupRemoteModeOverrides()
     }
+    if (props.controller) {
+      this.setupControllerOverrides()
+    }
+  }
+
+  setupControllerOverrides() {
+    // Intercept native queue drawer actions to route through unified controller
+    this.onDeleteAudioLists = (audioId) => (e) => {
+      if (e && typeof e.stopPropagation === 'function') {
+        e.stopPropagation()
+      }
+      const { controller } = this.props
+      if (!controller) return
+
+      if (!audioId) {
+        controller.clearQueue().catch(() => {})
+        return
+      }
+
+      const currentLists = this.state.audioLists || []
+      const targetItem = currentLists.find(
+        (a) =>
+          a.__PLAYER_KEY__ === audioId ||
+          a.queueItemId === audioId ||
+          a.uuid === audioId,
+      )
+      const targetQueueItemId =
+        targetItem?.queueItemId || targetItem?.uuid || audioId
+      controller.removeQueueItem(targetQueueItemId).catch(() => {})
+    }
+
+    this.onAudioListsSortEnd = (oldIndex, newIndex) => {
+      const { controller } = this.props
+      if (!controller) return
+      if (oldIndex === newIndex) return
+
+      const currentLists = this.state.audioLists || []
+      const item = currentLists[oldIndex]
+      if (!item) return
+      const queueItemId = item.queueItemId || item.uuid || item.__PLAYER_KEY__
+      controller.moveQueueItem(queueItemId, newIndex).catch(() => {})
+    }
+
+    this.audioListsPlay = (playId, ignore) => {
+      const { controller } = this.props
+      if (!controller) return
+
+      const currentLists = this.state.audioLists || []
+      const targetItem = currentLists.find(
+        (a) =>
+          a.__PLAYER_KEY__ === playId ||
+          a.queueItemId === playId ||
+          a.uuid === playId,
+      )
+      const targetQueueItemId =
+        targetItem?.queueItemId || targetItem?.uuid || playId
+      controller.skipToQueueItem(targetQueueItemId).catch(() => {})
+    }
   }
 
   setupRemoteModeOverrides() {
@@ -112,7 +170,9 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     this.loadAndPlayAudio = () => {}
     this.playAudio = () => {}
     this.resetAudioStatus = () => {}
-    this.audioListsPlay = () => {}
+    if (!this.props.controller) {
+      this.audioListsPlay = () => {}
+    }
     this.stopAll = () => {}
 
     // Zero facade: remote mode does not return a fake HTMLAudioElement
@@ -151,14 +211,21 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   }
 
   componentDidUpdate(prevProps) {
-    if (prevProps.engineMode !== this.props.engineMode) {
-      if (this.props.engineMode === 'remote') {
-        this.setupRemoteModeOverrides()
-        this.setState({ loading: false })
-      }
-      if (this.props.controller) {
-        this.applyAuthoritativeState(this.props.controller.getState())
-      }
+    if (
+      prevProps.engineMode !== this.props.engineMode &&
+      this.props.engineMode === 'remote'
+    ) {
+      this.setupRemoteModeOverrides()
+      this.setState({ loading: false })
+    }
+
+    if (
+      (prevProps.engineMode !== this.props.engineMode ||
+        prevProps.controller !== this.props.controller) &&
+      this.props.controller
+    ) {
+      this.setupControllerOverrides()
+      this.applyAuthoritativeState(this.props.controller.getState())
     }
   }
 
@@ -202,6 +269,17 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
         authoritativeState.duration !== prevState.remoteDuration
       ) {
         nextState.remoteDuration = authoritativeState.duration
+      }
+      if (Array.isArray(authoritativeState.queue)) {
+        const mappedLists = authoritativeState.queue.map((item) => ({
+          ...item,
+          __PLAYER_KEY__: item.queueItemId,
+          uuid: item.queueItemId,
+        }))
+        nextState.audioLists = mappedLists
+      }
+      if (authoritativeState.currentQueueItemId !== undefined) {
+        nextState.playId = authoritativeState.currentQueueItemId
       }
 
       return Object.keys(nextState).length > 0 ? nextState : null

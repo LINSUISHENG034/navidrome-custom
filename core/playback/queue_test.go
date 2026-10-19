@@ -222,3 +222,112 @@ var _ = Describe("Queue operations with duplicate IDs", func() {
 		Expect(queue.Current().Path).To(Equal("/a2.mp3"))
 	})
 })
+
+var _ = Describe("QueueCandidateModel with stable QueueItemID (Issue 03)", func() {
+	var modelQueue *QueueCandidateModel
+
+	BeforeEach(func() {
+		modelQueue = NewQueueCandidateModel()
+	})
+
+	It("separates track identity from queue instance identity with duplicate tracks", func() {
+		modelQueue.Add([]QueueCandidateItem{
+			{QueueItemID: "qitem-1", MediaFile: model.MediaFile{ID: "track-A", Title: "Song A"}},
+			{QueueItemID: "qitem-2", MediaFile: model.MediaFile{ID: "track-B", Title: "Song B"}},
+			{QueueItemID: "qitem-3", MediaFile: model.MediaFile{ID: "track-A", Title: "Song A"}},
+		})
+
+		Expect(modelQueue.Size()).To(Equal(3))
+		Expect(modelQueue.CurrentQueueItemID).To(Equal("qitem-1"))
+		Expect(modelQueue.Current().MediaFile.ID).To(Equal("track-A"))
+
+		idx1, item1, found1 := modelQueue.FindByQueueItemID("qitem-1")
+		Expect(found1).To(BeTrue())
+		Expect(idx1).To(Equal(0))
+		Expect(item1.QueueItemID).To(Equal("qitem-1"))
+
+		idx3, item3, found3 := modelQueue.FindByQueueItemID("qitem-3")
+		Expect(found3).To(BeTrue())
+		Expect(idx3).To(Equal(2))
+		Expect(item3.QueueItemID).To(Equal("qitem-3"))
+	})
+
+	It("removes specific duplicate instance without affecting other instances of the same track", func() {
+		modelQueue.Add([]QueueCandidateItem{
+			{QueueItemID: "qitem-1", MediaFile: model.MediaFile{ID: "track-A", Title: "Song A"}},
+			{QueueItemID: "qitem-2", MediaFile: model.MediaFile{ID: "track-B", Title: "Song B"}},
+			{QueueItemID: "qitem-3", MediaFile: model.MediaFile{ID: "track-A", Title: "Song A"}},
+		})
+
+		nextID, removed := modelQueue.RemoveByQueueItemID("qitem-3")
+		Expect(removed).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-1"))
+		Expect(modelQueue.Size()).To(Equal(2))
+
+		// Instance 1 remains untouched at index 0
+		idx1, _, found1 := modelQueue.FindByQueueItemID("qitem-1")
+		Expect(found1).To(BeTrue())
+		Expect(idx1).To(Equal(0))
+
+		// Instance 3 is gone
+		_, _, found3 := modelQueue.FindByQueueItemID("qitem-3")
+		Expect(found3).To(BeFalse())
+	})
+
+	It("selects successor when removing currently playing item", func() {
+		modelQueue.Add([]QueueCandidateItem{
+			{QueueItemID: "qitem-1", MediaFile: model.MediaFile{ID: "track-A"}},
+			{QueueItemID: "qitem-2", MediaFile: model.MediaFile{ID: "track-B"}},
+			{QueueItemID: "qitem-3", MediaFile: model.MediaFile{ID: "track-C"}},
+		})
+		modelQueue.SetCurrentByQueueItemID("qitem-2") // currently playing middle item
+
+		nextID, removed := modelQueue.RemoveByQueueItemID("qitem-2")
+		Expect(removed).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-3"))
+		Expect(modelQueue.CurrentQueueItemID).To(Equal("qitem-3"))
+		Expect(modelQueue.Size()).To(Equal(2))
+	})
+
+	It("selects remaining last item when removing last item (does not loop to 0)", func() {
+		modelQueue.Add([]QueueCandidateItem{
+			{QueueItemID: "qitem-1", MediaFile: model.MediaFile{ID: "track-A"}},
+			{QueueItemID: "qitem-2", MediaFile: model.MediaFile{ID: "track-B"}},
+			{QueueItemID: "qitem-3", MediaFile: model.MediaFile{ID: "track-C"}},
+		})
+		modelQueue.SetCurrentByQueueItemID("qitem-3") // currently playing end item
+
+		nextID, removed := modelQueue.RemoveByQueueItemID("qitem-3")
+		Expect(removed).To(BeTrue())
+		Expect(nextID).To(Equal("qitem-2")) // remaining last item, NOT qitem-1
+		Expect(modelQueue.CurrentQueueItemID).To(Equal("qitem-2"))
+		Expect(modelQueue.Size()).To(Equal(2))
+	})
+
+	It("moving currently playing item preserves current queue item identity", func() {
+		modelQueue.Add([]QueueCandidateItem{
+			{QueueItemID: "qitem-1", MediaFile: model.MediaFile{ID: "track-A"}},
+			{QueueItemID: "qitem-2", MediaFile: model.MediaFile{ID: "track-B"}},
+			{QueueItemID: "qitem-3", MediaFile: model.MediaFile{ID: "track-C"}},
+		})
+		modelQueue.SetCurrentByQueueItemID("qitem-1")
+
+		moved := modelQueue.MoveByQueueItemID("qitem-1", 2)
+		Expect(moved).To(BeTrue())
+		Expect(modelQueue.CurrentQueueItemID).To(Equal("qitem-1"))
+		Expect(modelQueue.Items[2].QueueItemID).To(Equal("qitem-1"))
+	})
+
+	It("clearing queue empties items and resets current queue item identity", func() {
+		modelQueue.Add([]QueueCandidateItem{
+			{QueueItemID: "qitem-1", MediaFile: model.MediaFile{ID: "track-A"}},
+		})
+		Expect(modelQueue.IsEmpty()).To(BeFalse())
+
+		modelQueue.Clear()
+		Expect(modelQueue.IsEmpty()).To(BeTrue())
+		Expect(modelQueue.CurrentQueueItemID).To(Equal(""))
+		Expect(modelQueue.Current()).To(BeNil())
+	})
+})
+

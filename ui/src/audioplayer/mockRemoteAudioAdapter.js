@@ -7,12 +7,23 @@
  * Confirms state via authoritative remote events and supports deterministic failure/permission/timeout injection.
  */
 
-import { PlaybackStatus } from './playbackControlModule'
+import {
+  PlaybackStatus,
+  applyQueueAdd,
+  applyQueueRemove,
+  applyQueueMove,
+  applyQueueClear,
+} from './playbackControlModule'
 
 export function createMockRemoteAudioAdapter(options = {}) {
   let activeEpoch = 0
   let isActive = false
   let stateCallback = null
+
+  let remoteQueue = []
+  let currentQueueItemId = null
+  let queueVersion = 0
+  const wireCommands = []
 
   let remoteState = {
     status: PlaybackStatus.IDLE,
@@ -35,6 +46,9 @@ export function createMockRemoteAudioAdapter(options = {}) {
     isActive = false
     activeEpoch = -1
     stateCallback = null
+    remoteQueue = []
+    currentQueueItemId = null
+    wireCommands.length = 0
   }
 
   function setFailure(config) {
@@ -111,12 +125,136 @@ export function createMockRemoteAudioAdapter(options = {}) {
       simulateAction('skipPrev', () => ({
         position: 0,
       })),
+    addQueueItems: (epoch, items = [], index = -1) => {
+      wireCommands.push({
+        action: 'add',
+        epoch,
+        items: items.map((i) => ({
+          queueItemId: i.queueItemId || i.uuid,
+          trackId: i.trackId,
+        })),
+        index,
+      })
+
+      return simulateAction('addQueueItems', () => {
+        const res = applyQueueAdd(remoteQueue, currentQueueItemId, items, index)
+        remoteQueue = res.queue
+        currentQueueItemId = res.currentQueueItemId
+        queueVersion += 1
+        return {
+          queue: [...remoteQueue],
+          currentQueueItemId,
+          queueVersion,
+        }
+      })
+    },
+    removeQueueItem: (epoch, queueItemId) => {
+      wireCommands.push({
+        action: 'remove',
+        epoch,
+        queueItemId,
+      })
+
+      return simulateAction('removeQueueItem', () => {
+        const isPlaying = remoteState.status === PlaybackStatus.PLAYING
+        const res = applyQueueRemove(
+          remoteQueue,
+          currentQueueItemId,
+          queueItemId,
+          isPlaying,
+        )
+        if (!res.removed) return {}
+
+        remoteQueue = res.queue
+        currentQueueItemId = res.currentQueueItemId
+        queueVersion += 1
+
+        return {
+          queue: [...remoteQueue],
+          currentQueueItemId: res.currentQueueItemId,
+          queueVersion,
+          ...(res.status ? { status: res.status, position: 0 } : {}),
+        }
+      })
+    },
+    moveQueueItem: (epoch, queueItemId, toIndex) => {
+      wireCommands.push({
+        action: 'move',
+        epoch,
+        queueItemId,
+        toIndex,
+      })
+
+      return simulateAction('moveQueueItem', () => {
+        const res = applyQueueMove(remoteQueue, queueItemId, toIndex)
+        if (!res.moved) return {}
+
+        remoteQueue = res.queue
+        queueVersion += 1
+
+        return {
+          queue: [...remoteQueue],
+          currentQueueItemId,
+          queueVersion,
+        }
+      })
+    },
+    clearQueue: (epoch) => {
+      wireCommands.push({
+        action: 'clear',
+        epoch,
+      })
+
+      return simulateAction('clearQueue', () => {
+        const res = applyQueueClear()
+        remoteQueue = res.queue
+        currentQueueItemId = res.currentQueueItemId
+        queueVersion += 1
+        return {
+          queue: [],
+          currentQueueItemId: null,
+          queueVersion,
+          status: PlaybackStatus.IDLE,
+          position: 0,
+        }
+      })
+    },
+    skipToQueueItem: (epoch, queueItemId) => {
+      wireCommands.push({
+        action: 'skip',
+        epoch,
+        queueItemId,
+      })
+
+      return simulateAction('skipToQueueItem', () => {
+        currentQueueItemId = queueItemId
+        return {
+          currentQueueItemId,
+          position: 0,
+        }
+      })
+    },
     // Direct injection of authoritative server push (e.g. position progress or track change)
     pushServerSnapshot: (snapshot) => {
       if (!isActive || !stateCallback) return
+      if (Array.isArray(snapshot.queue)) {
+        remoteQueue = [...snapshot.queue]
+      }
+      if (snapshot.currentQueueItemId !== undefined) {
+        currentQueueItemId = snapshot.currentQueueItemId
+      }
+      if (typeof snapshot.queueVersion === 'number') {
+        queueVersion = snapshot.queueVersion
+      }
       remoteState = { ...remoteState, ...snapshot }
       stateCallback(activeEpoch, snapshot)
     },
+    getWireCommands: () => [...wireCommands],
+    clearWireCommands: () => {
+      wireCommands.length = 0
+    },
+    getQueue: () => [...remoteQueue],
+    getCurrentQueueItemId: () => currentQueueItemId,
     setFailure,
     getRemoteState: () => ({ ...remoteState }),
   }

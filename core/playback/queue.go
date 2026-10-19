@@ -196,3 +196,152 @@ func (pd *Queue) IncreaseIndex() {
 		pd.SetIndex(pd.Index + 1)
 	}
 }
+
+// QueueCandidateItem represents a candidate server-side queue entry with a stable
+// instance identity, strictly separating track/media identity from queue instance identity.
+type QueueCandidateItem struct {
+	QueueItemID string          `json:"queueItemId"`
+	MediaFile   model.MediaFile `json:"mediaFile"`
+}
+
+// QueueCandidateModel provides candidate server-side queue operations tracking items
+// by stable QueueItemID across duplicate tracks, reordering, and deletions.
+type QueueCandidateModel struct {
+	CurrentQueueItemID string
+	Items              []QueueCandidateItem
+}
+
+func NewQueueCandidateModel() *QueueCandidateModel {
+	return &QueueCandidateModel{
+		CurrentQueueItemID: "",
+		Items:              nil,
+	}
+}
+
+func (m *QueueCandidateModel) Size() int {
+	return len(m.Items)
+}
+
+func (m *QueueCandidateModel) IsEmpty() bool {
+	return len(m.Items) == 0
+}
+
+func (m *QueueCandidateModel) Current() *QueueCandidateItem {
+	if m.CurrentQueueItemID == "" {
+		return nil
+	}
+	for i := range m.Items {
+		if m.Items[i].QueueItemID == m.CurrentQueueItemID {
+			return &m.Items[i]
+		}
+	}
+	return nil
+}
+
+func (m *QueueCandidateModel) Add(items []QueueCandidateItem) {
+	m.Items = append(m.Items, items...)
+	if m.CurrentQueueItemID == "" && len(m.Items) > 0 {
+		m.CurrentQueueItemID = m.Items[0].QueueItemID
+	}
+}
+
+func (m *QueueCandidateModel) Insert(index int, items []QueueCandidateItem) {
+	if len(items) == 0 {
+		return
+	}
+	index = max(0, min(index, len(m.Items)))
+	newItems := make([]QueueCandidateItem, 0, len(m.Items)+len(items))
+	newItems = append(newItems, m.Items[:index]...)
+	newItems = append(newItems, items...)
+	newItems = append(newItems, m.Items[index:]...)
+	m.Items = newItems
+
+	if m.CurrentQueueItemID == "" && len(m.Items) > 0 {
+		m.CurrentQueueItemID = m.Items[0].QueueItemID
+	}
+}
+
+func (m *QueueCandidateModel) findIndexByID(queueItemID string) int {
+	for i, item := range m.Items {
+		if item.QueueItemID == queueItemID {
+			return i
+		}
+	}
+	return -1
+}
+
+// RemoveByQueueItemID removes a specific queue instance by QueueItemID.
+// If the removed item is the current item:
+// - It prioritizes its successor (index + 1)
+// - If removing the last item, it selects the remaining last item (does not loop to 0)
+// - If the queue becomes empty, it clears CurrentQueueItemID.
+func (m *QueueCandidateModel) RemoveByQueueItemID(queueItemID string) (string, bool) {
+	idx := m.findIndexByID(queueItemID)
+	if idx == -1 {
+		return m.CurrentQueueItemID, false
+	}
+
+	if queueItemID == m.CurrentQueueItemID {
+		switch {
+		case idx < len(m.Items)-1:
+			m.CurrentQueueItemID = m.Items[idx+1].QueueItemID
+		case len(m.Items) > 1:
+			m.CurrentQueueItemID = m.Items[len(m.Items)-2].QueueItemID
+		default:
+			m.CurrentQueueItemID = ""
+		}
+	}
+
+	m.Items = append(m.Items[:idx], m.Items[idx+1:]...)
+	return m.CurrentQueueItemID, true
+}
+
+// MoveByQueueItemID moves a track by QueueItemID to toIndex.
+// Moving the currently playing item preserves CurrentQueueItemID without restarting playback.
+func (m *QueueCandidateModel) MoveByQueueItemID(queueItemID string, toIndex int) bool {
+	fromIdx := m.findIndexByID(queueItemID)
+	if fromIdx == -1 {
+		return false
+	}
+
+	toIndex = max(0, min(toIndex, len(m.Items)-1))
+	if fromIdx == toIndex {
+		return true
+	}
+
+	item := m.Items[fromIdx]
+	remaining := make([]QueueCandidateItem, 0, len(m.Items)-1)
+	remaining = append(remaining, m.Items[:fromIdx]...)
+	remaining = append(remaining, m.Items[fromIdx+1:]...)
+
+	newItems := make([]QueueCandidateItem, 0, len(m.Items))
+	newItems = append(newItems, remaining[:toIndex]...)
+	newItems = append(newItems, item)
+	newItems = append(newItems, remaining[toIndex:]...)
+	m.Items = newItems
+
+	return true
+}
+
+func (m *QueueCandidateModel) FindByQueueItemID(queueItemID string) (int, *QueueCandidateItem, bool) {
+	idx := m.findIndexByID(queueItemID)
+	if idx == -1 {
+		return -1, nil, false
+	}
+	return idx, &m.Items[idx], true
+}
+
+func (m *QueueCandidateModel) SetCurrentByQueueItemID(queueItemID string) bool {
+	idx := m.findIndexByID(queueItemID)
+	if idx != -1 {
+		m.CurrentQueueItemID = queueItemID
+		return true
+	}
+	return false
+}
+
+func (m *QueueCandidateModel) Clear() {
+	m.Items = nil
+	m.CurrentQueueItemID = ""
+}
+
