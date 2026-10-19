@@ -42,6 +42,14 @@ go.work*
 .worktrees/
 .playwright-mcp/
 
+# Local agent tracker and skill configuration
+/.scratch/
+/docs/agents/
+
+# Local runtime data and generated development assets
+/contrib/docker-compose/data/
+/ui/dev-dist/
+
 # Temp benchmark files
 zz_*_test.go
 
