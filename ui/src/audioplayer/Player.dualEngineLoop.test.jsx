@@ -13,6 +13,9 @@
  * - TC-DE-07 (US-1, US-24): Dynamic UI-Level Engine Switching (Local -> Remote)
  * - TC-DE-08 (US-1, US-3): Native DOM Button Interactions via Unified Control Loop
  * - TC-DE-09 (US-24, US-25): Backward Compatibility with Default Native Baseline
+ * - TC-IN-01 (US-1, US-4, Issue 05): Shortcut Input Consistency and Single-Issue Guarantee
+ * - TC-IN-02 (US-1, US-4, Issue 05): Media Session Action Delegation, Authority-Driven Metadata
+ * - TC-DSP-01 (US-3, Issue 05): Authoritative State Drives Lyric Time Sync Without Audio Events
  */
 
 import React from 'react'
@@ -614,44 +617,41 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
     })
   })
 
-  describe('Controlled native inputs and lifecycle', () => {
-    async function renderControlledPlayer(
-      engineMode = 'local',
-      extraProps = {},
-    ) {
-      const tracks = (extraProps.audioLists || sampleTracks).map(
-        (track, index) => ({
-          ...track,
-          queueItemId: track.queueItemId || `controlled-${index}`,
-        }),
-      )
-      const controller = createPlaybackControlModule()
-      const browserAdapter =
-        engineMode === 'local' ? createBrowserAudioAdapter() : undefined
-      const adapter = browserAdapter || createMockRemoteAudioAdapter()
-      controller.setAdapter(adapter)
-      await controller.addQueueItems(tracks)
-      const props = {
-        controller,
-        browserAdapter,
-        engineMode,
-        audioLists: tracks,
-        mode: 'full',
-        autoPlay: false,
-        ...extraProps,
-      }
-      const view = render(<UnifiedNativePlayer {...props} />)
-      return {
-        controller,
-        browserAdapter,
-        adapter,
-        tracks,
-        ...view,
-        rerenderPlayer: (overrides) =>
-          view.rerender(<UnifiedNativePlayer {...props} {...overrides} />),
-      }
+  async function renderControlledPlayer(engineMode = 'local', extraProps = {}) {
+    const tracks = (extraProps.audioLists || sampleTracks).map(
+      (track, index) => ({
+        ...track,
+        queueItemId: track.queueItemId || `controlled-${index}`,
+      }),
+    )
+    const controller = createPlaybackControlModule()
+    const browserAdapter =
+      engineMode === 'local' ? createBrowserAudioAdapter() : undefined
+    const adapter = browserAdapter || createMockRemoteAudioAdapter()
+    controller.setAdapter(adapter)
+    await controller.addQueueItems(tracks)
+    const props = {
+      controller,
+      browserAdapter,
+      engineMode,
+      audioLists: tracks,
+      mode: 'full',
+      autoPlay: false,
+      ...extraProps,
     }
+    const view = render(<UnifiedNativePlayer {...props} />)
+    return {
+      controller,
+      browserAdapter,
+      adapter,
+      tracks,
+      ...view,
+      rerenderPlayer: (overrides) =>
+        view.rerender(<UnifiedNativePlayer {...props} {...overrides} />),
+    }
+  }
 
+  describe('Controlled native inputs and lifecycle', () => {
     it('TC-QC-09: a failing custom drag-start hook cannot leave structural projection locked', async () => {
       const { controller } = await renderControlledPlayer('remote', {
         sortableOptions: {
@@ -1121,6 +1121,375 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
 
       expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 2)
       expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+    })
+
+    it.each(['local', 'remote'])(
+      'TC-IN-01: the %s space-bar shortcut enters the Module exactly once per keydown',
+      async (engineMode) => {
+        const ref = React.createRef()
+        const { controller, browserAdapter } = await renderControlledPlayer(
+          engineMode,
+          { ref, spaceBar: true },
+        )
+        const playBefore = controller.getMetrics().commandsSent.play
+
+        await act(async () => {
+          fireEvent.keyDown(ref.current.player.current, {
+            key: ' ',
+            keyCode: 32,
+          })
+        })
+
+        expect(controller.getMetrics().commandsSent.play).toBe(playBefore + 1)
+        if (browserAdapter) {
+          await act(async () => {
+            browserAdapter.getAudioElement().dispatchEvent(new Event('playing'))
+          })
+        }
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+
+        const pauseBefore = controller.getMetrics().commandsSent.pause
+        await act(async () => {
+          fireEvent.keyDown(ref.current.player.current, {
+            key: ' ',
+            keyCode: 32,
+          })
+        })
+        expect(controller.getMetrics().commandsSent.pause).toBe(pauseBefore + 1)
+        if (browserAdapter) {
+          await act(async () => {
+            browserAdapter.getAudioElement().dispatchEvent(new Event('pause'))
+          })
+        }
+        expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      },
+    )
+
+    it.each(['local', 'remote'])(
+      'TC-IN-01: %s visibility and focus changes issue no playback commands',
+      async (engineMode) => {
+        const { controller } = await renderControlledPlayer(engineMode)
+        const before = controller.getMetrics()
+        const statusBefore = controller.getState().status
+        await act(async () => {
+          document.dispatchEvent(new Event('visibilitychange'))
+          window.dispatchEvent(new Event('blur'))
+          window.dispatchEvent(new Event('focus'))
+          document.dispatchEvent(new Event('visibilitychange'))
+        })
+        const after = controller.getMetrics()
+        expect(after.intentsIssued).toBe(before.intentsIssued)
+        expect(after.commandsSent).toEqual(before.commandsSent)
+        expect(controller.getState().status).toBe(statusBefore)
+      },
+    )
+
+    it('TC-IN-01: a focused player and a document-level host handler do not double-issue one space press', async () => {
+      const ref = React.createRef()
+      let hostAudio = null
+      const { controller } = await renderControlledPlayer('local', {
+        ref,
+        spaceBar: true,
+        getAudioInstance: (audio) => {
+          hostAudio = audio
+        },
+      })
+      // Mirror the production host wiring (Player.jsx GlobalHotKeys ->
+      // keyHandlers -> audioInstance.togglePlay) with a plain document listener.
+      const hostListener = (event) => {
+        if (event.keyCode === 32 && hostAudio) hostAudio.togglePlay()
+      }
+      document.addEventListener('keydown', hostListener)
+      try {
+        const before = controller.getMetrics().intentsIssued
+        await act(async () => {
+          fireEvent.keyDown(ref.current.player.current, {
+            key: ' ',
+            keyCode: 32,
+          })
+        })
+        expect(controller.getMetrics().intentsIssued).toBe(before + 1)
+      } finally {
+        document.removeEventListener('keydown', hostListener)
+      }
+    })
+
+    it('TC-IN-01: without a controller the native space-bar binding keeps its default behavior', async () => {
+      const ref = React.createRef()
+      render(
+        <UnifiedNativePlayer
+          ref={ref}
+          audioLists={sampleTracks}
+          mode="full"
+          autoPlay={false}
+          spaceBar
+        />,
+      )
+      await waitFor(() => {
+        expect(document.querySelector('.play-btn')).not.toBeNull()
+      })
+      await act(async () => {
+        fireEvent.keyDown(ref.current.player.current, {
+          key: ' ',
+          keyCode: 32,
+        })
+      })
+      // The native player starts playback after the media canplay event; jsdom
+      // reports NETWORK_EMPTY, so mirror the baseline's loaded-media flags.
+      const audio = document.querySelector('audio')
+      setMediaFlags(audio, { networkState: 1, readyState: 4 })
+      await act(async () => {
+        audio.dispatchEvent(new Event('canplay'))
+      })
+      await waitFor(() => {
+        expect(playSpy).toHaveBeenCalled()
+      })
+    })
+  })
+
+  describe('Shortcut and media key consistency (Issue 05)', () => {
+    function installMediaSessionStub() {
+      const handlers = {}
+      const stub = {
+        metadata: null,
+        setActionHandler: vi.fn((action, handler) => {
+          handlers[action] = handler
+        }),
+        setPositionState: vi.fn(),
+      }
+      Object.defineProperty(window.navigator, 'mediaSession', {
+        configurable: true,
+        writable: true,
+        value: stub,
+      })
+      window.MediaMetadata = vi.fn(function MediaMetadata(config) {
+        Object.assign(this, config)
+      })
+      return { stub, handlers }
+    }
+
+    afterEach(() => {
+      delete window.navigator.mediaSession
+      delete window.MediaMetadata
+    })
+
+    it.each(['local', 'remote'])(
+      'TC-IN-02: %s media session transport actions enter the same Module intents',
+      async (engineMode) => {
+        const { stub, handlers } = installMediaSessionStub()
+        const { controller } = await renderControlledPlayer(engineMode, {
+          showMediaSession: true,
+        })
+        for (const action of [
+          'play',
+          'pause',
+          'previoustrack',
+          'nexttrack',
+          'seekto',
+          'seekbackward',
+          'seekforward',
+        ]) {
+          expect(typeof handlers[action]).toBe('function')
+        }
+
+        const sent = () => controller.getMetrics().commandsSent
+        const before = { ...sent() }
+        await act(async () => handlers.nexttrack())
+        await act(async () => handlers.previoustrack())
+        await act(async () => handlers.play())
+        await act(async () => handlers.pause())
+        expect(sent().skipNext).toBe(before.skipNext + 1)
+        expect(sent().skipPrev).toBe(before.skipPrev + 1)
+        expect(sent().play).toBe(before.play + 1)
+        expect(sent().pause).toBe(before.pause + 1)
+      },
+    )
+
+    it.each(['local', 'remote'])(
+      'TC-IN-02: %s media session seeks commit against the authoritative position, not a media element',
+      async (engineMode) => {
+        const { handlers } = installMediaSessionStub()
+        const { controller, browserAdapter } = await renderControlledPlayer(
+          engineMode,
+          { showMediaSession: true, duration: 180 },
+        )
+        await act(async () => controller.play())
+        if (browserAdapter) {
+          await act(async () => {
+            browserAdapter.getAudioElement().dispatchEvent(new Event('playing'))
+          })
+        }
+        await act(async () =>
+          controller.backfillState({ position: 40, duration: 180 }),
+        )
+        expect(controller.getState().position).toBe(40)
+
+        const sent = () => controller.getMetrics().commandsSent
+        const seekBefore = sent().seek
+
+        await act(async () => handlers.seekbackward({ seekOffset: 10 }))
+        if (browserAdapter) {
+          expect(browserAdapter.getAudioElement().currentTime).toBe(30)
+          await act(async () => {
+            browserAdapter.getAudioElement().dispatchEvent(new Event('seeked'))
+          })
+        }
+        expect(controller.getState().position).toBe(30)
+
+        await act(async () => handlers.seekforward({}))
+        if (browserAdapter) {
+          expect(browserAdapter.getAudioElement().currentTime).toBe(40)
+          await act(async () => {
+            browserAdapter.getAudioElement().dispatchEvent(new Event('seeked'))
+          })
+        }
+        expect(controller.getState().position).toBe(40)
+
+        await act(async () => handlers.seekto({ seekTime: 12 }))
+        if (browserAdapter) {
+          expect(browserAdapter.getAudioElement().currentTime).toBe(12)
+          await act(async () => {
+            browserAdapter.getAudioElement().dispatchEvent(new Event('seeked'))
+          })
+        }
+        expect(controller.getState().position).toBe(12)
+        expect(sent().seek).toBe(seekBefore + 3)
+      },
+    )
+
+    it.each(['local', 'remote'])(
+      'TC-IN-02: %s media session metadata and position state come from the authority',
+      async (engineMode) => {
+        const { stub } = installMediaSessionStub()
+        const { controller } = await renderControlledPlayer(engineMode, {
+          showMediaSession: true,
+          duration: 180,
+        })
+        await waitFor(() => expect(window.MediaMetadata).toHaveBeenCalled())
+        expect(stub.metadata.title).toBe('Song 0')
+        expect(stub.metadata.artist).toBe('Artist 0')
+
+        await act(async () =>
+          controller.backfillState({ position: 42, duration: 180 }),
+        )
+        expect(stub.setPositionState).toHaveBeenCalled()
+        const last = stub.setPositionState.mock.calls.at(-1)[0]
+        expect(last.position).toBe(42)
+        expect(last.duration).toBe(180)
+      },
+    )
+
+    it('TC-IN-02: unmounting the controlled player releases every media session action', async () => {
+      const { handlers } = installMediaSessionStub()
+      const { unmount } = await renderControlledPlayer('remote', {
+        showMediaSession: true,
+      })
+      expect(typeof handlers.play).toBe('function')
+      unmount()
+      for (const action of [
+        'play',
+        'pause',
+        'previoustrack',
+        'nexttrack',
+        'seekto',
+        'seekbackward',
+        'seekforward',
+      ]) {
+        expect(handlers[action]).toBeNull()
+      }
+    })
+
+    it('TC-IN-02: controlled mode without showMediaSession registers no media session handlers', async () => {
+      const { stub } = installMediaSessionStub()
+      await renderControlledPlayer('remote')
+      expect(stub.setActionHandler).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('Authoritative display state (Issue 05)', () => {
+    const lyricTracks = [
+      {
+        name: 'Lyric Song 1',
+        singer: 'Artist L1',
+        musicSrc: 'http://localhost/lyric1.mp3',
+        id: 's-l1',
+        queueItemId: 'q-l1',
+        lyric: '[00:01.00]line one\n[00:03.00]line two\n[00:05.00]line three',
+      },
+      {
+        name: 'Lyric Song 2',
+        singer: 'Artist L2',
+        musicSrc: 'http://localhost/lyric2.mp3',
+        id: 's-l2',
+        queueItemId: 'q-l2',
+        lyric: '[00:01.00]other one\n[00:03.00]other two',
+      },
+    ]
+
+    const currentLyricLine = () =>
+      document.querySelector('.music-player-lyric')?.textContent
+
+    async function openLyricView() {
+      await act(async () => document.querySelector('.lyric-btn').click())
+      expect(document.querySelector('.music-player-lyric')).not.toBeNull()
+    }
+
+    it('TC-DSP-01: remote lyric highlighting follows the authoritative position without any audio element', async () => {
+      const { controller } = await renderControlledPlayer('remote', {
+        audioLists: lyricTracks,
+        showLyric: true,
+      })
+      expect(document.querySelector('audio')).toBeNull()
+      await act(async () => controller.play())
+      await openLyricView()
+      const intentsBefore = controller.getMetrics().intentsIssued
+
+      await act(async () => controller.backfillState({ position: 3.2 }))
+      expect(currentLyricLine()).toContain('line two')
+
+      // An earlier snapshot moves the highlight back; nothing replays forward.
+      await act(async () => controller.backfillState({ position: 0.2 }))
+      expect(currentLyricLine()).not.toContain('line')
+
+      await act(async () => controller.backfillState({ position: 5.2 }))
+      expect(currentLyricLine()).toContain('line three')
+      expect(controller.getMetrics().intentsIssued).toBe(intentsBefore)
+    })
+
+    it('TC-DSP-01: a remote track change re-seeds lyric highlighting from the new authoritative track', async () => {
+      const { controller } = await renderControlledPlayer('remote', {
+        audioLists: lyricTracks,
+        showLyric: true,
+      })
+      await act(async () => controller.play())
+      await openLyricView()
+      await act(async () => controller.backfillState({ position: 3.2 }))
+      expect(currentLyricLine()).toContain('line two')
+
+      await act(async () => controller.skipNext())
+      await act(async () => controller.backfillState({ position: 1.2 }))
+      expect(currentLyricLine()).toContain('other one')
+    })
+
+    it('TC-DSP-01: local lyric highlighting follows the same authoritative position', async () => {
+      const { controller, browserAdapter } = await renderControlledPlayer(
+        'local',
+        { audioLists: lyricTracks, showLyric: true },
+      )
+      await act(async () => controller.play())
+      await act(async () => {
+        browserAdapter.getAudioElement().dispatchEvent(new Event('playing'))
+      })
+      await openLyricView()
+      const audio = browserAdapter.getAudioElement()
+      await act(async () => {
+        Object.defineProperty(audio, 'currentTime', {
+          configurable: true,
+          value: 3.2,
+        })
+        audio.dispatchEvent(new Event('timeupdate'))
+      })
+      expect(currentLyricLine()).toContain('line two')
     })
   })
 

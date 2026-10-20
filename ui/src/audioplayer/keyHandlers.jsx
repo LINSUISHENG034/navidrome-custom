@@ -1,5 +1,6 @@
 import jukeboxClient from './jukeboxClient'
 import { canControlJukebox } from './jukeboxSession'
+import { PlaybackStatus } from './playbackControlModule'
 import { stepRemoteGainByUiDelta } from './volumeProfiles'
 import {
   selectEffectiveCurrentTrack,
@@ -8,7 +9,9 @@ import {
   selectEffectiveJukeboxPlaying,
 } from '../selectors/playerSelectors'
 
-const keyHandlers = (audioInstance, playerState) => {
+const VOLUME_KEY_STEP = 0.1
+
+const keyHandlers = (audioInstance, playerState, playbackController = null) => {
   const nextSong = () => {
     const idx = playerState.queue.findIndex(
       (item) => item.uuid === playerState.current.uuid,
@@ -30,6 +33,45 @@ const keyHandlers = (audioInstance, playerState) => {
   const effectiveCurrentIndex = selectEffectiveJukeboxCurrentIndex(state)
   const effectiveJukeboxPlaying = selectEffectiveJukeboxPlaying(state)
   const effectiveJukeboxGain = selectEffectiveJukeboxGain(state)
+
+  // Unified candidate path (Issue 05): when a playback controller is supplied,
+  // every playback hotkey enters the Module exactly once; the audio element and
+  // the jukebox client are no longer command targets. Production callers pass
+  // no controller and keep the existing behavior below.
+  if (playbackController) {
+    return {
+      TOGGLE_PLAY: (e) => {
+        e.preventDefault()
+        const { status } = playbackController.getState()
+        const intent =
+          status === PlaybackStatus.PLAYING
+            ? playbackController.pause
+            : playbackController.play
+        intent.call(playbackController).catch(() => {})
+      },
+      VOL_UP: () => {
+        const { volume } = playbackController.getState()
+        playbackController
+          .setVolume(Math.min(1, volume + VOLUME_KEY_STEP))
+          .catch(() => {})
+      },
+      VOL_DOWN: () => {
+        const { volume } = playbackController.getState()
+        playbackController
+          .setVolume(Math.max(0, volume - VOLUME_KEY_STEP))
+          .catch(() => {})
+      },
+      PREV_SONG: (e) => {
+        if (!e.metaKey) playbackController.skipPrev().catch(() => {})
+      },
+      CURRENT_SONG: () => {
+        window.location.href = `#/album/${effectiveCurrentTrack?.song.albumId}/show`
+      },
+      NEXT_SONG: (e) => {
+        if (!e.metaKey) playbackController.skipNext().catch(() => {})
+      },
+    }
+  }
 
   return {
     TOGGLE_PLAY: (e) => {

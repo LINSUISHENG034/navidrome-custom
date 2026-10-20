@@ -519,6 +519,96 @@ describe('remote-state-first jukebox controls', () => {
   })
 })
 
+describe('unified controller hotkey routing (Issue 05, TC-IN-03)', () => {
+  const playerState = {
+    jukeboxMode: false,
+    queue: [],
+    current: {},
+  }
+
+  function makeController(status = 'paused', volume = 0.5) {
+    return {
+      getState: vi.fn(() => ({ status, volume, position: 0, duration: 0 })),
+      play: vi.fn(() => Promise.resolve()),
+      pause: vi.fn(() => Promise.resolve()),
+      setVolume: vi.fn(() => Promise.resolve()),
+      skipNext: vi.fn(() => Promise.resolve()),
+      skipPrev: vi.fn(() => Promise.resolve()),
+    }
+  }
+
+  it('TC-IN-03: TOGGLE_PLAY routes through the controller instead of the audio instance', () => {
+    const audioInstance = { togglePlay: vi.fn(), volume: 0.5 }
+    const controller = makeController('paused')
+    const handlers = keyHandlers(audioInstance, playerState, controller)
+
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    expect(controller.play).toHaveBeenCalledTimes(1)
+    expect(controller.pause).not.toHaveBeenCalled()
+    expect(audioInstance.togglePlay).not.toHaveBeenCalled()
+
+    const playingController = makeController('playing')
+    keyHandlers(audioInstance, playerState, playingController).TOGGLE_PLAY({
+      preventDefault: vi.fn(),
+    })
+    expect(playingController.pause).toHaveBeenCalledTimes(1)
+    expect(playingController.play).not.toHaveBeenCalled()
+    expect(audioInstance.togglePlay).not.toHaveBeenCalled()
+  })
+
+  it('TC-IN-03: VOL_UP and VOL_DOWN step the authoritative volume instead of mutating the element', () => {
+    const audioInstance = { togglePlay: vi.fn(), volume: 0.5 }
+    const controller = makeController('playing', 0.5)
+    const handlers = keyHandlers(audioInstance, playerState, controller)
+
+    handlers.VOL_UP()
+    expect(controller.setVolume).toHaveBeenLastCalledWith(0.6)
+    handlers.VOL_DOWN()
+    handlers.VOL_DOWN()
+    expect(controller.setVolume).toHaveBeenLastCalledWith(0.4)
+    expect(controller.setVolume).toHaveBeenCalledTimes(3)
+    expect(audioInstance.volume).toBe(0.5)
+
+    const clamped = makeController('playing', 0.97)
+    keyHandlers(audioInstance, playerState, clamped).VOL_UP()
+    expect(clamped.setVolume).toHaveBeenLastCalledWith(1)
+  })
+
+  it('TC-IN-03: NEXT_SONG and PREV_SONG route skips through the controller, keeping the metaKey guard', () => {
+    const audioInstance = {
+      togglePlay: vi.fn(),
+      playNext: vi.fn(),
+      playPrev: vi.fn(),
+      volume: 0.5,
+    }
+    const controller = makeController()
+    const handlers = keyHandlers(audioInstance, playerState, controller)
+
+    handlers.NEXT_SONG({ metaKey: false })
+    handlers.PREV_SONG({ metaKey: false })
+    expect(controller.skipNext).toHaveBeenCalledTimes(1)
+    expect(controller.skipPrev).toHaveBeenCalledTimes(1)
+    expect(audioInstance.playNext).not.toHaveBeenCalled()
+    expect(audioInstance.playPrev).not.toHaveBeenCalled()
+
+    handlers.NEXT_SONG({ metaKey: true })
+    handlers.PREV_SONG({ metaKey: true })
+    expect(controller.skipNext).toHaveBeenCalledTimes(1)
+    expect(controller.skipPrev).toHaveBeenCalledTimes(1)
+  })
+
+  it('TC-IN-03: without a controller the two-argument call keeps the existing host behavior', () => {
+    const audioInstance = { togglePlay: vi.fn(), volume: 0.5 }
+    const handlers = keyHandlers(audioInstance, playerState)
+
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    expect(audioInstance.togglePlay).toHaveBeenCalledTimes(1)
+
+    handlers.VOL_UP()
+    expect(audioInstance.volume).toBeCloseTo(0.6)
+  })
+})
+
 describe('jukebox session heartbeat lifecycle', () => {
   beforeEach(() => {
     vi.clearAllMocks()

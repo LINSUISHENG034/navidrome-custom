@@ -21,9 +21,22 @@ import React from 'react'
 import ReactDOM from 'react-dom'
 import ReactJkMusicPlayer from 'navidrome-music-player/es/index.js'
 import sortableConfig from 'navidrome-music-player/es/config/sortable.js'
+import { SPACE_BAR_KEYCODE } from 'navidrome-music-player/es/config/keycode.js'
 import Sortable from 'sortablejs'
 import { PlaybackStatus, PlaybackMode } from './playbackControlModule'
 import { audioVolumeToUiVolume, uiVolumeToAudioVolume } from './volumeMapping'
+
+const MEDIA_SESSION_ACTIONS = [
+  'play',
+  'pause',
+  'previoustrack',
+  'nexttrack',
+  'seekto',
+  'seekbackward',
+  'seekforward',
+]
+
+const DEFAULT_MEDIA_SESSION_SKIP_S = 10
 
 /**
  * Shared helper to resolve stable queue item identity across UI and drawer representations.
@@ -228,6 +241,181 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       const targetQueueItemId = resolveQueueItemId(playId, currentLists)
       controller.skipToQueueItem(targetQueueItemId).catch(() => {})
     }
+
+    // Space keydown: issue the toggle once. preventDefault stops a focused
+    // button's click activation; stopPropagation keeps a document-level host
+    // hotkey (Player.jsx GlobalHotKeys -> audioInstance.togglePlay) from
+    // re-issuing the same intent for the same key press.
+    this.onKeyDown = (e) => {
+      if (this.props.spaceBar && e.keyCode === SPACE_BAR_KEYCODE) {
+        e.preventDefault()
+        e.stopPropagation()
+        this.onTogglePlay()
+      }
+    }
+
+    // Media session position state reads the authoritative scene, never a
+    // media element (there is none in remote mode).
+    this.updateMediaSessionPositionState = () => {
+      if (
+        typeof navigator === 'undefined' ||
+        !('mediaSession' in navigator) ||
+        !('setPositionState' in navigator.mediaSession)
+      ) {
+        return
+      }
+      const authority = this.props.controller?.getState()
+      try {
+        navigator.mediaSession.setPositionState({
+          duration:
+            typeof authority?.duration === 'number' && authority.duration > 0
+              ? authority.duration
+              : this.audioDuration,
+          playbackRate: 1,
+          position:
+            typeof authority?.position === 'number' ? authority.position : 0,
+        })
+      } catch (error) {
+        // Same tolerance as the native class: invalid ranges are ignored.
+      }
+    }
+  }
+
+  syncControlledMediaSession() {
+    const supported =
+      typeof navigator !== 'undefined' && 'mediaSession' in navigator
+    const { controller, showMediaSession } = this.props
+    const shouldBind = Boolean(controller && showMediaSession && supported)
+    const binding = this.controlledMediaSession
+    if (binding && (!shouldBind || binding.controller !== controller)) {
+      binding.release()
+      this.controlledMediaSession = null
+    }
+    if (!shouldBind || this.controlledMediaSession?.controller === controller) {
+      return
+    }
+    const setHandler = (action, handler) => {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler)
+      } catch (error) {
+        // The browser does not support this action; skip it like the native class.
+      }
+    }
+    const intent =
+      (dispatch) =>
+      (...args) => {
+        if (this.props.controller !== controller) return
+        try {
+          const result = dispatch(...args)
+          if (result && typeof result.catch === 'function') {
+            result.catch(() => {})
+          }
+        } catch (error) {
+          // Handler errors must not escape into the UA media session dispatch.
+        }
+      }
+    // Keep native parity: the play/pause actions toggle through the same
+    // controlled entry the native onAddMediaSession would have captured.
+    setHandler(
+      'play',
+      intent(() => this.onTogglePlay()),
+    )
+    setHandler(
+      'pause',
+      intent(() => this.onTogglePlay()),
+    )
+    setHandler(
+      'previoustrack',
+      intent(() => controller.skipPrev()),
+    )
+    setHandler(
+      'nexttrack',
+      intent(() => controller.skipNext()),
+    )
+    setHandler(
+      'seekto',
+      intent((details) =>
+        typeof details?.seekTime === 'number'
+          ? controller.seek(details.seekTime)
+          : undefined,
+      ),
+    )
+    const seekBy = (details, direction) => {
+      const authority = controller.getState()
+      const offset = details?.seekOffset || DEFAULT_MEDIA_SESSION_SKIP_S
+      const position = authority.position || 0
+      const max =
+        typeof authority.duration === 'number' && authority.duration > 0
+          ? authority.duration
+          : Infinity
+      return controller.seek(
+        Math.min(Math.max(position + direction * offset, 0), max),
+      )
+    }
+    setHandler(
+      'seekbackward',
+      intent((details) => seekBy(details, -1)),
+    )
+    setHandler(
+      'seekforward',
+      intent((details) => seekBy(details, 1)),
+    )
+    this.controlledMediaSession = {
+      controller,
+      release: () => {
+        MEDIA_SESSION_ACTIONS.forEach((action) => {
+          try {
+            navigator.mediaSession.setActionHandler(action, null)
+          } catch (error) {
+            // Ignore: releasing an unsupported action.
+          }
+        })
+      },
+    }
+  }
+
+  releaseControlledMediaSession() {
+    const binding = this.controlledMediaSession
+    this.controlledMediaSession = null
+    binding?.release()
+  }
+
+  // Derived display projections that follow the authoritative scene:
+  // lyric line highlighting and media session metadata/position. Neither
+  // issues intents; lyric sync runs even below the seekbar's 0.5s dead-band.
+  // Runs in the setState callback, so this.state is the post-projection view.
+  syncAuthoritativeDerivedState(update, prevSnapshot) {
+    if (this.isUnmounted || !this.props.controller) return
+    const lyricChanged = this.state.lyric !== prevSnapshot.lyric
+    if (lyricChanged) {
+      this.initLyricParser()
+      const position =
+        typeof update.position === 'number'
+          ? update.position
+          : this.props.controller.getState().position
+      if (typeof position === 'number') {
+        this.lyric?.update(position * 1000)
+      }
+    } else if (typeof update.position === 'number') {
+      this.lyric?.update(update.position * 1000)
+    }
+    if (
+      this.props.showMediaSession &&
+      typeof navigator !== 'undefined' &&
+      'mediaSession' in navigator
+    ) {
+      const metaChanged = ['name', 'singer', 'cover'].some(
+        (field) => this.state[field] !== prevSnapshot[field],
+      )
+      if (metaChanged) {
+        this.updateMediaSessionMetadata()
+      } else if (
+        typeof update.position === 'number' ||
+        typeof update.status === 'string'
+      ) {
+        this.updateMediaSessionPositionState()
+      }
+    }
   }
 
   setupRemoteModeOverrides() {
@@ -421,6 +609,7 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
 
     if (this.props.controller) this.bindKeyDownEvents()
     this.subscribeToController()
+    this.syncControlledMediaSession()
   }
 
   subscribeToController() {
@@ -443,6 +632,12 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   componentDidUpdate(prevProps) {
     if (prevProps.controller !== this.props.controller) {
       this.subscribeToController()
+    }
+    if (
+      prevProps.controller !== this.props.controller ||
+      prevProps.showMediaSession !== this.props.showMediaSession
+    ) {
+      this.syncControlledMediaSession()
     }
     if (
       prevProps.engineMode !== this.props.engineMode &&
@@ -473,6 +668,7 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   componentWillUnmount() {
     this.isUnmounted = true
     this.cancelQueueDrag()
+    this.releaseControlledMediaSession()
     this.controllerSubscription = null
     if (this.unsubscribeController) {
       this.unsubscribeController()
@@ -499,74 +695,90 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       this.restoreVolume = authoritativeState.volume
     }
 
+    // Snapshot of the pre-update view fields for the derived-state diff.
+    const prevSnapshot = {
+      lyric: this.state.lyric,
+      name: this.state.name,
+      singer: this.state.singer,
+      cover: this.state.cover,
+    }
+
     // Use functional setState to ensure consecutive synchronous updates (e.g. preparing -> playing)
     // resolve cleanly against up-to-date state rather than stale closures.
-    this.setState((prevState) => {
-      if (
-        controller !== this.props.controller ||
-        epoch !== controller?.getEpoch()
-      ) {
-        return null
-      }
-      const nextState = {}
-      if (prevState.playbackError !== authoritativeState.error) {
-        nextState.playbackError = authoritativeState.error
-      }
-      if (prevState.playing !== isPlaying) {
-        nextState.playing = isPlaying
-      }
-      if (prevState.loading !== isLoading) {
-        nextState.loading = isLoading
-      }
-      if (
-        typeof authoritativeState.volume === 'number' &&
-        audioVolumeToUiVolume(authoritativeState.volume) !==
-          prevState.soundValue
-      ) {
-        nextState.soundValue = audioVolumeToUiVolume(authoritativeState.volume)
-      }
-      if (
-        typeof authoritativeState.position === 'number' &&
-        Math.abs(authoritativeState.position - (prevState.currentTime || 0)) >
-          0.5
-      ) {
-        nextState.currentTime = authoritativeState.position
-      }
-      if (
-        typeof authoritativeState.duration === 'number' &&
-        authoritativeState.duration !== prevState.remoteDuration
-      ) {
-        nextState.remoteDuration = authoritativeState.duration
-      }
-      if (Array.isArray(authoritativeState.queue) && !this.queueDrag) {
-        const mappedLists = authoritativeState.queue.map((item) => ({
-          ...item,
-          __PLAYER_KEY__: item.queueItemId,
-          uuid: item.queueItemId,
-        }))
-        nextState.audioLists = mappedLists
-        nextState.displayedQueueEpoch = epoch
-        nextState.displayedQueueVersion = authoritativeState.queueVersion
-      }
-      if (authoritativeState.currentQueueItemId !== undefined) {
-        nextState.playId = authoritativeState.currentQueueItemId
-        const selected = authoritativeState.queue?.find(
-          (item) => item.queueItemId === authoritativeState.currentQueueItemId,
-        )
-        for (const field of ['name', 'singer', 'cover', 'lyric']) {
-          const value = selected?.[field] || ''
-          if (prevState[field] !== value) nextState[field] = value
+    this.setState(
+      (prevState) => {
+        if (
+          controller !== this.props.controller ||
+          epoch !== controller?.getEpoch()
+        ) {
+          return null
         }
-      }
-      if (
-        authoritativeState.playMode !== undefined &&
-        authoritativeState.playMode !== prevState.playMode
-      ) {
-        nextState.playMode = authoritativeState.playMode
-      }
+        const nextState = {}
+        if (prevState.playbackError !== authoritativeState.error) {
+          nextState.playbackError = authoritativeState.error
+        }
+        if (prevState.playing !== isPlaying) {
+          nextState.playing = isPlaying
+        }
+        if (prevState.loading !== isLoading) {
+          nextState.loading = isLoading
+        }
+        if (
+          typeof authoritativeState.volume === 'number' &&
+          audioVolumeToUiVolume(authoritativeState.volume) !==
+            prevState.soundValue
+        ) {
+          nextState.soundValue = audioVolumeToUiVolume(
+            authoritativeState.volume,
+          )
+        }
+        if (
+          typeof authoritativeState.position === 'number' &&
+          Math.abs(authoritativeState.position - (prevState.currentTime || 0)) >
+            0.5
+        ) {
+          nextState.currentTime = authoritativeState.position
+        }
+        if (
+          typeof authoritativeState.duration === 'number' &&
+          authoritativeState.duration !== prevState.remoteDuration
+        ) {
+          nextState.remoteDuration = authoritativeState.duration
+        }
+        if (Array.isArray(authoritativeState.queue) && !this.queueDrag) {
+          const mappedLists = authoritativeState.queue.map((item) => ({
+            ...item,
+            __PLAYER_KEY__: item.queueItemId,
+            uuid: item.queueItemId,
+          }))
+          nextState.audioLists = mappedLists
+          nextState.displayedQueueEpoch = epoch
+          nextState.displayedQueueVersion = authoritativeState.queueVersion
+        }
+        if (authoritativeState.currentQueueItemId !== undefined) {
+          nextState.playId = authoritativeState.currentQueueItemId
+          const selected = authoritativeState.queue?.find(
+            (item) =>
+              item.queueItemId === authoritativeState.currentQueueItemId,
+          )
+          for (const field of ['name', 'singer', 'cover', 'lyric']) {
+            const value = selected?.[field] || ''
+            if (prevState[field] !== value) nextState[field] = value
+          }
+        }
+        if (
+          authoritativeState.playMode !== undefined &&
+          authoritativeState.playMode !== prevState.playMode
+        ) {
+          nextState.playMode = authoritativeState.playMode
+        }
 
-      return Object.keys(nextState).length > 0 ? nextState : null
-    })
+        return Object.keys(nextState).length > 0 ? nextState : null
+      },
+      () => {
+        this.syncAuthoritativeDerivedState(authoritativeState, prevSnapshot)
+      },
+    )
   }
 
   get audioDuration() {
