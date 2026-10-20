@@ -230,7 +230,21 @@ export function applyQueueRemove(
   }
 }
 
-export function applyQueueMove(queue = [], queueItemId, toIndex) {
+export function applyQueueMove(
+  queue = [],
+  queueItemId,
+  toIndex,
+  { expectedQueueVersion, queueVersion } = {},
+) {
+  if (
+    expectedQueueVersion !== undefined &&
+    expectedQueueVersion !== queueVersion
+  ) {
+    throw {
+      code: 'QUEUE_VERSION_CONFLICT',
+      message: 'The queue changed before the move could be applied',
+    }
+  }
   const fromIndex = queue.findIndex((item) => item.queueItemId === queueItemId)
   if (fromIndex === -1) {
     return { queue, moved: false }
@@ -266,7 +280,7 @@ export function createPlaybackControlModule(config = {}) {
   let currentEpoch = 0
   const defaultTimeoutMs = config.commandTimeoutMs || 5000
 
-  let state = {
+  const createInitialState = () => ({
     status: PlaybackStatus.IDLE,
     currentTrack: null,
     position: 0,
@@ -277,10 +291,12 @@ export function createPlaybackControlModule(config = {}) {
     queue: [],
     currentQueueItemId: null,
     queueVersion: 0,
+    stateSequence: null,
     playMode: normalizePlaybackMode(
       config.initialPlayMode || PlaybackMode.ORDER,
     ),
-  }
+  })
+  let state = createInitialState()
 
   const listeners = new Set()
   const metrics = {
@@ -333,12 +349,20 @@ export function createPlaybackControlModule(config = {}) {
     }
 
     activeAdapter = newAdapter
+    state = createInitialState()
+    notifySubscribers()
 
-    // 3. Activate new adapter with current epoch and authoritative state callback
-    if (activeAdapter && typeof activeAdapter.activate === 'function') {
-      activeAdapter.activate(newEpoch, (epoch, stateUpdate) => {
-        // Guard against late / superseded engine callbacks
-        if (epoch !== currentEpoch) {
+    // A subscriber may synchronously switch again while accepting the new scene.
+    if (currentEpoch !== newEpoch || activeAdapter !== newAdapter) return
+
+    // Queue and playback versions belong to this activation, not the previous engine.
+    if (newAdapter && typeof newAdapter.activate === 'function') {
+      newAdapter.activate(newEpoch, (epoch, stateUpdate) => {
+        if (
+          epoch !== newEpoch ||
+          currentEpoch !== newEpoch ||
+          activeAdapter !== newAdapter
+        ) {
           return
         }
         handleAuthoritativeStateUpdate(stateUpdate)
@@ -347,10 +371,12 @@ export function createPlaybackControlModule(config = {}) {
   }
 
   function handleAuthoritativeStateUpdate(update) {
-    // Guard against stale snapshots / out-of-order replay (Spec line 20)
     if (
-      typeof update.queueVersion === 'number' &&
-      update.queueVersion < state.queueVersion
+      (typeof update.queueVersion === 'number' &&
+        update.queueVersion < state.queueVersion) ||
+      (typeof update.stateSequence === 'number' &&
+        typeof state.stateSequence === 'number' &&
+        update.stateSequence <= state.stateSequence)
     ) {
       return
     }
@@ -359,6 +385,10 @@ export function createPlaybackControlModule(config = {}) {
 
     let hasChange = false
     const nextState = { ...state }
+    if (typeof update.stateSequence === 'number') {
+      nextState.stateSequence = update.stateSequence
+      hasChange = true
+    }
 
     if (update.status && update.status !== state.status) {
       nextState.status = update.status
@@ -454,39 +484,84 @@ export function createPlaybackControlModule(config = {}) {
     }
   }
 
-  async function dispatchCommand(commandName, executor, isPlayIntent = false) {
+  function captureOperation() {
     if (!activeAdapter) {
-      const err = {
+      const error = {
         code: 'NO_ACTIVE_ENGINE',
         message: 'No playback engine active',
       }
-      state = { ...state, status: PlaybackStatus.ERROR, error: err }
+      state = { ...state, status: PlaybackStatus.ERROR, error }
       notifySubscribers()
-      throw err
+      throw error
     }
+    return { adapter: activeAdapter, epoch: currentEpoch }
+  }
 
-    metrics.intentsIssued += 1
-    if (metrics.commandsSent[commandName] !== undefined) {
-      metrics.commandsSent[commandName] += 1
+  function isCurrentOperation(operation) {
+    return (
+      activeAdapter === operation.adapter && currentEpoch === operation.epoch
+    )
+  }
+
+  function assertCurrentOperation(operation) {
+    if (!isCurrentOperation(operation)) {
+      throw {
+        code: 'COMMAND_SUPERSEDED',
+        message: 'Playback engine changed before the operation completed',
+      }
     }
+  }
 
-    if (isPlayIntent) {
-      // Mark preparing; request sent does NOT equal confirmed playback
-      state = { ...state, status: PlaybackStatus.PREPARING, error: null }
-      notifySubscribers()
-    }
+  function markPreparing() {
+    state = { ...state, status: PlaybackStatus.PREPARING, error: null }
+    notifySubscribers()
+  }
 
+  async function runOperation(operation, commandName, executor) {
     try {
-      return await executeWithTimeout(executor(currentEpoch), defaultTimeoutMs)
+      assertCurrentOperation(operation)
+      const result = await executor()
+      assertCurrentOperation(operation)
+      return result
     } catch (err) {
       const formattedError = {
         code: err?.code || `${commandName.toUpperCase()}_REQUEST_FAILED`,
         message: err?.message || `Failed to execute ${commandName}`,
       }
-      state = { ...state, status: PlaybackStatus.ERROR, error: formattedError }
-      notifySubscribers()
+      if (
+        isCurrentOperation(operation) &&
+        formattedError.code !== 'COMMAND_SUPERSEDED'
+      ) {
+        state = {
+          ...state,
+          status: PlaybackStatus.ERROR,
+          error: formattedError,
+        }
+        notifySubscribers()
+      }
       throw formattedError
     }
+  }
+
+  async function sendCommand(operation, commandName, executor) {
+    assertCurrentOperation(operation)
+    if (metrics.commandsSent[commandName] !== undefined) {
+      metrics.commandsSent[commandName] += 1
+    }
+    const result = await executeWithTimeout(executor(), defaultTimeoutMs)
+    assertCurrentOperation(operation)
+    return result
+  }
+
+  async function dispatchCommand(commandName, executor, isPlayIntent = false) {
+    const operation = captureOperation()
+    metrics.intentsIssued += 1
+    if (isPlayIntent) markPreparing()
+    return runOperation(operation, commandName, () =>
+      sendCommand(operation, commandName, () =>
+        executor(operation.epoch, operation.adapter),
+      ),
+    )
   }
 
   return {
@@ -502,80 +577,93 @@ export function createPlaybackControlModule(config = {}) {
       return () => listeners.delete(listener)
     },
     play: () =>
-      dispatchCommand('play', (epoch) => activeAdapter.play(epoch), true),
+      dispatchCommand('play', (epoch, adapter) => adapter.play(epoch), true),
     pause: () =>
-      dispatchCommand('pause', (epoch) => activeAdapter.pause(epoch)),
+      dispatchCommand('pause', (epoch, adapter) => adapter.pause(epoch)),
     seek: (pos) =>
-      dispatchCommand('seek', (epoch) => activeAdapter.seek(epoch, pos)),
+      dispatchCommand('seek', (epoch, adapter) => adapter.seek(epoch, pos)),
     setVolume: (vol) =>
-      dispatchCommand('volume', (epoch) => activeAdapter.setVolume(epoch, vol)),
+      dispatchCommand('volume', (epoch, adapter) =>
+        adapter.setVolume(epoch, vol),
+      ),
     skipNext: () =>
-      dispatchCommand('skipNext', (epoch) => activeAdapter.skipNext(epoch)),
+      dispatchCommand('skipNext', (epoch, adapter) => adapter.skipNext(epoch)),
     skipPrev: () =>
-      dispatchCommand('skipPrev', (epoch) =>
-        activeAdapter.skipPrev(epoch, state.position),
+      dispatchCommand('skipPrev', (epoch, adapter) =>
+        adapter.skipPrev(epoch, state.position),
       ),
     setPlayMode: (mode) => {
       const normalized = normalizePlaybackMode(mode)
-      return dispatchCommand('setPlayMode', (epoch) =>
-        activeAdapter.setPlayMode(epoch, normalized),
+      return dispatchCommand('setPlayMode', (epoch, adapter) =>
+        adapter.setPlayMode(epoch, normalized),
       )
     },
     // Queue editing contract intents
     addQueueItems: (items, index = -1) =>
-      dispatchCommand('addQueueItems', (epoch) =>
-        activeAdapter.addQueueItems(epoch, items, index),
+      dispatchCommand('addQueueItems', (epoch, adapter) =>
+        adapter.addQueueItems(epoch, items, index),
       ),
     removeQueueItem: (queueItemId) =>
-      dispatchCommand('removeQueueItem', (epoch) =>
-        activeAdapter.removeQueueItem(epoch, queueItemId),
+      dispatchCommand('removeQueueItem', (epoch, adapter) =>
+        adapter.removeQueueItem(epoch, queueItemId),
       ),
-    moveQueueItem: (queueItemId, toIndex) =>
-      dispatchCommand('moveQueueItem', (epoch) =>
-        activeAdapter.moveQueueItem(epoch, queueItemId, toIndex),
+    moveQueueItem: (
+      queueItemId,
+      toIndex,
+      expectedQueueVersion = state.queueVersion,
+    ) =>
+      dispatchCommand('moveQueueItem', (epoch, adapter) =>
+        adapter.moveQueueItem(
+          epoch,
+          queueItemId,
+          toIndex,
+          expectedQueueVersion,
+        ),
       ),
     clearQueue: () =>
-      dispatchCommand('clearQueue', (epoch) => activeAdapter.clearQueue(epoch)),
+      dispatchCommand('clearQueue', (epoch, adapter) =>
+        adapter.clearQueue(epoch),
+      ),
     skipToQueueItem: (queueItemId) =>
-      dispatchCommand('skipToQueueItem', (epoch) =>
-        activeAdapter.skipToQueueItem(epoch, queueItemId),
+      dispatchCommand('skipToQueueItem', (epoch, adapter) =>
+        adapter.skipToQueueItem(epoch, queueItemId),
       ),
     playNext: (items) => {
       const curIdx = state.queue.findIndex(
         (it) => it.queueItemId === state.currentQueueItemId,
       )
       const targetIndex = curIdx >= 0 ? curIdx + 1 : state.queue.length
-      return dispatchCommand('addQueueItems', (epoch) =>
-        activeAdapter.addQueueItems(epoch, items, targetIndex),
+      return dispatchCommand('addQueueItems', (epoch, adapter) =>
+        adapter.addQueueItems(epoch, items, targetIndex),
       )
     },
     playAll: async (items, startIndex = 0) => {
+      const operation = captureOperation()
+      const { adapter, epoch } = operation
       metrics.intentsIssued += 1
-      if (!activeAdapter) {
-        throw { code: 'NO_ACTIVE_ENGINE', message: 'No playback engine active' }
-      }
-      metrics.commandsSent.clearQueue += 1
-      await executeWithTimeout(
-        activeAdapter.clearQueue(currentEpoch),
-        defaultTimeoutMs,
-      )
-      metrics.commandsSent.addQueueItems += 1
-      await executeWithTimeout(
-        activeAdapter.addQueueItems(currentEpoch, items, 0),
-        defaultTimeoutMs,
-      )
-      if (items.length > 0 && startIndex >= 0 && startIndex < items.length) {
-        metrics.commandsSent.skipToQueueItem += 1
-        await executeWithTimeout(
-          activeAdapter.skipToQueueItem(
-            currentEpoch,
-            items[startIndex].queueItemId,
-          ),
-          defaultTimeoutMs,
+      return runOperation(operation, 'playAll', async () => {
+        await sendCommand(operation, 'clearQueue', () =>
+          adapter.clearQueue(epoch),
         )
-      }
+        await sendCommand(operation, 'addQueueItems', () =>
+          adapter.addQueueItems(epoch, items, 0),
+        )
+        if (items.length > 0 && startIndex >= 0 && startIndex < items.length) {
+          await sendCommand(operation, 'skipToQueueItem', () =>
+            adapter.skipToQueueItem(
+              epoch,
+              items[startIndex].queueItemId || items[startIndex].uuid,
+            ),
+          )
+          markPreparing()
+          await sendCommand(operation, 'play', () => adapter.play(epoch))
+        }
+      })
     },
-    // Direct backfill channel for authoritative server snapshots
-    backfillState: (update) => handleAuthoritativeStateUpdate(update),
+    // Transports capture the epoch when they subscribe; legacy one-argument
+    // calls remain a current-scene backfill channel.
+    backfillState: (update, epoch = currentEpoch) => {
+      if (epoch === currentEpoch) handleAuthoritativeStateUpdate(update)
+    },
   }
 }

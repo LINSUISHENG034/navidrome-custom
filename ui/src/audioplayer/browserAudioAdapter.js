@@ -1,10 +1,8 @@
 /**
  * Browser Audio Adapter
  *
- * Core responsibility:
- * Concrete playback engine adapter managing a real browser HTMLAudioElement for local playback.
- * Legally holds the player's real media element, translates real DOM media events into authoritative local state updates,
- * and cleanly stops, cleans up, and invalidates late callbacks during engine deactivation.
+ * Owns local media execution and translates confirmed media results into the
+ * same authoritative state contract as the remote adapter.
  */
 
 import {
@@ -25,20 +23,55 @@ export function createBrowserAudioAdapter(options = {}) {
   let stateCallback = null
   let audioElement = options.audioElement || null
   let ownsElement = false
+  let explicitlyDetached = false
+  let boundElement = null
+  let boundEpoch = null
+  const eventListeners = new Map()
 
   let queue = []
   let currentQueueItemId = null
+  let loadedQueueItemId = null
   let queueVersion = 0
+  let stateSequence = 0
   let playMode = normalizePlaybackMode(
     options.initialPlayMode || PlaybackMode.ORDER,
   )
   const randomFn = options.randomFn || Math.random
+  let desiredPlaying = false
+  let activeAttempt = null
+  let localState = {
+    status: PlaybackStatus.IDLE,
+    position: 0,
+    duration: 0,
+    volume: options.initialVolume ?? 1,
+    isMuted: false,
+    error: null,
+  }
 
-  // Event handlers bound to current active instance
-  const eventListeners = {}
+  function publishState(patch = {}) {
+    localState = { ...localState, ...patch }
+    if (!isActive || !stateCallback) return
+    stateCallback(activeEpoch, {
+      ...localState,
+      queue: [...queue],
+      currentQueueItemId,
+      queueVersion,
+      playMode,
+      stateSequence: ++stateSequence,
+    })
+  }
+
+  function mediaState(el) {
+    return {
+      position: Number.isFinite(el.currentTime) ? el.currentTime : 0,
+      duration: Number.isFinite(el.duration) ? el.duration : 0,
+      volume: el.volume,
+      isMuted: el.muted,
+    }
+  }
 
   function ensureAudioElement() {
-    if (!audioElement) {
+    if (!audioElement && !explicitlyDetached) {
       audioElement = document.createElement('audio')
       audioElement.className = 'navidrome-browser-audio-engine'
       ownsElement = true
@@ -46,100 +79,237 @@ export function createBrowserAudioAdapter(options = {}) {
     return audioElement
   }
 
-  function playQueueItem(el, targetQueueItemId) {
-    if (!el || !targetQueueItemId) return
-
-    const isSameItem = targetQueueItemId === currentQueueItemId
-    currentQueueItemId = targetQueueItemId
-
-    // Spec compliance: only reload src if switching to a different track;
-    // same-item repeat (singleLoop) resets currentTime without reloading audio stream.
-    if (!isSameItem) {
-      const target = queue.find(
-        (item) => item.queueItemId === currentQueueItemId,
-      )
-      if (target && target.musicSrc) {
-        el.src = target.musicSrc
+  function requireAudioElement() {
+    const el = ensureAudioElement()
+    if (!el) {
+      throw {
+        code: 'NO_AUDIO_ELEMENT',
+        message: 'The local player is not attached to a media element',
       }
     }
+    return el
+  }
 
-    el.currentTime = 0
-    if (typeof el.play === 'function') {
-      el.play().catch(() => {})
-    }
-
-    if (stateCallback) {
-      stateCallback(activeEpoch, {
-        currentQueueItemId,
-        position: 0,
-        status: PlaybackStatus.PLAYING,
-      })
+  function supersededError() {
+    return {
+      code: 'COMMAND_SUPERSEDED',
+      message: 'The local playback request was superseded',
     }
   }
 
-  function handleMediaEvent(eventName) {
-    if (!isActive || !stateCallback) return
+  function invalidateAttempt() {
+    const previous = activeAttempt
+    activeAttempt = null
+    if (previous?.rejectPlaying) previous.rejectPlaying(supersededError())
+  }
 
-    const el = audioElement
-    if (!el) return
+  function isCurrentAttempt(attempt) {
+    return (
+      isActive &&
+      activeEpoch === attempt.epoch &&
+      audioElement === attempt.element &&
+      currentQueueItemId === attempt.queueItemId &&
+      activeAttempt === attempt
+    )
+  }
 
+  function assertCurrentAttempt(attempt) {
+    if (!isCurrentAttempt(attempt)) throw supersededError()
+  }
+
+  function observePlaybackFailure(error) {
+    // Selection commands report to their caller as well. Natural-end work has
+    // no caller, so its rejection is observed here through authoritative state.
+    if (error.code !== 'COMMAND_SUPERSEDED' && localState.error !== error) {
+      desiredPlaying = false
+      invalidateAttempt()
+      publishState({ status: PlaybackStatus.ERROR, error })
+    }
+  }
+
+  async function selectQueueItem(
+    epoch,
+    targetQueueItemId,
+    { play = false, restart = true } = {},
+  ) {
+    if (!isActive || epoch !== activeEpoch) return
+    const el = requireAudioElement()
+    invalidateAttempt()
+    currentQueueItemId = targetQueueItemId
+    desiredPlaying = play
+    const attempt = {
+      epoch,
+      element: el,
+      queueItemId: targetQueueItemId,
+      pending: true,
+      playingObserved: false,
+    }
+    activeAttempt = attempt
+    publishState({
+      status: play ? PlaybackStatus.PREPARING : PlaybackStatus.PAUSED,
+      position: restart ? 0 : mediaState(el).position,
+      error: null,
+    })
+
+    try {
+      assertCurrentAttempt(attempt)
+      const target = queue.find(
+        (item) => item.queueItemId === targetQueueItemId,
+      )
+      const needsSource =
+        target &&
+        (loadedQueueItemId !== targetQueueItemId || !el.getAttribute('src'))
+      if (needsSource) {
+        let source =
+          typeof target.musicSrc === 'function'
+            ? target.musicSrc()
+            : target.musicSrc
+        if (source && typeof source.then === 'function') source = await source
+        assertCurrentAttempt(attempt)
+        if (typeof source !== 'string' || !source) {
+          throw {
+            code: 'MEDIA_SOURCE_UNAVAILABLE',
+            message: 'The selected queue item did not resolve to a media URL',
+          }
+        }
+        el.src = source
+        loadedQueueItemId = targetQueueItemId
+      }
+      if (restart) el.currentTime = 0
+      assertCurrentAttempt(attempt)
+      if (play) {
+        const result = el.play()
+        if (result && typeof result.then === 'function') {
+          await result
+        } else if (!attempt.playingObserved) {
+          await new Promise((resolve, reject) => {
+            attempt.resolvePlaying = resolve
+            attempt.rejectPlaying = reject
+          })
+        }
+        assertCurrentAttempt(attempt)
+        attempt.pending = false
+        publishState({
+          ...mediaState(el),
+          status: PlaybackStatus.PLAYING,
+          error: null,
+        })
+      } else {
+        el.pause()
+        assertCurrentAttempt(attempt)
+        attempt.pending = false
+        publishState({
+          ...mediaState(el),
+          status: PlaybackStatus.PAUSED,
+          error: null,
+        })
+      }
+    } catch (error) {
+      if (!isCurrentAttempt(attempt)) throw supersededError()
+      desiredPlaying = false
+      invalidateAttempt()
+      el.pause()
+      const failure = {
+        code:
+          typeof error?.code === 'string'
+            ? error.code
+            : 'BROWSER_PLAY_REQUEST_FAILED',
+        message: error?.message || 'The browser could not start playback',
+      }
+      observePlaybackFailure(failure)
+      throw failure
+    }
+  }
+
+  function handleMediaEvent(eventName, el, epoch) {
+    if (!isActive || el !== audioElement || epoch !== activeEpoch) return
+    if (
+      eventName !== 'volumechange' &&
+      currentQueueItemId !== null &&
+      loadedQueueItemId !== currentQueueItemId
+    )
+      return
     switch (eventName) {
       case 'play':
+        // This event means play was requested, not that playback has started.
+        break
       case 'playing':
-        stateCallback(activeEpoch, {
-          status: PlaybackStatus.PLAYING,
-          position: el.currentTime || 0,
-          duration: el.duration || 0,
-          volume: el.volume,
-          isMuted: el.muted,
-        })
+        if (activeAttempt && desiredPlaying) {
+          activeAttempt.playingObserved = true
+          activeAttempt.resolvePlaying?.()
+          if (!activeAttempt.pending) {
+            publishState({ ...mediaState(el), status: PlaybackStatus.PLAYING })
+          }
+        }
         break
       case 'pause':
-        stateCallback(activeEpoch, {
-          status: PlaybackStatus.PAUSED,
-          position: el.currentTime || 0,
-        })
+        if (!el.paused) break
+        // Natural completion may queue pause before ended on the same resource.
+        if (
+          el.ended &&
+          desiredPlaying &&
+          activeAttempt &&
+          !activeAttempt.pending
+        )
+          break
+        if (
+          localState.status !== PlaybackStatus.ERROR &&
+          !(desiredPlaying && activeAttempt?.pending)
+        ) {
+          desiredPlaying = false
+          publishState({
+            status: PlaybackStatus.PAUSED,
+            position: mediaState(el).position,
+          })
+        }
         break
+      case 'loadedmetadata':
+      case 'durationchange':
       case 'seeked':
       case 'timeupdate':
-        stateCallback(activeEpoch, {
-          position: el.currentTime || 0,
-        })
+        publishState(mediaState(el))
         break
       case 'volumechange':
-        stateCallback(activeEpoch, {
-          volume: el.volume,
-          isMuted: el.muted,
-        })
+        publishState({ volume: el.volume, isMuted: el.muted })
         break
       case 'ended': {
-        const res = getNextTrack({
+        if (
+          !el.ended ||
+          !desiredPlaying ||
+          !activeAttempt ||
+          activeAttempt.pending ||
+          !isCurrentAttempt(activeAttempt)
+        )
+          return
+        const result = getNextTrack({
           queue,
           currentQueueItemId,
           mode: playMode,
           isManual: false,
           randomFn,
         })
-        if (res.shouldStop) {
-          stateCallback(activeEpoch, {
+        if (result.shouldStop) {
+          desiredPlaying = false
+          invalidateAttempt()
+          publishState({
             status: PlaybackStatus.PAUSED,
             position: el.duration || el.currentTime || 0,
           })
-        } else if (res.queueItemId) {
-          playQueueItem(el, res.queueItemId)
+        } else if (result.queueItemId) {
+          selectQueueItem(epoch, result.queueItemId, { play: true }).catch(
+            observePlaybackFailure,
+          )
         }
         break
       }
       case 'error': {
-        const mediaError = el.error
-        stateCallback(activeEpoch, {
-          status: PlaybackStatus.ERROR,
-          error: {
-            code: 'MEDIA_ELEMENT_ERROR',
-            message:
-              mediaError?.message || 'Audio element encountered playback error',
-          },
-        })
+        if (!el.error) break
+        const error = {
+          code: 'MEDIA_ELEMENT_ERROR',
+          message:
+            el.error?.message || 'Audio element encountered playback error',
+        }
+        observePlaybackFailure(error)
         break
       }
       default:
@@ -147,305 +317,261 @@ export function createBrowserAudioAdapter(options = {}) {
     }
   }
 
+  function unbindEvents() {
+    if (!boundElement) return
+    eventListeners.forEach((listener, name) =>
+      boundElement.removeEventListener(name, listener),
+    )
+    eventListeners.clear()
+    boundElement = null
+    boundEpoch = null
+  }
+
   function bindEvents(el) {
-    if (!el) return
+    if (!el || (boundElement === el && boundEpoch === activeEpoch)) return
+    unbindEvents()
+    boundElement = el
+    boundEpoch = activeEpoch
+    const epoch = activeEpoch
     const events = [
       'play',
       'playing',
       'pause',
+      'loadedmetadata',
+      'durationchange',
       'seeked',
       'timeupdate',
       'volumechange',
       'ended',
       'error',
     ]
-    events.forEach((evt) => {
-      const listener = () => handleMediaEvent(evt)
-      eventListeners[evt] = listener
-      el.addEventListener(evt, listener)
+    events.forEach((name) => {
+      const listener = () => handleMediaEvent(name, el, epoch)
+      eventListeners.set(name, listener)
+      el.addEventListener(name, listener)
     })
   }
 
-  function unbindEvents(el) {
-    if (!el) return
-    Object.entries(eventListeners).forEach(([evt, listener]) => {
-      el.removeEventListener(evt, listener)
-      delete eventListeners[evt]
-    })
+  function releaseElement() {
+    unbindEvents()
+    if (!audioElement) return
+    audioElement.pause()
+    audioElement.removeAttribute('src')
+    if (typeof audioElement.load === 'function') audioElement.load()
+    if (ownsElement && audioElement.parentNode) {
+      audioElement.parentNode.removeChild(audioElement)
+    }
+    loadedQueueItemId = null
   }
 
   function attachElement(el) {
-    if (audioElement && audioElement !== el) {
-      unbindEvents(audioElement)
+    if (audioElement === el) {
+      if (isActive && el) bindEvents(el)
+      return
     }
+    desiredPlaying = false
+    invalidateAttempt()
+    releaseElement()
     audioElement = el
     ownsElement = false
-    if (isActive && el) {
-      bindEvents(el)
+    explicitlyDetached = !el
+    if (isActive) {
+      if (el) bindEvents(el)
+      publishState({
+        ...(el ? mediaState(el) : { position: 0, duration: 0 }),
+        status: currentQueueItemId
+          ? PlaybackStatus.PAUSED
+          : PlaybackStatus.IDLE,
+        error: null,
+      })
     }
   }
 
   function activate(epoch, onStateChange) {
+    if (activeEpoch !== epoch) {
+      invalidateAttempt()
+      unbindEvents()
+      stateSequence = 0
+    }
     activeEpoch = epoch
     isActive = true
     stateCallback = onStateChange
-
     const el = ensureAudioElement()
-    bindEvents(el)
+    if (el) bindEvents(el)
+    publishState(el ? mediaState(el) : {})
   }
 
   function deactivate() {
     isActive = false
     activeEpoch = -1
+    desiredPlaying = false
+    invalidateAttempt()
+    releaseElement()
     queue = []
     currentQueueItemId = null
-
-    if (audioElement) {
-      try {
-        audioElement.pause()
-      } catch {
-        // Safe ignore
-      }
-      unbindEvents(audioElement)
-
-      if (ownsElement && audioElement.parentNode) {
-        audioElement.parentNode.removeChild(audioElement)
-      }
-      // Clear source to release network streams and memory
-      audioElement.removeAttribute('src')
-      if (typeof audioElement.load === 'function') {
-        try {
-          audioElement.load()
-        } catch {
-          // Safe ignore in environments without full media stack (e.g. jsdom)
-        }
-      }
+    localState = {
+      ...localState,
+      status: PlaybackStatus.IDLE,
+      position: 0,
+      duration: 0,
+      error: null,
     }
-
     stateCallback = null
   }
 
-  async function play() {
-    if (!isActive) return
-    const el = ensureAudioElement()
-    await el.play()
+  async function play(epoch) {
+    if (!isActive || epoch !== activeEpoch) return
+    return selectQueueItem(epoch, currentQueueItemId, {
+      play: true,
+      restart: false,
+    })
   }
 
-  async function pause() {
-    if (!isActive) return
-    const el = ensureAudioElement()
+  async function pause(epoch) {
+    if (!isActive || epoch !== activeEpoch) return
+    desiredPlaying = false
+    invalidateAttempt()
+    const el = requireAudioElement()
     el.pause()
+    publishState({
+      status: PlaybackStatus.PAUSED,
+      position: mediaState(el).position,
+      error: null,
+    })
   }
 
   async function seek(epoch, positionSeconds) {
     if (!isActive || epoch !== activeEpoch) return
-    const el = ensureAudioElement()
+    const el = requireAudioElement()
     el.currentTime = Math.max(0, positionSeconds)
+    publishState({ position: mediaState(el).position })
   }
 
   async function setVolume(epoch, volumeFraction) {
     if (!isActive || epoch !== activeEpoch) return
-    const el = ensureAudioElement()
-    const clamped = Math.max(0, Math.min(1, volumeFraction))
-    el.volume = clamped
+    const el = requireAudioElement()
+    el.volume = Math.max(0, Math.min(1, volumeFraction))
+    publishState({ volume: el.volume, isMuted: el.muted })
   }
 
   async function setPlayMode(epoch, mode) {
     if (!isActive || epoch !== activeEpoch) return
     playMode = normalizePlaybackMode(mode)
-    if (stateCallback) {
-      stateCallback(activeEpoch, {
-        playMode,
-      })
-    }
+    publishState()
   }
 
   async function skipNext(epoch) {
     if (!isActive || epoch !== activeEpoch) return
-    const el = ensureAudioElement()
-    const res = getNextTrack({
+    const result = getNextTrack({
       queue,
       currentQueueItemId,
       mode: playMode,
       isManual: true,
       randomFn,
     })
-    if (res.queueItemId) {
-      playQueueItem(el, res.queueItemId)
-    }
+    if (result.queueItemId)
+      return selectQueueItem(epoch, result.queueItemId, { play: true })
   }
 
   async function skipPrev(epoch, currentPos) {
     if (!isActive || epoch !== activeEpoch) return
-    const el = ensureAudioElement()
-    const pos =
-      typeof el.currentTime === 'number' && !isNaN(el.currentTime)
-        ? el.currentTime
-        : currentPos || 0
-
-    const res = getPrevTrack({
+    const el = requireAudioElement()
+    const position = Number.isFinite(el.currentTime)
+      ? el.currentTime
+      : currentPos || 0
+    const result = getPrevTrack({
       queue,
       currentQueueItemId,
       mode: playMode,
-      currentTime: pos,
+      currentTime: position,
       randomFn,
     })
-
-    if (res.rewindOnly) {
+    if (result.rewindOnly) {
       el.currentTime = 0
-      if (stateCallback) {
-        stateCallback(activeEpoch, {
-          position: 0,
-        })
-      }
-      return
-    }
-
-    if (res.queueItemId) {
-      playQueueItem(el, res.queueItemId)
+      publishState({ position: 0 })
+    } else if (result.queueItemId) {
+      return selectQueueItem(epoch, result.queueItemId, { play: true })
     }
   }
 
   async function addQueueItems(epoch, items = [], index = -1) {
     if (!isActive || epoch !== activeEpoch) return
-    const res = applyQueueAdd(queue, currentQueueItemId, items, index)
-    queue = res.queue
-    currentQueueItemId = res.currentQueueItemId
+    const result = applyQueueAdd(queue, currentQueueItemId, items, index)
+    queue = result.queue
+    currentQueueItemId = result.currentQueueItemId
     queueVersion += 1
-
-    if (stateCallback) {
-      stateCallback(activeEpoch, {
-        queue: [...queue],
-        currentQueueItemId,
-        queueVersion,
-      })
-    }
+    publishState()
   }
 
   async function removeQueueItem(epoch, queueItemId) {
     if (!isActive || epoch !== activeEpoch) return
-    const isCurrentlyPlaying = audioElement && !audioElement.paused
-    const res = applyQueueRemove(
+    const wasPlaying = desiredPlaying || (audioElement && !audioElement.paused)
+    const result = applyQueueRemove(
       queue,
       currentQueueItemId,
       queueItemId,
-      isCurrentlyPlaying,
+      wasPlaying,
     )
-    if (!res.removed) return
-
-    queue = res.queue
-    currentQueueItemId = res.currentQueueItemId
+    if (!result.removed) return
+    queue = result.queue
+    currentQueueItemId = result.currentQueueItemId
     queueVersion += 1
-
-    if (res.status === PlaybackStatus.IDLE) {
+    if (result.status === PlaybackStatus.IDLE) {
+      desiredPlaying = false
+      invalidateAttempt()
       if (audioElement) {
-        try {
-          audioElement.pause()
-        } catch {
-          // Safe ignore
-        }
+        audioElement.pause()
         audioElement.removeAttribute('src')
       }
-    } else if (res.successor) {
-      if (audioElement) {
-        if (res.successor.musicSrc) {
-          audioElement.src = res.successor.musicSrc
-        }
-        audioElement.currentTime = 0
-        if (
-          res.status === PlaybackStatus.PLAYING &&
-          typeof audioElement.play === 'function'
-        ) {
-          audioElement.play().catch(() => {})
-        } else {
-          audioElement.pause()
-        }
-      }
-    }
-
-    if (stateCallback) {
-      stateCallback(activeEpoch, {
-        queue: [...queue],
-        currentQueueItemId: res.currentQueueItemId,
-        queueVersion,
-        ...(res.status ? { status: res.status, position: 0 } : {}),
+      loadedQueueItemId = null
+      publishState({ status: PlaybackStatus.IDLE, position: 0, error: null })
+    } else if (result.successor) {
+      return selectQueueItem(epoch, currentQueueItemId, {
+        play: Boolean(wasPlaying),
       })
+    } else {
+      publishState()
     }
   }
 
-  async function moveQueueItem(epoch, queueItemId, toIndex) {
+  async function moveQueueItem(
+    epoch,
+    queueItemId,
+    toIndex,
+    expectedQueueVersion = queueVersion,
+  ) {
     if (!isActive || epoch !== activeEpoch) return
-    const res = applyQueueMove(queue, queueItemId, toIndex)
-    if (!res.moved) return
-
-    queue = res.queue
+    const result = applyQueueMove(queue, queueItemId, toIndex, {
+      expectedQueueVersion,
+      queueVersion,
+    })
+    if (!result.moved) return
+    queue = result.queue
     queueVersion += 1
-
-    // Move invariant: moving current playing item keeps playback continuous,
-    // does NOT reload audio element, does NOT reset currentTime!
-
-    if (stateCallback) {
-      stateCallback(activeEpoch, {
-        queue: [...queue],
-        currentQueueItemId,
-        queueVersion,
-      })
-    }
+    publishState()
   }
 
   async function clearQueue(epoch) {
     if (!isActive || epoch !== activeEpoch) return
-    const res = applyQueueClear()
-    queue = res.queue
-    currentQueueItemId = res.currentQueueItemId
+    const result = applyQueueClear()
+    desiredPlaying = false
+    invalidateAttempt()
+    queue = result.queue
+    currentQueueItemId = result.currentQueueItemId
     queueVersion += 1
-
     if (audioElement) {
-      try {
-        audioElement.pause()
-      } catch {
-        // Safe ignore
-      }
+      audioElement.pause()
       audioElement.removeAttribute('src')
     }
-
-    if (stateCallback) {
-      stateCallback(activeEpoch, {
-        queue: [],
-        currentQueueItemId: null,
-        queueVersion,
-        status: PlaybackStatus.IDLE,
-        position: 0,
-      })
-    }
+    loadedQueueItemId = null
+    publishState({ status: PlaybackStatus.IDLE, position: 0, error: null })
   }
 
   async function skipToQueueItem(epoch, queueItemId) {
     if (!isActive || epoch !== activeEpoch) return
-    const target = queue.find((item) => item.queueItemId === queueItemId)
-    if (!target) return
-
-    currentQueueItemId = queueItemId
-    const isCurrentlyPlaying = audioElement && !audioElement.paused
-    if (audioElement) {
-      if (target.musicSrc) {
-        audioElement.src = target.musicSrc
-      }
-      audioElement.currentTime = 0
-      if (isCurrentlyPlaying) {
-        audioElement.play().catch(() => {})
-      }
-    }
-
-    if (stateCallback) {
-      stateCallback(activeEpoch, {
-        currentQueueItemId,
-        position: 0,
-        status: isCurrentlyPlaying
-          ? PlaybackStatus.PLAYING
-          : PlaybackStatus.PAUSED,
-      })
-    }
+    if (!queue.some((item) => item.queueItemId === queueItemId)) return
+    const wasPlaying = desiredPlaying || (audioElement && !audioElement.paused)
+    return selectQueueItem(epoch, queueItemId, { play: Boolean(wasPlaying) })
   }
 
   return {

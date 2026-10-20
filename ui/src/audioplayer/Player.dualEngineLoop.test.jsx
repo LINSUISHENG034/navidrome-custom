@@ -17,13 +17,25 @@
 
 import React from 'react'
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { render, act, waitFor } from '@testing-library/react'
+import {
+  render,
+  act,
+  waitFor,
+  fireEvent,
+  cleanup,
+} from '@testing-library/react'
 
 vi.mock('sortablejs', async () => {
   function Swap() {}
-  function Sortable() {
+  const Sortable = vi.fn(function (element, options) {
+    this.el = element
+    this.options = options
     this.destroy = vi.fn()
-  }
+    this.option = vi.fn((name, value) => {
+      if (value !== undefined) this.options[name] = value
+      return this.options[name]
+    })
+  })
   Sortable.mount = vi.fn()
   Sortable.Swap = Swap
   return {
@@ -43,6 +55,61 @@ import {
 import { createBrowserAudioAdapter } from './browserAudioAdapter'
 import { createMockRemoteAudioAdapter } from './mockRemoteAudioAdapter'
 import { UnifiedNativePlayer } from './UnifiedNativePlayer'
+import Sortable from 'sortablejs'
+
+function getNativeVolumeBarValue() {
+  return Number(
+    document
+      .querySelector('.sound-operation .rc-slider-handle')
+      .getAttribute('aria-valuenow'),
+  )
+}
+
+function setMediaFlags(audio, flags) {
+  Object.entries(flags).forEach(([name, value]) => {
+    Object.defineProperty(audio, name, { configurable: true, value })
+  })
+}
+
+function finishMedia(audio) {
+  setMediaFlags(audio, { paused: true, ended: true })
+  audio.dispatchEvent(new Event('pause'))
+  audio.dispatchEvent(new Event('ended'))
+}
+
+function getDrawerLabels() {
+  return Array.from(document.querySelectorAll('.audio-item .player-name')).map(
+    (node) => node.textContent,
+  )
+}
+
+function startNativeDrag(oldIndex, newIndex) {
+  const list = document.querySelector('.audio-lists-panel-content-wrap')
+  const sortable = Sortable.mock.instances.findLast(
+    (instance) => instance.el === list && !instance.destroy.mock.calls.length,
+  )
+  expect(sortable).toBeDefined()
+  const nodes = Array.from(list.children)
+  const event = {
+    from: list,
+    to: list,
+    item: nodes[oldIndex],
+    oldIndex,
+    newIndex,
+  }
+  act(() => {
+    sortable.options.onStart(event)
+    const anchor =
+      oldIndex < newIndex ? nodes[newIndex].nextSibling : nodes[newIndex]
+    list.insertBefore(event.item, anchor)
+  })
+  return {
+    event,
+    sortable,
+    end: (overrides = {}) =>
+      act(async () => sortable.options.onEnd({ ...event, ...overrides })),
+  }
+}
 
 describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
   let playSpy
@@ -81,10 +148,15 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
 
     playSpy = vi
       .spyOn(window.HTMLMediaElement.prototype, 'play')
-      .mockImplementation(() => Promise.resolve())
+      .mockImplementation(function () {
+        setMediaFlags(this, { paused: false, ended: false })
+        return Promise.resolve()
+      })
     pauseSpy = vi
       .spyOn(window.HTMLMediaElement.prototype, 'pause')
-      .mockImplementation(() => {})
+      .mockImplementation(function () {
+        setMediaFlags(this, { paused: true })
+      })
     vi.spyOn(window.HTMLMediaElement.prototype, 'load').mockImplementation(
       () => {},
     )
@@ -94,6 +166,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
   })
 
   afterEach(() => {
+    cleanup()
     vi.restoreAllMocks()
   })
 
@@ -304,7 +377,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         await controller.setVolume(0.6)
       })
       expect(controller.getState().volume).toBe(0.6)
-      expect(playerRef.state.soundValue).toBe(60)
+      expect(getNativeVolumeBarValue()).toBeCloseTo(0.7745966692)
 
       // 4. Pause intent
       await act(async () => {
@@ -369,7 +442,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
 
       // UI state should be updated via backfill
       expect(playerRef.state.currentTime).toBe(92)
-      expect(playerRef.state.soundValue).toBe(40)
+      expect(getNativeVolumeBarValue()).toBeCloseTo(0.632455532)
 
       // CRITICAL ASSERTION: No new commands or intents issued due to state backfill!
       const metricsAfter = controller.getMetrics()
@@ -541,6 +614,327 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
     })
   })
 
+  describe('Controlled native inputs and lifecycle', () => {
+    async function renderControlledPlayer(
+      engineMode = 'local',
+      extraProps = {},
+    ) {
+      const tracks = (extraProps.audioLists || sampleTracks).map(
+        (track, index) => ({
+          ...track,
+          queueItemId: track.queueItemId || `controlled-${index}`,
+        }),
+      )
+      const controller = createPlaybackControlModule()
+      const browserAdapter =
+        engineMode === 'local' ? createBrowserAudioAdapter() : undefined
+      controller.setAdapter(browserAdapter || createMockRemoteAudioAdapter())
+      await controller.addQueueItems(tracks)
+      const props = {
+        controller,
+        browserAdapter,
+        engineMode,
+        audioLists: tracks,
+        mode: 'full',
+        autoPlay: false,
+        ...extraProps,
+      }
+      const view = render(<UnifiedNativePlayer {...props} />)
+      return {
+        controller,
+        browserAdapter,
+        tracks,
+        ...view,
+        rerenderPlayer: (overrides) =>
+          view.rerender(<UnifiedNativePlayer {...props} {...overrides} />),
+      }
+    }
+
+    it('TC-QC-09: structural updates during drag keep scalar authority live and cancel the stale move', async () => {
+      const { controller, tracks } = await renderControlledPlayer('remote')
+      const drag = startNativeDrag(0, 1)
+      const initialIntents = controller.getMetrics().intentsIssued
+      await act(async () => {
+        await controller.removeQueueItem(tracks[0].queueItemId)
+        await controller.setVolume(0.25)
+        await controller.seek(45)
+      })
+
+      expect(
+        controller.getState().queue.map((item) => item.queueItemId),
+      ).toEqual([tracks[1].queueItemId])
+      expect(getDrawerLabels()).toEqual(['Song 1', 'Song 0'])
+      expect(getNativeVolumeBarValue()).toBeCloseTo(0.5)
+      expect(document.querySelector('.current-time').textContent).toBe('00:45')
+
+      await drag.end()
+      expect(getDrawerLabels()).toEqual(['Song 1'])
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 3)
+      expect(controller.getMetrics().commandsSent.moveQueueItem).toBe(0)
+      await act(async () => {
+        await controller.addQueueItems([
+          { queueItemId: 'later', name: 'Later song' },
+        ])
+      })
+      expect(getDrawerLabels()).toEqual(['Song 1', 'Later song'])
+    })
+
+    it('TC-DE-04: native track labels and highlighting follow queue authority without extra intents', async () => {
+      const { controller } = await renderControlledPlayer('remote')
+      expect(document.querySelector('.audio-title').textContent).toContain(
+        'Song 0',
+      )
+      const initialIntents = controller.getMetrics().intentsIssued
+      await act(async () => document.querySelectorAll('.audio-item')[1].click())
+      expect(document.querySelector('.audio-title').textContent).toContain(
+        'Song 1',
+      )
+      expect(
+        document.querySelector('.audio-item.playing .player-name').textContent,
+      ).toBe('Song 1')
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+    })
+
+    it('TC-DE-07: local play rejection after confirmed remote pause is visible without fallback or retry', async () => {
+      const { controller, tracks, rerenderPlayer, getByRole } =
+        await renderControlledPlayer('remote')
+      await act(async () => document.querySelector('.play-btn').click())
+      await act(async () => document.querySelector('.play-btn').click())
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      const browserAdapter = createBrowserAudioAdapter()
+      await act(async () => controller.setAdapter(browserAdapter))
+      rerenderPlayer({ engineMode: 'local', browserAdapter })
+      await act(async () => controller.addQueueItems(tracks))
+      const epoch = controller.getEpoch()
+      const initialIntents = controller.getMetrics().intentsIssued
+      playSpy.mockRejectedValue(
+        new DOMException('User gesture required', 'NotAllowedError'),
+      )
+
+      await act(async () => document.querySelector('.play-btn').click())
+
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(getByRole('alert').textContent).toContain('User gesture required')
+      expect(controller.getEpoch()).toBe(epoch)
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+      expect(playSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it.each(['local', 'remote'])(
+      'TC-DE-08: controlled %s mounting never resolves or loads media outside its Adapter',
+      async (engineMode) => {
+        const musicSrc = vi.fn(() =>
+          Promise.resolve('http://localhost/resolved.mp3'),
+        )
+        const { browserAdapter } = await renderControlledPlayer(engineMode, {
+          audioLists: [{ ...sampleTracks[0], musicSrc }],
+        })
+        expect(musicSrc).not.toHaveBeenCalled()
+        if (browserAdapter) {
+          expect(
+            browserAdapter.getAudioElement().getAttribute('src'),
+          ).toBeNull()
+        }
+
+        await act(async () => document.querySelector('.play-btn').click())
+        if (browserAdapter) {
+          expect(musicSrc).toHaveBeenCalledTimes(1)
+          expect(browserAdapter.getAudioElement().src).toBe(
+            'http://localhost/resolved.mp3',
+          )
+        } else {
+          expect(musicSrc).not.toHaveBeenCalled()
+          expect(document.querySelector('audio')).toBeNull()
+        }
+      },
+    )
+
+    it('TC-DE-07: the same native player restores its real audio interface after two engine round trips', async () => {
+      const ref = React.createRef()
+      const instances = []
+      const { controller, browserAdapter, tracks, rerenderPlayer, unmount } =
+        await renderControlledPlayer('local', {
+          ref,
+          getAudioInstance: (audio) => instances.push(audio),
+        })
+      const player = ref.current
+      let previousBrowser = browserAdapter
+
+      for (let round = 0; round < 2; round += 1) {
+        const remoteAdapter = createMockRemoteAudioAdapter()
+        await act(async () => controller.setAdapter(remoteAdapter))
+        rerenderPlayer({ engineMode: 'remote', browserAdapter: undefined })
+        expect(document.querySelector('audio')).toBeNull()
+        expect(previousBrowser.getAudioElement()).toBeNull()
+
+        const nextBrowser = createBrowserAudioAdapter()
+        await act(async () => controller.setAdapter(nextBrowser))
+        rerenderPlayer({ engineMode: 'local', browserAdapter: nextBrowser })
+        await act(async () => controller.addQueueItems(tracks))
+        const audio = document.querySelector('audio')
+        expect(ref.current).toBe(player)
+        expect(nextBrowser.getAudioElement()).toBe(audio)
+        expect(instances.at(-1)).toBe(audio)
+        expect(typeof instances.at(-1).togglePlay).toBe('function')
+        previousBrowser = nextBrowser
+      }
+
+      const finalIntents = controller.getMetrics().intentsIssued
+      unmount()
+      expect(previousBrowser.getAudioElement()).toBeNull()
+      expect(controller.getMetrics().intentsIssued).toBe(finalIntents)
+    })
+
+    it('TC-DE-07: replacing the controller subscribes only to the new authority', async () => {
+      const { controller: oldController, rerenderPlayer } =
+        await renderControlledPlayer('remote')
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(createMockRemoteAudioAdapter())
+      await controller.addQueueItems([
+        { queueItemId: 'replacement', name: 'Replacement song' },
+      ])
+      rerenderPlayer({ controller })
+
+      await act(async () => controller.play())
+      expect(document.querySelector('.play-btn').getAttribute('title')).toMatch(
+        /pause/i,
+      )
+      await act(async () => oldController.pause())
+      expect(document.querySelector('.play-btn').getAttribute('title')).toMatch(
+        /pause/i,
+      )
+      expect(document.querySelector('.player-name').textContent).toBe(
+        'Replacement song',
+      )
+      expect(document.querySelector('audio')).toBeNull()
+    })
+
+    it.each(['local', 'remote'])(
+      'TC-DE-08: the %s native mute control restores volume through the Module',
+      async (engineMode) => {
+        const { controller } = await renderControlledPlayer(engineMode)
+        await act(async () => controller.setVolume(0.25))
+        const initialIntents = controller.getMetrics().intentsIssued
+
+        await act(async () => document.querySelector('.sounds-icon').click())
+        expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+        expect(controller.getState().volume).toBe(0)
+
+        await act(async () => document.querySelector('.sounds-icon').click())
+        expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 2)
+        expect(controller.getState().volume).toBe(0.25)
+      },
+    )
+
+    it.each(['local', 'remote'])(
+      'TC-DE-08: the %s native seek slider commits one Module intent',
+      async (engineMode) => {
+        const { controller, browserAdapter } =
+          await renderControlledPlayer(engineMode)
+        await act(async () => {
+          if (browserAdapter) {
+            Object.defineProperty(
+              browserAdapter.getAudioElement(),
+              'duration',
+              {
+                configurable: true,
+                value: 180,
+              },
+            )
+          }
+          controller.backfillState({ duration: 180 })
+        })
+        const handle = document.querySelector('.progress-bar .rc-slider-handle')
+        const initialIntents = controller.getMetrics().intentsIssued
+
+        await act(async () => {
+          fireEvent.keyDown(handle, { key: 'ArrowRight', keyCode: 39 })
+          fireEvent.keyUp(handle, { key: 'ArrowRight', keyCode: 39 })
+        })
+
+        expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+        if (browserAdapter) {
+          expect(browserAdapter.getAudioElement().currentTime).toBe(1)
+          await act(async () => {
+            browserAdapter.getAudioElement().dispatchEvent(new Event('seeked'))
+          })
+        } else {
+          expect(document.querySelector('audio')).toBeNull()
+        }
+        expect(controller.getState().position).toBe(1)
+      },
+    )
+
+    it.each(['local', 'remote'])(
+      'TC-DE-08: the %s native volume slider uses the shared normalized volume curve once',
+      async (engineMode) => {
+        const { controller, browserAdapter } =
+          await renderControlledPlayer(engineMode)
+        await act(async () => controller.setVolume(0.25))
+        const handle = document.querySelector(
+          '.sound-operation .rc-slider-handle',
+        )
+        expect(getNativeVolumeBarValue()).toBeCloseTo(0.5)
+        const initialIntents = controller.getMetrics().intentsIssued
+
+        await act(async () => {
+          fireEvent.keyDown(handle, { key: 'ArrowRight', keyCode: 39 })
+          fireEvent.keyUp(handle, { key: 'ArrowRight', keyCode: 39 })
+        })
+
+        expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+        expect(controller.getState().volume).toBeCloseTo(0.2601)
+        if (browserAdapter) {
+          expect(browserAdapter.getAudioElement().volume).toBeCloseTo(0.2601)
+        } else {
+          expect(document.querySelector('audio')).toBeNull()
+        }
+      },
+    )
+
+    it('TC-DE-08: a native play event cannot hide pending local playback or confirm success', async () => {
+      let rejectPlay
+      playSpy.mockImplementation(
+        () => new Promise((_, reject) => (rejectPlay = reject)),
+      )
+      const { controller, browserAdapter } = await renderControlledPlayer()
+      await act(async () => document.querySelector('.play-btn').click())
+      await act(async () => {
+        browserAdapter.getAudioElement().dispatchEvent(new Event('play'))
+      })
+
+      try {
+        expect(controller.getState().status).toBe(PlaybackStatus.PREPARING)
+        expect(document.querySelector('.loading-icon')).not.toBeNull()
+      } finally {
+        await act(async () => rejectPlay(new Error('Playback not allowed')))
+      }
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+    })
+
+    it('TC-DE-08: local native play and pause each enter the Module exactly once', async () => {
+      playSpy.mockImplementation(function () {
+        this.dispatchEvent(new Event('playing'))
+        return Promise.resolve()
+      })
+      pauseSpy.mockImplementation(function () {
+        this.dispatchEvent(new Event('pause'))
+      })
+      const { controller } = await renderControlledPlayer()
+      const initialIntents = controller.getMetrics().intentsIssued
+
+      await act(async () => document.querySelector('.play-btn').click())
+
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      await act(async () => document.querySelector('.play-btn').click())
+
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 2)
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+    })
+  })
+
   describe('Native DOM Controller Interactions', () => {
     /**
      * Case: TC-DE-08
@@ -632,6 +1026,798 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
     })
   })
 
+  describe('Async authority and media-result regressions', () => {
+    it('TC-DE-05: a previous engine rejection cannot replace the new engine state', async () => {
+      vi.useFakeTimers()
+      try {
+        const controller = createPlaybackControlModule()
+        const oldAdapter = {
+          activate: () => {},
+          deactivate: () => {},
+          play: () =>
+            new Promise((_, reject) => {
+              setTimeout(() => reject({ code: 'OLD_ENGINE_REJECTED' }), 20)
+            }),
+        }
+        controller.setAdapter(oldAdapter)
+        const oldResult = controller.play().catch((error) => error)
+
+        controller.setAdapter(createMockRemoteAudioAdapter())
+        await controller.play()
+        await controller.pause()
+        const newState = controller.getState()
+
+        await vi.advanceTimersByTimeAsync(20)
+        expect((await oldResult).code).toBe('OLD_ENGINE_REJECTED')
+        expect(controller.getState()).toEqual(newState)
+        expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+        expect(controller.getState().error).toBeNull()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it.each([
+      ['clear', 0],
+      ['add', 20],
+    ])(
+      'TC-QC-10: switching during Play All %s cannot write to the new engine',
+      async (_phase, elapsed) => {
+        vi.useFakeTimers()
+        try {
+          const controller = createPlaybackControlModule()
+          controller.setAdapter(createMockRemoteAudioAdapter({ delayMs: 20 }))
+          const oldResult = controller
+            .playAll([{ queueItemId: 'old-item', name: 'Old scene' }])
+            .catch((error) => error)
+          if (elapsed) await vi.advanceTimersByTimeAsync(elapsed)
+
+          const newAdapter = createMockRemoteAudioAdapter()
+          controller.setAdapter(newAdapter)
+          await controller.addQueueItems([
+            { queueItemId: 'new-item', name: 'New scene' },
+          ])
+          const newState = controller.getState()
+          const newCommands = newAdapter.getWireCommands()
+
+          await vi.advanceTimersByTimeAsync(20)
+          expect((await oldResult).code).toBe('COMMAND_SUPERSEDED')
+          expect(controller.getState()).toEqual(newState)
+          expect(newAdapter.getWireCommands()).toEqual(newCommands)
+          expect(newAdapter.getQueue().map((item) => item.queueItemId)).toEqual(
+            ['new-item'],
+          )
+        } finally {
+          vi.useRealTimers()
+        }
+      },
+    )
+
+    it('TC-QC-11: a fresh adapter accepts its lower queue version without retaining the old scene', async () => {
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(createMockRemoteAudioAdapter())
+      await controller.addQueueItems([{ queueItemId: 'old-one' }])
+      await controller.addQueueItems([{ queueItemId: 'old-two' }])
+      await controller.play()
+      expect(controller.getState().queueVersion).toBe(2)
+
+      const newAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(newAdapter)
+      await controller.addQueueItems([{ queueItemId: 'new-one' }])
+
+      expect(controller.getState().queueVersion).toBe(1)
+      expect(
+        controller.getState().queue.map((item) => item.queueItemId),
+      ).toEqual(['new-one'])
+      expect(controller.getState().currentQueueItemId).toBe('new-one')
+      expect(controller.getState().status).toBe(PlaybackStatus.IDLE)
+      expect(controller.getState().error).toBeNull()
+      expect(newAdapter.getQueue()).toEqual(controller.getState().queue)
+    })
+
+    it('TC-QC-11: playback ordering rejects an older state at the same queue version before remote mutation', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+      await controller.addQueueItems([{ queueItemId: 'one' }])
+      remoteAdapter.pushServerSnapshot({
+        queueVersion: 1,
+        stateSequence: 10,
+        status: PlaybackStatus.PAUSED,
+        position: 12,
+        error: null,
+      })
+      const accepted = controller.getState()
+      const intents = controller.getMetrics().intentsIssued
+      remoteAdapter.pushServerSnapshot({
+        queueVersion: 1,
+        stateSequence: 9,
+        status: PlaybackStatus.PLAYING,
+        position: 3,
+      })
+
+      expect(controller.getState()).toEqual(accepted)
+      expect(remoteAdapter.getRemoteState().status).toBe(PlaybackStatus.PAUSED)
+      expect(remoteAdapter.getRemoteState().position).toBe(12)
+      expect(controller.getMetrics().intentsIssued).toBe(intents)
+      await controller.setVolume(0.4)
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      expect(controller.getState().position).toBe(12)
+    })
+
+    it('TC-PM-01: a local next waits for media confirmation and exposes a rejected play', async () => {
+      let rejectPlayback
+      playSpy.mockImplementation(
+        () =>
+          new Promise((_, reject) => {
+            rejectPlayback = reject
+          }),
+      )
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      await controller.addQueueItems([
+        { queueItemId: 'one', musicSrc: '/one.mp3' },
+        { queueItemId: 'two', musicSrc: '/two.mp3' },
+      ])
+      const result = controller.skipNext().catch((error) => error)
+      try {
+        expect(controller.getState().currentQueueItemId).toBe('two')
+        expect(controller.getState().status).toBe(PlaybackStatus.PREPARING)
+        browserAdapter.getAudioElement().dispatchEvent(new Event('play'))
+        expect(controller.getState().status).toBe(PlaybackStatus.PREPARING)
+      } finally {
+        rejectPlayback(
+          new DOMException('Playback permission denied', 'NotAllowedError'),
+        )
+        await result
+      }
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(controller.getState().error.message).toContain(
+        'Playback permission denied',
+      )
+      expect((await result).code).toBe('BROWSER_PLAY_REQUEST_FAILED')
+    })
+
+    it.each(['resolve', 'reject'])(
+      'TC-DE-05: an earlier track %s cannot overwrite a newer playback attempt',
+      async (completion) => {
+        let finishOldPlayback
+        playSpy.mockImplementationOnce(
+          () =>
+            new Promise((resolve, reject) => {
+              finishOldPlayback =
+                completion === 'resolve'
+                  ? resolve
+                  : () =>
+                      reject(
+                        new DOMException(
+                          'Old playback rejected',
+                          'NotAllowedError',
+                        ),
+                      )
+            }),
+        )
+        const controller = createPlaybackControlModule()
+        const browserAdapter = createBrowserAudioAdapter()
+        controller.setAdapter(browserAdapter)
+        await controller.addQueueItems([
+          { queueItemId: 'old-track', musicSrc: '/old.mp3' },
+          { queueItemId: 'new-track', musicSrc: '/new.mp3' },
+        ])
+        const oldResult = controller.play().catch((error) => error)
+        await controller.pause()
+        await controller.skipNext()
+        const accepted = controller.getState()
+        finishOldPlayback()
+
+        expect((await oldResult).code).toBe('COMMAND_SUPERSEDED')
+        expect(controller.getState()).toEqual(accepted)
+        expect(controller.getState().currentQueueItemId).toBe('new-track')
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+        expect(controller.getState().error).toBeNull()
+      },
+    )
+
+    it('TC-DE-05: a delayed remote write cannot execute after the same adapter is reactivated', async () => {
+      vi.useFakeTimers()
+      try {
+        const controller = createPlaybackControlModule()
+        const remoteAdapter = createMockRemoteAudioAdapter({ delayMs: 20 })
+        controller.setAdapter(remoteAdapter)
+        const oldResult = controller
+          .addQueueItems([{ queueItemId: 'obsolete' }])
+          .catch((error) => error)
+        controller.setAdapter(createMockRemoteAudioAdapter())
+        controller.setAdapter(remoteAdapter)
+        const newResult = controller.addQueueItems([{ queueItemId: 'current' }])
+        await vi.advanceTimersByTimeAsync(20)
+        await newResult
+
+        expect((await oldResult).code).toBe('COMMAND_SUPERSEDED')
+        expect(
+          remoteAdapter.getQueue().map((item) => item.queueItemId),
+        ).toEqual(['current'])
+        expect(controller.getState().queue).toEqual(remoteAdapter.getQueue())
+        expect(controller.getState().error).toBeNull()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('TC-QC-01: a removed skip target is a no-op on both adapters', async () => {
+      for (const adapter of [
+        createBrowserAudioAdapter(),
+        createMockRemoteAudioAdapter(),
+      ]) {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+        await controller.addQueueItems([
+          { queueItemId: 'keep', musicSrc: '/keep.mp3' },
+          { queueItemId: 'removed', musicSrc: '/removed.mp3' },
+        ])
+        await controller.removeQueueItem('removed')
+        const before = controller.getState()
+        const plays = playSpy.mock.calls.length
+        await controller.skipToQueueItem('removed')
+
+        const after = controller.getState()
+        expect(after.currentQueueItemId).toBe('keep')
+        expect(after.queue).toEqual(before.queue)
+        expect(after.status).toBe(before.status)
+        expect(after.position).toBe(before.position)
+        expect(after.error).toBeNull()
+        expect(playSpy.mock.calls.length).toBe(plays)
+        controller.setAdapter(null)
+      }
+    })
+
+    it('TC-QC-11: an explicitly captured old backfill epoch cannot enter the current scene', async () => {
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(createMockRemoteAudioAdapter())
+      await controller.addQueueItems([{ queueItemId: 'obsolete' }])
+      const oldEpoch = controller.getEpoch()
+      controller.setAdapter(createMockRemoteAudioAdapter())
+      await controller.addQueueItems([{ queueItemId: 'current' }])
+      const accepted = controller.getState()
+      const intents = controller.getMetrics().intentsIssued
+      controller.backfillState(
+        {
+          queue: [{ queueItemId: 'obsolete' }],
+          currentQueueItemId: 'obsolete',
+          queueVersion: 100,
+          stateSequence: 100,
+          status: PlaybackStatus.ERROR,
+          error: { code: 'OLD_SCENE_ERROR' },
+        },
+        oldEpoch,
+      )
+
+      expect(controller.getState()).toEqual(accepted)
+      expect(controller.getMetrics().intentsIssued).toBe(intents)
+    })
+
+    it('TC-QC-11: a remote snapshot from an earlier activation cannot mutate its reactivated adapter', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+      const oldEpoch = controller.getEpoch()
+      controller.setAdapter(createMockRemoteAudioAdapter())
+      controller.setAdapter(remoteAdapter)
+      await controller.addQueueItems([{ queueItemId: 'current' }])
+      const accepted = controller.getState()
+      remoteAdapter.pushServerSnapshot(
+        {
+          queue: [{ queueItemId: 'obsolete' }],
+          currentQueueItemId: 'obsolete',
+          queueVersion: 100,
+          stateSequence: 100,
+          status: PlaybackStatus.PLAYING,
+        },
+        oldEpoch,
+      )
+
+      expect(remoteAdapter.getQueue().map((item) => item.queueItemId)).toEqual([
+        'current',
+      ])
+      expect(controller.getState()).toEqual(accepted)
+    })
+    it.each(['resolve', 'reject'])(
+      'TC-DE-05: an obsolete async media source %s never loads or plays over a new track',
+      async (completion) => {
+        let finishSource
+        const source = new Promise((resolve, reject) => {
+          finishSource =
+            completion === 'resolve'
+              ? () => resolve('/obsolete.mp3')
+              : () => reject(new Error('Obsolete URL lookup failed'))
+        })
+        const controller = createPlaybackControlModule()
+        const browserAdapter = createBrowserAudioAdapter()
+        controller.setAdapter(browserAdapter)
+        await controller.addQueueItems([
+          { queueItemId: 'obsolete', musicSrc: () => source },
+          { queueItemId: 'current', musicSrc: '/current.mp3' },
+        ])
+        const oldResult = controller.play().catch((error) => error)
+        await controller.skipNext()
+        const accepted = controller.getState()
+        const plays = playSpy.mock.calls.length
+        finishSource()
+
+        expect((await oldResult).code).toBe('COMMAND_SUPERSEDED')
+        expect(browserAdapter.getAudioElement().getAttribute('src')).toBe(
+          '/current.mp3',
+        )
+        expect(playSpy.mock.calls.length).toBe(plays)
+        expect(controller.getState()).toEqual(accepted)
+      },
+    )
+    it('TC-DE-06: an old command timeout cannot replace a new paused scene', async () => {
+      vi.useFakeTimers()
+      try {
+        const controller = createPlaybackControlModule({ commandTimeoutMs: 30 })
+        controller.setAdapter({
+          activate: () => {},
+          deactivate: () => {},
+          play: () => new Promise(() => {}),
+        })
+        const oldResult = controller.play().catch((error) => error)
+        controller.setAdapter(createMockRemoteAudioAdapter())
+        await controller.play()
+        await controller.pause()
+        const accepted = controller.getState()
+        const intents = controller.getMetrics().intentsIssued
+        await vi.advanceTimersByTimeAsync(30)
+
+        expect((await oldResult).code).toBe('COMMAND_TIMEOUT')
+        expect(controller.getState()).toEqual(accepted)
+        expect(controller.getMetrics().intentsIssued).toBe(intents)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+    it('TC-DE-05: real native mounting and repeated attachment advance once and detach without an orphan engine', async () => {
+      const tracks = [
+        { ...sampleTracks[0], queueItemId: 'first' },
+        { ...sampleTracks[1], queueItemId: 'second' },
+        { ...sampleTracks[0], queueItemId: 'third' },
+      ]
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      await controller.addQueueItems(tracks)
+      const { unmount } = render(
+        <UnifiedNativePlayer
+          controller={controller}
+          browserAdapter={browserAdapter}
+          engineMode="local"
+          audioLists={tracks}
+          mode="full"
+          autoPlay={false}
+        />,
+      )
+      const audio = document.querySelector('audio')
+      expect(browserAdapter.getAudioElement()).toBe(audio)
+      browserAdapter.attachElement(audio)
+      browserAdapter.attachElement(audio)
+      await act(async () => {
+        await controller.play()
+      })
+      const intents = controller.getMetrics().intentsIssued
+      const plays = playSpy.mock.calls.length
+      await act(async () => {
+        finishMedia(audio)
+      })
+
+      expect(controller.getState().currentQueueItemId).toBe('second')
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(playSpy.mock.calls.length).toBe(plays + 1)
+      expect(controller.getMetrics().intentsIssued).toBe(intents)
+      unmount()
+      const detached = controller.getState()
+      audio.dispatchEvent(new Event('ended'))
+      expect(controller.getState()).toEqual(detached)
+      expect(browserAdapter.getAudioElement()).toBeNull()
+      const created = createElementSpy.mock.calls.filter(
+        ([tag]) => tag === 'audio',
+      ).length
+      const playsAfterDetach = playSpy.mock.calls.length
+      const error = await controller.play().catch((failure) => failure)
+      expect(error.code).toBe('NO_AUDIO_ELEMENT')
+      expect(
+        createElementSpy.mock.calls.filter(([tag]) => tag === 'audio'),
+      ).toHaveLength(created)
+      expect(playSpy.mock.calls.length).toBe(playsAfterDetach)
+      controller.setAdapter(null)
+    })
+    it.each(['next', 'single repeat', 'remove current', 'select item'])(
+      'TC-PM-04: %s reports media rejection without automatic replay',
+      async (action) => {
+        const source = vi.fn().mockResolvedValue('/resolved-first.mp3')
+        const controller = createPlaybackControlModule()
+        const browserAdapter = createBrowserAudioAdapter()
+        controller.setAdapter(browserAdapter)
+        await controller.addQueueItems([
+          { queueItemId: 'first', musicSrc: source },
+          { queueItemId: 'second', musicSrc: '/second.mp3' },
+        ])
+        await controller.play()
+        const audio = browserAdapter.getAudioElement()
+        expect(audio.getAttribute('src')).toBe('/resolved-first.mp3')
+        if (action === 'single repeat')
+          await controller.setPlayMode(PlaybackMode.REPEAT_TRACK)
+        const sourceWrites = vi.spyOn(audio, 'src', 'set')
+        const intents = controller.getMetrics().intentsIssued
+        const plays = playSpy.mock.calls.length
+        playSpy.mockRejectedValueOnce(
+          new DOMException('Playback blocked', 'NotAllowedError'),
+        )
+        let result
+        if (action === 'single repeat') {
+          await act(async () => {
+            finishMedia(audio)
+          })
+        } else if (action === 'next') {
+          result = await controller.skipNext().catch((error) => error)
+        } else if (action === 'remove current') {
+          result = await controller
+            .removeQueueItem('first')
+            .catch((error) => error)
+        } else {
+          result = await controller
+            .skipToQueueItem('second')
+            .catch((error) => error)
+        }
+
+        expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+        expect(controller.getState().error.message).toBe('Playback blocked')
+        expect(playSpy.mock.calls.length).toBe(plays + 1)
+        expect(controller.getMetrics().intentsIssued).toBe(
+          intents + (action === 'single repeat' ? 0 : 1),
+        )
+        if (action === 'single repeat') {
+          expect(controller.getState().currentQueueItemId).toBe('first')
+          expect(sourceWrites).not.toHaveBeenCalled()
+          expect(source).toHaveBeenCalledTimes(1)
+        } else {
+          expect(result.code).toBe('BROWSER_PLAY_REQUEST_FAILED')
+          expect(controller.getState().currentQueueItemId).toBe('second')
+        }
+        controller.setAdapter(null)
+      },
+    )
+    it('TC-DE-05: a subscriber switching during PREPARING cannot redirect the issued play', async () => {
+      const controller = createPlaybackControlModule()
+      const oldAdapter = createMockRemoteAudioAdapter()
+      const newAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(oldAdapter)
+      const unsubscribe = controller.subscribe((state) => {
+        if (state.status === PlaybackStatus.PREPARING) {
+          unsubscribe()
+          controller.setAdapter(newAdapter)
+        }
+      })
+      const result = await controller.play().catch((error) => error)
+
+      expect(result.code).toBe('COMMAND_SUPERSEDED')
+      expect(controller.getState().status).toBe(PlaybackStatus.IDLE)
+      expect(controller.getState().error).toBeNull()
+      expect(newAdapter.getRemoteState().status).toBe(PlaybackStatus.IDLE)
+      expect(controller.getMetrics().commandsSent.play).toBe(0)
+      expect(controller.getMetrics().intentsIssued).toBe(1)
+    })
+    it('TC-DE-05: an earlier activation callback cannot impersonate the current adapter epoch', () => {
+      const callbacks = []
+      const adapter = {
+        activate: (_epoch, callback) => callbacks.push(callback),
+        deactivate: () => {},
+      }
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(adapter)
+      controller.setAdapter(createMockRemoteAudioAdapter())
+      controller.setAdapter(adapter)
+      const epoch = controller.getEpoch()
+      callbacks[1](epoch, { status: PlaybackStatus.PAUSED, stateSequence: 2 })
+      const accepted = controller.getState()
+      callbacks[0](epoch, {
+        status: PlaybackStatus.ERROR,
+        error: { code: 'OLD_ACTIVATION' },
+        queueVersion: 100,
+        stateSequence: 100,
+      })
+
+      expect(controller.getState()).toEqual(accepted)
+      expect(controller.getMetrics().intentsIssued).toBe(0)
+    })
+    it('TC-DE-06: a missing resolved media URL cannot play the previous track as a successful selection', async () => {
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      await controller.addQueueItems([
+        { queueItemId: 'first', musicSrc: '/first.mp3' },
+        { queueItemId: 'invalid', musicSrc: async () => undefined },
+      ])
+      await controller.play()
+      const plays = playSpy.mock.calls.length
+      const result = await controller.skipNext().catch((error) => error)
+
+      expect(result.code).toBe('MEDIA_SOURCE_UNAVAILABLE')
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(playSpy.mock.calls.length).toBe(plays)
+    })
+    it('TC-DE-05: old-epoch play and pause perform no work on either reactivated adapter', async () => {
+      for (const adapter of [
+        createBrowserAudioAdapter(),
+        createMockRemoteAudioAdapter(),
+      ]) {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+        const oldEpoch = controller.getEpoch()
+        controller.setAdapter(createMockRemoteAudioAdapter())
+        controller.setAdapter(adapter)
+        const accepted = controller.getState()
+        const plays = playSpy.mock.calls.length
+        const pauses = pauseSpy.mock.calls.length
+        await adapter.play(oldEpoch)
+        await adapter.pause(oldEpoch)
+
+        expect(controller.getState()).toEqual(accepted)
+        expect(playSpy.mock.calls.length).toBe(plays)
+        expect(pauseSpy.mock.calls.length).toBe(pauses)
+        expect(controller.getMetrics().intentsIssued).toBe(0)
+        controller.setAdapter(null)
+      }
+    })
+    it('TC-PM-02: an old ended event cannot advance a new resource that has not ended', async () => {
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      await controller.addQueueItems([
+        { queueItemId: 'first', musicSrc: '/first.mp3' },
+        { queueItemId: 'second', musicSrc: '/second.mp3' },
+        { queueItemId: 'third', musicSrc: '/third.mp3' },
+      ])
+      await controller.play()
+      await controller.skipNext()
+      const audio = browserAdapter.getAudioElement()
+      expect(audio.ended).toBe(false)
+      const accepted = controller.getState()
+      const plays = playSpy.mock.calls.length
+      const intents = controller.getMetrics().intentsIssued
+      await act(async () => {
+        audio.dispatchEvent(new Event('ended'))
+      })
+
+      expect(controller.getState()).toEqual(accepted)
+      expect(controller.getState().currentQueueItemId).toBe('second')
+      expect(playSpy.mock.calls.length).toBe(plays)
+      expect(controller.getMetrics().intentsIssued).toBe(intents)
+    })
+    it.each(['same item', 'different item'])(
+      'TC-PM-04: late single-repeat completion cannot confirm a newer %s attempt',
+      async (selection) => {
+        const controller = createPlaybackControlModule()
+        const browserAdapter = createBrowserAudioAdapter()
+        controller.setAdapter(browserAdapter)
+        await controller.addQueueItems([
+          { queueItemId: 'first', musicSrc: '/first.mp3' },
+          { queueItemId: 'second', musicSrc: '/second.mp3' },
+        ])
+        await controller.play()
+        await controller.setPlayMode(PlaybackMode.REPEAT_TRACK)
+        let finishRepeat
+        playSpy.mockImplementationOnce(function () {
+          setMediaFlags(this, { paused: false, ended: false })
+          return new Promise((resolve) => {
+            finishRepeat = resolve
+          })
+        })
+        const audio = browserAdapter.getAudioElement()
+        await act(async () => {
+          finishMedia(audio)
+        })
+        expect(controller.getState().status).toBe(PlaybackStatus.PREPARING)
+        await controller.pause()
+        if (selection === 'same item') await controller.play()
+        else await controller.skipNext()
+        const accepted = controller.getState()
+        const intents = controller.getMetrics().intentsIssued
+        const plays = playSpy.mock.calls.length
+        await act(async () => {
+          finishRepeat()
+        })
+
+        expect(controller.getState()).toEqual(accepted)
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+        expect(controller.getState().currentQueueItemId).toBe(
+          selection === 'same item' ? 'first' : 'second',
+        )
+        expect(controller.getMetrics().intentsIssued).toBe(intents)
+        expect(playSpy.mock.calls.length).toBe(plays)
+      },
+    )
+    it('TC-DE-05: stale pause and error events cannot replace a healthy current resource', async () => {
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      await controller.addQueueItems([
+        { queueItemId: 'first', musicSrc: '/first.mp3' },
+        { queueItemId: 'second', musicSrc: '/second.mp3' },
+      ])
+      await controller.play()
+      await controller.skipNext()
+      const audio = browserAdapter.getAudioElement()
+      setMediaFlags(audio, { error: null })
+      expect(audio.paused).toBe(false)
+      expect(audio.error).toBeNull()
+      const accepted = controller.getState()
+      const intents = controller.getMetrics().intentsIssued
+      await act(async () => {
+        audio.dispatchEvent(new Event('pause'))
+        audio.dispatchEvent(new Event('error'))
+      })
+
+      expect(controller.getState()).toEqual(accepted)
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controller.getMetrics().intentsIssued).toBe(intents)
+    })
+    it('TC-QC-07: a delayed move rejects an intervening authoritative queue edit', async () => {
+      vi.useFakeTimers()
+      try {
+        const controller = createPlaybackControlModule()
+        const remoteAdapter = createMockRemoteAudioAdapter({ delayMs: 20 })
+        controller.setAdapter(remoteAdapter)
+        const items = [
+          { queueItemId: 'first' },
+          { queueItemId: 'second' },
+          { queueItemId: 'third' },
+        ]
+        const initial = controller.addQueueItems(items)
+        await vi.advanceTimersByTimeAsync(20)
+        await initial
+        const move = controller
+          .moveQueueItem('third', 0)
+          .catch((error) => error)
+        const authoritative = [
+          items[0],
+          { queueItemId: 'inserted' },
+          items[1],
+          items[2],
+        ]
+        remoteAdapter.pushServerSnapshot({
+          queue: authoritative,
+          currentQueueItemId: 'first',
+          queueVersion: 2,
+        })
+        const intents = controller.getMetrics().intentsIssued
+        await vi.advanceTimersByTimeAsync(20)
+        const result = await move
+
+        expect(result?.code).toBe('QUEUE_VERSION_CONFLICT')
+        expect(remoteAdapter.getQueue()).toEqual(authoritative)
+        expect(controller.getState().queue).toEqual(authoritative)
+        expect(controller.getState().currentQueueItemId).toBe('first')
+        expect(controller.getState().error.code).toBe('QUEUE_VERSION_CONFLICT')
+        expect(controller.getMetrics().intentsIssued).toBe(intents)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+    it('TC-DE-06: a current media error stays visible after its pending play settles', async () => {
+      let finishPlayback
+      playSpy.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishPlayback = resolve
+          }),
+      )
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      await controller.addQueueItems([
+        { queueItemId: 'current', musicSrc: '/current.mp3' },
+      ])
+      const result = controller.play().catch((error) => error)
+      const audio = browserAdapter.getAudioElement()
+      setMediaFlags(audio, {
+        paused: true,
+        error: { code: 3, message: 'Current decoder failed' },
+      })
+      audio.dispatchEvent(new Event('error'))
+      const failed = controller.getState()
+      finishPlayback()
+
+      expect((await result).code).toBe('COMMAND_SUPERSEDED')
+      expect(controller.getState()).toEqual(failed)
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(controller.getState().error).toEqual({
+        code: 'MEDIA_ELEMENT_ERROR',
+        message: 'Current decoder failed',
+      })
+    })
+    it('TC-QC-07: both adapters reject an explicit outdated move baseline without changing the queue', async () => {
+      for (const adapter of [
+        createBrowserAudioAdapter(),
+        createMockRemoteAudioAdapter(),
+      ]) {
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(adapter)
+        await controller.addQueueItems([
+          { queueItemId: 'first', musicSrc: '/first.mp3' },
+          { queueItemId: 'second', musicSrc: '/second.mp3' },
+        ])
+        const before = controller.getState()
+        const result = await controller
+          .moveQueueItem('second', 0, 0)
+          .catch((error) => error)
+
+        expect(result.code).toBe('QUEUE_VERSION_CONFLICT')
+        expect(controller.getState().queue).toEqual(before.queue)
+        expect(controller.getState().queueVersion).toBe(before.queueVersion)
+        expect(controller.getState().currentQueueItemId).toBe('first')
+        expect(adapter.getQueue()).toEqual(before.queue)
+        controller.setAdapter(null)
+      }
+    })
+    it('TC-DE-05: an old resource error cannot cancel the next track while its URL is pending', async () => {
+      let finishSource
+      const source = new Promise((resolve) => {
+        finishSource = resolve
+      })
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      await controller.addQueueItems([
+        { queueItemId: 'first', musicSrc: '/first.mp3' },
+        { queueItemId: 'second', musicSrc: () => source },
+      ])
+      await controller.play()
+      const next = controller.skipNext().catch((error) => error)
+      const audio = browserAdapter.getAudioElement()
+      setMediaFlags(audio, {
+        error: { code: 3, message: 'Old resource failed' },
+      })
+      try {
+        audio.dispatchEvent(new Event('error'))
+        expect(controller.getState().status).toBe(PlaybackStatus.PREPARING)
+        expect(controller.getState().error).toBeNull()
+      } finally {
+        setMediaFlags(audio, { error: null })
+        finishSource('/second.mp3')
+        await next
+      }
+      expect(controller.getState().currentQueueItemId).toBe('second')
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controller.getState().error).toBeNull()
+    })
+    it('TC-QC-11: an old remote queue snapshot cannot corrupt a subsequent valid edit', async () => {
+      const controller = createPlaybackControlModule()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+      await controller.addQueueItems([{ queueItemId: 'first' }])
+      await controller.addQueueItems([{ queueItemId: 'second' }])
+      const accepted = controller.getState()
+      const intents = controller.getMetrics().intentsIssued
+      remoteAdapter.pushServerSnapshot({
+        queue: [{ queueItemId: 'obsolete' }],
+        currentQueueItemId: 'obsolete',
+        queueVersion: 1,
+        stateSequence: 100,
+      })
+      expect(controller.getState()).toEqual(accepted)
+      expect(controller.getMetrics().intentsIssued).toBe(intents)
+      await controller.addQueueItems([{ queueItemId: 'third' }])
+
+      expect(controller.getState().queueVersion).toBe(3)
+      expect(
+        controller.getState().queue.map((item) => item.queueItemId),
+      ).toEqual(['first', 'second', 'third'])
+      expect(remoteAdapter.getQueue()).toEqual(controller.getState().queue)
+      expect(controller.getState().currentQueueItemId).toBe('first')
+    })
+  })
+
   describe('Native Queue Editing Contract and Stable Instance Identity (Issue 03)', () => {
     let playSpy
     let pauseSpy
@@ -674,10 +1860,6 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       loadSpy = vi
         .spyOn(window.HTMLMediaElement.prototype, 'load')
         .mockImplementation(() => {})
-    })
-
-    afterEach(() => {
-      vi.restoreAllMocks()
     })
 
     /**
@@ -925,12 +2107,8 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       const remoteAdapter = createMockRemoteAudioAdapter()
       controller.setAdapter(remoteAdapter)
 
-      let playerInstance = null
       render(
         <UnifiedNativePlayer
-          ref={(ref) => {
-            playerInstance = ref
-          }}
           controller={controller}
           engineMode="remote"
           mode="full"
@@ -938,14 +2116,13 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         />,
       )
 
-      await controller.addQueueItems(duplicateQueueTracks)
+      await act(async () => controller.addQueueItems(duplicateQueueTracks))
       remoteAdapter.clearWireCommands()
+      await act(async () => document.querySelector('.audio-lists-btn').click())
 
-      // 1. Delete item via onDeleteAudioLists
+      // Delete through the real native row action.
       await act(async () => {
-        playerInstance.onDeleteAudioLists('q-dup-3')({
-          stopPropagation: vi.fn(),
-        })
+        document.querySelectorAll('.audio-item .player-delete')[2].click()
       })
       await waitFor(() => {
         const cmd = remoteAdapter
@@ -955,10 +2132,9 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         expect(cmd.queueItemId).toBe('q-dup-3')
       })
 
-      // 2. Reorder item via onAudioListsSortEnd
-      await act(async () => {
-        playerInstance.onAudioListsSortEnd(0, 1)
-      })
+      // Sortable physically moves DOM and delivers one event object, not two indexes.
+      const drag = startNativeDrag(0, 1)
+      await drag.end()
       await waitFor(() => {
         const cmd = remoteAdapter
           .getWireCommands()
@@ -968,9 +2144,8 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         expect(cmd.toIndex).toBe(1)
       })
 
-      // 3. Skip item via audioListsPlay
       await act(async () => {
-        playerInstance.audioListsPlay('q-mid-2')
+        document.querySelectorAll('.audio-item')[0].click()
       })
       await waitFor(() => {
         const cmd = remoteAdapter
@@ -980,11 +2155,8 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         expect(cmd.queueItemId).toBe('q-mid-2')
       })
 
-      // 4. Clear queue via onDeleteAudioLists(null / undefined)
       await act(async () => {
-        playerInstance.onDeleteAudioLists()({
-          stopPropagation: vi.fn(),
-        })
+        document.querySelector('.audio-lists-panel-header-delete-btn').click()
       })
       await waitFor(() => {
         const cmd = remoteAdapter
@@ -1230,26 +2402,27 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       localController.setAdapter(localAdapter)
       await localController.addQueueItems(modeTracks)
       await localController.setPlayMode(PlaybackMode.ORDER)
+      await localController.play()
 
       const audioEl = localAdapter.getAudioElement()
 
       // Natural end on mode-1 -> advances to mode-2
-      act(() => {
-        audioEl.dispatchEvent(new Event('ended'))
+      await act(async () => {
+        finishMedia(audioEl)
       })
       expect(localController.getState().currentQueueItemId).toBe('mode-2')
       expect(localController.getState().status).toBe(PlaybackStatus.PLAYING)
 
       // Natural end on mode-2 -> advances to mode-3
-      act(() => {
-        audioEl.dispatchEvent(new Event('ended'))
+      await act(async () => {
+        finishMedia(audioEl)
       })
       expect(localController.getState().currentQueueItemId).toBe('mode-3')
       expect(localController.getState().status).toBe(PlaybackStatus.PLAYING)
 
       // Natural end on mode-3 (last) -> stops! Does NOT wrap around
-      act(() => {
-        audioEl.dispatchEvent(new Event('ended'))
+      await act(async () => {
+        finishMedia(audioEl)
       })
       expect(localController.getState().currentQueueItemId).toBe('mode-3')
       expect(localController.getState().status).toBe(PlaybackStatus.PAUSED)
@@ -1260,6 +2433,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       remoteController.setAdapter(remoteAdapter)
       await remoteController.addQueueItems(modeTracks)
       await remoteController.setPlayMode(PlaybackMode.ORDER)
+      await remoteController.play()
 
       remoteAdapter.triggerNaturalEnd()
       expect(remoteController.getState().currentQueueItemId).toBe('mode-2')
@@ -1289,10 +2463,11 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       await localController.addQueueItems(modeTracks)
       await localController.setPlayMode(PlaybackMode.REPEAT_LIST)
       await localController.skipToQueueItem('mode-3')
+      await localController.play()
 
       const audioEl = localAdapter.getAudioElement()
-      act(() => {
-        audioEl.dispatchEvent(new Event('ended'))
+      await act(async () => {
+        finishMedia(audioEl)
       })
       expect(localController.getState().currentQueueItemId).toBe('mode-1')
       expect(localController.getState().status).toBe(PlaybackStatus.PLAYING)
@@ -1304,6 +2479,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       await remoteController.addQueueItems(modeTracks)
       await remoteController.setPlayMode(PlaybackMode.REPEAT_LIST)
       await remoteController.skipToQueueItem('mode-3')
+      await remoteController.play()
 
       const res = remoteAdapter.triggerNaturalEnd()
       expect(res.stopped).toBe(false)
@@ -1325,10 +2501,11 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       await localController.addQueueItems(modeTracks)
       await localController.setPlayMode(PlaybackMode.REPEAT_TRACK)
       await localController.skipToQueueItem('mode-2')
+      await localController.play()
 
       const audioEl = localAdapter.getAudioElement()
-      act(() => {
-        audioEl.dispatchEvent(new Event('ended'))
+      await act(async () => {
+        finishMedia(audioEl)
       })
       expect(localController.getState().currentQueueItemId).toBe('mode-2')
       expect(audioEl.currentTime).toBe(0)
@@ -1341,6 +2518,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       await remoteController.addQueueItems(modeTracks)
       await remoteController.setPlayMode(PlaybackMode.REPEAT_TRACK)
       await remoteController.skipToQueueItem('mode-2')
+      await remoteController.play()
 
       const res = remoteAdapter.triggerNaturalEnd()
       expect(res.stopped).toBe(false)

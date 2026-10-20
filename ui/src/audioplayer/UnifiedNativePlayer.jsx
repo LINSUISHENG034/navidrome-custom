@@ -20,11 +20,10 @@
 import React from 'react'
 import ReactDOM from 'react-dom'
 import ReactJkMusicPlayer from 'navidrome-music-player/es/index.js'
-import {
-  PlaybackStatus,
-  PlaybackMode,
-  normalizePlaybackMode,
-} from './playbackControlModule'
+import sortableConfig from 'navidrome-music-player/es/config/sortable.js'
+import Sortable from 'sortablejs'
+import { PlaybackStatus, PlaybackMode } from './playbackControlModule'
+import { audioVolumeToUiVolume, uiVolumeToAudioVolume } from './volumeMapping'
 
 /**
  * Shared helper to resolve stable queue item identity across UI and drawer representations.
@@ -43,6 +42,36 @@ function resolveQueueItemId(identifier, lists = []) {
 export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   constructor(props) {
     super(props)
+
+    const nativeInitPlayer = this.initPlayer
+    this.initPlayer = (...args) => {
+      if (!this.props.controller && this.props.engineMode !== 'remote') {
+        return nativeInitPlayer(...args)
+      }
+    }
+    const nativeInitSortable = this.initSortableAudioLists
+    this.initSortableAudioLists = () => {
+      if (this.props.controller) {
+        this.syncQueueSortable()
+      } else if (this.props.engineMode !== 'remote') {
+        nativeInitSortable()
+      }
+    }
+    const nativeGetEnhanceAudio = this.getEnhanceAudio
+    this.getEnhanceAudio = (...args) => {
+      if (this.props.engineMode === 'remote') return null
+      if (this.props.controller && this.enhancedAudioElement === this.audio) {
+        return this.audio
+      }
+      const audio = nativeGetEnhanceAudio(...args)
+      if (this.props.controller) this.enhancedAudioElement = audio
+      return audio
+    }
+    const nativeOnGetAudioInstance = this.onGetAudioInstance
+    this.onGetAudioInstance = () => {
+      this.syncBrowserElement()
+      return nativeOnGetAudioInstance()
+    }
 
     const initialMode = props.controller
       ? props.controller.getState().playMode
@@ -64,6 +93,41 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   }
 
   setupControllerOverrides() {
+    if (this.controllerOverridesInstalled) return
+    this.controllerOverridesInstalled = true
+
+    this.onAudioMute = () => {
+      this.props.controller?.setVolume(0).catch(() => {})
+    }
+    this.onResetVolume = () => {
+      this.props.controller
+        ?.setVolume(this.restoreVolume ?? this.props.defaultVolume ?? 1)
+        .catch(() => {})
+    }
+
+    this.onProgressChange = (position) => {
+      this.setState({ currentTime: position })
+    }
+    this.onAudioSeeked = (position) => {
+      this.props.controller?.seek(position).catch(() => {})
+    }
+
+    this.onAudioSoundChange = (value) => {
+      this.props.controller
+        ?.setVolume(uiVolumeToAudioVolume(value))
+        .catch(() => {})
+    }
+
+    this.onTogglePlay = () => {
+      const { controller } = this.props
+      if (!controller) return
+      if (controller.getState().status === PlaybackStatus.PLAYING) {
+        controller.pause().catch(() => {})
+      } else {
+        controller.play().catch(() => {})
+      }
+    }
+
     // Intercept native play mode toggle to route through unified controller
     this.togglePlayMode = () => {
       const { controller } = this.props
@@ -117,19 +181,45 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       controller.removeQueueItem(targetQueueItemId).catch(() => {})
     }
 
-    this.onAudioListsSortEnd = (oldIndex, newIndex) => {
+    this.onAudioListsSortEnd = async (event) => {
+      const drag = this.releaseQueueDrag()
       const { controller } = this.props
-      if (!controller) return
-      if (oldIndex === newIndex) return
+      if (!drag || !controller || this.isUnmounted) return
+      const snapshot = controller.getState()
+      const { oldIndex, newIndex } = event
+      const sameView =
+        drag.controller === controller &&
+        drag.epoch === controller.getEpoch() &&
+        drag.queueVersion === snapshot.queueVersion &&
+        drag.ids.length === snapshot.queue.length &&
+        drag.ids.every((id, index) => snapshot.queue[index].queueItemId === id)
+      const validMove =
+        sameView &&
+        event.from === drag.container &&
+        event.to === drag.container &&
+        Number.isInteger(oldIndex) &&
+        Number.isInteger(newIndex) &&
+        oldIndex >= 0 &&
+        newIndex >= 0 &&
+        oldIndex < drag.ids.length &&
+        newIndex < drag.ids.length &&
+        oldIndex !== newIndex
 
-      const currentLists = this.state.audioLists || []
-      const item = currentLists[oldIndex]
-      if (!item) return
-      const queueItemId = resolveQueueItemId(
-        item.queueItemId || item.uuid || item.__PLAYER_KEY__,
-        currentLists,
-      )
-      controller.moveQueueItem(queueItemId, newIndex).catch(() => {})
+      try {
+        if (validMove) {
+          await controller.moveQueueItem(
+            drag.ids[oldIndex],
+            newIndex,
+            drag.queueVersion,
+          )
+        }
+      } catch {
+        // The Module owns the error; the view always returns to current authority.
+      } finally {
+        if (!this.isUnmounted && this.props.controller) {
+          this.applyAuthoritativeState(this.props.controller.getState())
+        }
+      }
     }
 
     this.audioListsPlay = (playId, ignore) => {
@@ -143,17 +233,9 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   }
 
   setupRemoteModeOverrides() {
-    // 1. User Intent Interceptors: forward to unified controller without optimistic drift
-    this.onTogglePlay = () => {
-      const { controller } = this.props
-      if (!controller) return
-
-      const currentState = controller.getState()
-      if (currentState.status === PlaybackStatus.PLAYING) {
-        controller.pause().catch(() => {})
-      } else {
-        controller.play().catch(() => {})
-      }
+    // Remote-only execution guards; controlled inputs are shared by both engines.
+    if (!this.props.controller) {
+      this.onTogglePlay = () => {}
     }
 
     this.onPlayNextAudio = () => {
@@ -170,22 +252,6 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       }
     }
 
-    // Spec compliance: forward intent to controller without optimistic UI mutation;
-    // UI updates when authoritative state is confirmed/backfilled.
-    this.onAudioSoundChange = (value) => {
-      const { controller } = this.props
-      if (controller) {
-        controller.setVolume(value / 100).catch(() => {})
-      }
-    }
-
-    this.onProgressChange = (progress) => {
-      const { controller } = this.props
-      if (controller) {
-        controller.seek(progress).catch(() => {})
-      }
-    }
-
     // 2. Safe overrides for methods that access this.audio in native class
     this.setAudioVolume = (volumeBarValue) => {
       this.setState({
@@ -199,21 +265,6 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       this.setAudioVolume(defaultVolumeValue * 100)
     }
 
-    this.onResetVolume = () => {
-      const restoreValue = this.state.currentAudioVolume || 100
-      const { controller } = this.props
-      if (controller) {
-        controller.setVolume(restoreValue / 100).catch(() => {})
-      }
-    }
-
-    this.onAudioMute = () => {
-      const { controller } = this.props
-      if (controller) {
-        controller.setVolume(0).catch(() => {})
-      }
-    }
-
     this.loadAndPlayAudio = () => {}
     this.playAudio = () => {}
     this.resetAudioStatus = () => {}
@@ -221,51 +272,150 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       this.audioListsPlay = () => {}
     }
     this.stopAll = () => {}
-
-    // Zero facade: remote mode does not return a fake HTMLAudioElement
-    this.getEnhanceAudio = () => null
   }
 
-  onGetAudioInstance() {
-    super.onGetAudioInstance()
-    // In local mode, attach the native player's real media element to the browser adapter
+  syncQueueSortable() {
+    if (this.queueDrag || this.isUnmounted) return
+    const { selector, ...defaults } = sortableConfig
+    const container = this.player.current?.querySelector(`.${selector}`)
+    const options = this.props.sortableOptions
     if (
-      this.props.engineMode === 'local' &&
-      this.props.browserAdapter &&
-      this.audio
+      this.sortable?.el === container &&
+      this.boundSortableOptions === options
     ) {
-      this.props.browserAdapter.attachElement(this.audio)
+      return
     }
+    this.destroyQueueSortable()
+    if (!container) return
+
+    this.boundSortableOptions = options
+    this.sortable = new Sortable(container, {
+      ...defaults,
+      ...options,
+      // The controlled contract is remove-and-insert, not the native Swap plugin.
+      swap: false,
+      onStart: (event) => {
+        this.beginQueueDrag(event)
+        options?.onStart?.(event)
+      },
+      onEnd: (event) => {
+        const result = this.onAudioListsSortEnd(event)
+        options?.onEnd?.(event)
+        return result
+      },
+    })
+  }
+
+  destroyQueueSortable() {
+    this.sortable?.destroy()
+    this.sortable = null
+    this.boundSortableOptions = null
+  }
+
+  beginQueueDrag(event) {
+    this.releaseQueueDrag()
+    if (!this.props.controller) return
+    const container = event.from
+    this.queueDrag = {
+      controller: this.props.controller,
+      epoch: this.state.displayedQueueEpoch,
+      queueVersion: this.state.displayedQueueVersion,
+      ids: this.state.audioLists.map((item) => item.queueItemId),
+      container,
+      nodes: Array.from(container.children),
+    }
+  }
+
+  releaseQueueDrag() {
+    const drag = this.queueDrag
+    this.queueDrag = null
+    if (drag?.container.isConnected) {
+      // Restore React's last committed DOM before allowing keyed reconciliation.
+      drag.nodes.forEach((node) => {
+        if (node.parentNode) drag.container.appendChild(node)
+      })
+    }
+    return drag
+  }
+
+  detachBrowserElement() {
+    const binding = this.browserBinding
+    this.browserBinding = null
+    if (binding && binding.adapter.getAudioElement() === binding.element) {
+      binding.adapter.attachElement(null)
+    }
+  }
+
+  syncBrowserElement() {
+    const adapter =
+      this.props.engineMode !== 'remote' ? this.props.browserAdapter : null
+    const element = adapter ? this.audio : null
+    if (
+      this.browserBinding?.adapter === adapter &&
+      this.browserBinding?.element === element
+    ) {
+      return
+    }
+    this.detachBrowserElement()
+    if (adapter && element) {
+      adapter.attachElement(element)
+      this.browserBinding = { adapter, element }
+    }
+  }
+
+  UNSAFE_componentWillMount() {
+    if (!this.props.controller && this.props.engineMode !== 'remote') {
+      super.UNSAFE_componentWillMount()
+    }
+  }
+
+  UNSAFE_componentWillReceiveProps(nextProps) {
+    if (
+      this.props.controller ||
+      nextProps.controller ||
+      this.props.engineMode === 'remote' ||
+      nextProps.engineMode === 'remote'
+    ) {
+      this.updateTheme(nextProps.theme)
+      this.updateMode(nextProps.mode)
+      return
+    }
+    super.UNSAFE_componentWillReceiveProps(nextProps)
   }
 
   componentDidMount() {
     super.componentDidMount()
-
-    if (
-      this.props.engineMode === 'local' &&
-      this.props.browserAdapter &&
-      this.audio
-    ) {
-      this.props.browserAdapter.attachElement(this.audio)
-    }
 
     if (this.props.engineMode === 'remote') {
       // In remote mode, clear loading state since there is no browser audio waiting to load
       this.setState({ loading: false })
     }
 
+    if (this.props.controller) this.bindKeyDownEvents()
+    this.subscribeToController()
+  }
+
+  subscribeToController() {
+    this.controllerSubscription = null
+    this.unsubscribeController?.()
+    this.unsubscribeController = null
     const { controller } = this.props
-    if (controller && typeof controller.subscribe === 'function') {
-      this.applyAuthoritativeState(controller.getState())
-      this.unsubscribeController = controller.subscribe(
-        (authoritativeState) => {
-          this.applyAuthoritativeState(authoritativeState)
-        },
-      )
-    }
+    if (!controller) return
+
+    const subscription = { controller }
+    this.controllerSubscription = subscription
+    this.unsubscribeController = controller.subscribe((state) => {
+      if (this.controllerSubscription === subscription) {
+        this.applyAuthoritativeState(state)
+      }
+    })
+    this.applyAuthoritativeState(controller.getState())
   }
 
   componentDidUpdate(prevProps) {
+    if (prevProps.controller !== this.props.controller) {
+      this.subscribeToController()
+    }
     if (
       prevProps.engineMode !== this.props.engineMode &&
       this.props.engineMode === 'remote'
@@ -275,13 +425,10 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     }
 
     if (
-      (prevProps.engineMode !== this.props.engineMode ||
-        prevProps.browserAdapter !== this.props.browserAdapter) &&
-      this.props.engineMode === 'local' &&
-      this.props.browserAdapter &&
-      this.audio
+      prevProps.engineMode !== this.props.engineMode ||
+      prevProps.browserAdapter !== this.props.browserAdapter
     ) {
-      this.props.browserAdapter.attachElement(this.audio)
+      this.onGetAudioInstance()
     }
 
     if (
@@ -292,24 +439,36 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       this.setupControllerOverrides()
       this.applyAuthoritativeState(this.props.controller.getState())
     }
+    if (this.props.controller) this.initSortableAudioLists()
   }
 
   componentWillUnmount() {
+    this.isUnmounted = true
+    this.releaseQueueDrag()
+    this.destroyQueueSortable()
+    this.controllerSubscription = null
     if (this.unsubscribeController) {
       this.unsubscribeController()
       this.unsubscribeController = null
     }
+    this.detachBrowserElement()
     super.componentWillUnmount()
   }
 
   applyAuthoritativeState(authoritativeState) {
     const isPlaying = authoritativeState.status === PlaybackStatus.PLAYING
     const isLoading = authoritativeState.status === PlaybackStatus.PREPARING
+    if (authoritativeState.volume > 0) {
+      this.restoreVolume = authoritativeState.volume
+    }
 
     // Use functional setState to ensure consecutive synchronous updates (e.g. preparing -> playing)
     // resolve cleanly against up-to-date state rather than stale closures.
     this.setState((prevState) => {
       const nextState = {}
+      if (prevState.playbackError !== authoritativeState.error) {
+        nextState.playbackError = authoritativeState.error
+      }
       if (prevState.playing !== isPlaying) {
         nextState.playing = isPlaying
       }
@@ -318,9 +477,10 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       }
       if (
         typeof authoritativeState.volume === 'number' &&
-        Math.round(authoritativeState.volume * 100) !== prevState.soundValue
+        audioVolumeToUiVolume(authoritativeState.volume) !==
+          prevState.soundValue
       ) {
-        nextState.soundValue = Math.round(authoritativeState.volume * 100)
+        nextState.soundValue = audioVolumeToUiVolume(authoritativeState.volume)
       }
       if (
         typeof authoritativeState.position === 'number' &&
@@ -335,16 +495,25 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       ) {
         nextState.remoteDuration = authoritativeState.duration
       }
-      if (Array.isArray(authoritativeState.queue)) {
+      if (Array.isArray(authoritativeState.queue) && !this.queueDrag) {
         const mappedLists = authoritativeState.queue.map((item) => ({
           ...item,
           __PLAYER_KEY__: item.queueItemId,
           uuid: item.queueItemId,
         }))
         nextState.audioLists = mappedLists
+        nextState.displayedQueueEpoch = this.props.controller?.getEpoch()
+        nextState.displayedQueueVersion = authoritativeState.queueVersion
       }
       if (authoritativeState.currentQueueItemId !== undefined) {
         nextState.playId = authoritativeState.currentQueueItemId
+        const selected = authoritativeState.queue?.find(
+          (item) => item.queueItemId === authoritativeState.currentQueueItemId,
+        )
+        for (const field of ['name', 'singer', 'cover', 'lyric']) {
+          const value = selected?.[field] || ''
+          if (prevState[field] !== value) nextState[field] = value
+        }
       }
       if (
         authoritativeState.playMode !== undefined &&
@@ -367,16 +536,30 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   render() {
     const portal = super.render()
 
-    if (this.props.engineMode === 'remote' && portal && portal.children) {
+    if (
+      (this.props.controller || this.props.engineMode === 'remote') &&
+      portal?.children
+    ) {
       const rootDiv = portal.children
-      if (rootDiv && rootDiv.props && Array.isArray(rootDiv.props.children)) {
-        // Strip out the <audio> element to enforce zero audio engine creation
-        const filteredChildren = rootDiv.props.children.filter(
-          (child) => child && child.type !== 'audio',
-        )
-        const newRootDiv = React.cloneElement(rootDiv, {}, filteredChildren)
-        return ReactDOM.createPortal(newRootDiv, portal.containerInfo)
-      }
+      const children = React.Children.map(rootDiv.props.children, (child) => {
+        if (child?.type !== 'audio') return child
+        if (this.props.engineMode === 'remote') return null
+        // Preserve the native element/ref; only the Adapter may assign its source.
+        return React.cloneElement(child, { src: undefined })
+      })
+      return ReactDOM.createPortal(
+        React.cloneElement(
+          rootDiv,
+          {},
+          children,
+          this.state.playbackError ? (
+            <div className="music-player-error" role="alert">
+              {this.state.playbackError.message}
+            </div>
+          ) : null,
+        ),
+        portal.containerInfo,
+      )
     }
 
     return portal
