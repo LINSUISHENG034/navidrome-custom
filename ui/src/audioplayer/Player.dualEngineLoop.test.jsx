@@ -628,7 +628,8 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       const controller = createPlaybackControlModule()
       const browserAdapter =
         engineMode === 'local' ? createBrowserAudioAdapter() : undefined
-      controller.setAdapter(browserAdapter || createMockRemoteAudioAdapter())
+      const adapter = browserAdapter || createMockRemoteAudioAdapter()
+      controller.setAdapter(adapter)
       await controller.addQueueItems(tracks)
       const props = {
         controller,
@@ -643,12 +644,195 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       return {
         controller,
         browserAdapter,
+        adapter,
         tracks,
         ...view,
         rerenderPlayer: (overrides) =>
           view.rerender(<UnifiedNativePlayer {...props} {...overrides} />),
       }
     }
+
+    it('TC-QC-09: a failing custom drag-start hook cannot leave structural projection locked', async () => {
+      const { controller } = await renderControlledPlayer('remote', {
+        sortableOptions: {
+          onStart: () => {
+            throw new Error('Drag hook failed')
+          },
+        },
+      })
+      expect(() => startNativeDrag(0, 1)).toThrow('Drag hook failed')
+      const initialIntents = controller.getMetrics().intentsIssued
+      await act(async () => {
+        await controller.addQueueItems([
+          { queueItemId: 'after-hook', name: 'After hook' },
+        ])
+      })
+      expect(getDrawerLabels()).toEqual(['Song 0', 'Song 1', 'After hook'])
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+      expect(controller.getMetrics().commandsSent.moveQueueItem).toBe(0)
+    })
+
+    it('TC-QC-09: nonadjacent dragging uses move semantics and composes native Sortable hooks', async () => {
+      const onStart = vi.fn()
+      const onEnd = vi.fn()
+      const { controller } = await renderControlledPlayer('remote', {
+        audioLists: [
+          ...sampleTracks,
+          { ...sampleTracks[0], id: 's-2', name: 'Song 2' },
+        ],
+        sortableOptions: { onStart, onEnd, swap: true },
+      })
+      const initialIntents = controller.getMetrics().intentsIssued
+      const drag = startNativeDrag(0, 2)
+      expect(drag.sortable.options.swap).toBe(false)
+      await drag.end()
+
+      expect(getDrawerLabels()).toEqual(['Song 1', 'Song 2', 'Song 0'])
+      expect(
+        controller.getState().queue.map((item) => item.queueItemId),
+      ).toEqual(['controlled-1', 'controlled-2', 'controlled-0'])
+      expect(controller.getState().currentQueueItemId).toBe('controlled-0')
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+      expect(onStart).toHaveBeenCalledTimes(1)
+      expect(onEnd).toHaveBeenCalledTimes(1)
+      expect(onStart.mock.contexts[0]).toBe(drag.sortable)
+      expect(onEnd.mock.contexts[0]).toBe(drag.sortable)
+    })
+
+    it('TC-QC-09: unmounting during drag cleans the binding and ignores its late drop', async () => {
+      const { controller, unmount } = await renderControlledPlayer('remote')
+      const drag = startNativeDrag(0, 1)
+      const initialIntents = controller.getMetrics().intentsIssued
+      unmount()
+      await drag.end()
+
+      expect(drag.sortable.destroy).toHaveBeenCalledTimes(1)
+      expect(
+        document.querySelector('.audio-lists-panel-content-wrap'),
+      ).toBeNull()
+      expect(document.querySelector('audio')).toBeNull()
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents)
+    })
+
+    it.each([
+      { reason: 'unchanged position', newIndex: 0 },
+      { reason: 'missing target', newIndex: undefined },
+    ])(
+      'TC-QC-09: a canceled drag ($reason) releases its view without an intent',
+      async ({ newIndex }) => {
+        const { controller } = await renderControlledPlayer('remote')
+        const initialIntents = controller.getMetrics().intentsIssued
+        const canceled = startNativeDrag(0, 1)
+        await canceled.end({ newIndex })
+        expect(getDrawerLabels()).toEqual(['Song 0', 'Song 1'])
+        expect(controller.getMetrics().intentsIssued).toBe(initialIntents)
+
+        const next = startNativeDrag(0, 1)
+        await next.end()
+        expect(getDrawerLabels()).toEqual(['Song 1', 'Song 0'])
+        expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+      },
+    )
+
+    it('TC-QC-09: a rejected move restores DOM and authority before the next gesture', async () => {
+      const { controller, adapter, getByRole } =
+        await renderControlledPlayer('remote')
+      const initialQueue = controller.getState().queue
+      const initialIntents = controller.getMetrics().intentsIssued
+      adapter.setFailure({
+        action: 'moveQueueItem',
+        code: 'MOVE_REJECTED',
+        message: 'Move rejected',
+      })
+      const rejected = startNativeDrag(0, 1)
+      await rejected.end()
+
+      expect(getByRole('alert').textContent).toBe('Move rejected')
+      expect(getDrawerLabels()).toEqual(['Song 0', 'Song 1'])
+      expect(controller.getState().queue).toEqual(initialQueue)
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+
+      adapter.setFailure(null)
+      const accepted = startNativeDrag(0, 1)
+      await accepted.end()
+      expect(getDrawerLabels()).toEqual(['Song 1', 'Song 0'])
+      expect(controller.getState().error).toBeNull()
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 2)
+    })
+
+    it('TC-QC-09: a destroyed Sortable drop cannot finish a newer drag', async () => {
+      const { controller, tracks } = await renderControlledPlayer('remote')
+      const previous = startNativeDrag(0, 1)
+      await act(async () => {
+        controller.setAdapter(createMockRemoteAudioAdapter())
+        await controller.addQueueItems(tracks)
+      })
+      const current = startNativeDrag(0, 1)
+      const initialIntents = controller.getMetrics().intentsIssued
+
+      await previous.end()
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents)
+      expect(getDrawerLabels()).toEqual(['Song 1', 'Song 0'])
+
+      await current.end()
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+      expect(getDrawerLabels()).toEqual(['Song 1', 'Song 0'])
+    })
+
+    it.each(['adapter', 'controller'])(
+      'TC-QC-09: changing the %s during drag immediately projects the new scene',
+      async (change) => {
+        const { controller: original, rerenderPlayer } =
+          await renderControlledPlayer('remote')
+        const drag = startNativeDrag(0, 1)
+        const controller =
+          change === 'controller' ? createPlaybackControlModule() : original
+        await act(async () => {
+          controller.setAdapter(createMockRemoteAudioAdapter())
+          await controller.addQueueItems([
+            { queueItemId: 'new-scene', name: 'New scene' },
+          ])
+        })
+        if (change === 'controller') rerenderPlayer({ controller })
+
+        expect(getDrawerLabels()).toEqual(['New scene'])
+        const initialIntents = controller.getMetrics().intentsIssued
+        await drag.end()
+        expect(getDrawerLabels()).toEqual(['New scene'])
+        expect(controller.getMetrics().intentsIssued).toBe(initialIntents)
+        expect(controller.getMetrics().commandsSent.moveQueueItem).toBe(0)
+      },
+    )
+
+    it('TC-QC-09: losing control during drag cancels the view and ignores its later drop', async () => {
+      const { controller, adapter, getByRole } =
+        await renderControlledPlayer('remote')
+      const drag = startNativeDrag(0, 1)
+      const initialIntents = controller.getMetrics().intentsIssued
+      await act(async () => {
+        adapter.pushServerSnapshot({
+          status: PlaybackStatus.ERROR,
+          error: { code: 'PERMISSION_DENIED', message: 'Control lost' },
+        })
+      })
+
+      expect(getByRole('alert').textContent).toBe('Control lost')
+      expect(getDrawerLabels()).toEqual(['Song 0', 'Song 1'])
+      await drag.end()
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents)
+      expect(controller.getMetrics().commandsSent.moveQueueItem).toBe(0)
+
+      await act(async () => {
+        adapter.pushServerSnapshot({
+          status: PlaybackStatus.PAUSED,
+          error: null,
+        })
+      })
+      const recovered = startNativeDrag(0, 1)
+      await recovered.end()
+      expect(getDrawerLabels()).toEqual(['Song 1', 'Song 0'])
+      expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
+    })
 
     it('TC-QC-09: structural updates during drag keep scalar authority live and cancel the stale move', async () => {
       const { controller, tracks } = await renderControlledPlayer('remote')
@@ -775,7 +959,12 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         expect(ref.current).toBe(player)
         expect(nextBrowser.getAudioElement()).toBe(audio)
         expect(instances.at(-1)).toBe(audio)
-        expect(typeof instances.at(-1).togglePlay).toBe('function')
+        const initialIntents = controller.getMetrics().intentsIssued
+        await act(async () => instances.at(-1).togglePlay())
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+        await act(async () => instances.at(-1).togglePlay())
+        expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+        expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 2)
         previousBrowser = nextBrowser
       }
 
@@ -1816,6 +2005,96 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(remoteAdapter.getQueue()).toEqual(controller.getState().queue)
       expect(controller.getState().currentQueueItemId).toBe('first')
     })
+    it.each(['clear', 'remove last'])(
+      'TC-QC-08: %s ignores released-resource event tails while volume stays live',
+      async (action) => {
+        const controller = createPlaybackControlModule()
+        const browserAdapter = createBrowserAudioAdapter()
+        controller.setAdapter(browserAdapter)
+        try {
+          await controller.addQueueItems([
+            { queueItemId: 'only', musicSrc: '/only.mp3' },
+          ])
+          await controller.play()
+          await controller.seek(27)
+          const audio = browserAdapter.getAudioElement()
+          if (action === 'clear') await controller.clearQueue()
+          else await controller.removeQueueItem('only')
+          const released = controller.getState()
+          expect(released.status).toBe(PlaybackStatus.IDLE)
+          expect(released.currentQueueItemId).toBeNull()
+          expect(released.position).toBe(0)
+          expect(released.error).toBeNull()
+          expect(audio.getAttribute('src')).toBeNull()
+          const intents = controller.getMetrics().intentsIssued
+          const plays = playSpy.mock.calls.length
+          setMediaFlags(audio, {
+            paused: true,
+            ended: true,
+            duration: 99,
+            error: { code: 2, message: 'Released stream failed' },
+          })
+          audio.currentTime = 27
+          await act(async () => {
+            for (const name of [
+              'pause',
+              'timeupdate',
+              'seeked',
+              'loadedmetadata',
+              'durationchange',
+              'error',
+              'ended',
+              'playing',
+            ]) {
+              audio.dispatchEvent(new Event(name))
+            }
+          })
+
+          expect(controller.getState()).toEqual(released)
+          expect(controller.getMetrics().intentsIssued).toBe(intents)
+          expect(playSpy.mock.calls.length).toBe(plays)
+          await act(async () => {
+            audio.volume = 0.4
+            audio.dispatchEvent(new Event('volumechange'))
+          })
+          expect(controller.getState().volume).toBe(0.4)
+          expect(controller.getState().status).toBe(PlaybackStatus.IDLE)
+          expect(controller.getState().currentQueueItemId).toBeNull()
+          expect(controller.getState().position).toBe(0)
+          expect(controller.getState().error).toBeNull()
+          expect(controller.getMetrics().intentsIssued).toBe(intents)
+        } finally {
+          controller.setAdapter(null)
+        }
+      },
+    )
+    it('TC-DE-02: legacy no-queue play and seek reopen media admission after release', async () => {
+      const controller = createPlaybackControlModule()
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      try {
+        await controller.clearQueue()
+        const audio = browserAdapter.getAudioElement()
+        audio.src = '/legacy-media.mp3'
+        const intents = controller.getMetrics().intentsIssued
+        await controller.play()
+        await controller.seek(12)
+
+        expect(controller.getState().queue).toEqual([])
+        expect(controller.getState().currentQueueItemId).toBeNull()
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+        expect(controller.getState().position).toBe(12)
+        expect(controller.getState().error).toBeNull()
+        expect(controller.getMetrics().intentsIssued).toBe(intents + 2)
+        audio.currentTime = 13
+        audio.dispatchEvent(new Event('timeupdate'))
+        expect(controller.getState().position).toBe(13)
+        await controller.pause()
+        expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      } finally {
+        controller.setAdapter(null)
+      }
+    })
   })
 
   describe('Native Queue Editing Contract and Stable Instance Identity (Issue 03)', () => {
@@ -2174,7 +2453,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
      * Input Intent: Dispatch list operations
      * Expected State: Single intent issued per operation, correct insertion positions
      */
-    it('TC-QC-10: host list actions dispatch unified queue intents with single-intent guarantee', async () => {
+    it('TC-QC-10: Module list intents preserve single-intent and compound-command semantics', async () => {
       const controller = createPlaybackControlModule()
       const remoteAdapter = createMockRemoteAudioAdapter()
       controller.setAdapter(remoteAdapter)

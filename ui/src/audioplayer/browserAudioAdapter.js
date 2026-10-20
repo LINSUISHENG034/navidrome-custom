@@ -31,6 +31,7 @@ export function createBrowserAudioAdapter(options = {}) {
   let queue = []
   let currentQueueItemId = null
   let loadedQueueItemId = null
+  let resourceReleased = false
   let queueVersion = 0
   let stateSequence = 0
   let playMode = normalizePlaybackMode(
@@ -134,6 +135,7 @@ export function createBrowserAudioAdapter(options = {}) {
   ) {
     if (!isActive || epoch !== activeEpoch) return
     const el = requireAudioElement()
+    resourceReleased = false
     invalidateAttempt()
     currentQueueItemId = targetQueueItemId
     desiredPlaying = play
@@ -223,6 +225,7 @@ export function createBrowserAudioAdapter(options = {}) {
 
   function handleMediaEvent(eventName, el, epoch) {
     if (!isActive || el !== audioElement || epoch !== activeEpoch) return
+    if (resourceReleased && eventName !== 'volumechange') return
     if (
       eventName !== 'volumechange' &&
       currentQueueItemId !== null &&
@@ -517,6 +520,7 @@ export function createBrowserAudioAdapter(options = {}) {
     currentQueueItemId = result.currentQueueItemId
     queueVersion += 1
     if (result.status === PlaybackStatus.IDLE) {
+      resourceReleased = true
       desiredPlaying = false
       invalidateAttempt()
       if (audioElement) {
@@ -554,6 +558,7 @@ export function createBrowserAudioAdapter(options = {}) {
   async function clearQueue(epoch) {
     if (!isActive || epoch !== activeEpoch) return
     const result = applyQueueClear()
+    resourceReleased = true
     desiredPlaying = false
     invalidateAttempt()
     queue = result.queue

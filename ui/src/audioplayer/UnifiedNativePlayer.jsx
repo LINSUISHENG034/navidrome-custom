@@ -216,9 +216,7 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       } catch {
         // The Module owns the error; the view always returns to current authority.
       } finally {
-        if (!this.isUnmounted && this.props.controller) {
-          this.applyAuthoritativeState(this.props.controller.getState())
-        }
+        this.refreshAuthoritativeState()
       }
     }
 
@@ -289,27 +287,51 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     if (!container) return
 
     this.boundSortableOptions = options
-    this.sortable = new Sortable(container, {
+    const binding = {}
+    this.sortableBinding = binding
+    binding.instance = new Sortable(container, {
       ...defaults,
       ...options,
       // The controlled contract is remove-and-insert, not the native Swap plugin.
       swap: false,
       onStart: (event) => {
+        if (this.sortableBinding !== binding) return
         this.beginQueueDrag(event)
-        options?.onStart?.(event)
+        try {
+          options?.onStart?.call(binding.instance, event)
+        } catch (error) {
+          this.cancelQueueDrag()
+          this.refreshAuthoritativeState()
+          throw error
+        }
       },
       onEnd: (event) => {
+        if (this.sortableBinding !== binding) return
         const result = this.onAudioListsSortEnd(event)
-        options?.onEnd?.(event)
+        options?.onEnd?.call(binding.instance, event)
         return result
       },
     })
+    this.sortable = binding.instance
   }
 
   destroyQueueSortable() {
-    this.sortable?.destroy()
+    const sortable = this.sortable
+    this.sortableBinding = null
     this.sortable = null
     this.boundSortableOptions = null
+    sortable?.destroy()
+  }
+
+  cancelQueueDrag() {
+    this.releaseQueueDrag()
+    this.destroyQueueSortable()
+  }
+
+  refreshAuthoritativeState() {
+    if (!this.isUnmounted && this.props.controller) {
+      this.applyAuthoritativeState(this.props.controller.getState())
+    }
   }
 
   beginQueueDrag(event) {
@@ -444,8 +466,7 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
 
   componentWillUnmount() {
     this.isUnmounted = true
-    this.releaseQueueDrag()
-    this.destroyQueueSortable()
+    this.cancelQueueDrag()
     this.controllerSubscription = null
     if (this.unsubscribeController) {
       this.unsubscribeController()
@@ -456,6 +477,16 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
   }
 
   applyAuthoritativeState(authoritativeState) {
+    const controller = this.props.controller
+    const epoch = controller?.getEpoch()
+    if (
+      this.queueDrag &&
+      (authoritativeState.error ||
+        this.queueDrag.controller !== controller ||
+        this.queueDrag.epoch !== epoch)
+    ) {
+      this.cancelQueueDrag()
+    }
     const isPlaying = authoritativeState.status === PlaybackStatus.PLAYING
     const isLoading = authoritativeState.status === PlaybackStatus.PREPARING
     if (authoritativeState.volume > 0) {
@@ -465,6 +496,12 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     // Use functional setState to ensure consecutive synchronous updates (e.g. preparing -> playing)
     // resolve cleanly against up-to-date state rather than stale closures.
     this.setState((prevState) => {
+      if (
+        controller !== this.props.controller ||
+        epoch !== controller?.getEpoch()
+      ) {
+        return null
+      }
       const nextState = {}
       if (prevState.playbackError !== authoritativeState.error) {
         nextState.playbackError = authoritativeState.error
@@ -502,7 +539,7 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
           uuid: item.queueItemId,
         }))
         nextState.audioLists = mappedLists
-        nextState.displayedQueueEpoch = this.props.controller?.getEpoch()
+        nextState.displayedQueueEpoch = epoch
         nextState.displayedQueueVersion = authoritativeState.queueVersion
       }
       if (authoritativeState.currentQueueItemId !== undefined) {
