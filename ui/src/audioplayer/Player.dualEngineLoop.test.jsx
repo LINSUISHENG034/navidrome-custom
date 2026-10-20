@@ -1566,6 +1566,24 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         vi.useRealTimers()
       }
     })
+    it('TC-DE-08: a legacy non-Promise play() on an already-playing element confirms without waiting for a playing event', async () => {
+      // Legacy engines return undefined from play(); when the element already
+      // reports playing, no fresh 'playing' event fires to confirm the attempt.
+      playSpy.mockImplementation(function () {
+        setMediaFlags(this, { paused: false, ended: false })
+        return undefined
+      })
+      const controller = createPlaybackControlModule({ commandTimeoutMs: 300 })
+      const browserAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(browserAdapter)
+      await controller.addQueueItems([
+        { queueItemId: 'legacy', musicSrc: '/legacy.mp3' },
+      ])
+
+      await controller.play()
+
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+    })
     it('TC-DE-05: real native mounting and repeated attachment advance once and detach without an orphan engine', async () => {
       const tracks = [
         { ...sampleTracks[0], queueItemId: 'first' },

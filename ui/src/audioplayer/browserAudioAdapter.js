@@ -183,7 +183,10 @@ export function createBrowserAudioAdapter(options = {}) {
         const result = el.play()
         if (result && typeof result.then === 'function') {
           await result
-        } else if (!attempt.playingObserved) {
+        } else if (!attempt.playingObserved && (el.paused || el.ended)) {
+          // Legacy engines return no Promise; only wait for a 'playing'
+          // event when the element does not already report playback,
+          // otherwise an already-playing element would hang the attempt.
           await new Promise((resolve, reject) => {
             attempt.resolvePlaying = resolve
             attempt.rejectPlaying = reject
