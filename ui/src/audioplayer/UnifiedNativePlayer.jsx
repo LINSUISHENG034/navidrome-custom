@@ -320,7 +320,13 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     this.sortableBinding = null
     this.sortable = null
     this.boundSortableOptions = null
-    sortable?.destroy()
+    if (!sortable) return
+    sortable.destroy()
+    // Sortable's destroy() sets its own `el` to null before the internal drop
+    // teardown finishes; a late document-level drop/dragend that still targets
+    // the instance would read a null el. Neutralize the stale instance's own
+    // handleEvent so control-loss unmounts stay error-free.
+    sortable.handleEvent = () => {}
   }
 
   cancelQueueDrag() {
