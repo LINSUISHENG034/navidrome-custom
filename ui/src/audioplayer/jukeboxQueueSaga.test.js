@@ -1,5 +1,11 @@
-import { describe, expect, it, vi } from 'vitest'
-import {
+import React from 'react'
+import { Provider } from 'react-redux'
+import { ThemeProvider, createTheme } from '@material-ui/core/styles'
+import { applyMiddleware, combineReducers, createStore } from 'redux'
+import createSagaMiddleware from 'redux-saga'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import jukeboxQueueSaga, {
   handlePlayTracks,
   handlePlayNext,
   handleAddTracks,
@@ -8,11 +14,380 @@ import {
   extractTrackIds,
 } from './jukeboxQueueSaga'
 import jukeboxClient from './jukeboxClient'
+import { BatchPlayButton } from '../common/BatchPlayButton'
+import {
+  addTracks,
+  clearQueue,
+  currentPlaying,
+  playNext,
+  playTracks,
+  setTrack,
+  setJukeboxMode,
+  syncQueue,
+} from '../actions'
+import { playerReducer } from '../reducers/playerReducer'
+import {
+  createPlaybackControlModule,
+  PlaybackStatus,
+} from './playbackControlModule'
+import { createMockRemoteAudioAdapter } from './mockRemoteAudioAdapter'
+import { createBrowserAudioAdapter } from './browserAudioAdapter'
+
+const listApi = vi.hoisted(() => ({
+  getMany: vi.fn(),
+  unselectAll: vi.fn(),
+  notify: vi.fn(),
+}))
+
+vi.mock('react-admin', async (importOriginal) => ({
+  ...(await importOriginal()),
+  useDataProvider: () => ({ getMany: listApi.getMany }),
+  useTranslate: () => (key) => key,
+  useUnselectAll: () => listApi.unselectAll,
+  useNotify: () => listApi.notify,
+}))
 
 vi.mock('./jukeboxSession', () => ({
   getJukeboxSessionId: () => 'jukebox-session:admin',
   getOrCreateJukeboxClientId: () => 'tab-a',
 }))
+
+describe('opt-in unified host list entry', () => {
+  const song = { id: 'song-a', title: 'Song A', artist: 'Artist' }
+  const hosts = []
+
+  beforeEach(() => {
+    listApi.getMany.mockReset()
+    listApi.unselectAll.mockClear()
+    listApi.notify.mockClear()
+  })
+
+  afterEach(() => {
+    hosts.splice(0).forEach(({ task, controller }) => {
+      task.cancel()
+      controller.setAdapter(null)
+    })
+    vi.restoreAllMocks()
+  })
+
+  function createCandidateHost({
+    adapterOptions = {},
+    withController = true,
+    engineMode = 'remote',
+  } = {}) {
+    const controller = createPlaybackControlModule()
+    let adapter
+    if (engineMode === 'local') {
+      const audioElement = document.createElement('audio')
+      let paused = true
+      Object.defineProperty(audioElement, 'paused', { get: () => paused })
+      vi.spyOn(audioElement, 'play').mockImplementation(() => {
+        paused = false
+        audioElement.dispatchEvent(new Event('playing'))
+        return Promise.resolve()
+      })
+      vi.spyOn(audioElement, 'pause').mockImplementation(() => {
+        if (!paused) {
+          paused = true
+          audioElement.dispatchEvent(new Event('pause'))
+        }
+      })
+      vi.spyOn(audioElement, 'load').mockImplementation(() => {})
+      adapter = createBrowserAudioAdapter({ ...adapterOptions, audioElement })
+    } else {
+      adapter = createMockRemoteAudioAdapter(adapterOptions)
+    }
+    controller.setAdapter(adapter)
+    const sagaMiddleware = createSagaMiddleware({
+      context: withController ? { playbackController: controller } : {},
+    })
+    const store = createStore(
+      combineReducers({ player: playerReducer }),
+      applyMiddleware(sagaMiddleware),
+    )
+    hosts.push({ controller, task: sagaMiddleware.run(jukeboxQueueSaga) })
+    return { controller, adapter, store, sagaMiddleware }
+  }
+
+  function renderListAction(host, action, selectedIds = [song.id]) {
+    return render(
+      React.createElement(
+        Provider,
+        { store: host.store },
+        React.createElement(
+          ThemeProvider,
+          { theme: createTheme() },
+          React.createElement(BatchPlayButton, {
+            resource: 'song',
+            selectedIds,
+            action,
+            label: 'Queue selected songs',
+            icon: React.createElement('span'),
+          }),
+        ),
+      ),
+    )
+  }
+
+  it.each(['local', 'remote'])(
+    'TC-QC-10: actual list Add uses the normalized occurrence once with the %s adapter',
+    async (engineMode) => {
+      listApi.getMany.mockResolvedValue({ data: [song] })
+      const legacyAdd = vi.spyOn(jukeboxClient, 'add').mockResolvedValue({})
+      const host = createCandidateHost({ engineMode })
+      renderListAction(host, addTracks)
+
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Queue selected songs' }),
+      )
+
+      await waitFor(() =>
+        expect(host.controller.getState().queue).toHaveLength(1),
+      )
+      const queued = host.controller.getState().queue[0]
+      expect(queued.trackId).toBe('song-a')
+      expect(queued.queueItemId).toBe(
+        host.store.getState().player.queue[0].uuid,
+      )
+      expect(host.controller.getMetrics().intentsIssued).toBe(1)
+      expect(host.store.getState().player.jukeboxMode).toBe(false)
+      expect(legacyAdd).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['local', 'remote'])(
+    'TC-QC-10: actual list Play Next inserts its own occurrence with the %s adapter',
+    async (engineMode) => {
+      const second = { id: 'song-b', title: 'Song B' }
+      const next = { id: 'song-next', title: 'Play next song' }
+      listApi.getMany
+        .mockResolvedValueOnce({ data: [song, second] })
+        .mockResolvedValueOnce({ data: [next] })
+      const host = createCandidateHost({ engineMode })
+      const firstAction = renderListAction(host, addTracks, [
+        song.id,
+        second.id,
+      ])
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Queue selected songs' }),
+      )
+      await waitFor(() =>
+        expect(host.controller.getState().queue).toHaveLength(2),
+      )
+      host.store.dispatch(currentPlaying(host.store.getState().player.queue[0]))
+      firstAction.unmount()
+      renderListAction(host, playNext, [next.id])
+
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Queue selected songs' }),
+      )
+
+      await waitFor(() =>
+        expect(host.controller.getState().queue).toHaveLength(3),
+      )
+      expect(
+        host.controller.getState().queue.map((item) => item.trackId),
+      ).toEqual(['song-a', 'song-next', 'song-b'])
+      expect(host.controller.getState().queue[1].queueItemId).toBe(
+        host.store.getState().player.queue[1].uuid,
+      )
+      expect(host.controller.getMetrics().intentsIssued).toBe(2)
+    },
+  )
+
+  it.each(['local', 'remote'])(
+    'TC-QC-10: actual list Play All starts distinct same-song occurrences with the %s adapter',
+    async (engineMode) => {
+      const first = {
+        id: 'entry-1',
+        mediaFileId: 'same-song',
+        title: 'Same song',
+      }
+      const second = { ...first, id: 'entry-2' }
+      listApi.getMany.mockResolvedValue({ data: [second, first] })
+      const host = createCandidateHost({ engineMode })
+      renderListAction(host, playTracks, [first.id, second.id])
+
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Queue selected songs' }),
+      )
+
+      await waitFor(() =>
+        expect(host.controller.getState().status).toBe(PlaybackStatus.PLAYING),
+      )
+      const queue = host.controller.getState().queue
+      expect(queue.map((item) => item.trackId)).toEqual([
+        'same-song',
+        'same-song',
+      ])
+      expect(queue.map((item) => item.song.id)).toEqual(['entry-1', 'entry-2'])
+      expect(queue.map((item) => item.queueItemId)).toEqual(
+        host.store.getState().player.queue.map((item) => item.uuid),
+      )
+      expect(new Set(queue.map((item) => item.queueItemId)).size).toBe(2)
+      expect(host.controller.getState().currentQueueItemId).toBe(
+        queue[0].queueItemId,
+      )
+      expect(host.controller.getMetrics().intentsIssued).toBe(1)
+    },
+  )
+
+  it.each(['local', 'remote'])(
+    'TC-QC-10: candidate single-track selection starts once with the %s adapter',
+    async (engineMode) => {
+      const host = createCandidateHost({ engineMode })
+
+      host.store.dispatch(setTrack(song))
+
+      await waitFor(() =>
+        expect(host.controller.getState().status).toBe(PlaybackStatus.PLAYING),
+      )
+      expect(
+        host.controller.getState().queue.map((item) => item.trackId),
+      ).toEqual(['song-a'])
+      expect(host.controller.getState().currentQueueItemId).toBe(
+        host.store.getState().player.queue[0].uuid,
+      )
+      expect(host.controller.getMetrics().intentsIssued).toBe(1)
+    },
+  )
+
+  it.each(['local', 'remote'])(
+    'TC-QC-10: candidate Clear stops the %s adapter without a legacy engine command',
+    async (engineMode) => {
+      listApi.getMany.mockResolvedValue({ data: [song] })
+      const legacyStop = vi.spyOn(jukeboxClient, 'stop').mockResolvedValue({})
+      const legacySet = vi.spyOn(jukeboxClient, 'set').mockResolvedValue({})
+      const host = createCandidateHost({ engineMode })
+      renderListAction(host, playTracks)
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Queue selected songs' }),
+      )
+      await waitFor(() =>
+        expect(host.controller.getState().status).toBe(PlaybackStatus.PLAYING),
+      )
+
+      host.store.dispatch(clearQueue())
+
+      await waitFor(() => expect(host.controller.getState().queue).toEqual([]))
+      expect(host.controller.getState().currentQueueItemId).toBeNull()
+      expect(host.controller.getState().status).toBe(PlaybackStatus.IDLE)
+      expect(host.controller.getState().position).toBe(0)
+      expect(host.controller.getMetrics().intentsIssued).toBe(2)
+      expect(legacyStop).not.toHaveBeenCalled()
+      expect(legacySet).not.toHaveBeenCalled()
+    },
+  )
+
+  it('TC-QC-10: rapid list Adds retain distinct normalized instances while the first engine command is pending', async () => {
+    listApi.getMany.mockResolvedValue({ data: [song] })
+    const host = createCandidateHost({ adapterOptions: { delayMs: 40 } })
+    renderListAction(host, addTracks)
+    const button = screen.getByRole('button', { name: 'Queue selected songs' })
+
+    fireEvent.click(button)
+    fireEvent.click(button)
+
+    await waitFor(() =>
+      expect(host.controller.getState().queue).toHaveLength(2),
+    )
+    const queue = host.controller.getState().queue
+    expect(queue.map((item) => item.trackId)).toEqual(['song-a', 'song-a'])
+    expect(queue.map((item) => item.queueItemId)).toEqual(
+      host.store.getState().player.queue.map((item) => item.uuid),
+    )
+    expect(new Set(queue.map((item) => item.queueItemId)).size).toBe(2)
+    expect(host.controller.getMetrics().intentsIssued).toBe(2)
+  })
+
+  it('TC-QC-10: rejected list Add is visible without legacy fallback or replay of its optimistic row', async () => {
+    const nextSong = { id: 'song-b', title: 'Song B' }
+    listApi.getMany
+      .mockResolvedValueOnce({ data: [song] })
+      .mockResolvedValueOnce({ data: [nextSong] })
+    const legacyAdd = vi.spyOn(jukeboxClient, 'add').mockResolvedValue({})
+    const host = createCandidateHost({
+      adapterOptions: {
+        failure: { action: 'addQueueItems', code: 'PERMISSION_DENIED' },
+      },
+    })
+    host.store.dispatch(setJukeboxMode(true))
+    const rejectedAction = renderListAction(host, addTracks)
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Queue selected songs' }),
+    )
+
+    await waitFor(() =>
+      expect(host.controller.getState().error?.code).toBe('PERMISSION_DENIED'),
+    )
+    expect(host.controller.getState().status).toBe(PlaybackStatus.ERROR)
+    expect(host.controller.getState().queue).toEqual([])
+    expect(legacyAdd).not.toHaveBeenCalled()
+    rejectedAction.unmount()
+    host.adapter.setFailure(null)
+    renderListAction(host, addTracks, [nextSong.id])
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Queue selected songs' }),
+    )
+
+    await waitFor(() =>
+      expect(host.controller.getState().queue).toHaveLength(1),
+    )
+    expect(host.controller.getState().queue[0].trackId).toBe('song-b')
+    expect(host.controller.getState().queue[0].queueItemId).toBe(
+      host.store.getState().player.queue[1].uuid,
+    )
+    expect(host.controller.getMetrics().intentsIssued).toBe(2)
+    expect(legacyAdd).not.toHaveBeenCalled()
+  })
+
+  it('TC-QC-10: missing candidate context preserves the existing host jukebox entry', async () => {
+    listApi.getMany.mockResolvedValue({ data: [song] })
+    const legacyAdd = vi.spyOn(jukeboxClient, 'add').mockResolvedValue({})
+    const host = createCandidateHost({ withController: false })
+    host.store.dispatch(setJukeboxMode(true))
+    renderListAction(host, addTracks)
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Queue selected songs' }),
+    )
+
+    await waitFor(() => expect(legacyAdd).toHaveBeenCalledTimes(1))
+    expect(legacyAdd).toHaveBeenCalledWith(['song-a'], -1, {
+      sessionId: 'jukebox-session:admin',
+      clientId: 'tab-a',
+    })
+    expect(host.controller.getMetrics().intentsIssued).toBe(0)
+    expect(host.controller.getState().queue).toEqual([])
+  })
+
+  it('TC-QC-11: restored normalized queue IDs and current-item projections do not replay list intents', async () => {
+    listApi.getMany.mockResolvedValue({ data: [song] })
+    const host = createCandidateHost()
+    renderListAction(host, addTracks)
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Queue selected songs' }),
+    )
+    await waitFor(() =>
+      expect(host.controller.getState().queue).toHaveLength(1),
+    )
+    const restored = JSON.parse(
+      JSON.stringify(host.store.getState().player.queue),
+    )
+    const before = host.controller.getMetrics()
+
+    host.store.dispatch(syncQueue(restored[0], restored))
+    host.store.dispatch(currentPlaying(restored[0]))
+
+    expect(host.store.getState().player.queue[0].uuid).toBe(restored[0].uuid)
+    expect(host.controller.getState().queue[0].queueItemId).toBe(
+      restored[0].uuid,
+    )
+    expect(host.controller.getMetrics()).toEqual(before)
+  })
+})
 
 describe('extractTrackIds', () => {
   it('extracts track IDs from single song object', () => {
