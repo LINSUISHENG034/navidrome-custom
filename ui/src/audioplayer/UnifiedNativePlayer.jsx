@@ -380,6 +380,42 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     binding?.release()
   }
 
+  updateLyricPosition(timeMs) {
+    if (!this.lyric) return
+    if (typeof this.lyric.update === 'function') {
+      this.lyric.update(timeMs)
+      return
+    }
+    const lines = this.lyric.lines || []
+    if (!lines.length) return
+    let lo = 0
+    let hi = lines.length - 1
+    let active = -1
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2)
+      if (lines[mid].time <= timeMs) {
+        active = mid
+        lo = mid + 1
+      } else {
+        hi = mid - 1
+      }
+    }
+    if (active === this.lyric._lastActive) return
+    this.lyric._lastActive = active
+    const handler =
+      typeof this.lyric.handler === 'function'
+        ? this.lyric.handler
+        : this.onLyricChange
+    if (active < 0) {
+      handler?.call(this.lyric, { txt: '', lineNum: -1 })
+    } else {
+      handler?.call(this.lyric, {
+        txt: lines[active].txt ?? lines[active].text ?? '',
+        lineNum: active,
+      })
+    }
+  }
+
   // Derived display projections that follow the authoritative scene:
   // lyric line highlighting and media session metadata/position. Neither
   // issues intents; lyric sync runs even below the seekbar's 0.5s dead-band.
@@ -394,10 +430,10 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
           ? update.position
           : this.props.controller.getState().position
       if (typeof position === 'number') {
-        this.lyric?.update(position * 1000)
+        this.updateLyricPosition(position * 1000)
       }
     } else if (typeof update.position === 'number') {
-      this.lyric?.update(update.position * 1000)
+      this.updateLyricPosition(update.position * 1000)
     }
     if (
       this.props.showMediaSession &&
