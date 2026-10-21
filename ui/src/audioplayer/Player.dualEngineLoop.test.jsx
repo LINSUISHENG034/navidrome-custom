@@ -4151,7 +4151,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(observerController.getState().status).toBe(PlaybackStatus.PLAYING)
     })
 
-    it('TC-MIG-02: empty queue paused migration sets PAUSED status (not stuck in PREPARING)', async () => {
+    it('TC-MIG-12: empty queue paused migration sets PAUSED status (not stuck in PREPARING)', async () => {
       const controller = createPlaybackControlModule()
       const localAdapter = createBrowserAudioAdapter()
       controller.setAdapter(localAdapter)
