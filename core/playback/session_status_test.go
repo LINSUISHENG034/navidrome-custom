@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,6 +122,7 @@ type capturedBrokerMessage struct {
 }
 
 type fakeEventBroker struct {
+	mu         sync.Mutex
 	sent       []capturedBrokerMessage
 	broadcasts []capturedBrokerMessage
 }
@@ -128,10 +130,14 @@ type fakeEventBroker struct {
 func (f *fakeEventBroker) ServeHTTP(http.ResponseWriter, *http.Request) {}
 
 func (f *fakeEventBroker) SendMessage(ctx context.Context, event serverevents.Event) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.sent = append(f.sent, capturedBrokerMessage{ctx: ctx, event: event})
 }
 
 func (f *fakeEventBroker) SendBroadcastMessage(ctx context.Context, event serverevents.Event) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.broadcasts = append(f.broadcasts, capturedBrokerMessage{ctx: ctx, event: event})
 }
 
