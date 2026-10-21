@@ -46,6 +46,10 @@ export function createMockRemoteAudioAdapter(options = {}) {
   let failureConfig = options.failure || null
   let delayMs = options.delayMs || 0
 
+  let hasActiveSession = Boolean(options.hasActiveSession)
+  let activeSessionOwner =
+    options.activeSessionOwner || (hasActiveSession ? 'other-client' : null)
+
   function publishState(patch = {}, sequence = stateSequence + 1) {
     remoteState = { ...remoteState, ...patch }
     stateSequence = sequence
@@ -92,12 +96,21 @@ export function createMockRemoteAudioAdapter(options = {}) {
     if (isActive && command.epoch === activeEpoch) wireCommands.push(command)
   }
 
-  async function simulateAction(epoch, actionName, statePatch) {
+  async function simulateAction(
+    epoch,
+    actionName,
+    statePatch,
+    commandExtra = {},
+    wireAction = actionName,
+  ) {
     if (!isActive || epoch !== activeEpoch) return
+    recordCommand({ action: wireAction, epoch, ...commandExtra })
     const callback = stateCallback
     const failure =
       failureConfig &&
-      (failureConfig.action === actionName || failureConfig.action === '*')
+      (failureConfig.action === actionName ||
+        failureConfig.action === wireAction ||
+        failureConfig.action === '*')
         ? { ...failureConfig }
         : null
     const assertCurrent = () => {
@@ -148,32 +161,46 @@ export function createMockRemoteAudioAdapter(options = {}) {
         status: PlaybackStatus.PAUSED,
         position: remoteState.position,
       })),
+    stop: (epoch) =>
+      simulateAction(epoch, 'stop', () => ({
+        status: PlaybackStatus.PAUSED,
+        position: remoteState.position,
+      })),
     seek: (epoch, positionSeconds) =>
-      simulateAction(epoch, 'seek', () => ({
-        position: Math.max(0, Math.min(positionSeconds, remoteState.duration)),
-      })),
+      simulateAction(
+        epoch,
+        'seek',
+        () => ({
+          position: Math.max(
+            0,
+            Math.min(positionSeconds, remoteState.duration),
+          ),
+        }),
+        { position: positionSeconds },
+      ),
     setVolume: (epoch, volumeFraction) =>
-      simulateAction(epoch, 'volume', () => ({
-        volume: Math.max(0, Math.min(1, volumeFraction)),
-      })),
+      simulateAction(
+        epoch,
+        'volume',
+        () => ({
+          volume: Math.max(0, Math.min(1, volumeFraction)),
+        }),
+        { volume: volumeFraction },
+      ),
     setPlayMode: (epoch, mode) => {
       const normalized = normalizePlaybackMode(mode)
-      recordCommand({
-        action: 'setPlayMode',
+      return simulateAction(
         epoch,
-        mode: normalized,
-      })
-      return simulateAction(epoch, 'setPlayMode', () => {
-        playMode = normalized
-        return { playMode }
-      })
+        'setPlayMode',
+        () => {
+          playMode = normalized
+          return { playMode }
+        },
+        { mode: normalized },
+      )
     },
-    skipNext: (epoch) => {
-      recordCommand({
-        action: 'skipNext',
-        epoch,
-      })
-      return simulateAction(epoch, 'skipNext', () => {
+    skipNext: (epoch) =>
+      simulateAction(epoch, 'skipNext', () => {
         const res = getNextTrack({
           queue: remoteQueue,
           currentQueueItemId,
@@ -188,14 +215,9 @@ export function createMockRemoteAudioAdapter(options = {}) {
           position: 0,
           status: PlaybackStatus.PLAYING,
         }
-      })
-    },
-    skipPrev: (epoch) => {
-      recordCommand({
-        action: 'skipPrev',
-        epoch,
-      })
-      return simulateAction(epoch, 'skipPrev', () => {
+      }),
+    skipPrev: (epoch) =>
+      simulateAction(epoch, 'skipPrev', () => {
         // Authoritative server state holds remote playback position
         const curPos = remoteState.position
         const res = getPrevTrack({
@@ -215,128 +237,128 @@ export function createMockRemoteAudioAdapter(options = {}) {
           position: 0,
           status: PlaybackStatus.PLAYING,
         }
-      })
-    },
-    addQueueItems: (epoch, items = [], index = -1) => {
-      recordCommand({
-        action: 'add',
+      }),
+    addQueueItems: (epoch, items = [], index = -1) =>
+      simulateAction(
         epoch,
-        items: items.map((i) => ({
-          queueItemId: i.queueItemId || i.uuid,
-          trackId: i.trackId,
-        })),
-        index,
-      })
-
-      return simulateAction(epoch, 'addQueueItems', () => {
-        const res = applyQueueAdd(remoteQueue, currentQueueItemId, items, index)
-        remoteQueue = res.queue
-        currentQueueItemId = res.currentQueueItemId
-        queueVersion += 1
-        return {
-          queue: [...remoteQueue],
-          currentQueueItemId,
-          queueVersion,
-        }
-      })
-    },
-    removeQueueItem: (epoch, queueItemId) => {
-      recordCommand({
-        action: 'remove',
+        'addQueueItems',
+        () => {
+          const res = applyQueueAdd(
+            remoteQueue,
+            currentQueueItemId,
+            items,
+            index,
+          )
+          remoteQueue = res.queue
+          currentQueueItemId = res.currentQueueItemId
+          queueVersion += 1
+          return {
+            queue: [...remoteQueue],
+            currentQueueItemId,
+            queueVersion,
+          }
+        },
+        {
+          items: items.map((i) => ({
+            queueItemId: i.queueItemId || i.uuid,
+            trackId: i.trackId,
+          })),
+          index,
+        },
+        'add',
+      ),
+    removeQueueItem: (epoch, queueItemId) =>
+      simulateAction(
         epoch,
-        queueItemId,
-      })
+        'removeQueueItem',
+        () => {
+          const isPlaying = remoteState.status === PlaybackStatus.PLAYING
+          const res = applyQueueRemove(
+            remoteQueue,
+            currentQueueItemId,
+            queueItemId,
+            isPlaying,
+          )
+          if (!res.removed) return {}
 
-      return simulateAction(epoch, 'removeQueueItem', () => {
-        const isPlaying = remoteState.status === PlaybackStatus.PLAYING
-        const res = applyQueueRemove(
-          remoteQueue,
-          currentQueueItemId,
-          queueItemId,
-          isPlaying,
-        )
-        if (!res.removed) return {}
+          remoteQueue = res.queue
+          currentQueueItemId = res.currentQueueItemId
+          queueVersion += 1
 
-        remoteQueue = res.queue
-        currentQueueItemId = res.currentQueueItemId
-        queueVersion += 1
-
-        return {
-          queue: [...remoteQueue],
-          currentQueueItemId: res.currentQueueItemId,
-          queueVersion,
-          ...(res.status ? { status: res.status, position: 0 } : {}),
-        }
-      })
-    },
+          return {
+            queue: [...remoteQueue],
+            currentQueueItemId: res.currentQueueItemId,
+            queueVersion,
+            ...(res.status ? { status: res.status, position: 0 } : {}),
+          }
+        },
+        { queueItemId },
+        'remove',
+      ),
     moveQueueItem: (
       epoch,
       queueItemId,
       toIndex,
       expectedQueueVersion = queueVersion,
-    ) => {
-      recordCommand({
-        action: 'move',
+    ) =>
+      simulateAction(
         epoch,
-        queueItemId,
-        toIndex,
-        expectedQueueVersion,
-      })
+        'moveQueueItem',
+        () => {
+          const res = applyQueueMove(remoteQueue, queueItemId, toIndex, {
+            expectedQueueVersion,
+            queueVersion,
+          })
+          if (!res.moved) return {}
 
-      return simulateAction(epoch, 'moveQueueItem', () => {
-        const res = applyQueueMove(remoteQueue, queueItemId, toIndex, {
-          expectedQueueVersion,
-          queueVersion,
-        })
-        if (!res.moved) return {}
+          remoteQueue = res.queue
+          queueVersion += 1
 
-        remoteQueue = res.queue
-        queueVersion += 1
-
-        return {
-          queue: [...remoteQueue],
-          currentQueueItemId,
-          queueVersion,
-        }
-      })
-    },
-    clearQueue: (epoch) => {
-      recordCommand({
-        action: 'clear',
+          return {
+            queue: [...remoteQueue],
+            currentQueueItemId,
+            queueVersion,
+          }
+        },
+        { queueItemId, toIndex, expectedQueueVersion },
+        'move',
+      ),
+    clearQueue: (epoch) =>
+      simulateAction(
         epoch,
-      })
-
-      return simulateAction(epoch, 'clearQueue', () => {
-        const res = applyQueueClear()
-        remoteQueue = res.queue
-        currentQueueItemId = res.currentQueueItemId
-        queueVersion += 1
-        return {
-          queue: [],
-          currentQueueItemId: null,
-          queueVersion,
-          status: PlaybackStatus.IDLE,
-          position: 0,
-        }
-      })
-    },
-    skipToQueueItem: (epoch, queueItemId) => {
-      recordCommand({
-        action: 'skip',
+        'clearQueue',
+        () => {
+          const res = applyQueueClear()
+          remoteQueue = res.queue
+          currentQueueItemId = res.currentQueueItemId
+          queueVersion += 1
+          return {
+            queue: [],
+            currentQueueItemId: null,
+            queueVersion,
+            status: PlaybackStatus.IDLE,
+            position: 0,
+          }
+        },
+        {},
+        'clear',
+      ),
+    skipToQueueItem: (epoch, queueItemId) =>
+      simulateAction(
         epoch,
-        queueItemId,
-      })
-
-      return simulateAction(epoch, 'skipToQueueItem', () => {
-        if (!remoteQueue.some((item) => item.queueItemId === queueItemId))
-          return {}
-        currentQueueItemId = queueItemId
-        return {
-          currentQueueItemId,
-          position: 0,
-        }
-      })
-    },
+        'skipToQueueItem',
+        () => {
+          if (!remoteQueue.some((item) => item.queueItemId === queueItemId))
+            return {}
+          currentQueueItemId = queueItemId
+          return {
+            currentQueueItemId,
+            position: 0,
+          }
+        },
+        { queueItemId },
+        'skip',
+      ),
     // Direct injection of authoritative server push (e.g. position progress or track change)
     pushServerSnapshot: (snapshot, epoch = activeEpoch) => {
       if (epoch !== activeEpoch) return
@@ -396,6 +418,26 @@ export function createMockRemoteAudioAdapter(options = {}) {
     getCurrentQueueItemId: () => currentQueueItemId,
     getPlayMode: () => playMode,
     setFailure,
+    hasActiveSession: () => hasActiveSession,
+    getActiveSessionOwner: () => activeSessionOwner,
+    admitClient: async ({
+      forceTakeover = false,
+      clientId = 'client',
+    } = {}) => {
+      if (
+        hasActiveSession &&
+        !forceTakeover &&
+        clientId !== activeSessionOwner
+      ) {
+        return false
+      }
+      hasActiveSession = true
+      activeSessionOwner = clientId
+      return true
+    },
+    getPlayCount: () => wireCommands.filter((c) => c.action === 'play').length,
+    getStopCount: () => wireCommands.filter((c) => c.action === 'stop').length,
+    getAppliedVolume: () => remoteState.volume,
     getRemoteState: () => ({ ...remoteState }),
   }
 }

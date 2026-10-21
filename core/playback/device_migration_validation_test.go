@@ -851,3 +851,202 @@ func TestPlaybackServerMigrationToAttachedTargetDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("target did not observe migrated playback: %#v, %v", status, err)
 	}
 }
+
+func TestPlaybackServerScopedSwitchToTargetWithExistingSessionRejected(t *testing.T) {
+	ctx, server := newMigrationValidationServer(t)
+	scope1 := CommandScope{User: "admin", SessionID: "owner-session", ClientID: "tab-1"}
+	if _, err := server.AttachSession(ctx, AttachRequest{SessionID: "owner-session", User: "admin", ClientID: "tab-1", DeviceName: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.ExecuteCommand(ctx, scope1, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.ExecuteCommand(ctx, scope1, PlaybackCommand{Action: CommandStart}); err != nil {
+		t.Fatal(err)
+	}
+
+	scope2 := CommandScope{User: "admin", SessionID: "target-session", ClientID: "other-tab"}
+	if _, err := server.AttachSession(ctx, AttachRequest{SessionID: "target-session", User: "admin", ClientID: "other-tab", DeviceName: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.ExecuteCommand(ctx, scope2, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.ExecuteCommand(ctx, scope2, PlaybackCommand{Action: CommandStart}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.ExecuteCommand(ctx, scope2, PlaybackCommand{Action: CommandSeek, Position: 12}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := server.SwitchDeviceForCommand(ctx, scope1, "new")
+	if !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("expected ErrSessionOwnership when target has active session, got: %v", err)
+	}
+
+	targetStatus, err := server.SessionStatus(ctx, "target-session")
+	if err != nil || !targetStatus.Playing || targetStatus.Position != 12 || targetStatus.DeviceName != "new" {
+		t.Fatalf("target session modified after rejected migration: %#v err=%v", targetStatus, err)
+	}
+	oldStatus, err := server.SessionStatus(ctx, "owner-session")
+	if err != nil || !oldStatus.Playing || oldStatus.DeviceName != "old" {
+		t.Fatalf("old session modified after rejected migration: %#v err=%v", oldStatus, err)
+	}
+}
+
+func TestPlaybackSameOwnerLateCommandAcrossDeviceSwitchDoesNotMutateNewScene(t *testing.T) {
+	ctx, server := newMigrationValidationServer(t)
+	scope := CommandScope{User: "admin", SessionID: "s1", ClientID: "tab-1"}
+	if _, err := server.AttachSession(ctx, AttachRequest{SessionID: "s1", User: "admin", ClientID: "tab-1", DeviceName: "old"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var enterOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+
+	previousNewTrack := newTrack
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		return &mockTrack{onSetVolume: func(gain float32) {
+			if gain == 0.125 {
+				enterOnce.Do(func() { close(entered) })
+				<-release
+			}
+		}}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+
+	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandStart}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandSeek, Position: 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDev := server.playbackDevices[0]
+	lateCmdDone := make(chan error, 1)
+	go func() {
+		_, err := oldDev.SetGain(ctx, 0.125)
+		lateCmdDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("late command did not enter execution")
+	}
+
+	switched := make(chan error, 1)
+	go func() {
+		switched <- server.SwitchDeviceForCommand(ctx, scope, "new")
+	}()
+
+	select {
+	case <-switched:
+		t.Fatal("switch finished before in-flight old device mutation linearized")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	unblock()
+
+	select {
+	case err := <-lateCmdDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late command deadlocked")
+	}
+
+	select {
+	case err := <-switched:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("switch deadlocked")
+	}
+
+	// Verify session was rebound to new device
+	newStatus, err := server.SessionStatus(ctx, "s1")
+	if err != nil || newStatus.DeviceName != "new" || !newStatus.Playing || newStatus.Position != 10 {
+		t.Fatalf("switch did not rebind cleanly: %#v, %v", newStatus, err)
+	}
+
+	// Subsequent late mutations targeting the retired old device cannot mutate the new scene
+	_, _ = oldDev.SetGain(ctx, 0.99)
+	newStatusAfter, err := server.SessionStatus(ctx, "s1")
+	if err != nil || newStatusAfter.Gain == 0.99 || newStatusAfter.DeviceName != "new" {
+		t.Fatalf("late old device command corrupted new scene: %#v", newStatusAfter)
+	}
+}
+
+func TestPlaybackServerMigrationTargetStartFailurePreservesFailedSceneWithoutOutput(t *testing.T) {
+	ctx, server := newMigrationValidationServer(t)
+	device, err := server.GetDeviceForUser("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := device.Set(ctx, []string{"track"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := device.SetGain(ctx, 0.5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := device.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := device.Skip(ctx, 0, 17); err != nil {
+		t.Fatal(err)
+	}
+
+	targetPrepErr := errors.New("target volume/preparation failed")
+	previousNewTrack := newTrack
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, _ model.PlaybackToken, deviceName string, _ model.MediaFile) (Track, error) {
+		if deviceName == "new" {
+			return nil, targetPrepErr
+		}
+		return &mockTrack{}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+
+	err = server.SwitchDevice(ctx, "new")
+	if !errors.Is(err, targetPrepErr) {
+		t.Fatalf("expected target preparation failure error, got: %v", err)
+	}
+
+	oldDev := server.playbackDevices[0]
+	oldStatus, _ := oldDev.Status(ctx)
+	if oldStatus.Playing || !oldDev.PlaybackQueue.IsEmpty() {
+		t.Fatalf("old device still playing or not cleared: %#v", oldStatus)
+	}
+
+	newDev := server.playbackDevices[1]
+	newStatus, _ := newDev.Status(ctx)
+	if newStatus.Playing {
+		t.Fatalf("target device is playing despite start failure: %#v", newStatus)
+	}
+
+	if newStatus.Position != 17 || newStatus.Gain != 0.5 || newDev.PlaybackQueue.IsEmpty() {
+		t.Fatalf("failed scene was not preserved on target device: %#v", newStatus)
+	}
+
+	if !newDev.Default || oldDev.Default {
+		t.Fatalf("default device not switched to target: old.Default=%v new.Default=%v", oldDev.Default, newDev.Default)
+	}
+
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, _ model.PlaybackToken, _ string, _ model.MediaFile) (Track, error) {
+		return &mockTrack{}, nil
+	}
+	resumedStatus, err := newDev.Start(ctx)
+	if err != nil || !resumedStatus.Playing || resumedStatus.Position != 17 || resumedStatus.Gain != 0.5 {
+		t.Fatalf("retry after volume/prep failure did not resume from preserved scene: %#v, %v", resumedStatus, err)
+	}
+}
+

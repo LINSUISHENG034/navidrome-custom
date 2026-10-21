@@ -58,6 +58,7 @@ import {
 import { createBrowserAudioAdapter } from './browserAudioAdapter'
 import { createMockRemoteAudioAdapter } from './mockRemoteAudioAdapter'
 import { UnifiedNativePlayer } from './UnifiedNativePlayer'
+import { audioVolumeToRemoteGain } from './volumeProfiles'
 import Sortable from 'sortablejs'
 
 function getNativeVolumeBarValue() {
@@ -3574,6 +3575,660 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(remoteRes.steps).toEqual(localRes.steps)
       expect(remoteRes.pos4).toBe(localRes.pos4)
       expect(remoteRes.finalMode).toBe(localRes.finalMode)
+    })
+  })
+
+  describe('Safe Output Migration and Takeover Protocol (Issue 06)', () => {
+    it('TC-MIG-01: minimal sequential playback scene migration (local -> remote -> local) preserves queue, current item, position, and playing state', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: false, ended: false })
+
+      const migrationTracks = [
+        {
+          queueItemId: 'mig-1',
+          trackId: 't1',
+          name: 'Song 1',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+        {
+          queueItemId: 'mig-2',
+          trackId: 't2',
+          name: 'Song 2',
+          musicSrc: 'http://example.com/2.mp3',
+        },
+        {
+          queueItemId: 'mig-3',
+          trackId: 't3',
+          name: 'Song 3',
+          musicSrc: 'http://example.com/3.mp3',
+        },
+      ]
+
+      await controller.addQueueItems(migrationTracks)
+      await controller.skipToQueueItem('mig-2')
+      await controller.setVolume(0.8)
+      await controller.seek(17)
+      await controller.play()
+
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controller.getState().currentQueueItemId).toBe('mig-2')
+      expect(controller.getState().position).toBe(17)
+      expect(controller.getState().volume).toBe(0.8)
+
+      // Migrate from Local to Remote
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+
+      // Invariants:
+      // 1. Local audio is paused
+      expect(audio.paused).toBe(true)
+      // 2. Remote adapter preserves scene: queue, current item, position, volume, and playing state
+      const remoteState = controller.getState()
+      expect(remoteState.status).toBe(PlaybackStatus.PLAYING)
+      expect(remoteState.currentQueueItemId).toBe('mig-2')
+      expect(remoteState.position).toBe(17)
+      expect(remoteState.volume).toBe(0.8)
+      expect(remoteState.queue).toHaveLength(3)
+
+      // Remote advances naturally to 35s
+      remoteAdapter.pushServerSnapshot({ position: 35 })
+      expect(controller.getState().position).toBe(35)
+
+      // Migrate from Remote back to Local
+      const nextBrowserAdapter = createBrowserAudioAdapter()
+      const nextAudio = document.createElement('audio')
+      nextBrowserAdapter.attachElement(nextAudio)
+      setMediaFlags(nextAudio, { paused: false, ended: false })
+
+      await controller.migrateOutput({
+        targetAdapter: nextBrowserAdapter,
+        targetDevice: { name: 'Local' },
+      })
+
+      // Invariants:
+      // 1. Local adapter received migrated scene
+      const localState = controller.getState()
+      expect(localState.status).toBe(PlaybackStatus.PLAYING)
+      expect(localState.currentQueueItemId).toBe('mig-2')
+      expect(localState.position).toBe(35)
+      expect(localState.volume).toBe(0.8)
+      expect(localState.queue).toHaveLength(3)
+
+      // 2. Old remote adapter was deactivated
+      expect(remoteAdapter.getRemoteState().status).toBe(PlaybackStatus.IDLE)
+    })
+
+    it('TC-MIG-02: paused playback scene migration stays PAUSED throughout with 0 play calls', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: true, ended: false })
+
+      const migrationTracks = [
+        {
+          queueItemId: 'mig-1',
+          trackId: 't1',
+          name: 'Song 1',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+        {
+          queueItemId: 'mig-2',
+          trackId: 't2',
+          name: 'Song 2',
+          musicSrc: 'http://example.com/2.mp3',
+        },
+      ]
+
+      await controller.addQueueItems(migrationTracks)
+      await controller.skipToQueueItem('mig-2')
+      await controller.seek(12)
+      await controller.pause()
+
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      expect(controller.getState().position).toBe(12)
+
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+
+      // Invariants:
+      // 1. Target remains PAUSED
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      expect(controller.getState().position).toBe(12)
+      expect(controller.getState().currentQueueItemId).toBe('mig-2')
+      // 2. Target play() was called 0 times
+      expect(remoteAdapter.getPlayCount()).toBe(0)
+    })
+
+    it('TC-MIG-03: target device occupied requires prompt and explicit confirmation before any overwrite action', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: false, ended: false })
+
+      await controller.addQueueItems([
+        {
+          queueItemId: 'loc-1',
+          trackId: 't-loc',
+          name: 'Local Track',
+          musicSrc: 'http://example.com/l.mp3',
+        },
+      ])
+      await controller.seek(5)
+      await controller.play()
+
+      // Target remote device has an active session from another client
+      const remoteAdapter = createMockRemoteAudioAdapter({
+        hasActiveSession: true,
+        activeSessionOwner: 'other-user',
+        initialPosition: 40,
+      })
+      remoteAdapter.pushServerSnapshot({
+        queue: [
+          { queueItemId: 'rem-1', trackId: 't-rem', name: 'Remote Track' },
+        ],
+        currentQueueItemId: 'rem-1',
+        position: 40,
+        status: PlaybackStatus.PLAYING,
+      })
+
+      // Sub-case A: Confirmation callback returns false (user cancels/rejects)
+      const requestConfirmationCancel = vi.fn(async () => false)
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: { name: 'Living Room TV', hasActiveSession: true },
+          requestConfirmation: requestConfirmationCancel,
+        }),
+      ).rejects.toMatchObject({
+        code: 'TARGET_CONFIRMATION_REJECTED',
+      })
+
+      expect(requestConfirmationCancel).toHaveBeenCalledTimes(1)
+      // Remote scene is 100% untouched: still playing remote track at 40s
+      expect(remoteAdapter.getQueue()).toHaveLength(1)
+      expect(remoteAdapter.getCurrentQueueItemId()).toBe('rem-1')
+      expect(remoteAdapter.getRemoteState().position).toBe(40)
+      expect(remoteAdapter.getStopCount()).toBe(0)
+
+      // Local player continues playing undisturbed
+      expect(controller.getState().currentQueueItemId).toBe('loc-1')
+      expect(audio.paused).toBe(false)
+
+      // Sub-case B: No confirmation callback and not forceTakeover -> TARGET_OCCUPIED
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: { name: 'Living Room TV', hasActiveSession: true },
+        }),
+      ).rejects.toMatchObject({
+        code: 'TARGET_OCCUPIED',
+      })
+      expect(remoteAdapter.getQueue()).toHaveLength(1)
+
+      // Sub-case C: User confirms explicit takeover
+      const requestConfirmationConfirm = vi.fn(async () => true)
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Living Room TV', hasActiveSession: true },
+        requestConfirmation: requestConfirmationConfirm,
+      })
+
+      expect(requestConfirmationConfirm).toHaveBeenCalledTimes(1)
+      expect(controller.getState().currentQueueItemId).toBe('loc-1')
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+    })
+
+    it('TC-MIG-04: old device stop confirmation failure prevents target startup (no parallel output)', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      await controller.addQueueItems([
+        {
+          queueItemId: 'loc-1',
+          trackId: 't1',
+          name: 'Local Track',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+      ])
+      await controller.play()
+
+      // Inject stop failure on old adapter
+      localAdapter.stop = vi.fn(async () => {
+        throw {
+          code: 'AUDIO_DEVICE_LOCKED',
+          message: 'Hardware audio device locked',
+        }
+      })
+
+      const remoteAdapter = createMockRemoteAudioAdapter()
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: { name: 'Remote Speaker' },
+        }),
+      ).rejects.toMatchObject({
+        code: 'AUDIO_DEVICE_LOCKED',
+      })
+
+      // Invariants:
+      // 1. Target remote adapter play was NEVER called (zero sound from target)
+      expect(remoteAdapter.getPlayCount()).toBe(0)
+      // 2. Error is recorded on controller state
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(controller.getState().error.code).toBe('AUDIO_DEVICE_LOCKED')
+
+      // Sub-case B: Stop timeout prevents target startup
+      const remoteAdapterTimeout = createMockRemoteAudioAdapter()
+      localAdapter.stop = vi.fn(
+        () =>
+          new Promise((_, reject) =>
+            setTimeout(() => reject({ code: 'COMMAND_TIMEOUT' }), 10),
+          ),
+      )
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapterTimeout,
+          targetDevice: { name: 'Remote Speaker' },
+        }),
+      ).rejects.toMatchObject({
+        code: 'COMMAND_TIMEOUT',
+      })
+      expect(remoteAdapterTimeout.getPlayCount()).toBe(0)
+    })
+
+    it('TC-MIG-05: target volume setting failure prevents target startup (preserves unstarted scene, no local fallback)', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: false, ended: false })
+
+      await controller.addQueueItems([
+        {
+          queueItemId: 'loc-1',
+          trackId: 't1',
+          name: 'Track 1',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+      ])
+      await controller.seek(20)
+      await controller.play()
+
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      remoteAdapter.setFailure({
+        action: 'volume',
+        code: 'MPV_SET_VOLUME_IPC_ERROR',
+        message: 'IPC error: set_property volume failed',
+      })
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: { name: 'Remote Speaker' },
+        }),
+      ).rejects.toMatchObject({
+        code: 'MPV_SET_VOLUME_IPC_ERROR',
+      })
+
+      // Invariants:
+      // 1. Target play() was NEVER called
+      expect(remoteAdapter.getPlayCount()).toBe(0)
+      // 2. Failed scene is preserved and visible on target
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(controller.getState().currentQueueItemId).toBe('loc-1')
+      expect(controller.getState().position).toBe(20)
+      expect(controller.getState().queue).toHaveLength(1)
+      // 3. Local audio is not resurrected / no local fallback
+      expect(audio.paused).toBe(true)
+    })
+
+    it('TC-MIG-06: three volume paths (no active track, prepared paused track, running track) with target device profile mapping', async () => {
+      const controller = createPlaybackControlModule()
+      const localAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(localAdapter)
+
+      // Path 1: No active track - saves desired volume
+      expect(controller.getState().queue).toHaveLength(0)
+      await controller.setVolume(0.75)
+      expect(controller.getState().volume).toBe(0.75)
+
+      // Add track and prepare
+      await controller.addQueueItems([
+        {
+          queueItemId: 'track-1',
+          trackId: 't1',
+          name: 'Song 1',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+      ])
+
+      // Path 2: Prepared track during migration to Bluetooth device
+      // Maps volume 0.64 through Bluetooth profile exponent mapping
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      await controller.setVolume(0.64)
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: {
+          name: 'BT Headset',
+          deviceName: 'pulse/bluez_sink',
+          isBluetooth: true,
+        },
+      })
+
+      // Applied volume on remote adapter was mapped for Bluetooth
+      const expectedBtGain = audioVolumeToRemoteGain(0.64, {
+        deviceName: 'pulse/bluez_sink',
+        isBluetooth: true,
+      })
+      expect(remoteAdapter.getAppliedVolume()).toBeCloseTo(expectedBtGain, 3)
+
+      // Path 3: Running track modification
+      await controller.play()
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      await controller.setVolume(0.5)
+      expect(controller.getState().volume).toBe(0.5)
+    })
+
+    it('TC-MIG-07: same-owner late command across migration cannot mutate new scene or inject error', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: false, ended: false })
+
+      await controller.addQueueItems([
+        {
+          queueItemId: 'old-1',
+          trackId: 't1',
+          name: 'Song 1',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+      ])
+      await controller.play()
+
+      // Start a slow command on localAdapter that will resolve late
+      let completeOldSeek
+      const oldSeekPromise = new Promise((resolve) => {
+        completeOldSeek = resolve
+      })
+      const originalSeek = localAdapter.seek
+      localAdapter.seek = vi.fn(async (...args) => {
+        await oldSeekPromise
+        return originalSeek.apply(localAdapter, args)
+      })
+
+      // Issue seek on old adapter
+      const seekPromise = controller.seek(99)
+
+      // Migrate to new remote adapter while seek is still in-flight
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+
+      expect(controller.getState().position).not.toBe(99)
+
+      // Release the late old seek (which rejects or finishes with COMMAND_SUPERSEDED)
+      completeOldSeek()
+      try {
+        await seekPromise
+      } catch {
+        // Expected superseded rejection
+      }
+
+      // New remote scene remains completely unaffected
+      expect(controller.getState().position).not.toBe(99)
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controller.getState().error).toBeNull()
+    })
+
+    it('TC-MIG-08: compound intent (playAll) interrupted by migration stops cleanly without writing to new adapter', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      let finishClear
+      localAdapter.clearQueue = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishClear = resolve
+          }),
+      )
+
+      // Start playAll which begins with clearQueue
+      const playAllPromise = controller.playAll([
+        { queueItemId: 'item-1', trackId: 't1', name: 'Item 1' },
+        { queueItemId: 'item-2', trackId: 't2', name: 'Item 2' },
+      ])
+
+      // Switch to new adapter while playAll is waiting on clearQueue
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(remoteAdapter)
+
+      // Finish old clearQueue
+      finishClear()
+      await expect(playAllPromise).rejects.toMatchObject({
+        code: 'COMMAND_SUPERSEDED',
+      })
+
+      // Remote adapter did NOT receive the addQueueItems or play from the old playAll
+      expect(remoteAdapter.getQueue()).toHaveLength(0)
+      expect(remoteAdapter.getPlayCount()).toBe(0)
+    })
+
+    it('TC-MIG-09: target adapter lower queueVersion is legally accepted as new baseline', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      // Advance old adapter's queueVersion to 5
+      await controller.addQueueItems([{ queueItemId: 'q1', trackId: 't1' }])
+      await controller.addQueueItems([{ queueItemId: 'q2', trackId: 't2' }])
+      await controller.addQueueItems([{ queueItemId: 'q3', trackId: 't3' }])
+      expect(controller.getState().queueVersion).toBeGreaterThanOrEqual(3)
+      await controller.clearQueue()
+      expect(controller.getState().queue).toHaveLength(0)
+
+      // Migrate to fresh remote adapter which starts with queueVersion = 0
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+      })
+
+      // Push authoritative update with queueVersion 1 from the new adapter
+      remoteAdapter.pushServerSnapshot({
+        queue: [{ queueItemId: 'fresh-1', trackId: 'f1', name: 'Fresh 1' }],
+        currentQueueItemId: 'fresh-1',
+        queueVersion: 1,
+      })
+
+      // Module accepts the new adapter's lower queueVersion as authoritative
+      expect(controller.getState().queueVersion).toBe(1)
+      expect(controller.getState().currentQueueItemId).toBe('fresh-1')
+      expect(controller.getState().queue[0].queueItemId).toBe('fresh-1')
+    })
+
+    it('TC-MIG-10: shared remote output single-controller rule & explicit takeover vs recovering owner re-attachment', async () => {
+      // Remote adapter owned by 'client-A'
+      const remoteAdapter = createMockRemoteAudioAdapter({
+        hasActiveSession: true,
+        activeSessionOwner: 'client-A',
+        initialPosition: 25,
+      })
+      remoteAdapter.pushServerSnapshot({
+        queue: [
+          { queueItemId: 'q-rem', trackId: 't-rem', name: 'Remote Track' },
+        ],
+        currentQueueItemId: 'q-rem',
+        position: 25,
+        status: PlaybackStatus.PLAYING,
+      })
+
+      // 1. Observer client-B attempts normal attach without takeover -> rejected
+      const observerController = createPlaybackControlModule()
+      await expect(
+        observerController.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: {
+            hasActiveSession: true,
+            activeController: 'client-A',
+            clientId: 'client-B',
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: 'TARGET_OCCUPIED',
+      })
+
+      // 2. Recovering owner client-A reattaches after disconnect gap -> succeeds without takeover
+      const ownerController = createPlaybackControlModule()
+      await ownerController.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: {
+          hasActiveSession: true,
+          activeController: 'client-A',
+          clientId: 'client-A',
+        },
+      })
+      // Remote authoritative scene continues at 25s without rewinding
+      expect(ownerController.getState().position).toBe(25)
+      expect(ownerController.getState().currentQueueItemId).toBe('q-rem')
+
+      // 3. Client-B explicitly takes over -> succeeds and continues without rewinding
+      await observerController.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: {
+          hasActiveSession: true,
+          activeController: 'client-A',
+          clientId: 'client-B',
+        },
+        forceTakeover: true,
+      })
+      expect(observerController.getState().position).toBe(25)
+      expect(remoteAdapter.getActiveSessionOwner()).toBe('client-B')
+
+      // 4. Revoked old owner (client-A) subsequent normal migrations are rejected
+      await expect(
+        ownerController.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: {
+            hasActiveSession: true,
+            activeController: 'client-B',
+            clientId: 'client-A',
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: 'TARGET_OCCUPIED',
+      })
+      expect(remoteAdapter.getActiveSessionOwner()).toBe('client-B')
+
+      // 5. Lease/heartbeat gap does not stop remote playback
+      remoteAdapter.pushServerSnapshot({ position: 28 })
+      expect(observerController.getState().position).toBe(28)
+      expect(observerController.getState().status).toBe(PlaybackStatus.PLAYING)
+    })
+
+    it('TC-MIG-02: empty queue paused migration sets PAUSED status (not stuck in PREPARING)', async () => {
+      const controller = createPlaybackControlModule()
+      const localAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(localAdapter)
+      await controller.pause()
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      expect(remoteAdapter.getPlayCount()).toBe(0)
+    })
+
+    it('TC-MIG-11: full round trips (local -> remote -> local -> remote -> local) on UnifiedNativePlayer with visible play rejection', async () => {
+      const ref = React.createRef()
+      const { controller, rerenderPlayer, getByRole, unmount } =
+        await renderControlledPlayer('local', { ref })
+
+      const player = ref.current
+      expect(document.querySelector('audio')).not.toBeNull()
+
+      // Initial local play
+      await act(async () => document.querySelector('.play-btn').click())
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      // Round trip 1: local -> remote
+      const remoteAdapter1 = createMockRemoteAudioAdapter()
+      await act(async () =>
+        controller.migrateOutput({ targetAdapter: remoteAdapter1 }),
+      )
+      rerenderPlayer({ engineMode: 'remote', browserAdapter: undefined })
+      expect(document.querySelector('audio')).toBeNull()
+      expect(ref.current).toBe(player)
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      // Remote toggle play -> pause
+      await act(async () => document.querySelector('.play-btn').click())
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+
+      // Round trip 1: remote -> local
+      const nextBrowser1 = createBrowserAudioAdapter()
+      await act(async () =>
+        controller.migrateOutput({ targetAdapter: nextBrowser1 }),
+      )
+      rerenderPlayer({ engineMode: 'local', browserAdapter: nextBrowser1 })
+      expect(document.querySelector('audio')).not.toBeNull()
+      expect(ref.current).toBe(player)
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+
+      // Round trip 2: local -> remote
+      const remoteAdapter2 = createMockRemoteAudioAdapter()
+      await act(async () =>
+        controller.migrateOutput({ targetAdapter: remoteAdapter2 }),
+      )
+      rerenderPlayer({ engineMode: 'remote', browserAdapter: undefined })
+      expect(document.querySelector('audio')).toBeNull()
+
+      // Round trip 2: remote -> local with play rejection (e.g. autoplay gesture blocked)
+      const nextBrowser2 = createBrowserAudioAdapter()
+      await act(async () =>
+        controller.migrateOutput({ targetAdapter: nextBrowser2 }),
+      )
+      rerenderPlayer({ engineMode: 'local', browserAdapter: nextBrowser2 })
+      expect(document.querySelector('audio')).not.toBeNull()
+
+      playSpy.mockRejectedValueOnce(
+        new DOMException('User gesture required', 'NotAllowedError'),
+      )
+      await act(async () => document.querySelector('.play-btn').click())
+
+      // Visible rejection: state is ERROR, alert displayed, no auto-fallback
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(getByRole('alert').textContent).toContain('User gesture required')
+
+      unmount()
     })
   })
 })

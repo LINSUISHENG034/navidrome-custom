@@ -446,6 +446,20 @@ export function createBrowserAudioAdapter(options = {}) {
     })
   }
 
+  async function stop(epoch) {
+    if (!isActive || epoch !== activeEpoch) return
+    desiredPlaying = false
+    invalidateAttempt()
+    if (audioElement) {
+      audioElement.pause()
+    }
+    publishState({
+      status: PlaybackStatus.PAUSED,
+      position: audioElement ? mediaState(audioElement).position : 0,
+      error: null,
+    })
+  }
+
   async function seek(epoch, positionSeconds) {
     if (!isActive || epoch !== activeEpoch) return
     const el = requireAudioElement()
@@ -588,6 +602,7 @@ export function createBrowserAudioAdapter(options = {}) {
     attachElement,
     play,
     pause,
+    stop,
     seek,
     setVolume,
     skipNext,
