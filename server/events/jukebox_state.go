@@ -18,4 +18,5 @@ type JukeboxStateUpdated struct {
 	QueueVersion      int        `json:"queueVersion"`
 	LastHeartbeat     time.Time  `json:"lastHeartbeat"`
 	StaleSince        *time.Time `json:"staleSince,omitempty"`
+	BindingGeneration uint64     `json:"bindingGeneration"`
 }

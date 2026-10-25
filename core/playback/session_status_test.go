@@ -47,6 +47,24 @@ func (s *sessionStatusStubServer) ExecuteCommand(context.Context, CommandScope, 
 func (s *sessionStatusStubServer) SwitchDeviceForCommand(context.Context, CommandScope, string) error {
 	return nil
 }
+func (s *sessionStatusStubServer) HandoffSession(context.Context, HandoffRequest) (SessionStatus, error) {
+	return SessionStatus{}, nil
+}
+func (s *sessionStatusStubServer) ReserveMigration(context.Context, ReserveMigrationRequest) (CommandResult, error) {
+	return CommandResult{}, nil
+}
+func (s *sessionStatusStubServer) ReleaseMigrationReservation(context.Context, string, string) (CommandResult, error) {
+	return CommandResult{}, nil
+}
+func (s *sessionStatusStubServer) QueryReservation(context.Context, string) (ReservationInfo, error) {
+	return ReservationInfo{}, nil
+}
+func (s *sessionStatusStubServer) CommitMigration(context.Context, CommitMigrationRequest) (SessionStatus, error) {
+	return SessionStatus{}, nil
+}
+func (s *sessionStatusStubServer) QueryOperation(context.Context, string, string) (OperationRecord, error) {
+	return OperationRecord{}, nil
+}
 
 func TestPlaybackServerDetachSessionReturnsSnapshot(t *testing.T) {
 	ctx := context.Background()

@@ -47,6 +47,7 @@ type playbackDevice struct {
 	preparing             sync.WaitGroup
 	retiring              bool
 	recoveryPosition      *int
+	sceneRevision         uint64
 }
 
 type DeviceStatus struct {
@@ -81,6 +82,30 @@ func (pd *playbackDevice) stateChangeNotifierLocked() func() {
 
 func (pd *playbackDevice) incrementQueueVersionLocked() {
 	pd.queueVersion++
+}
+
+func (pd *playbackDevice) incrementSceneRevisionLocked() {
+	pd.sceneRevision++
+}
+
+func (pd *playbackDevice) sceneFingerprintLocked() string {
+	return fmt.Sprintf("fp-%s-%d", pd.DeviceName, pd.sceneRevision)
+}
+
+func (pd *playbackDevice) SceneFingerprint() string {
+	pd.mu.Lock()
+	defer pd.mu.Unlock()
+	return pd.sceneFingerprintLocked()
+}
+
+func (pd *playbackDevice) QueueSize() int {
+	pd.mu.Lock()
+	defer pd.mu.Unlock()
+	return pd.PlaybackQueue.Size()
+}
+
+func (pd *playbackDevice) isOccupiedLocked(hasSession bool) bool {
+	return hasSession || pd.isPlaying() || !pd.PlaybackQueue.IsEmpty()
 }
 
 func (pd *playbackDevice) getStatus() DeviceStatus {
@@ -118,6 +143,7 @@ func NewPlaybackDevice(ctx context.Context, playbackServer PlaybackServer, name 
 		PlaybackQueue:         NewQueue(),
 		PlaybackEvents:        make(chan model.PlaybackEvent, 32),
 		pendingPlaybackTokens: make(map[model.PlaybackToken]chan struct{}),
+		sceneRevision:         1,
 	}
 }
 
@@ -151,6 +177,7 @@ func (pd *playbackDevice) setLocked(ctx context.Context, ids []string) (DeviceSt
 	status, err := pd.addLocked(ctx, ids)
 	if err == nil && queueChanged {
 		pd.incrementQueueVersionLocked()
+		pd.incrementSceneRevisionLocked()
 		status = pd.getStatus()
 	}
 	return status, queueChanged, err
@@ -208,6 +235,9 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, bool, 
 		}
 	}
 
+	if changed {
+		pd.incrementSceneRevisionLocked()
+	}
 	return pd.getStatus(), changed, nil
 }
 
@@ -232,6 +262,9 @@ func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, bool, e
 		log.Error(ctx, "error pausing active track", err)
 		return pd.getStatus(), false, err
 	}
+	if changed {
+		pd.incrementSceneRevisionLocked()
+	}
 	return pd.getStatus(), changed, nil
 }
 
@@ -248,6 +281,9 @@ func (pd *playbackDevice) shutdownLocked(ctx context.Context) (DeviceStatus, boo
 	if err != nil {
 		log.Error(ctx, "error pausing active track during shutdown", err)
 		return pd.getStatus(), false, err
+	}
+	if changed {
+		pd.incrementSceneRevisionLocked()
 	}
 	return pd.getStatus(), changed, nil
 }
@@ -305,6 +341,7 @@ func (pd *playbackDevice) skipLocked(ctx context.Context, index int, offset int)
 		}
 	}
 
+	pd.incrementSceneRevisionLocked()
 	return pd.getStatus(), true, nil
 }
 
@@ -368,6 +405,9 @@ func (pd *playbackDevice) clearCommandLocked(ctx context.Context) (DeviceStatus,
 	if queueChanged {
 		pd.incrementQueueVersionLocked()
 	}
+	if changed {
+		pd.incrementSceneRevisionLocked()
+	}
 	return pd.getStatus(), changed, nil
 }
 
@@ -403,6 +443,7 @@ func (pd *playbackDevice) removeLocked(ctx context.Context, index int) (DeviceSt
 	if index > -1 && index < pd.PlaybackQueue.Size() {
 		pd.PlaybackQueue.Remove(index)
 		pd.incrementQueueVersionLocked()
+		pd.incrementSceneRevisionLocked()
 	} else {
 		log.Error(ctx, "Index to remove out of range: "+fmt.Sprint(index))
 	}
@@ -420,6 +461,7 @@ func (pd *playbackDevice) moveLocked(ctx context.Context, fromIndex, toIndex int
 	}
 	pd.PlaybackQueue.Move(fromIndex, toIndex)
 	pd.incrementQueueVersionLocked()
+	pd.incrementSceneRevisionLocked()
 	return pd.getStatus(), true, nil
 }
 
@@ -433,6 +475,7 @@ func (pd *playbackDevice) shuffleLocked(ctx context.Context) (DeviceStatus, bool
 	if changed {
 		pd.PlaybackQueue.Shuffle()
 		pd.incrementQueueVersionLocked()
+		pd.incrementSceneRevisionLocked()
 	}
 	return pd.getStatus(), changed, nil
 }
@@ -452,6 +495,9 @@ func (pd *playbackDevice) setGainLocked(ctx context.Context, gain float32) (Devi
 		}
 	}
 	changed := pd.Gain != gain
+	if changed {
+		pd.incrementSceneRevisionLocked()
+	}
 	pd.Gain = gain
 	return pd.getStatus(), changed, nil
 }
@@ -501,6 +547,7 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 		changed := len(command.IDs) > 0
 		if err == nil && changed {
 			pd.incrementQueueVersionLocked()
+			pd.incrementSceneRevisionLocked()
 			status = pd.getStatus()
 		}
 		return status, changed, err
@@ -561,6 +608,7 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 	case model.PlaybackEventNaturalEnd:
 		pd.recoveryPosition = nil
 		pd.retireActiveTrackLocked()
+		pd.incrementSceneRevisionLocked()
 		if !pd.PlaybackQueue.IsAtLastElement() {
 			pd.PlaybackQueue.IncreaseIndex()
 			idx := pd.PlaybackQueue.Index

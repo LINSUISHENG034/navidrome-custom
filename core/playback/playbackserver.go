@@ -32,21 +32,43 @@ type PlaybackServer interface {
 	AttachSession(ctx context.Context, req AttachRequest) (SessionStatus, error)
 	HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
 	DetachSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error)
+	HandoffSession(ctx context.Context, req HandoffRequest) (SessionStatus, error)
 	SessionStatus(ctx context.Context, sessionID string) (SessionStatus, error)
 	SessionSnapshot(ctx context.Context, sessionID, user string) (SessionSnapshot, error)
 	ExecuteCommand(ctx context.Context, scope CommandScope, command PlaybackCommand) (DeviceStatus, error)
 	SwitchDeviceForCommand(ctx context.Context, scope CommandScope, deviceName string) error
+	ReserveMigration(ctx context.Context, req ReserveMigrationRequest) (CommandResult, error)
+	ReleaseMigrationReservation(ctx context.Context, migrationID string, clientID string) (CommandResult, error)
+	QueryReservation(ctx context.Context, migrationID string) (ReservationInfo, error)
+	CommitMigration(ctx context.Context, req CommitMigrationRequest) (SessionStatus, error)
+	QueryOperation(ctx context.Context, sessionID, operationID string) (OperationRecord, error)
 }
 
 var (
-	ErrCommandScope   = errors.New("sessionId and clientId must be supplied together")
-	ErrDeviceNotFound = errors.New("device not found")
+	ErrCommandScope             = errors.New("sessionId and clientId must be supplied together")
+	ErrDeviceNotFound           = errors.New("device not found")
+	ErrGenerationRequired       = errors.New("bindingGeneration is required")
+	ErrCommandSuperseded        = errors.New("command superseded by newer generation")
+	ErrProtectedContextConflict = fmt.Errorf("%w: cannot issue legacy writes to protected playback context", ErrSessionOwnership)
+	ErrMigrationConflict        = errors.New("target device is reserved by another migration")
+	ErrReservationNotFound      = errors.New("migration reservation not found or not active")
 )
 
+type TargetOccupiedError struct {
+	SceneFingerprint string `json:"sceneFingerprint"`
+	QueueCount       int    `json:"queueCount"`
+}
+
+func (e *TargetOccupiedError) Error() string {
+	return fmt.Sprintf("target device is occupied (fingerprint: %s, queueCount: %d)", e.SceneFingerprint, e.QueueCount)
+}
+
 type CommandScope struct {
-	User      string `json:"-"`
-	SessionID string `json:"sessionId,omitempty"`
-	ClientID  string `json:"clientId,omitempty"`
+	User              string  `json:"-"`
+	SessionID         string  `json:"sessionId,omitempty"`
+	ClientID          string  `json:"clientId,omitempty"`
+	BindingGeneration *uint64 `json:"bindingGeneration,omitempty"`
+	OperationID       string  `json:"operationId,omitempty"`
 }
 
 type PlaybackCommand struct {
@@ -106,6 +128,195 @@ type JukeboxEntrySnapshot struct {
 	Duration float32 `json:"duration"`
 }
 
+const (
+	OperationStatusApplied     = "APPLIED"
+	OperationStatusNotExecuted = "NOT_EXECUTED"
+	OperationStatusFailed      = "FAILED"
+	OperationStatusUnknown     = "UNKNOWN"
+)
+
+type OperationRecord struct {
+	Status            string        `json:"status"`
+	Action            string        `json:"action,omitempty"`
+	SessionID         string        `json:"sessionId"`
+	OperationID       string        `json:"operationId"`
+	BindingGeneration uint64        `json:"bindingGeneration,omitempty"`
+	DeviceStatus      *DeviceStatus `json:"deviceStatus,omitempty"`
+	ErrorCode         string        `json:"errorCode,omitempty"`
+	ErrorMessage      string        `json:"errorMessage,omitempty"`
+	CreatedAt         time.Time     `json:"createdAt"`
+}
+
+type OperationStore struct {
+	mu       sync.Mutex
+	capacity int
+	ttl      time.Duration
+	now      func() time.Time
+	order    []string
+	records  map[string]OperationRecord
+	inflight map[string][]chan OperationRecord
+}
+
+func NewOperationStore(capacity int, ttl time.Duration, now ...func() time.Time) *OperationStore {
+	nowFn := time.Now
+	if len(now) > 0 && now[0] != nil {
+		nowFn = now[0]
+	}
+	if capacity <= 0 {
+		capacity = 1000
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	return &OperationStore{
+		capacity: capacity,
+		ttl:      ttl,
+		now:      nowFn,
+		records:  make(map[string]OperationRecord),
+		inflight: make(map[string][]chan OperationRecord),
+	}
+}
+
+func (s *OperationStore) Get(sessionID, operationID string) (OperationRecord, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := sessionID + ":" + operationID
+	rec, ok := s.records[key]
+	if !ok {
+		return OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}, false
+	}
+	if s.ttl > 0 && s.now().Sub(rec.CreatedAt) > s.ttl {
+		delete(s.records, key)
+		for i, k := range s.order {
+			if k == key {
+				s.order = append(s.order[:i], s.order[i+1:]...)
+				break
+			}
+		}
+		return OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}, false
+	}
+	return rec, true
+}
+
+func (s *OperationStore) Begin(sessionID, operationID string) (<-chan OperationRecord, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := sessionID + ":" + operationID
+	if waiters, exists := s.inflight[key]; exists {
+		ch := make(chan OperationRecord, 1)
+		s.inflight[key] = append(waiters, ch)
+		return ch, false
+	}
+	s.inflight[key] = nil
+	return nil, true
+}
+
+func (s *OperationStore) CleanupInflight(sessionID, operationID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := sessionID + ":" + operationID
+	delete(s.inflight, key)
+}
+
+func (s *OperationStore) Complete(sessionID, operationID string, rec OperationRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := sessionID + ":" + operationID
+	rec.CreatedAt = s.now().UTC()
+	rec.SessionID = sessionID
+	rec.OperationID = operationID
+
+	if _, exists := s.records[key]; !exists {
+		for len(s.order) >= s.capacity && len(s.order) > 0 {
+			oldest := s.order[0]
+			s.order = s.order[1:]
+			delete(s.records, oldest)
+		}
+		s.order = append(s.order, key)
+	}
+	s.records[key] = rec
+
+	if waiters, exists := s.inflight[key]; exists {
+		for _, ch := range waiters {
+			ch <- rec
+			close(ch)
+		}
+		delete(s.inflight, key)
+	}
+}
+
+type ReservationStatus string
+
+const (
+	ReservationActive   ReservationStatus = "ACTIVE"
+	ReservationReleased ReservationStatus = "RELEASED"
+	ReservationExpired  ReservationStatus = "EXPIRED"
+	ReservationNotFound ReservationStatus = "NOT_FOUND"
+)
+
+type MigrationReservation struct {
+	MigrationID         string            `json:"migrationId"`
+	DeviceName          string            `json:"deviceName"`
+	SessionID           string            `json:"sessionId"`
+	ClientID            string            `json:"clientId"`
+	User                string            `json:"user"`
+	Status              ReservationStatus `json:"status"`
+	ExpectedFingerprint string            `json:"expectedFingerprint"`
+	CreatedAt           time.Time         `json:"createdAt"`
+	ExpiresAt           time.Time         `json:"expiresAt"`
+}
+
+type ReserveMigrationRequest struct {
+	MigrationID         string `json:"migrationId"`
+	OperationID         string `json:"operationId"`
+	SessionID           string `json:"sessionId"`
+	ClientID            string `json:"clientId"`
+	User                string `json:"user"`
+	DeviceName          string `json:"deviceName"`
+	ForceTakeover       bool   `json:"forceTakeover"`
+	ExpectedFingerprint string `json:"expectedFingerprint,omitempty"`
+}
+
+type ReleaseMigrationRequest struct {
+	MigrationID string `json:"migrationId"`
+	OperationID string `json:"operationId"`
+	SessionID   string `json:"sessionId"`
+	ClientID    string `json:"clientId"`
+}
+
+type CommitMigrationRequest struct {
+	MigrationID         string   `json:"migrationId"`
+	OperationID         string   `json:"operationId"`
+	SessionID           string   `json:"sessionId"`
+	ClientID            string   `json:"clientId"`
+	User                string   `json:"user"`
+	TargetDeviceName    string   `json:"targetDeviceName"`
+	ExpectedGeneration  uint64   `json:"expectedGeneration"`
+	ExpectedFingerprint string   `json:"expectedFingerprint"`
+	Queue               []string `json:"queue,omitempty"`
+	CurrentIndex        int      `json:"currentIndex,omitempty"`
+	Position            int      `json:"position,omitempty"`
+	Gain                float32  `json:"gain,omitempty"`
+}
+
+type CommandResult struct {
+	Status      string `json:"status"`
+	MigrationID string `json:"migrationId,omitempty"`
+	OperationID string `json:"operationId,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+type ReservationInfo struct {
+	Status              string    `json:"status"`
+	MigrationID         string    `json:"migrationId,omitempty"`
+	DeviceName          string    `json:"deviceName,omitempty"`
+	SessionID           string    `json:"sessionId,omitempty"`
+	ClientID            string    `json:"clientId,omitempty"`
+	ExpectedFingerprint string    `json:"expectedFingerprint,omitempty"`
+	CreatedAt           time.Time `json:"createdAt,omitempty"`
+	ExpiresAt           time.Time `json:"expiresAt,omitempty"`
+}
+
 type playbackServer struct {
 	mu                  sync.Mutex
 	ctx                 *context.Context
@@ -115,6 +326,9 @@ type playbackServer struct {
 	onDeviceStateChange func(*playbackDevice, DeviceStatus)
 	playbackDevices     []*playbackDevice
 	shuttingDown        bool
+	operationStore      *OperationStore
+	reservations        map[string]MigrationReservation
+	now                 func() time.Time
 }
 
 var discoverAllSinks = bluetooth.DiscoverSinks
@@ -193,13 +407,41 @@ func (ps *playbackServer) monitorSessionExpiry(ctx context.Context) {
 	}
 }
 
+func (ps *playbackServer) getNow() time.Time {
+	if ps.now != nil {
+		return ps.now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (ps *playbackServer) ensureOperationStoreLocked() *OperationStore {
+	if ps.operationStore == nil {
+		ps.operationStore = NewOperationStore(1000, 10*time.Minute, ps.now)
+	}
+	return ps.operationStore
+}
+
+func (ps *playbackServer) ensureReservationsLocked() map[string]MigrationReservation {
+	if ps.reservations == nil {
+		ps.reservations = make(map[string]MigrationReservation)
+	}
+	return ps.reservations
+}
+
+func (ps *playbackServer) ensureSessionManagerLocked() *SessionManager {
+	if ps.sessionManager == nil {
+		ps.sessionManager = NewSessionManager(defaultSessionTTL)
+		if ps.now != nil {
+			ps.sessionManager.now = ps.now
+		}
+	}
+	return ps.sessionManager
+}
+
 func (ps *playbackServer) ensureSessionManager() *SessionManager {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	if ps.sessionManager == nil {
-		ps.sessionManager = NewSessionManager(defaultSessionTTL)
-	}
-	return ps.sessionManager
+	return ps.ensureSessionManagerLocked()
 }
 
 func (ps *playbackServer) getDeviceByName(deviceName string) *playbackDevice {
@@ -235,13 +477,14 @@ func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 
 func newSessionStatus(session Session) SessionStatus {
 	status := SessionStatus{
-		SessionID:      session.SessionID,
-		DeviceName:     session.DeviceName,
-		OwnerClientID:  session.OwnerClientID,
-		Attached:       true,
-		OwnershipState: session.OwnershipState,
-		LastHeartbeat:  session.LastHeartbeat,
-		StaleSince:     session.StaleSince,
+		SessionID:         session.SessionID,
+		DeviceName:        session.DeviceName,
+		OwnerClientID:     session.OwnerClientID,
+		Attached:          true,
+		OwnershipState:    session.OwnershipState,
+		LastHeartbeat:     session.LastHeartbeat,
+		StaleSince:        session.StaleSince,
+		BindingGeneration: session.BindingGeneration,
 	}
 	if status.OwnershipState == "" {
 		status.OwnershipState = SessionOwnershipAttached
@@ -290,7 +533,7 @@ func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) 
 	}
 	if previous, ok := sessionManager.Get(req.SessionID); ok {
 		if previous.User != req.User || previous.DeviceName != req.DeviceName ||
-			(previous.OwnerClientID != req.ClientID && previous.OwnershipState != SessionOwnershipRecovering && !req.Takeover) {
+			(previous.OwnerClientID != req.ClientID && !req.Takeover) {
 			ps.mu.Unlock()
 			return SessionStatus{}, ErrSessionOwnership
 		}
@@ -312,10 +555,12 @@ func (ps *playbackServer) AttachSession(ctx context.Context, req AttachRequest) 
 	if previous, ok := sessionManager.Get(req.SessionID); !ok || previous.OwnerClientID != req.ClientID {
 		device.cancelPreparationLocked()
 	}
-	session := sessionManager.Attach(req)
+	session, token := sessionManager.Attach(req)
 	device.mu.Unlock()
 	ps.mu.Unlock()
-	return ps.statusFromSession(session), nil
+	status := ps.statusFromSession(session)
+	status.ControlHandoffToken = token
+	return status, nil
 }
 
 func (ps *playbackServer) HeartbeatSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error) {
@@ -325,12 +570,38 @@ func (ps *playbackServer) HeartbeatSession(ctx context.Context, sessionID, clien
 		ps.mu.Unlock()
 		return SessionStatus{}, ErrSessionOwnership
 	}
-	err := sessionManager.Heartbeat(sessionID, clientID)
+	token, err := sessionManager.Heartbeat(sessionID, clientID)
 	ps.mu.Unlock()
 	if err != nil {
 		return SessionStatus{}, err
 	}
-	return ps.SessionStatus(ctx, sessionID)
+	status, err := ps.SessionStatus(ctx, sessionID)
+	if err != nil {
+		return SessionStatus{}, err
+	}
+	status.ControlHandoffToken = token
+	return status, nil
+}
+
+func (ps *playbackServer) HandoffSession(ctx context.Context, req HandoffRequest) (SessionStatus, error) {
+	sessionManager := ps.ensureSessionManager()
+	ps.mu.Lock()
+	if ps.shuttingDown {
+		ps.mu.Unlock()
+		return SessionStatus{}, context.Canceled
+	}
+	if user, ok := request.UserFrom(ctx); ok && req.User != "" && user.UserName != req.User {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionOwnership
+	}
+	session, token, err := sessionManager.Handoff(req)
+	ps.mu.Unlock()
+	if err != nil {
+		return SessionStatus{}, err
+	}
+	status := ps.statusFromSession(session)
+	status.ControlHandoffToken = token
+	return status, nil
 }
 
 func (ps *playbackServer) DetachSession(ctx context.Context, sessionID, clientID string) (SessionStatus, error) {
@@ -609,6 +880,9 @@ func (ps *playbackServer) getDefaultDevice() (*playbackDevice, error) {
 
 // GetMediaFile retrieves the MediaFile given by the id parameter
 func (ps *playbackServer) GetMediaFile(id string) (*model.MediaFile, error) {
+	if ps.datastore == nil || ps.ctx == nil {
+		return nil, errors.New("no datastore")
+	}
 	return ps.datastore.MediaFile().Get(*ps.ctx, id)
 }
 
@@ -646,7 +920,7 @@ func (ps *playbackServer) authorizeCommandLocked(ctx context.Context, scope Comm
 			return nil, err
 		}
 		if ps.sessionManager != nil && (ps.sessionManager.HasUserSession(scope.User) || len(ps.sessionManager.FindByDevice(device.DeviceName)) > 0) {
-			return nil, ErrSessionOwnership
+			return nil, ErrProtectedContextConflict
 		}
 		return device, nil
 	}
@@ -660,6 +934,12 @@ func (ps *playbackServer) authorizeCommandLocked(ctx context.Context, scope Comm
 	if session.User != scope.User || session.OwnerClientID != scope.ClientID {
 		return nil, ErrSessionOwnership
 	}
+	if scope.BindingGeneration == nil || *scope.BindingGeneration == 0 {
+		return nil, ErrGenerationRequired
+	}
+	if *scope.BindingGeneration != session.BindingGeneration {
+		return nil, ErrCommandSuperseded
+	}
 	device := ps.deviceByNameLocked(session.DeviceName)
 	if device == nil {
 		return nil, fmt.Errorf("%w: %s", ErrDeviceNotFound, session.DeviceName)
@@ -668,10 +948,56 @@ func (ps *playbackServer) authorizeCommandLocked(ctx context.Context, scope Comm
 }
 
 func (ps *playbackServer) ExecuteCommand(ctx context.Context, scope CommandScope, command PlaybackCommand) (DeviceStatus, error) {
+	if scope.SessionID != "" && scope.OperationID != "" {
+		ps.mu.Lock()
+		store := ps.ensureOperationStoreLocked()
+		ps.mu.Unlock()
+
+		if rec, found := store.Get(scope.SessionID, scope.OperationID); found {
+			if rec.DeviceStatus != nil {
+				return *rec.DeviceStatus, nil
+			}
+			if rec.ErrorCode != "" {
+				return DeviceStatus{}, errors.New(rec.ErrorMessage)
+			}
+			return DeviceStatus{}, nil
+		}
+
+		waiter, isFirst := store.Begin(scope.SessionID, scope.OperationID)
+		if !isFirst {
+			select {
+			case rec, ok := <-waiter:
+				if ok && rec.DeviceStatus != nil {
+					return *rec.DeviceStatus, nil
+				}
+				if ok && rec.ErrorCode != "" {
+					return DeviceStatus{}, errors.New(rec.ErrorMessage)
+				}
+				return DeviceStatus{}, nil
+			case <-ctx.Done():
+				return DeviceStatus{}, ctx.Err()
+			}
+		}
+		defer store.CleanupInflight(scope.SessionID, scope.OperationID)
+	}
+
 	ps.mu.Lock()
 	device, err := ps.authorizeCommandLocked(ctx, scope)
 	if err != nil {
 		ps.mu.Unlock()
+		if scope.SessionID != "" && scope.OperationID != "" {
+			ps.mu.Lock()
+			store := ps.ensureOperationStoreLocked()
+			ps.mu.Unlock()
+			store.Complete(scope.SessionID, scope.OperationID, OperationRecord{
+				Status:       OperationStatusFailed,
+				Action:       command.Action,
+				SessionID:    scope.SessionID,
+				OperationID:  scope.OperationID,
+				ErrorCode:    "COMMAND_FAILED",
+				ErrorMessage: err.Error(),
+			})
+		}
 		return DeviceStatus{}, err
 	}
 	// Acquire the state lock before releasing the authority/binding lock. Slow
@@ -679,7 +1005,282 @@ func (ps *playbackServer) ExecuteCommand(ctx context.Context, scope CommandScope
 	device.mu.Lock()
 	device.User = scope.User
 	ps.mu.Unlock()
-	return device.finishCommandLocked(ctx, command)
+	status, err := device.finishCommandLocked(ctx, command)
+
+	if scope.SessionID != "" && scope.OperationID != "" {
+		ps.mu.Lock()
+		store := ps.ensureOperationStoreLocked()
+		ps.mu.Unlock()
+		opStatus := OperationStatusApplied
+		errCode := ""
+		errMsg := ""
+		if err != nil {
+			opStatus = OperationStatusFailed
+			errCode = "COMMAND_FAILED"
+			errMsg = err.Error()
+		}
+		stCopy := status
+		gen := uint64(0)
+		if scope.BindingGeneration != nil {
+			gen = *scope.BindingGeneration
+		}
+		store.Complete(scope.SessionID, scope.OperationID, OperationRecord{
+			Status:            opStatus,
+			Action:            command.Action,
+			SessionID:         scope.SessionID,
+			OperationID:       scope.OperationID,
+			BindingGeneration: gen,
+			DeviceStatus:      &stCopy,
+			ErrorCode:         errCode,
+			ErrorMessage:      errMsg,
+		})
+	}
+
+	return status, err
+}
+
+func (ps *playbackServer) ReserveMigration(ctx context.Context, req ReserveMigrationRequest) (CommandResult, error) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if ps.shuttingDown || ctx.Err() != nil {
+		return CommandResult{Status: OperationStatusFailed}, context.Canceled
+	}
+	if user, ok := request.UserFrom(ctx); ok && req.User != "" && user.UserName != req.User {
+		return CommandResult{Status: OperationStatusFailed}, ErrSessionOwnership
+	}
+	device := ps.deviceByNameLocked(req.DeviceName)
+	if device == nil {
+		return CommandResult{Status: OperationStatusFailed}, fmt.Errorf("%w: %s", ErrDeviceNotFound, req.DeviceName)
+	}
+
+	reservations := ps.ensureReservationsLocked()
+	now := ps.getNow()
+
+	// Check if already reserved by this migration
+	if existing, ok := reservations[req.MigrationID]; ok {
+		if existing.Status == ReservationActive && now.Before(existing.ExpiresAt) {
+			if req.ExpectedFingerprint != "" {
+				existing.ExpectedFingerprint = req.ExpectedFingerprint
+				reservations[req.MigrationID] = existing
+			}
+			return CommandResult{Status: OperationStatusApplied, MigrationID: req.MigrationID}, nil
+		}
+	}
+
+	// Check conflicting active reservations for this target device
+	for _, other := range reservations {
+		if other.DeviceName == req.DeviceName && other.MigrationID != req.MigrationID &&
+			other.Status == ReservationActive && now.Before(other.ExpiresAt) {
+			return CommandResult{Status: OperationStatusFailed, MigrationID: req.MigrationID}, ErrMigrationConflict
+		}
+	}
+
+	// Check occupancy
+	device.mu.Lock()
+	hasSession := false
+	if ps.sessionManager != nil {
+		for _, s := range ps.sessionManager.FindByDevice(req.DeviceName) {
+			if s.SessionID != req.SessionID {
+				hasSession = true
+				break
+			}
+		}
+	}
+	isOccupied := device.isOccupiedLocked(hasSession)
+	currentFp := device.sceneFingerprintLocked()
+	queueCount := device.PlaybackQueue.Size()
+	device.mu.Unlock()
+
+	if isOccupied && !req.ForceTakeover {
+		if req.ExpectedFingerprint == "" || req.ExpectedFingerprint != currentFp {
+			return CommandResult{Status: OperationStatusFailed, MigrationID: req.MigrationID}, &TargetOccupiedError{
+				SceneFingerprint: currentFp,
+				QueueCount:       queueCount,
+			}
+		}
+	}
+
+	res := MigrationReservation{
+		MigrationID:         req.MigrationID,
+		DeviceName:          req.DeviceName,
+		SessionID:           req.SessionID,
+		ClientID:            req.ClientID,
+		User:                req.User,
+		Status:              ReservationActive,
+		ExpectedFingerprint: currentFp,
+		CreatedAt:           now,
+		ExpiresAt:           now.Add(30 * time.Second),
+	}
+	reservations[req.MigrationID] = res
+
+	return CommandResult{Status: OperationStatusApplied, MigrationID: req.MigrationID}, nil
+}
+
+func (ps *playbackServer) ReleaseMigrationReservation(ctx context.Context, migrationID string, clientID string) (CommandResult, error) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	reservations := ps.ensureReservationsLocked()
+	res, ok := reservations[migrationID]
+	if !ok {
+		return CommandResult{Status: OperationStatusNotExecuted, MigrationID: migrationID, Reason: "NOT_FOUND"}, nil
+	}
+	if clientID != "" && res.ClientID != "" && res.ClientID != clientID {
+		return CommandResult{Status: OperationStatusFailed, MigrationID: migrationID, Reason: "NOT_OWNER"}, ErrSessionOwnership
+	}
+	if res.Status == ReservationActive {
+		res.Status = ReservationReleased
+		reservations[migrationID] = res
+		return CommandResult{Status: OperationStatusApplied, MigrationID: migrationID}, nil
+	}
+	if res.Status == ReservationReleased {
+		return CommandResult{Status: OperationStatusApplied, MigrationID: migrationID}, nil
+	}
+	return CommandResult{Status: OperationStatusNotExecuted, MigrationID: migrationID, Reason: string(res.Status)}, nil
+}
+
+func (ps *playbackServer) QueryReservation(ctx context.Context, migrationID string) (ReservationInfo, error) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	reservations := ps.ensureReservationsLocked()
+	res, ok := reservations[migrationID]
+	if !ok {
+		return ReservationInfo{Status: string(ReservationNotFound)}, nil
+	}
+	now := ps.getNow()
+	status := res.Status
+	if status == ReservationActive && now.After(res.ExpiresAt) {
+		status = ReservationExpired
+		res.Status = status
+		reservations[migrationID] = res
+	}
+	return ReservationInfo{
+		Status:              string(status),
+		MigrationID:         res.MigrationID,
+		DeviceName:          res.DeviceName,
+		SessionID:           res.SessionID,
+		ClientID:            res.ClientID,
+		ExpectedFingerprint: res.ExpectedFingerprint,
+		CreatedAt:           res.CreatedAt,
+		ExpiresAt:           res.ExpiresAt,
+	}, nil
+}
+
+func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrationRequest) (SessionStatus, error) {
+	ps.mu.Lock()
+
+	if ps.shuttingDown || ctx.Err() != nil {
+		ps.mu.Unlock()
+		return SessionStatus{}, context.Canceled
+	}
+	if user, ok := request.UserFrom(ctx); ok && req.User != "" && user.UserName != req.User {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionOwnership
+	}
+
+	reservations := ps.ensureReservationsLocked()
+	res, ok := reservations[req.MigrationID]
+	now := ps.getNow()
+	if !ok || res.Status != ReservationActive || now.After(res.ExpiresAt) {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrReservationNotFound
+	}
+	if res.SessionID != req.SessionID || (res.ClientID != "" && req.ClientID != "" && res.ClientID != req.ClientID) {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionOwnership
+	}
+	if res.DeviceName != req.TargetDeviceName {
+		ps.mu.Unlock()
+		return SessionStatus{}, fmt.Errorf("reservation device mismatch: %s vs %s", res.DeviceName, req.TargetDeviceName)
+	}
+
+	sessionManager := ps.ensureSessionManagerLocked()
+	session, ok := sessionManager.Get(req.SessionID)
+	if !ok {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionNotFound
+	}
+	if req.User != "" && session.User != req.User {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionOwnership
+	}
+	if req.ClientID != "" && session.OwnerClientID != req.ClientID {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrSessionOwnership
+	}
+	if req.ExpectedGeneration > 0 && session.BindingGeneration != req.ExpectedGeneration {
+		ps.mu.Unlock()
+		return SessionStatus{}, ErrCommandSuperseded
+	}
+
+	targetDevice := ps.deviceByNameLocked(req.TargetDeviceName)
+	if targetDevice == nil {
+		ps.mu.Unlock()
+		return SessionStatus{}, fmt.Errorf("%w: %s", ErrDeviceNotFound, req.TargetDeviceName)
+	}
+
+	targetDevice.mu.Lock()
+	currentFp := targetDevice.sceneFingerprintLocked()
+	if req.ExpectedFingerprint != "" && currentFp != req.ExpectedFingerprint {
+		targetDevice.mu.Unlock()
+		ps.mu.Unlock()
+		return SessionStatus{}, &TargetOccupiedError{
+			SceneFingerprint: currentFp,
+			QueueCount:       targetDevice.PlaybackQueue.Size(),
+		}
+	}
+
+	res.Status = ReservationReleased
+	reservations[req.MigrationID] = res
+
+	session.DeviceName = req.TargetDeviceName
+	session.BindingGeneration++
+	sessionManager.Update(session)
+
+	targetDevice.clearLocked(ctx)
+	if len(req.Queue) > 0 {
+		items := model.MediaFiles{}
+		for _, id := range req.Queue {
+			if mf, err := ps.GetMediaFile(id); err == nil && mf != nil {
+				items = append(items, *mf)
+			} else {
+				items = append(items, model.MediaFile{ID: id, Path: "/" + id + ".mp3"})
+			}
+		}
+		targetDevice.PlaybackQueue.Set(items)
+		targetDevice.PlaybackQueue.SetIndex(req.CurrentIndex)
+	}
+	if req.Position > 0 {
+		pos := req.Position
+		targetDevice.recoveryPosition = &pos
+	}
+	if req.Gain > 0 {
+		targetDevice.Gain = req.Gain
+		targetDevice.DesiredGain = req.Gain
+	}
+	targetDevice.incrementQueueVersionLocked()
+	targetDevice.incrementSceneRevisionLocked()
+	targetDevice.mu.Unlock()
+	ps.mu.Unlock()
+
+	return ps.statusFromSession(session), nil
+}
+
+func (ps *playbackServer) QueryOperation(ctx context.Context, sessionID, operationID string) (OperationRecord, error) {
+	ps.mu.Lock()
+	store := ps.ensureOperationStoreLocked()
+	ps.mu.Unlock()
+
+	if rec, ok := store.Get(sessionID, operationID); ok {
+		return rec, nil
+	}
+	return OperationRecord{
+		Status:      OperationStatusUnknown,
+		SessionID:   sessionID,
+		OperationID: operationID,
+	}, nil
 }
 
 // mergeBluetoothDevices discovers Bluetooth sinks and appends any new ones to playbackDevices.

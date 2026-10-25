@@ -1,6 +1,10 @@
 package playback
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"sync"
 	"time"
@@ -9,7 +13,9 @@ import (
 var (
 	ErrSessionNotFound  = errors.New("session not found")
 	ErrSessionOwnership = errors.New("session owned by another client")
+	ErrHandoffInvalid   = errors.New("invalid or expired handoff token")
 	defaultSessionTTL   = 45 * time.Second
+	defaultHandoffTTL   = 30 * time.Second
 )
 
 const (
@@ -32,31 +38,54 @@ type AttachRequest struct {
 }
 
 type Session struct {
-	SessionID      string     `json:"sessionId"`
-	User           string     `json:"user"`
-	OwnerClientID  string     `json:"ownerClientId"`
-	DeviceName     string     `json:"deviceName"`
-	LastHeartbeat  time.Time  `json:"lastHeartbeat"`
-	OwnershipState string     `json:"ownershipState"`
-	StaleSince     *time.Time `json:"staleSince,omitempty"`
+	SessionID          string     `json:"sessionId"`
+	User               string     `json:"user"`
+	OwnerClientID      string     `json:"ownerClientId"`
+	DeviceName         string     `json:"deviceName"`
+	LastHeartbeat      time.Time  `json:"lastHeartbeat"`
+	OwnershipState     string     `json:"ownershipState"`
+	StaleSince         *time.Time `json:"staleSince,omitempty"`
+	BindingGeneration  uint64     `json:"bindingGeneration"`
+	HandoffTokenHash   string     `json:"-"`
+	HandoffTokenExpiry time.Time  `json:"-"`
 }
 
 type SessionStatus struct {
-	SessionID         string     `json:"sessionId"`
-	DeviceName        string     `json:"deviceName"`
-	OwnerClientID     string     `json:"ownerClientId"`
-	CurrentIndex      int        `json:"currentIndex"`
-	TrackID           string     `json:"trackId"`
-	Playing           bool       `json:"playing"`
-	Position          int        `json:"position"`
-	Gain              float32    `json:"gain"`
-	DesiredGain       float32    `json:"desiredGain,omitempty"`
-	Attached          bool       `json:"attached"`
-	OwnershipState    string     `json:"ownershipState"`
-	TerminationReason string     `json:"terminationReason,omitempty"`
-	QueueVersion      int        `json:"queueVersion"`
-	LastHeartbeat     time.Time  `json:"lastHeartbeat"`
-	StaleSince        *time.Time `json:"staleSince,omitempty"`
+	SessionID           string     `json:"sessionId"`
+	DeviceName          string     `json:"deviceName"`
+	OwnerClientID       string     `json:"ownerClientId"`
+	CurrentIndex        int        `json:"currentIndex"`
+	TrackID             string     `json:"trackId"`
+	Playing             bool       `json:"playing"`
+	Position            int        `json:"position"`
+	Gain                float32    `json:"gain"`
+	DesiredGain         float32    `json:"desiredGain,omitempty"`
+	Attached            bool       `json:"attached"`
+	OwnershipState      string     `json:"ownershipState"`
+	TerminationReason   string     `json:"terminationReason,omitempty"`
+	QueueVersion        int        `json:"queueVersion"`
+	LastHeartbeat       time.Time  `json:"lastHeartbeat"`
+	StaleSince          *time.Time `json:"staleSince,omitempty"`
+	BindingGeneration   uint64     `json:"bindingGeneration"`
+	ControlHandoffToken string     `json:"controlHandoffToken,omitempty"`
+}
+
+type HandoffRequest struct {
+	SessionID    string
+	User         string
+	NewClientID  string
+	HandoffToken string
+}
+
+func generateHandoffToken() (string, string, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", "", err
+	}
+	token := hex.EncodeToString(bytes)
+	h := sha256.Sum256([]byte(token))
+	hash := hex.EncodeToString(h[:])
+	return token, hash, nil
 }
 
 type SessionManager struct {
@@ -80,39 +109,112 @@ func NewSessionManager(ttl time.Duration, maxStale ...time.Duration) *SessionMan
 	}
 }
 
-func (sm *SessionManager) Attach(req AttachRequest) Session {
+func (sm *SessionManager) Attach(req AttachRequest) (Session, string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	generation := uint64(1)
+	if previous, ok := sm.sessions[req.SessionID]; ok {
+		if previous.OwnerClientID == req.ClientID {
+			// Ordinary same-owner reattach preserves generation
+			generation = max(1, previous.BindingGeneration)
+		} else if req.Takeover {
+			// Explicit takeover increments generation
+			generation = max(1, previous.BindingGeneration) + 1
+		}
+	}
+
+	token, hash, _ := generateHandoffToken()
+	now := sm.now().UTC()
+
 	session := Session{
-		SessionID:      req.SessionID,
-		User:           req.User,
-		OwnerClientID:  req.ClientID,
-		DeviceName:     req.DeviceName,
-		LastHeartbeat:  sm.now().UTC(),
-		OwnershipState: SessionOwnershipAttached,
+		SessionID:          req.SessionID,
+		User:               req.User,
+		OwnerClientID:      req.ClientID,
+		DeviceName:         req.DeviceName,
+		LastHeartbeat:      now,
+		OwnershipState:     SessionOwnershipAttached,
+		BindingGeneration:  generation,
+		HandoffTokenHash:   hash,
+		HandoffTokenExpiry: now.Add(defaultHandoffTTL),
 	}
 	sm.sessions[req.SessionID] = session
-	return session
+	return session, token
 }
 
-func (sm *SessionManager) Heartbeat(sessionID, clientID string) error {
+func (sm *SessionManager) Heartbeat(sessionID, clientID string) (string, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	session, ok := sm.sessions[sessionID]
 	if !ok {
-		return ErrSessionNotFound
+		return "", ErrSessionNotFound
 	}
 	if session.OwnerClientID != clientID {
-		return ErrSessionOwnership
+		return "", ErrSessionOwnership
 	}
 
-	session.LastHeartbeat = sm.now().UTC()
+	token, hash, _ := generateHandoffToken()
+	now := sm.now().UTC()
+
+	session.LastHeartbeat = now
 	session.OwnershipState = SessionOwnershipAttached
 	session.StaleSince = nil
+	session.HandoffTokenHash = hash
+	session.HandoffTokenExpiry = now.Add(defaultHandoffTTL)
 	sm.sessions[sessionID] = session
-	return nil
+	return token, nil
+}
+
+func (sm *SessionManager) Handoff(req HandoffRequest) (Session, string, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	session, ok := sm.sessions[req.SessionID]
+	if !ok {
+		return Session{}, "", ErrSessionNotFound
+	}
+	if req.User != "" && session.User != req.User {
+		return Session{}, "", ErrSessionOwnership
+	}
+	if req.HandoffToken == "" || session.HandoffTokenHash == "" {
+		return Session{}, "", ErrHandoffInvalid
+	}
+	now := sm.now().UTC()
+	if now.After(session.HandoffTokenExpiry) {
+		session.HandoffTokenHash = ""
+		sm.sessions[req.SessionID] = session
+		return Session{}, "", ErrHandoffInvalid
+	}
+
+	h := sha256.Sum256([]byte(req.HandoffToken))
+	computedHash := hex.EncodeToString(h[:])
+	if subtle.ConstantTimeCompare([]byte(session.HandoffTokenHash), []byte(computedHash)) != 1 {
+		return Session{}, "", ErrHandoffInvalid
+	}
+
+	// Single-use: consumed atomically
+	session.HandoffTokenHash = ""
+
+	// Issue a new token for the new document owner
+	newToken, newHash, _ := generateHandoffToken()
+
+	session.OwnerClientID = req.NewClientID
+	session.BindingGeneration++
+	session.LastHeartbeat = now
+	session.OwnershipState = SessionOwnershipAttached
+	session.StaleSince = nil
+	session.HandoffTokenHash = newHash
+	session.HandoffTokenExpiry = now.Add(defaultHandoffTTL)
+	sm.sessions[req.SessionID] = session
+
+	return session, newToken, nil
+}
+
+func (sm *SessionManager) Update(session Session) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.sessions[session.SessionID] = session
 }
 
 func (sm *SessionManager) Detach(sessionID, clientID string) error {
@@ -182,6 +284,7 @@ func (sm *SessionManager) RebindDevice(oldDeviceName, newDeviceName string) []Se
 			continue
 		}
 		session.DeviceName = newDeviceName
+		session.BindingGeneration++
 		sm.sessions[id] = session
 		rebound = append(rebound, session)
 	}

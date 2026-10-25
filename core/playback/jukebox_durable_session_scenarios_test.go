@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,11 +22,13 @@ func newDurableScenarioHarness(t *testing.T) *durableScenarioHarness {
 	t.Helper()
 
 	ctx := context.Background()
+	dev := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+	dev.Default = true
 	server := &playbackServer{
 		ctx:            &ctx,
 		sessionManager: NewSessionManager(50*time.Millisecond, 100*time.Millisecond),
 		playbackDevices: []*playbackDevice{
-			NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test"),
+			dev,
 		},
 	}
 	harness := &durableScenarioHarness{
@@ -35,6 +38,7 @@ func newDurableScenarioHarness(t *testing.T) *durableScenarioHarness {
 		device: server.playbackDevices[0],
 	}
 	server.sessionManager.now = func() time.Time { return harness.now }
+	server.now = func() time.Time { return harness.now }
 	return harness
 }
 
@@ -273,5 +277,411 @@ func TestDurableSessionSuspendResumeReattachesToCurrentRemoteSnapshot(t *testing
 	status := h.attach(t, "tab-1")
 	if status.OwnershipState != SessionOwnershipAttached || status.CurrentIndex != 2 || status.TrackID != "3" {
 		t.Fatalf("expected suspend/resume re-attach to recover current remote snapshot, got %#v", status)
+	}
+}
+
+func TestDurableSessionGenerationMatrix(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	status := h.attach(t, "owner-tab")
+
+	if status.BindingGeneration != 1 {
+		t.Fatalf("expected initial generation 1, got %d", status.BindingGeneration)
+	}
+
+	ctx := h.ctx
+	sessionID := "s1"
+	clientID := "owner-tab"
+
+	// 1. Missing generation -> ErrGenerationRequired
+	scopeMissing := CommandScope{User: "admin", SessionID: sessionID, ClientID: clientID}
+	if _, err := h.server.ExecuteCommand(ctx, scopeMissing, PlaybackCommand{Action: CommandSet, IDs: []string{"1"}}); !errors.Is(err, ErrGenerationRequired) {
+		t.Fatalf("expected ErrGenerationRequired for nil generation, got %v", err)
+	}
+
+	// 2. Zero generation -> ErrGenerationRequired
+	zero := uint64(0)
+	scopeZero := CommandScope{User: "admin", SessionID: sessionID, ClientID: clientID, BindingGeneration: &zero}
+	if _, err := h.server.ExecuteCommand(ctx, scopeZero, PlaybackCommand{Action: CommandSet, IDs: []string{"1"}}); !errors.Is(err, ErrGenerationRequired) {
+		t.Fatalf("expected ErrGenerationRequired for 0 generation, got %v", err)
+	}
+
+	// 3. Future generation -> ErrCommandSuperseded with zero target side effects
+	future := uint64(5)
+	scopeFuture := CommandScope{User: "admin", SessionID: sessionID, ClientID: clientID, BindingGeneration: &future}
+	if _, err := h.server.ExecuteCommand(ctx, scopeFuture, PlaybackCommand{Action: CommandGain, Gain: 0.125}); !errors.Is(err, ErrCommandSuperseded) {
+		t.Fatalf("expected ErrCommandSuperseded for future generation, got %v", err)
+	}
+	if h.device.Gain == 0.125 {
+		t.Fatal("future generation modified target device side effects!")
+	}
+
+	// 4. Exact generation (1) -> succeeds
+	gen1 := uint64(1)
+	scope1 := CommandScope{User: "admin", SessionID: sessionID, ClientID: clientID, BindingGeneration: &gen1}
+	if st, err := h.server.ExecuteCommand(ctx, scope1, PlaybackCommand{Action: CommandGain, Gain: 0.5}); err != nil || st.Gain != 0.5 {
+		t.Fatalf("exact generation failed: %v", err)
+	}
+
+	// 5. Same-owner reattach preserves generation 1
+	reattachStatus := h.attach(t, "owner-tab")
+	if reattachStatus.BindingGeneration != 1 {
+		t.Fatalf("same-owner reattach changed generation: %d", reattachStatus.BindingGeneration)
+	}
+
+	// 6. Explicit takeover increments generation to 2
+	takeoverStatus := h.attach(t, "new-tab", true)
+	if takeoverStatus.BindingGeneration != 2 {
+		t.Fatalf("takeover did not increment generation: %d", takeoverStatus.BindingGeneration)
+	}
+
+	// 7. Old owner with old generation -> ErrSessionOwnership
+	if _, err := h.server.ExecuteCommand(ctx, scope1, PlaybackCommand{Action: CommandGain, Gain: 0.75}); !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("expected ErrSessionOwnership for old owner, got %v", err)
+	}
+
+	// 8. New owner with older generation 1 -> ErrCommandSuperseded
+	scopeNewOldGen := CommandScope{User: "admin", SessionID: sessionID, ClientID: "new-tab", BindingGeneration: &gen1}
+	if _, err := h.server.ExecuteCommand(ctx, scopeNewOldGen, PlaybackCommand{Action: CommandGain, Gain: 0.75}); !errors.Is(err, ErrCommandSuperseded) {
+		t.Fatalf("expected ErrCommandSuperseded for older generation on new owner, got %v", err)
+	}
+	if h.device.Gain == 0.75 {
+		t.Fatal("older generation modified target device side effects!")
+	}
+
+	// 9. New owner with exact generation 2 -> succeeds
+	gen2 := uint64(2)
+	scopeNewExact := CommandScope{User: "admin", SessionID: sessionID, ClientID: "new-tab", BindingGeneration: &gen2}
+	if st, err := h.server.ExecuteCommand(ctx, scopeNewExact, PlaybackCommand{Action: CommandGain, Gain: 0.75}); err != nil || st.Gain != 0.75 {
+		t.Fatalf("exact generation 2 failed on new owner: %v", err)
+	}
+
+	// 10. Legacy access to protected context is rejected
+	legacyScope := CommandScope{User: "admin"}
+	if _, err := h.server.ExecuteCommand(ctx, legacyScope, PlaybackCommand{Action: CommandGain, Gain: 0.9}); !errors.Is(err, ErrProtectedContextConflict) {
+		t.Fatalf("expected ErrProtectedContextConflict for legacy access to protected context, got %v", err)
+	}
+}
+
+func TestDurableSessionOperationStoreDeduplicationAndEviction(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	h.attach(t, "tab-1")
+	gen1 := uint64(1)
+
+	ctx := h.ctx
+	scope := CommandScope{
+		User:              "admin",
+		SessionID:         "s1",
+		ClientID:          "tab-1",
+		BindingGeneration: &gen1,
+		OperationID:       "op-unique-1",
+	}
+
+	// First execution applies
+	st1, err := h.server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandGain, Gain: 0.4})
+	if err != nil || st1.Gain != 0.4 {
+		t.Fatalf("first execution failed: %v", err)
+	}
+
+	// Sequential retry with same OperationID returns identical result without re-executing
+	st2, err := h.server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandGain, Gain: 0.4})
+	if err != nil || st2.Gain != 0.4 {
+		t.Fatalf("sequential retry failed: %v", err)
+	}
+
+	// Query operation result returns APPLIED
+	rec, err := h.server.QueryOperation(ctx, "s1", "op-unique-1")
+	if err != nil || rec.Status != OperationStatusApplied {
+		t.Fatalf("queryOperation failed: %#v, %v", rec, err)
+	}
+
+	// Concurrent execution across 10 goroutines with same OperationID
+	concurrentScope := CommandScope{
+		User:              "admin",
+		SessionID:         "s1",
+		ClientID:          "tab-1",
+		BindingGeneration: &gen1,
+		OperationID:       "op-concurrent-1",
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 10)
+	results := make([]DeviceStatus, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results[idx], errs[idx] = h.server.ExecuteCommand(ctx, concurrentScope, PlaybackCommand{Action: CommandGain, Gain: 0.6})
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < 10; i++ {
+		if errs[i] != nil || results[i].Gain != 0.6 {
+			t.Fatalf("concurrent execution goroutine %d failed: %v, %#v", i, errs[i], results[i])
+		}
+	}
+
+	// Bounded capacity eviction
+	store := NewOperationStore(3, time.Hour)
+	store.Complete("s1", "op-1", OperationRecord{Status: OperationStatusApplied})
+	store.Complete("s1", "op-2", OperationRecord{Status: OperationStatusApplied})
+	store.Complete("s1", "op-3", OperationRecord{Status: OperationStatusApplied})
+	store.Complete("s1", "op-4", OperationRecord{Status: OperationStatusApplied}) // evicts op-1
+
+	if rec, found := store.Get("s1", "op-1"); found || rec.Status != OperationStatusUnknown {
+		t.Fatalf("expected evicted op-1 to return UNKNOWN, got found=%v, status=%s", found, rec.Status)
+	}
+	if rec, found := store.Get("s1", "op-4"); !found || rec.Status != OperationStatusApplied {
+		t.Fatalf("expected op-4 to remain in store, got found=%v, %#v", found, rec)
+	}
+
+	// TTL eviction
+	now := time.Now()
+	storeWithClock := NewOperationStore(10, 50*time.Millisecond, func() time.Time { return now })
+	storeWithClock.Complete("s1", "op-ttl", OperationRecord{Status: OperationStatusApplied})
+	now = now.Add(60 * time.Millisecond)
+	if rec, found := storeWithClock.Get("s1", "op-ttl"); found || rec.Status != OperationStatusUnknown {
+		t.Fatalf("expected expired op-ttl to return UNKNOWN, got found=%v, status=%s", found, rec.Status)
+	}
+}
+
+func TestDurableSessionTargetOccupancyAndNonDestructiveReservation(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	h.startPlayback(t)
+	h.attach(t, "target-owner")
+
+	ctx := h.ctx
+	targetDevice := "pulse/test"
+
+	// 1. Admission to occupied target without confirmation returns 409 TargetOccupiedError
+	resReq := ReserveMigrationRequest{
+		MigrationID: "mig-1",
+		SessionID:   "source-session",
+		ClientID:    "source-client",
+		User:        "admin",
+		DeviceName:  targetDevice,
+	}
+	_, err := h.server.ReserveMigration(ctx, resReq)
+	var occupiedErr *TargetOccupiedError
+	if !errors.As(err, &occupiedErr) {
+		t.Fatalf("expected TargetOccupiedError, got: %v", err)
+	}
+	if occupiedErr.SceneFingerprint == "" || occupiedErr.QueueCount != 2 {
+		t.Fatalf("unexpected occupied error details: %#v", occupiedErr)
+	}
+	firstFp := occupiedErr.SceneFingerprint
+
+	// Target remains completely undisturbed
+	targetStatus, _ := h.server.SessionStatus(ctx, "s1")
+	if targetStatus.OwnerClientID != "target-owner" || !targetStatus.Playing || targetStatus.QueueVersion != h.device.queueVersion {
+		t.Fatalf("target was disturbed before confirmation: %#v", targetStatus)
+	}
+
+	// 2. Reservation with expected fingerprint succeeds
+	resReq.ExpectedFingerprint = firstFp
+	res, err := h.server.ReserveMigration(ctx, resReq)
+	if err != nil || res.Status != OperationStatusApplied {
+		t.Fatalf("reservation with matching fingerprint failed: %v, %#v", err, res)
+	}
+
+	// Target is STILL untouched
+	targetStatus2, _ := h.server.SessionStatus(ctx, "s1")
+	if targetStatus2.OwnerClientID != "target-owner" || !targetStatus2.Playing {
+		t.Fatalf("reservation evicted target owner or stopped playback: %#v", targetStatus2)
+	}
+
+	// 3. Conflicting reservation from another migration is rejected
+	conflictingReq := ReserveMigrationRequest{
+		MigrationID:         "mig-2",
+		SessionID:           "other-session",
+		ClientID:            "other-client",
+		User:                "admin",
+		DeviceName:          targetDevice,
+		ExpectedFingerprint: firstFp,
+	}
+	_, err = h.server.ReserveMigration(ctx, conflictingReq)
+	if !errors.Is(err, ErrMigrationConflict) {
+		t.Fatalf("expected ErrMigrationConflict on conflicting reservation, got: %v", err)
+	}
+
+	// 4. Query reservation returns ACTIVE
+	qRes, err := h.server.QueryReservation(ctx, "mig-1")
+	if err != nil || qRes.Status != string(ReservationActive) {
+		t.Fatalf("expected ACTIVE reservation, got %#v, %v", qRes, err)
+	}
+
+	// 5. Release reservation is idempotent
+	relRes, err := h.server.ReleaseMigrationReservation(ctx, "mig-1", "source-client")
+	if err != nil || relRes.Status != OperationStatusApplied {
+		t.Fatalf("release failed: %v, %#v", err, relRes)
+	}
+	// Repeated release returns APPLIED (idempotent)
+	relRes2, err := h.server.ReleaseMigrationReservation(ctx, "mig-1", "source-client")
+	if err != nil || relRes2.Status != OperationStatusApplied {
+		t.Fatalf("repeated release failed: %v, %#v", err, relRes2)
+	}
+
+	// Query reservation now returns RELEASED
+	qResReleased, err := h.server.QueryReservation(ctx, "mig-1")
+	if err != nil || qResReleased.Status != string(ReservationReleased) {
+		t.Fatalf("expected RELEASED reservation, got %#v, %v", qResReleased, err)
+	}
+}
+
+func TestDurableSessionCommitMigrationAtomicity(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	ctx := h.ctx
+
+	// Add target device
+	targetDev := NewPlaybackDevice(ctx, h.server, "Target Speaker", "target-dev")
+	targetDev.PlaybackQueue.Add(model.MediaFiles{{ID: "target-1", Path: "/t1.mp3"}})
+	h.server.playbackDevices = append(h.server.playbackDevices, targetDev)
+
+	// Create source session on pulse/test
+	sourceSession, err := h.server.AttachSession(ctx, AttachRequest{
+		SessionID:  "source-session",
+		User:       "admin",
+		ClientID:   "source-tab",
+		DeviceName: "pulse/test",
+	})
+	if err != nil {
+		t.Fatalf("attach source: %v", err)
+	}
+
+	// Reserve target
+	fp := targetDev.SceneFingerprint()
+	resReq := ReserveMigrationRequest{
+		MigrationID:         "mig-commit-1",
+		SessionID:           "source-session",
+		ClientID:            "source-tab",
+		User:                "admin",
+		DeviceName:          "target-dev",
+		ExpectedFingerprint: fp,
+	}
+	if _, err := h.server.ReserveMigration(ctx, resReq); err != nil {
+		t.Fatalf("reserve failed: %v", err)
+	}
+
+	// Third-party modifies target scene between reserve and commit
+	targetDev.mu.Lock()
+	targetDev.incrementSceneRevisionLocked()
+	targetDev.mu.Unlock()
+
+	// Commit with stale fingerprint is rejected, preserving third-party scene
+	commitReq := CommitMigrationRequest{
+		MigrationID:         "mig-commit-1",
+		SessionID:           "source-session",
+		ClientID:            "source-tab",
+		User:                "admin",
+		TargetDeviceName:    "target-dev",
+		ExpectedGeneration:  sourceSession.BindingGeneration,
+		ExpectedFingerprint: fp,
+	}
+	_, err = h.server.CommitMigration(ctx, commitReq)
+	var occupiedErr *TargetOccupiedError
+	if !errors.As(err, &occupiedErr) {
+		t.Fatalf("expected TargetOccupiedError when scene changed before commit, got: %v", err)
+	}
+
+	// Update reservation with new fingerprint
+	newFp := targetDev.SceneFingerprint()
+	resReq.ExpectedFingerprint = newFp
+	if _, err := h.server.ReserveMigration(ctx, resReq); err != nil {
+		t.Fatalf("re-reserve failed: %v", err)
+	}
+
+	// Commit succeeds atomically
+	commitReq.ExpectedFingerprint = newFp
+	commitReq.Position = 42
+	commitReq.Gain = 0.8
+	committedStatus, err := h.server.CommitMigration(ctx, commitReq)
+	if err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+
+	if committedStatus.BindingGeneration != sourceSession.BindingGeneration+1 {
+		t.Fatalf("expected generation increment on commit: %d vs %d", committedStatus.BindingGeneration, sourceSession.BindingGeneration+1)
+	}
+	if committedStatus.DeviceName != "target-dev" {
+		t.Fatalf("expected device target-dev, got %s", committedStatus.DeviceName)
+	}
+}
+
+func TestDurableSessionRefreshHandoffContract(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	status := h.attach(t, "tab-1")
+
+	if status.ControlHandoffToken == "" {
+		t.Fatal("expected attach response to issue handoff token to owner")
+	}
+	initialToken := status.ControlHandoffToken
+
+	// Observer/status query does NOT disclose the handoff token
+	statusQuery, err := h.server.SessionStatus(h.ctx, "s1")
+	if err != nil || statusQuery.ControlHandoffToken != "" {
+		t.Fatalf("status query disclosed handoff token: %#v", statusQuery)
+	}
+
+	// Snapshot query does NOT disclose handoff token
+	snapQuery, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
+	if err != nil || snapQuery.SessionStatus.ControlHandoffToken != "" {
+		t.Fatalf("snapshot query disclosed handoff token: %#v", snapQuery)
+	}
+
+	// Handoff to new document tab-2
+	handoffStatus, err := h.server.HandoffSession(h.ctx, HandoffRequest{
+		SessionID:    "s1",
+		User:         "admin",
+		NewClientID:  "tab-2",
+		HandoffToken: initialToken,
+	})
+	if err != nil {
+		t.Fatalf("handoff failed: %v", err)
+	}
+	if handoffStatus.OwnerClientID != "tab-2" {
+		t.Fatalf("expected owner tab-2, got %s", handoffStatus.OwnerClientID)
+	}
+	if handoffStatus.BindingGeneration != 2 {
+		t.Fatalf("expected generation 2 after handoff, got %d", handoffStatus.BindingGeneration)
+	}
+	if handoffStatus.ControlHandoffToken == "" || handoffStatus.ControlHandoffToken == initialToken {
+		t.Fatalf("expected rotated handoff token on handoff response: %s", handoffStatus.ControlHandoffToken)
+	}
+
+	// Clone competition: tab-3 reusing initialToken is rejected
+	_, err = h.server.HandoffSession(h.ctx, HandoffRequest{
+		SessionID:    "s1",
+		User:         "admin",
+		NewClientID:  "tab-3",
+		HandoffToken: initialToken,
+	})
+	if !errors.Is(err, ErrHandoffInvalid) {
+		t.Fatalf("expected ErrHandoffInvalid on reused token, got: %v", err)
+	}
+
+	// Old document tab-1 cannot continue writing
+	gen1 := uint64(1)
+	oldDocScope := CommandScope{
+		User:              "admin",
+		SessionID:         "s1",
+		ClientID:          "tab-1",
+		BindingGeneration: &gen1,
+	}
+	if _, err := h.server.ExecuteCommand(h.ctx, oldDocScope, PlaybackCommand{Action: CommandGain, Gain: 0.1}); !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("expected ErrSessionOwnership for old document, got: %v", err)
+	}
+
+	// Tab-2 is active owner and writes with generation 2 succeed
+	gen2 := uint64(2)
+	newDocScope := CommandScope{
+		User:              "admin",
+		SessionID:         "s1",
+		ClientID:          "tab-2",
+		BindingGeneration: &gen2,
+	}
+	if st, err := h.server.ExecuteCommand(h.ctx, newDocScope, PlaybackCommand{Action: CommandGain, Gain: 0.1}); err != nil || st.Gain != 0.1 {
+		t.Fatalf("new document command failed: %v", err)
 	}
 }

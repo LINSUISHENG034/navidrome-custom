@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/navidrome/navidrome/core/playback"
@@ -32,6 +33,11 @@ type jukeboxCommandRequest struct {
 
 func (api *Router) addJukeboxControlRoute(r chi.Router) {
 	r.Get("/jukebox/status", api.jukeboxStatus)
+	r.Get("/jukebox/operation", api.jukeboxOperation)
+	r.Post("/jukebox/migration/reserve", api.jukeboxMigrationReserve)
+	r.Post("/jukebox/migration/release", api.jukeboxMigrationRelease)
+	r.Post("/jukebox/migration/commit", api.jukeboxMigrationCommit)
+	r.Get("/jukebox/migration/reservation", api.jukeboxMigrationReservation)
 	r.Post("/jukebox/set", api.jukeboxSet)
 	r.Post("/jukebox/start", api.jukeboxStart)
 	r.Post("/jukebox/play", api.jukeboxStart)
@@ -100,6 +106,16 @@ func commandScopeFromRequest(r *http.Request, scope playback.CommandScope) (play
 	}
 	if scope.ClientID == "" {
 		scope.ClientID = queryClient
+	}
+	if scope.BindingGeneration == nil {
+		if qGen := query.Get("bindingGeneration"); qGen != "" {
+			if val, err := strconv.ParseUint(qGen, 10, 64); err == nil {
+				scope.BindingGeneration = &val
+			}
+		}
+	}
+	if scope.OperationID == "" {
+		scope.OperationID = query.Get("operationId")
 	}
 	user, _ := request.UserFrom(r.Context())
 	scope.User = user.UserName
@@ -176,4 +192,92 @@ func (api *Router) jukeboxRemove(w http.ResponseWriter, r *http.Request) {
 
 func (api *Router) jukeboxMove(w http.ResponseWriter, r *http.Request) {
 	api.jukeboxCommand(w, r, playback.CommandMove, true)
+}
+
+func (api *Router) jukeboxOperation(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("sessionId")
+	operationID := r.URL.Query().Get("operationId")
+	if sessionID == "" || operationID == "" {
+		http.Error(w, "sessionId and operationId are required", http.StatusBadRequest)
+		return
+	}
+	rec, err := api.playback.QueryOperation(r.Context(), sessionID, operationID)
+	if err != nil {
+		api.writeJukeboxSessionError(w, err)
+		return
+	}
+	api.writeJukeboxJSON(w, r, rec)
+}
+
+func (api *Router) jukeboxMigrationReserve(w http.ResponseWriter, r *http.Request) {
+	var req playback.ReserveMigrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.MigrationID == "" || req.DeviceName == "" {
+		http.Error(w, "migrationId and deviceName are required", http.StatusBadRequest)
+		return
+	}
+	user, _ := request.UserFrom(r.Context())
+	req.User = user.UserName
+	res, err := api.playback.ReserveMigration(r.Context(), req)
+	if err != nil {
+		api.writeJukeboxSessionError(w, err)
+		return
+	}
+	api.writeJukeboxJSON(w, r, res)
+}
+
+func (api *Router) jukeboxMigrationRelease(w http.ResponseWriter, r *http.Request) {
+	var req playback.ReleaseMigrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.MigrationID == "" {
+		http.Error(w, "migrationId is required", http.StatusBadRequest)
+		return
+	}
+	res, err := api.playback.ReleaseMigrationReservation(r.Context(), req.MigrationID, req.ClientID)
+	if err != nil {
+		api.writeJukeboxSessionError(w, err)
+		return
+	}
+	api.writeJukeboxJSON(w, r, res)
+}
+
+func (api *Router) jukeboxMigrationReservation(w http.ResponseWriter, r *http.Request) {
+	migrationID := r.URL.Query().Get("migrationId")
+	if migrationID == "" {
+		http.Error(w, "migrationId is required", http.StatusBadRequest)
+		return
+	}
+	info, err := api.playback.QueryReservation(r.Context(), migrationID)
+	if err != nil {
+		api.writeJukeboxSessionError(w, err)
+		return
+	}
+	api.writeJukeboxJSON(w, r, info)
+}
+
+func (api *Router) jukeboxMigrationCommit(w http.ResponseWriter, r *http.Request) {
+	var req playback.CommitMigrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.MigrationID == "" || req.SessionID == "" || req.TargetDeviceName == "" {
+		http.Error(w, "migrationId, sessionId, and targetDeviceName are required", http.StatusBadRequest)
+		return
+	}
+	user, _ := request.UserFrom(r.Context())
+	req.User = user.UserName
+	status, err := api.playback.CommitMigration(r.Context(), req)
+	if err != nil {
+		api.writeJukeboxSessionError(w, err)
+		return
+	}
+	publishJukeboxSessionEvent(r, status)
+	api.writeJukeboxJSON(w, r, status)
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,6 +30,8 @@ func TestJukeboxSessionRoutes(t *testing.T) {
 		"POST /jukebox/session/attach":    true,
 		"POST /jukebox/session/heartbeat": true,
 		"POST /jukebox/session/detach":    true,
+		"POST /jukebox/session/handoff":   true,
+		"GET /jukebox/session/operation":  true,
 	}
 
 	err := chi.Walk(r, func(method string, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
@@ -60,6 +63,9 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 	snapshotID := uniqueSessionID("snapshot")
 	forbiddenSnapshotID := uniqueSessionID("forbidden-snapshot")
 	detachSnapshotID := uniqueSessionID("detach-snapshot")
+	handoffID := uniqueSessionID("handoff")
+	handoffSuccessID := uniqueSessionID("handoff-success")
+	var handoffSuccessToken string
 
 	tests := []struct {
 		name       string
@@ -282,12 +288,123 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 			handler:    (*Router).jukeboxSessionSnapshot,
 			wantStatus: http.StatusForbidden,
 		},
+		{
+			name:       "handoff validates required fields",
+			method:     http.MethodPost,
+			path:       "/jukebox/session/handoff",
+			body:       map[string]any{"sessionId": "s1"},
+			handler:    (*Router).jukeboxSessionHandoff,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:   "handoff with invalid token returns 403 HANDOFF_INVALID",
+			method: http.MethodPost,
+			path:   "/jukebox/session/handoff",
+			body: map[string]any{
+				"sessionId":    handoffID,
+				"newClientId":  "tab-2",
+				"handoffToken": "invalid-token",
+			},
+			setup: func(t *testing.T) {
+				t.Helper()
+				_, err := api.playback.AttachSession(context.Background(), playback.AttachRequest{
+					SessionID:  handoffID,
+					User:       "admin",
+					ClientID:   "tab-1",
+					DeviceName: "pulse/test",
+				})
+				if err != nil {
+					t.Fatalf("attach setup: %v", err)
+				}
+			},
+			handler:    (*Router).jukeboxSessionHandoff,
+			wantStatus: http.StatusForbidden,
+			assertJSON: func(t *testing.T, body []byte) {
+				t.Helper()
+				var got map[string]any
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if got["code"] != "HANDOFF_INVALID" {
+					t.Fatalf("expected HANDOFF_INVALID code, got %#v", got)
+				}
+			},
+		},
+		{
+			name:   "handoff succeeds and rotates token",
+			method: http.MethodPost,
+			path:   "/jukebox/session/handoff",
+			body: map[string]any{
+				"sessionId":   handoffSuccessID,
+				"newClientId": "tab-2",
+			},
+			setup: func(t *testing.T) {
+				t.Helper()
+				st, err := api.playback.AttachSession(context.Background(), playback.AttachRequest{
+					SessionID:  handoffSuccessID,
+					User:       "admin",
+					ClientID:   "tab-1",
+					DeviceName: "pulse/test",
+				})
+				if err != nil {
+					t.Fatalf("attach setup: %v", err)
+				}
+				handoffSuccessToken = st.ControlHandoffToken
+			},
+			handler: func(r *Router, w http.ResponseWriter, req *http.Request) {
+				bodyBytes, _ := json.Marshal(map[string]any{
+					"sessionId":    handoffSuccessID,
+					"newClientId":  "tab-2",
+					"handoffToken": handoffSuccessToken,
+				})
+				req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				r.jukeboxSessionHandoff(w, req)
+			},
+			wantStatus: http.StatusOK,
+			assertJSON: func(t *testing.T, body []byte) {
+				t.Helper()
+				var got map[string]any
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if got["ownerClientId"] != "tab-2" || got["bindingGeneration"] != float64(2) {
+					t.Fatalf("unexpected handoff response: %#v", got)
+				}
+				if got["controlHandoffToken"] == "" || got["controlHandoffToken"] == handoffSuccessToken {
+					t.Fatalf("expected rotated token, got %#v", got)
+				}
+			},
+		},
+		{
+			name:       "operation query validates required fields",
+			method:     http.MethodGet,
+			path:       "/jukebox/session/operation?sessionId=s1",
+			handler:    (*Router).jukeboxOperation,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "operation query returns UNKNOWN for unrecorded operation",
+			method:     http.MethodGet,
+			path:       "/jukebox/session/operation?sessionId=s1&operationId=unknown-op",
+			handler:    (*Router).jukeboxOperation,
+			wantStatus: http.StatusOK,
+			assertJSON: func(t *testing.T, body []byte) {
+				t.Helper()
+				var got map[string]any
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if got["status"] != "UNKNOWN" || got["operationId"] != "unknown-op" {
+					t.Fatalf("expected UNKNOWN status, got %#v", got)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Cleanup(func() {
-				for _, sessionID := range []string{attachID, forbiddenHeartbeatID, forbiddenDetachID, snapshotID, forbiddenSnapshotID, detachSnapshotID} {
+				for _, sessionID := range []string{attachID, forbiddenHeartbeatID, forbiddenDetachID, snapshotID, forbiddenSnapshotID, detachSnapshotID, handoffID, handoffSuccessID} {
 					_, _ = ps.DetachSession(context.Background(), sessionID, "tab-1")
 				}
 			})
