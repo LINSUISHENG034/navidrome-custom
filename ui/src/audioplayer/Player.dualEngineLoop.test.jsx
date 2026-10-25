@@ -3053,7 +3053,11 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         }
       }
 
-      await testManualNext(createBrowserAudioAdapter(), false)
+      const localAudio = document.createElement('audio')
+      await testManualNext(
+        createBrowserAudioAdapter({ audioElement: localAudio }),
+        false,
+      )
       await testManualNext(createMockRemoteAudioAdapter(), true)
     })
 
@@ -3065,14 +3069,13 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
      */
     it('TC-PM-02: natural end in order mode advances before end and stops at end of queue across both engines', async () => {
       // 1. Local Browser Audio Adapter: real DOM ended event
-      const localAdapter = createBrowserAudioAdapter()
+      const audioEl = document.createElement('audio')
+      const localAdapter = createBrowserAudioAdapter({ audioElement: audioEl })
       const localController = createPlaybackControlModule()
       localController.setAdapter(localAdapter)
       await localController.addQueueItems(modeTracks)
       await localController.setPlayMode(PlaybackMode.ORDER)
       await localController.play()
-
-      const audioEl = localAdapter.getAudioElement()
 
       // Natural end on mode-1 -> advances to mode-2
       await act(async () => {
@@ -3125,15 +3128,14 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
      */
     it('TC-PM-03: natural end in orderLoop mode wraps from last item to first item across both engines', async () => {
       // 1. Local Browser Audio Adapter
-      const localAdapter = createBrowserAudioAdapter()
+      const audioEl = document.createElement('audio')
+      const localAdapter = createBrowserAudioAdapter({ audioElement: audioEl })
       const localController = createPlaybackControlModule()
       localController.setAdapter(localAdapter)
       await localController.addQueueItems(modeTracks)
       await localController.setPlayMode(PlaybackMode.REPEAT_LIST)
       await localController.skipToQueueItem('mode-3')
       await localController.play()
-
-      const audioEl = localAdapter.getAudioElement()
       await act(async () => {
         finishMedia(audioEl)
       })
@@ -3163,15 +3165,14 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
      */
     it('TC-PM-04: natural end in singleLoop mode replays current item across both engines', async () => {
       // 1. Local Browser Audio Adapter
-      const localAdapter = createBrowserAudioAdapter()
+      const audioEl = document.createElement('audio')
+      const localAdapter = createBrowserAudioAdapter({ audioElement: audioEl })
       const localController = createPlaybackControlModule()
       localController.setAdapter(localAdapter)
       await localController.addQueueItems(modeTracks)
       await localController.setPlayMode(PlaybackMode.REPEAT_TRACK)
       await localController.skipToQueueItem('mode-2')
       await localController.play()
-
-      const audioEl = localAdapter.getAudioElement()
       await act(async () => {
         finishMedia(audioEl)
       })
@@ -3203,13 +3204,12 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
      */
     it('TC-PM-05: manual Prev rewinds when currentTime > 1.0s, otherwise moves to previous with wrap-around', async () => {
       // 1. Local Browser Audio Adapter
-      const localAdapter = createBrowserAudioAdapter()
+      const audioEl = document.createElement('audio')
+      const localAdapter = createBrowserAudioAdapter({ audioElement: audioEl })
       const localController = createPlaybackControlModule()
       localController.setAdapter(localAdapter)
       await localController.addQueueItems(modeTracks)
       await localController.skipToQueueItem('mode-2')
-
-      const audioEl = localAdapter.getAudioElement()
 
       // Progress > 1s -> rewind only
       audioEl.currentTime = 15.0
@@ -3556,8 +3556,12 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         }
       }
 
+      const localAudio = document.createElement('audio')
       const localRes = await runModeSequence(
-        createBrowserAudioAdapter({ randomFn: deterministicRandom }),
+        createBrowserAudioAdapter({
+          audioElement: localAudio,
+          randomFn: deterministicRandom,
+        }),
       )
       const remoteRes = await runModeSequence(
         createMockRemoteAudioAdapter({ randomFn: deterministicRandom }),
@@ -4685,6 +4689,303 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(controller.isMigrating()).toBe(false)
       // Target play was never called
       expect(remoteAdapter.getPlayCount()).toBe(0)
+    })
+
+    it('TC-MIG-21: pendingOutputTarget is published before waiting for browser readiness, enabling host/UnifiedNativePlayer to mount <audio> element and satisfy readiness immediately', async () => {
+      const ref = React.createRef()
+      const { controller, rerenderPlayer, unmount } =
+        await renderControlledPlayer('remote', { ref })
+
+      expect(document.querySelector('audio')).toBeNull()
+
+      const unattachedBrowser = createBrowserAudioAdapter({ unattached: true })
+      expect(unattachedBrowser.getAudioElement()).toBeNull()
+
+      let observedPending = null
+      const unsubscribe = controller.subscribe((state) => {
+        if (state.pendingOutputTarget) {
+          observedPending = state.pendingOutputTarget
+        }
+      })
+
+      const migrationPromise = controller.migrateOutput({
+        targetAdapter: unattachedBrowser,
+        targetDevice: { name: 'Browser Local', type: 'browser' },
+        readinessTimeoutMs: 1000,
+      })
+
+      // Invariant: pendingOutputTarget published before readiness wait completes
+      await waitFor(() => {
+        expect(observedPending).toMatchObject({
+          name: 'Browser Local',
+          type: 'browser',
+        })
+      })
+
+      // UnifiedNativePlayer mounts <audio> branch when target is browser
+      rerenderPlayer({
+        engineMode: 'local',
+        browserAdapter: unattachedBrowser,
+      })
+      await waitFor(() => {
+        expect(document.querySelector('audio')).not.toBeNull()
+      })
+
+      await migrationPromise
+      unsubscribe()
+
+      // Post-migration: pendingOutputTarget is cleared, real audio element remains
+      expect(controller.getState().pendingOutputTarget).toBeNull()
+      expect(unattachedBrowser.getAudioElement()).not.toBeNull()
+      expect(document.querySelector('audio')).not.toBeNull()
+
+      unmount()
+    })
+
+    it('TC-MIG-22: valid attached element satisfies migration preparation immediately, while unattached target waits and produces TARGET_NOT_READY on readiness watchdog timeout', async () => {
+      // Subcase A: Valid attached element satisfies immediately
+      const attachedAudio = document.createElement('audio')
+      const attachedAdapter = createBrowserAudioAdapter({
+        audioElement: attachedAudio,
+      })
+      const opIdA = 'mig_imm:phase1:admission'
+      const resA = await attachedAdapter.reserveMigration(opIdA, {
+        migrationId: 'mig_imm',
+        readinessTimeoutMs: 50,
+      })
+      expect(resA.status).toBe(CommandResultStatus.APPLIED)
+
+      // Subcase B: Unattached target waits; times out with TARGET_NOT_READY
+      const unattachedAdapter = createBrowserAudioAdapter({ unattached: true })
+      const opIdB = 'mig_timeout:phase1:admission'
+
+      await expect(
+        unattachedAdapter.reserveMigration(opIdB, {
+          migrationId: 'mig_timeout',
+          readinessTimeoutMs: 30,
+        }),
+      ).rejects.toMatchObject({
+        code: 'TARGET_NOT_READY',
+        status: CommandResultStatus.FAILED,
+      })
+
+      // Target was never played
+      expect(unattachedAdapter.getAudioElement()).toBeNull()
+    })
+
+    it('TC-MIG-23: unattached readiness wait honors AbortSignal cancellation and cleans up timers', async () => {
+      const unattachedAdapter = createBrowserAudioAdapter({ unattached: true })
+      const abortController = new AbortController()
+
+      const waitPromise = unattachedAdapter.reserveMigration(
+        'mig_cancel:phase1:admission',
+        {
+          migrationId: 'mig_cancel',
+          signal: abortController.signal,
+          readinessTimeoutMs: 5000,
+        },
+      )
+
+      // Cancel while waiting for attachment
+      abortController.abort()
+
+      await expect(waitPromise).rejects.toMatchObject({
+        code: 'MIGRATION_CANCELLED',
+      })
+      expect(
+        unattachedAdapter.getReservations().get('mig_cancel')?.status,
+      ).toBe('CANCELLED')
+    })
+
+    it('TC-MIG-24: no detached Audio object is created to start playback early; detachment invalidates local reservation', async () => {
+      const initialCreated = createElementSpy.mock.calls.filter(
+        ([tag]) => tag === 'audio',
+      ).length
+
+      const unattachedAdapter = createBrowserAudioAdapter({ unattached: true })
+      expect(unattachedAdapter.getAudioElement()).toBeNull()
+
+      // 1. Calling reserveMigration on unattached target does NOT create an Audio element
+      const waitPromise = unattachedAdapter
+        .reserveMigration('mig_early:phase1:admission', {
+          migrationId: 'mig_early',
+          readinessTimeoutMs: 50,
+        })
+        .catch((e) => e)
+
+      expect(
+        createElementSpy.mock.calls.filter(([tag]) => tag === 'audio'),
+      ).toHaveLength(initialCreated)
+
+      // 2. Detach invalidates local reservation
+      unattachedAdapter.attachElement(null)
+      const resAfterDetach = unattachedAdapter
+        .getReservations()
+        .get('mig_early')
+      expect(resAfterDetach?.status === 'INVALIDATED' || !resAfterDetach).toBe(
+        true,
+      )
+
+      await waitPromise
+
+      // 3. Attempting play on unattached adapter throws NO_AUDIO_ELEMENT without creating audio
+      unattachedAdapter.activate(1, () => {})
+      await expect(unattachedAdapter.play(1)).rejects.toMatchObject({
+        code: 'NO_AUDIO_ELEMENT',
+      })
+      expect(
+        createElementSpy.mock.calls.filter(([tag]) => tag === 'audio'),
+      ).toHaveLength(initialCreated)
+    })
+
+    it('TC-MIG-25: late attachment after migration cannot clear, rewind, or replace already migrated Playback Context', async () => {
+      const localAdapter = createBrowserAudioAdapter({ unattached: true })
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      await controller.addQueueItems([
+        { queueItemId: 'mig-1', musicSrc: '/1.mp3' },
+        { queueItemId: 'mig-2', musicSrc: '/2.mp3' },
+        { queueItemId: 'mig-3', musicSrc: '/3.mp3' },
+      ])
+      await controller.skipToQueueItem('mig-2')
+      await controller.seek(42)
+
+      const migratedContext = controller.getState()
+      expect(migratedContext.currentQueueItemId).toBe('mig-2')
+      expect(migratedContext.position).toBe(42)
+      expect(migratedContext.queue).toHaveLength(3)
+
+      // Mount element late
+      const lateAudio = document.createElement('audio')
+      localAdapter.attachElement(lateAudio)
+
+      // Invariants: late attachment must NOT clear, rewind, or replace the migrated scene
+      const currentContext = controller.getState()
+      expect(currentContext.currentQueueItemId).toBe('mig-2')
+      expect(currentContext.position).toBe(42)
+      expect(currentContext.queue).toHaveLength(3)
+      expect(lateAudio.currentTime).toBe(42)
+      expect(localAdapter.getAudioElement()).toBe(lateAudio)
+    })
+
+    it('TC-MIG-26: media listener binding is reused: same-element/same-epoch is idempotent, cross-epoch removes duplicates, and deactivation unloads media', () => {
+      const audio = document.createElement('audio')
+      const addSpy = vi.spyOn(audio, 'addEventListener')
+      const removeSpy = vi.spyOn(audio, 'removeEventListener')
+
+      const adapter = createBrowserAudioAdapter({ unattached: true })
+      adapter.activate(1, () => {})
+
+      // 1. Initial attachment binds listeners
+      adapter.attachElement(audio)
+      const initialAddCalls = addSpy.mock.calls.length
+      expect(initialAddCalls).toBeGreaterThan(0)
+
+      // 2. Same element, same epoch attachment is idempotent (0 additional addEventListener calls)
+      adapter.attachElement(audio)
+      expect(addSpy.mock.calls.length).toBe(initialAddCalls)
+
+      // 3. Cross-epoch attachment removes previous listeners and re-binds for new epoch
+      adapter.activate(2, () => {})
+      expect(removeSpy.mock.calls.length).toBe(initialAddCalls)
+      expect(addSpy.mock.calls.length).toBe(initialAddCalls * 2)
+
+      // 4. Deactivation unbinds listeners and unloads media resources
+      const testLoadSpy = vi.spyOn(audio, 'load')
+      audio.setAttribute('src', '/test.mp3')
+      adapter.deactivate()
+
+      expect(removeSpy.mock.calls.length).toBe(initialAddCalls * 2)
+      expect(audio.getAttribute('src')).toBeNull()
+      expect(testLoadSpy).toHaveBeenCalled()
+    })
+
+    it('TC-MIG-27: tail error, pause, ended, and timeupdate events emitted during cleanup are rejected by epoch and resource-generation guards', async () => {
+      const audio = document.createElement('audio')
+      const adapter = createBrowserAudioAdapter({ audioElement: audio })
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(adapter)
+
+      await controller.addQueueItems([
+        { queueItemId: 'track-1', musicSrc: '/1.mp3' },
+        { queueItemId: 'track-2', musicSrc: '/2.mp3' },
+      ])
+      await controller.play()
+
+      // Deactivate / cleanup output via controller
+      controller.setAdapter(null)
+
+      // Emit tail events that occur as browser unloads media
+      await act(async () => {
+        audio.dispatchEvent(new Event('timeupdate'))
+        audio.dispatchEvent(new Event('pause'))
+        audio.dispatchEvent(new Event('error'))
+        audio.dispatchEvent(new Event('ended'))
+      })
+
+      // Invariants: tail events do NOT advance track, do NOT corrupt state with error, do NOT update progress
+      expect(controller.getState().status).toBe(PlaybackStatus.IDLE)
+      expect(controller.getState().error).toBeNull()
+      expect(controller.getState().currentQueueItemId).toBeNull()
+    })
+
+    it('TC-MIG-28: real media promise rejections (NotAllowedError) propagate through shared failure envelope without fabricating PLAYING; subsequent user play recovers', async () => {
+      const ref = React.createRef()
+      const { controller, rerenderPlayer, getByRole, unmount } =
+        await renderControlledPlayer('remote', { ref })
+
+      // Initial remote playback
+      await act(async () => {
+        await controller.play()
+      })
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+
+      const nextBrowser = createBrowserAudioAdapter({ unattached: true })
+
+      // Start migration from remote to browser with playing intent
+      const migrationPromise = controller.migrateOutput({
+        targetAdapter: nextBrowser,
+        targetDevice: { name: 'Browser Local', type: 'browser' },
+      })
+
+      // Host switches to local branch
+      rerenderPlayer({
+        engineMode: 'local',
+        browserAdapter: nextBrowser,
+      })
+
+      // Simulate browser autoplay rejection (NotAllowedError)
+      playSpy.mockRejectedValueOnce(
+        new DOMException(
+          'Autoplay blocked: gesture required',
+          'NotAllowedError',
+        ),
+      )
+
+      await expect(migrationPromise).rejects.toMatchObject({
+        message: 'Autoplay blocked: gesture required',
+      })
+
+      // Invariants:
+      // 1. Status is ERROR, never fabricates PLAYING
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(controller.getState().error.message).toContain('Autoplay blocked')
+      // 2. Alert visible in UI
+      expect(getByRole('alert').textContent).toContain('Autoplay blocked')
+      // 3. No audible sound restored automatically
+      expect(nextBrowser.getAudioElement().paused).toBe(true)
+
+      // Recovery: Subsequent explicit user play action succeeds with user gesture
+      playSpy.mockResolvedValueOnce(undefined)
+      await act(async () => {
+        await controller.play()
+      })
+
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controller.getState().error).toBeNull()
+
+      unmount()
     })
   })
 })

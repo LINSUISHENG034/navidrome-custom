@@ -1142,12 +1142,173 @@ class AppSmoke:
                         "sessionId": clone_session, "clientId": "clone-cleanup",
                     })
                     self.require(code, 200, "/api/jukebox/session/detach (clone cleanup)")
+
+                # Level 3 Issue 10: Browser Output Readiness and Real Media Failure Handling
+                level3_page = context.new_page()
+                self._track_page_errors(level3_page, browser_errors, browser_console_details)
+                try:
+                    level3_url = self.vite_url + "/validation/remote-player.html?" + urlencode({
+                        "sessionId": self.session_id,
+                        "clientId": "browser-level3-verifier",
+                    })
+                    level3_page.goto(level3_url, wait_until="domcontentloaded", timeout=30000)
+                    level3_page.wait_for_function("Boolean(document.querySelector('fieldset'))")
+
+                    level3_result = level3_page.evaluate("""async () => {
+                        const { createPlaybackControlModule, PlaybackStatus } = await import('/src/audioplayer/playbackControlModule.js')
+                        const { createBrowserAudioAdapter } = await import('/src/audioplayer/browserAudioAdapter.js')
+                        const { createMockRemoteAudioAdapter } = await import('/src/audioplayer/mockRemoteAudioAdapter.js')
+
+                        // Contract 1: Complete pending-target-to-mounted-element path & absence of detached playback
+                        const controller = createPlaybackControlModule()
+                        const remoteAdapter = createMockRemoteAudioAdapter()
+                        controller.setAdapter(remoteAdapter)
+
+                        const unattachedBrowser = createBrowserAudioAdapter({ unattached: true })
+                        let publishedPending = null
+                        controller.subscribe((s) => {
+                            if (s.pendingOutputTarget) publishedPending = s.pendingOutputTarget
+                        })
+
+                        const migrationPromise = controller.migrateOutput({
+                            targetAdapter: unattachedBrowser,
+                            targetDevice: { name: 'Browser Output', type: 'browser' },
+                            readinessTimeoutMs: 2000,
+                        })
+
+                        if (!publishedPending || publishedPending.name !== 'Browser Output') {
+                            throw new Error('pendingOutputTarget was not published before waiting for readiness')
+                        }
+
+                        if (unattachedBrowser.getAudioElement() !== null) {
+                            throw new Error('Detached audio element was created early')
+                        }
+
+                        // Host mounts real element in DOM
+                        const realEl = document.createElement('audio')
+                        realEl.id = 'real-level3-audio'
+                        document.body.appendChild(realEl)
+                        unattachedBrowser.attachElement(realEl)
+
+                        await migrationPromise
+                        if (controller.getState().pendingOutputTarget !== null) {
+                            throw new Error('pendingOutputTarget was not cleared upon completion')
+                        }
+                        if (unattachedBrowser.getAudioElement() !== realEl) {
+                            throw new Error('Target adapter is not using the real mounted DOM element')
+                        }
+
+                        // Contract 2: Late attachment cannot clear, rewind or replace context
+                        const lateController = createPlaybackControlModule()
+                        const lateAdapter = createBrowserAudioAdapter({ unattached: true })
+                        lateController.setAdapter(lateAdapter)
+                        await lateController.addQueueItems([
+                            { queueItemId: 'track-A', musicSrc: 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=' },
+                            { queueItemId: 'track-B', musicSrc: 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=' },
+                        ])
+                        await lateController.skipToQueueItem('track-B')
+                        await lateController.seek(18.5)
+
+                        const lateEl = document.createElement('audio')
+                        document.body.appendChild(lateEl)
+                        lateAdapter.attachElement(lateEl)
+
+                        const stateAfterLate = lateController.getState()
+                        if (stateAfterLate.currentQueueItemId !== 'track-B') {
+                            throw new Error('Late attachment replaced currentQueueItemId')
+                        }
+                        if (stateAfterLate.position !== 18.5) {
+                            throw new Error('Late attachment rewound position')
+                        }
+                        if (lateEl.currentTime !== 18.5) {
+                            throw new Error('Late attachment element currentTime was not synchronized to migrated position')
+                        }
+
+                        // Contract 3: Media error propagation
+                        const errorController = createPlaybackControlModule()
+                        const errorAudio = document.createElement('audio')
+                        document.body.appendChild(errorAudio)
+                        const errorAdapter = createBrowserAudioAdapter({ audioElement: errorAudio })
+                        errorController.setAdapter(errorAdapter)
+                        await errorController.addQueueItems([
+                            { queueItemId: 'err-1', musicSrc: '/api/invalid-track-not-found-404.mp3' }
+                        ])
+
+                        const errorPlay = errorController.play().catch(e => e)
+                        Object.defineProperty(errorAudio, 'error', {
+                            configurable: true,
+                            value: { code: 4, message: 'Source not supported / 404' }
+                        })
+                        errorAudio.dispatchEvent(new Event('error'))
+
+                        const errorState = errorController.getState()
+                        if (errorState.status !== PlaybackStatus.ERROR) {
+                            throw new Error('Media error did not enter PlaybackStatus.ERROR')
+                        }
+
+                        // Contract 4: Autoplay rejection and explicit user recovery
+                        const recoverAudio = document.createElement('audio')
+                        document.body.appendChild(recoverAudio)
+                        const recoverAdapter = createBrowserAudioAdapter({ audioElement: recoverAudio })
+                        const recoverController = createPlaybackControlModule()
+                        recoverController.setAdapter(recoverAdapter)
+                        await recoverController.addQueueItems([
+                            { queueItemId: 'rec-1', musicSrc: 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=' }
+                        ])
+
+                        const origPlay = recoverAudio.play.bind(recoverAudio)
+                        recoverAudio.play = () => Promise.reject(new DOMException('Autoplay blocked in Chrome', 'NotAllowedError'))
+
+                        const failedPlay = await recoverController.play().catch(e => e)
+                        if (recoverController.getState().status !== PlaybackStatus.ERROR) {
+                            throw new Error('Autoplay rejection fabricated PLAYING instead of ERROR')
+                        }
+                        if (recoverAudio.paused !== true) {
+                            throw new Error('Autoplay rejection did not maintain paused state')
+                        }
+
+                        // User explicit recovery
+                        recoverAudio.play = origPlay
+                        await recoverController.play()
+                        if (recoverController.getState().status !== PlaybackStatus.PLAYING) {
+                            throw new Error('Explicit user play recovery failed to achieve PLAYING')
+                        }
+                        if (recoverController.getState().error !== null) {
+                            throw new Error('Explicit user play recovery failed to clear error')
+                        }
+
+                        realEl.remove()
+                        lateEl.remove()
+                        errorAudio.remove()
+                        recoverAudio.remove()
+
+                        return {
+                            pendingTargetSatisfied: true,
+                            realElementMounted: true,
+                            absenceOfDetachedPlayback: true,
+                            lateAttachmentPreservedContext: true,
+                            mediaErrorPropagated: true,
+                            autoplayRejectionHandled: true,
+                            userExplicitRecoverySucceeded: true,
+                        }
+                    }""")
+                    level3_screenshot = browser_dir / "issue10-level3-verification.png"
+                    level3_page.screenshot(path=str(level3_screenshot), full_page=True)
+                    browser_checks["issue10_level3_contracts"] = {
+                        "status": "pass",
+                        "details": level3_result,
+                        "screenshot": str(level3_screenshot),
+                    }
+                finally:
+                    level3_page.close()
+
                 required_checks = {
                     "default_app_login", "default_app_device_switch", "default_app_local_return",
                     "prototype_audio_elements", "prototype_user_play", "sse_snapshot_refresh",
                     "controller2_read_only_probe", "explicit_takeover",
                     "page_close_preserves_remote_playback", "reopen_restores_snapshot",
                     "final_stop_release", "opener_cloned_identity",
+                    "issue10_level3_contracts",
                 }
                 if required_checks.difference(browser_checks):
                     raise SmokeFailure("not all real browser functional contracts completed")

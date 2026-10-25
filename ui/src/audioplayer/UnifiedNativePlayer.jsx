@@ -598,9 +598,36 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     }
   }
 
+  shouldRenderBrowserEngine() {
+    if (this.props.engineMode !== 'remote') return true
+    const pending =
+      this.state?.pendingOutputTarget ??
+      this.props.controller?.getState()?.pendingOutputTarget
+    if (pending) {
+      return (
+        pending.type === 'browser' ||
+        pending.type === 'local' ||
+        pending.isLocal === true ||
+        pending.name === 'Browser' ||
+        pending.name === 'Browser Local' ||
+        (typeof pending.name === 'string' &&
+          pending.name.toLowerCase().includes('browser')) ||
+        !pending.deviceId
+      )
+    }
+    return false
+  }
+
   syncBrowserElement() {
-    const adapter =
-      this.props.engineMode !== 'remote' ? this.props.browserAdapter : null
+    const shouldRender = this.shouldRenderBrowserEngine()
+    const activeMigration = this.props.controller?.getActiveMigration?.()
+    const adapter = shouldRender
+      ? this.props.browserAdapter ||
+        activeMigration?.targetAdapter ||
+        (this.props.controller?.getState()?.pendingOutputTarget
+          ? activeMigration?.targetAdapter
+          : null)
+      : null
     const element = adapter ? this.audio : null
     if (
       this.browserBinding?.adapter === adapter &&
@@ -808,10 +835,14 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
         ) {
           nextState.playMode = authoritativeState.playMode
         }
+        if (authoritativeState.pendingOutputTarget !== undefined) {
+          nextState.pendingOutputTarget = authoritativeState.pendingOutputTarget
+        }
 
         return Object.keys(nextState).length > 0 ? nextState : null
       },
       () => {
+        this.syncBrowserElement()
         this.syncAuthoritativeDerivedState(authoritativeState, prevSnapshot)
       },
     )
@@ -834,7 +865,12 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
       const rootDiv = portal.children
       const children = React.Children.map(rootDiv.props.children, (child) => {
         if (child?.type !== 'audio') return child
-        if (this.props.engineMode === 'remote') return null
+        if (
+          this.props.engineMode === 'remote' &&
+          !this.shouldRenderBrowserEngine()
+        ) {
+          return null
+        }
         // Preserve the native element/ref; only the Adapter may assign its source.
         return React.cloneElement(child, { src: undefined })
       })

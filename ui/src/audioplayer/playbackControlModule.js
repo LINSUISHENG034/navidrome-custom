@@ -310,6 +310,7 @@ export function createPlaybackControlModule(config = {}) {
     acceptedIntent: null,
     intentSequence: 0,
     playbackInstanceId: null,
+    pendingOutputTarget: null,
   })
   let state = createInitialState()
 
@@ -704,6 +705,7 @@ export function createPlaybackControlModule(config = {}) {
     }
     state = {
       ...state,
+      pendingOutputTarget: null,
       status: PlaybackStatus.ERROR,
       error: formatted,
     }
@@ -728,6 +730,8 @@ export function createPlaybackControlModule(config = {}) {
       volumeProfile,
       forceTakeover = false,
       signal,
+      readinessTimeoutMs = options.readinessTimeoutMs ??
+        targetDevice.readinessTimeoutMs,
       overallTimeoutMs = 15000,
       phaseTimeoutMs = defaultTimeoutMs,
     } = options
@@ -805,6 +809,12 @@ export function createPlaybackControlModule(config = {}) {
       checkAborted()
 
       // Phase 1: Target Admission & Explicit Confirmation
+      state = {
+        ...state,
+        pendingOutputTarget: targetDevice,
+      }
+      notifySubscribers()
+
       const activeOwner =
         targetDevice.activeController ||
         (typeof targetAdapter.getActiveSessionOwner === 'function'
@@ -844,14 +854,19 @@ export function createPlaybackControlModule(config = {}) {
 
       const opIdAdmission = opId('phase1', 'admission')
       if (typeof targetAdapter.reserveMigration === 'function') {
+        const reserveTimeout = readinessTimeoutMs
+          ? Math.max(phaseTimeoutMs, readinessTimeoutMs + 1000)
+          : phaseTimeoutMs
         const reserveRes = await executeWithTimeout(
           targetAdapter.reserveMigration(opIdAdmission, {
             migrationId,
             clientId: targetDevice.clientId,
             forceTakeover: takeoverAllowed,
+            signal: abortController.signal,
+            readinessTimeoutMs,
             ...targetDevice,
           }),
-          phaseTimeoutMs,
+          reserveTimeout,
           opIdAdmission,
           targetAdapter,
         )
@@ -1172,6 +1187,12 @@ export function createPlaybackControlModule(config = {}) {
         }
       }
 
+      state = {
+        ...state,
+        pendingOutputTarget: null,
+      }
+      notifySubscribers()
+
       return { ...state }
     }
 
@@ -1180,6 +1201,13 @@ export function createPlaybackControlModule(config = {}) {
     } finally {
       clearTimeout(overallTimer)
       activeMigration = null
+      if (state.pendingOutputTarget) {
+        state = {
+          ...state,
+          pendingOutputTarget: null,
+        }
+        notifySubscribers()
+      }
     }
   }
 

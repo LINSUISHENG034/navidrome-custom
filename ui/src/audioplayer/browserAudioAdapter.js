@@ -8,6 +8,7 @@
 import {
   PlaybackStatus,
   PlaybackMode,
+  CommandResultStatus,
   normalizePlaybackMode,
   getNextTrack,
   getPrevTrack,
@@ -21,12 +22,27 @@ export function createBrowserAudioAdapter(options = {}) {
   let activeEpoch = 0
   let isActive = false
   let stateCallback = null
-  let audioElement = options.audioElement || null
+  let explicitlyDetached = Boolean(
+    options.unattached || options.audioElement === null,
+  )
+  let audioElement = options.unattached
+    ? null
+    : options.audioElement !== undefined
+      ? options.audioElement
+      : null
   let ownsElement = false
-  let explicitlyDetached = false
+  if (!audioElement && !explicitlyDetached) {
+    audioElement = document.createElement('audio')
+    audioElement.className = 'navidrome-browser-audio-engine'
+    ownsElement = true
+  }
   let boundElement = null
   let boundEpoch = null
+  let resourceGeneration = 0
   const eventListeners = new Map()
+  const operations = new Map()
+  const reservations = new Map()
+  let activeReservation = null
 
   let queue = []
   let currentQueueItemId = null
@@ -134,11 +150,21 @@ export function createBrowserAudioAdapter(options = {}) {
     { play = false, restart = true } = {},
   ) {
     if (!isActive || epoch !== activeEpoch) return
-    const el = requireAudioElement()
     resourceReleased = false
     invalidateAttempt()
     currentQueueItemId = targetQueueItemId
     desiredPlaying = play
+
+    if (play && !audioElement) {
+      const failure = {
+        code: 'NO_AUDIO_ELEMENT',
+        message: 'The local player is not attached to a media element',
+      }
+      observePlaybackFailure(failure)
+      throw failure
+    }
+
+    const el = audioElement
     const attempt = {
       epoch,
       element: el,
@@ -149,9 +175,19 @@ export function createBrowserAudioAdapter(options = {}) {
     activeAttempt = attempt
     publishState({
       status: play ? PlaybackStatus.PREPARING : PlaybackStatus.PAUSED,
-      position: restart ? 0 : mediaState(el).position,
+      position:
+        el && restart
+          ? 0
+          : el
+            ? mediaState(el).position
+            : localState.position || 0,
       error: null,
     })
+
+    if (!el) {
+      attempt.pending = false
+      return
+    }
 
     try {
       assertCurrentAttempt(attempt)
@@ -213,21 +249,29 @@ export function createBrowserAudioAdapter(options = {}) {
       if (!isCurrentAttempt(attempt)) throw supersededError()
       desiredPlaying = false
       invalidateAttempt()
-      el.pause()
+      if (el) {
+        try {
+          el.pause()
+        } catch {
+          // ignore pause failure
+        }
+      }
       const failure = {
         code:
           typeof error?.code === 'string'
             ? error.code
             : 'BROWSER_PLAY_REQUEST_FAILED',
         message: error?.message || 'The browser could not start playback',
+        name: error?.name,
       }
       observePlaybackFailure(failure)
       throw failure
     }
   }
 
-  function handleMediaEvent(eventName, el, epoch) {
+  function handleMediaEvent(eventName, el, epoch, eventResGen) {
     if (!isActive || el !== audioElement || epoch !== activeEpoch) return
+    if (eventResGen !== resourceGeneration) return
     if (resourceReleased && eventName !== 'volumechange') return
     if (
       eventName !== 'volumechange' &&
@@ -309,7 +353,7 @@ export function createBrowserAudioAdapter(options = {}) {
         break
       }
       case 'error': {
-        if (!el.error) break
+        if (!el.error || resourceReleased) break
         const error = {
           code: 'MEDIA_ELEMENT_ERROR',
           message:
@@ -339,6 +383,7 @@ export function createBrowserAudioAdapter(options = {}) {
     boundElement = el
     boundEpoch = activeEpoch
     const epoch = activeEpoch
+    const currentResGen = resourceGeneration
     const events = [
       'play',
       'playing',
@@ -352,44 +397,90 @@ export function createBrowserAudioAdapter(options = {}) {
       'error',
     ]
     events.forEach((name) => {
-      const listener = () => handleMediaEvent(name, el, epoch)
+      const listener = () => handleMediaEvent(name, el, epoch, currentResGen)
       eventListeners.set(name, listener)
       el.addEventListener(name, listener)
     })
   }
 
   function releaseElement() {
+    resourceReleased = true
+    resourceGeneration += 1
     unbindEvents()
     if (!audioElement) return
     audioElement.pause()
     audioElement.removeAttribute('src')
     if (typeof audioElement.load === 'function') audioElement.load()
-    if (ownsElement && audioElement.parentNode) {
-      audioElement.parentNode.removeChild(audioElement)
-    }
     loadedQueueItemId = null
   }
 
   function attachElement(el) {
-    if (audioElement === el) {
+    if (audioElement === el && el !== null) {
       if (isActive && el) bindEvents(el)
       return
     }
-    desiredPlaying = false
-    invalidateAttempt()
-    releaseElement()
+
+    if (!el) {
+      if (activeReservation) {
+        activeReservation.status = 'INVALIDATED'
+        activeReservation = null
+      }
+      desiredPlaying = false
+      invalidateAttempt()
+      releaseElement()
+      audioElement = null
+      explicitlyDetached = true
+      return
+    }
+
+    explicitlyDetached = false
+    const previousElement = audioElement
+    if (previousElement) {
+      unbindEvents()
+    }
     audioElement = el
-    ownsElement = false
-    explicitlyDetached = !el
+
+    if (activeReservation && activeReservation.status === 'WAITING') {
+      activeReservation.resolveReady(el)
+    }
+
     if (isActive) {
-      if (el) bindEvents(el)
-      publishState({
-        ...(el ? mediaState(el) : { position: 0, duration: 0 }),
-        status: currentQueueItemId
-          ? PlaybackStatus.PAUSED
-          : PlaybackStatus.IDLE,
-        error: null,
-      })
+      bindEvents(el)
+      if (currentQueueItemId) {
+        const target = queue.find(
+          (item) => item.queueItemId === currentQueueItemId,
+        )
+        if (
+          target &&
+          loadedQueueItemId !== currentQueueItemId &&
+          desiredPlaying
+        ) {
+          let source =
+            typeof target.musicSrc === 'function'
+              ? target.musicSrc()
+              : target.musicSrc
+          if (typeof source === 'string' && source) {
+            el.src = source
+            loadedQueueItemId = currentQueueItemId
+          }
+        }
+        if (localState.position > 0) {
+          el.currentTime = localState.position
+        }
+        publishState({
+          ...mediaState(el),
+          status: desiredPlaying
+            ? PlaybackStatus.PLAYING
+            : PlaybackStatus.PAUSED,
+          error: null,
+        })
+      } else {
+        publishState({
+          ...mediaState(el),
+          status: PlaybackStatus.IDLE,
+          error: null,
+        })
+      }
     }
   }
 
@@ -402,14 +493,15 @@ export function createBrowserAudioAdapter(options = {}) {
     activeEpoch = epoch
     isActive = true
     stateCallback = onStateChange
-    const el = ensureAudioElement()
-    if (el) bindEvents(el)
-    publishState(el ? mediaState(el) : {})
+    if (audioElement) bindEvents(audioElement)
+    publishState(audioElement ? mediaState(audioElement) : {})
   }
 
   function deactivate() {
     isActive = false
     activeEpoch = -1
+    resourceReleased = true
+    resourceGeneration += 1
     desiredPlaying = false
     invalidateAttempt()
     releaseElement()
@@ -425,29 +517,36 @@ export function createBrowserAudioAdapter(options = {}) {
     stateCallback = null
   }
 
-  async function play(epoch) {
+  async function play(epoch, options = {}) {
     if (!isActive || epoch !== activeEpoch) return
-    return selectQueueItem(epoch, currentQueueItemId, {
-      play: true,
-      restart: false,
-    })
+    const opId = options.operationId
+    try {
+      const res = await selectQueueItem(epoch, currentQueueItemId, {
+        play: true,
+        restart: false,
+      })
+      if (opId) {
+        operations.set(opId, {
+          status: CommandResultStatus.APPLIED,
+          operationId: opId,
+        })
+      }
+      return res
+    } catch (err) {
+      if (opId) {
+        operations.set(opId, {
+          status: CommandResultStatus.FAILED,
+          error: err,
+          operationId: opId,
+        })
+      }
+      throw err
+    }
   }
 
-  async function pause(epoch) {
+  async function pause(epoch, options = {}) {
     if (!isActive || epoch !== activeEpoch) return
-    desiredPlaying = false
-    invalidateAttempt()
-    const el = requireAudioElement()
-    el.pause()
-    publishState({
-      status: PlaybackStatus.PAUSED,
-      position: mediaState(el).position,
-      error: null,
-    })
-  }
-
-  async function stop(epoch) {
-    if (!isActive || epoch !== activeEpoch) return
+    const opId = options.operationId
     desiredPlaying = false
     invalidateAttempt()
     if (audioElement) {
@@ -455,29 +554,239 @@ export function createBrowserAudioAdapter(options = {}) {
     }
     publishState({
       status: PlaybackStatus.PAUSED,
-      position: audioElement ? mediaState(audioElement).position : 0,
+      position: audioElement
+        ? mediaState(audioElement).position
+        : localState.position || 0,
       error: null,
+    })
+    if (opId) {
+      operations.set(opId, {
+        status: CommandResultStatus.APPLIED,
+        operationId: opId,
+      })
+    }
+  }
+
+  async function stop(epoch, options = {}) {
+    if (!isActive || epoch !== activeEpoch) return
+    const opId = options.operationId
+    desiredPlaying = false
+    invalidateAttempt()
+    if (audioElement) {
+      audioElement.pause()
+    }
+    publishState({
+      status: PlaybackStatus.PAUSED,
+      position: audioElement
+        ? mediaState(audioElement).position
+        : localState.position || 0,
+      error: null,
+    })
+    if (opId) {
+      operations.set(opId, {
+        status: CommandResultStatus.APPLIED,
+        operationId: opId,
+      })
+    }
+  }
+
+  async function seek(epoch, positionSeconds, options = {}) {
+    if (!isActive || epoch !== activeEpoch) return
+    const opId = options.operationId
+    if (audioElement) {
+      audioElement.currentTime = Math.max(0, positionSeconds)
+      publishState({ position: mediaState(audioElement).position })
+    } else {
+      localState.position = Math.max(0, positionSeconds)
+      publishState({ position: localState.position })
+    }
+    if (opId) {
+      operations.set(opId, {
+        status: CommandResultStatus.APPLIED,
+        operationId: opId,
+      })
+    }
+  }
+
+  async function setVolume(epoch, volumeFraction, options = {}) {
+    if (!isActive || epoch !== activeEpoch) return
+    const opId = options.operationId
+    const vol = Math.max(0, Math.min(1, volumeFraction))
+    if (audioElement) {
+      audioElement.volume = vol
+      publishState({ volume: audioElement.volume, isMuted: audioElement.muted })
+    } else {
+      localState.volume = vol
+      publishState({ volume: vol, isMuted: localState.isMuted })
+    }
+    if (opId) {
+      operations.set(opId, {
+        status: CommandResultStatus.APPLIED,
+        operationId: opId,
+      })
+    }
+  }
+
+  async function setPlayMode(epoch, mode, options = {}) {
+    if (!isActive || epoch !== activeEpoch) return
+    const opId = options.operationId
+    playMode = normalizePlaybackMode(mode)
+    publishState()
+    if (opId) {
+      operations.set(opId, {
+        status: CommandResultStatus.APPLIED,
+        operationId: opId,
+      })
+    }
+  }
+
+  async function reserveMigration(operationId, options = {}) {
+    const { migrationId, signal, readinessTimeoutMs = 3000 } = options
+
+    if (signal?.aborted) {
+      const cancelErr = {
+        code: 'MIGRATION_CANCELLED',
+        message: 'Migration was cancelled before reservation',
+        migrationId,
+        operationId,
+      }
+      if (operationId) {
+        operations.set(operationId, {
+          status: CommandResultStatus.FAILED,
+          error: cancelErr,
+          operationId,
+        })
+      }
+      throw cancelErr
+    }
+
+    if (audioElement && !explicitlyDetached) {
+      const res = {
+        status: CommandResultStatus.APPLIED,
+        migrationId,
+        operationId,
+      }
+      activeReservation = {
+        migrationId,
+        operationId,
+        status: 'ACTIVE',
+        element: audioElement,
+      }
+      if (migrationId) reservations.set(migrationId, activeReservation)
+      if (operationId) operations.set(operationId, res)
+      return res
+    }
+
+    return new Promise((resolve, reject) => {
+      let timer = null
+      let onAbort = null
+
+      const cleanup = () => {
+        if (timer) clearTimeout(timer)
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort)
+      }
+
+      timer = setTimeout(() => {
+        cleanup()
+        if (activeReservation?.migrationId === migrationId) {
+          activeReservation = null
+        }
+        const err = {
+          code: 'TARGET_NOT_READY',
+          message: `Browser audio element was not attached within ${readinessTimeoutMs}ms`,
+          status: CommandResultStatus.FAILED,
+          migrationId,
+          operationId,
+        }
+        if (operationId) {
+          operations.set(operationId, {
+            status: CommandResultStatus.FAILED,
+            error: err,
+            operationId,
+          })
+        }
+        reject(err)
+      }, readinessTimeoutMs)
+
+      let pendingRes = null
+      if (signal) {
+        onAbort = () => {
+          cleanup()
+          if (pendingRes) {
+            pendingRes.status = 'CANCELLED'
+          }
+          if (activeReservation?.migrationId === migrationId) {
+            activeReservation = null
+          }
+          const err = {
+            code: 'MIGRATION_CANCELLED',
+            message:
+              'Migration was cancelled while waiting for browser readiness',
+            migrationId,
+            operationId,
+          }
+          if (operationId) {
+            operations.set(operationId, {
+              status: CommandResultStatus.FAILED,
+              error: err,
+              operationId,
+            })
+          }
+          reject(err)
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+
+      pendingRes = {
+        migrationId,
+        operationId,
+        status: 'WAITING',
+        resolveReady: (el) => {
+          cleanup()
+          pendingRes.status = 'ACTIVE'
+          pendingRes.element = el
+          activeReservation = pendingRes
+          if (migrationId) reservations.set(migrationId, pendingRes)
+          const res = {
+            status: CommandResultStatus.APPLIED,
+            migrationId,
+            operationId,
+          }
+          if (operationId) operations.set(operationId, res)
+          resolve(res)
+        },
+      }
+      activeReservation = pendingRes
+      if (migrationId) reservations.set(migrationId, pendingRes)
     })
   }
 
-  async function seek(epoch, positionSeconds) {
-    if (!isActive || epoch !== activeEpoch) return
-    const el = requireAudioElement()
-    el.currentTime = Math.max(0, positionSeconds)
-    publishState({ position: mediaState(el).position })
+  async function releaseMigrationReservation(
+    operationId,
+    { migrationId } = {},
+  ) {
+    const res =
+      (migrationId && reservations.get(migrationId)) || activeReservation
+    if (res && (!migrationId || res.migrationId === migrationId)) {
+      res.status = 'RELEASED'
+      if (activeReservation?.migrationId === res.migrationId) {
+        activeReservation = null
+      }
+    }
+    const result = {
+      status: CommandResultStatus.APPLIED,
+      migrationId,
+      operationId,
+    }
+    if (operationId) operations.set(operationId, result)
+    return result
   }
 
-  async function setVolume(epoch, volumeFraction) {
-    if (!isActive || epoch !== activeEpoch) return
-    const el = requireAudioElement()
-    el.volume = Math.max(0, Math.min(1, volumeFraction))
-    publishState({ volume: el.volume, isMuted: el.muted })
-  }
-
-  async function setPlayMode(epoch, mode) {
-    if (!isActive || epoch !== activeEpoch) return
-    playMode = normalizePlaybackMode(mode)
-    publishState()
+  async function queryOperation(operationId) {
+    if (!operationId) return { status: CommandResultStatus.UNKNOWN }
+    const record = operations.get(operationId)
+    if (record) return record
+    return { status: CommandResultStatus.UNKNOWN, operationId }
   }
 
   async function skipNext(epoch) {
@@ -613,6 +922,10 @@ export function createBrowserAudioAdapter(options = {}) {
     moveQueueItem,
     clearQueue,
     skipToQueueItem,
+    reserveMigration,
+    releaseMigrationReservation,
+    queryOperation,
+    getReservations: () => new Map(reservations),
     getQueue: () => [...queue],
     getCurrentQueueItemId: () => currentQueueItemId,
     getPlayMode: () => playMode,
