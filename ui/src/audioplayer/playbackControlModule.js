@@ -8,7 +8,7 @@
  * and generation epoch invalidation across engine/mode switches.
  */
 
-import { audioVolumeToRemoteGain } from './volumeProfiles'
+import { audioVolumeToRemoteGain, resolveVolumeProfile } from './volumeProfiles'
 
 export const PlaybackStatus = {
   IDLE: 'idle',
@@ -291,13 +291,15 @@ export function createPlaybackControlModule(config = {}) {
   let migrationCounter = 0
   let activeMigration = null
   const defaultTimeoutMs = config.commandTimeoutMs || 5000
+  const initialVolume = config.initialVolume ?? 1
 
   const createInitialState = () => ({
     status: PlaybackStatus.IDLE,
     currentTrack: null,
     position: 0,
     duration: 0,
-    volume: config.initialVolume ?? 1,
+    volume: initialVolume,
+    lastNonZeroVolume: initialVolume > 0 ? initialVolume : 1,
     isMuted: false,
     error: null,
     queue: [],
@@ -324,6 +326,7 @@ export function createPlaybackControlModule(config = {}) {
       stop: 0,
       seek: 0,
       volume: 0,
+      mute: 0,
       skipNext: 0,
       skipPrev: 0,
       setPlayMode: 0,
@@ -444,6 +447,17 @@ export function createPlaybackControlModule(config = {}) {
     }
     if (typeof update.volume === 'number' && update.volume !== state.volume) {
       nextState.volume = update.volume
+      if (update.volume > 0) {
+        nextState.lastNonZeroVolume = update.volume
+      }
+      hasChange = true
+    }
+    if (
+      typeof update.lastNonZeroVolume === 'number' &&
+      update.lastNonZeroVolume > 0 &&
+      update.lastNonZeroVolume !== state.lastNonZeroVolume
+    ) {
+      nextState.lastNonZeroVolume = update.lastNonZeroVolume
       hasChange = true
     }
     if (
@@ -909,6 +923,7 @@ export function createPlaybackControlModule(config = {}) {
         currentQueueItemId: state.currentQueueItemId,
         position: state.position,
         volume: state.volume,
+        lastNonZeroVolume: state.lastNonZeroVolume,
         isMuted: state.isMuted,
         playMode: state.playMode,
         status: state.status,
@@ -994,6 +1009,7 @@ export function createPlaybackControlModule(config = {}) {
         currentQueueItemId: snapshot.currentQueueItemId,
         position: snapshot.position,
         volume: snapshot.volume,
+        lastNonZeroVolume: snapshot.lastNonZeroVolume,
         isMuted: snapshot.isMuted,
         playMode: snapshot.playMode,
         status: PlaybackStatus.PREPARING,
@@ -1053,24 +1069,41 @@ export function createPlaybackControlModule(config = {}) {
       checkAborted()
 
       // Phase 4: Target Volume Setting & Confirmation
-      let targetVolume = snapshot.volume
-      if (typeof volumeProfile === 'function') {
-        targetVolume = volumeProfile(snapshot.volume, targetDevice)
-      } else if (typeof targetDevice?.volumeProfile === 'function') {
-        targetVolume = targetDevice.volumeProfile(snapshot.volume, targetDevice)
-      } else if (targetDevice?.isBluetooth) {
-        targetVolume = audioVolumeToRemoteGain(snapshot.volume, targetDevice)
+      const explicitProfile =
+        options.volumeProfile ?? targetDevice.volumeProfile
+      try {
+        resolveVolumeProfile(targetDevice, explicitProfile)
+      } catch (profErr) {
+        failMigration(
+          profErr,
+          'VOLUME_PROFILE_UNKNOWN',
+          profErr?.message ||
+            'Failed to resolve volume profile for target device',
+        )
       }
 
       const opIdVolume = opId('phase4', 'volume')
       try {
         if (typeof targetAdapter.setVolume === 'function') {
           await executeWithTimeout(
-            targetAdapter.setVolume(newEpoch, targetVolume, {
+            targetAdapter.setVolume(newEpoch, snapshot.volume, {
               operationId: opIdVolume,
+              volumeProfile: explicitProfile,
             }),
             phaseTimeoutMs,
             opIdVolume,
+            targetAdapter,
+          )
+          assertMigrationEpoch(newEpoch, targetAdapter)
+        }
+        if (snapshot.isMuted && typeof targetAdapter.setMute === 'function') {
+          const opIdMute = opId('phase4', 'mute')
+          await executeWithTimeout(
+            targetAdapter.setMute(newEpoch, true, {
+              operationId: opIdMute,
+            }),
+            phaseTimeoutMs,
+            opIdMute,
             targetAdapter,
           )
           assertMigrationEpoch(newEpoch, targetAdapter)
@@ -1254,10 +1287,47 @@ export function createPlaybackControlModule(config = {}) {
       dispatchCommand('seek', (epoch, adapter, options) =>
         adapter.seek(epoch, pos, options),
       ),
-    setVolume: (vol) =>
-      dispatchCommand('volume', (epoch, adapter) =>
-        adapter.setVolume(epoch, vol),
-      ),
+    setVolume: (vol) => {
+      if (
+        typeof vol !== 'number' ||
+        Number.isNaN(vol) ||
+        !Number.isFinite(vol) ||
+        vol < 0 ||
+        vol > 1
+      ) {
+        return Promise.reject({
+          code: 'INVALID_VOLUME',
+          message: `Volume must be a finite number between 0 and 1, got ${vol}`,
+        })
+      }
+      state.volume = vol
+      if (vol > 0) {
+        state.lastNonZeroVolume = vol
+      }
+      notifySubscribers()
+      return dispatchCommand('volume', (epoch, adapter, options) =>
+        adapter.setVolume(epoch, vol, options),
+      )
+    },
+    setMute: (isMuted) => {
+      if (typeof isMuted !== 'boolean') {
+        return Promise.reject({
+          code: 'INVALID_MUTE',
+          message: `Mute must be a boolean, got ${isMuted}`,
+        })
+      }
+      state.isMuted = isMuted
+      notifySubscribers()
+      return dispatchCommand('mute', (epoch, adapter, options) => {
+        if (typeof adapter.setMute === 'function') {
+          return adapter.setMute(epoch, isMuted, options)
+        }
+        return Promise.resolve()
+      })
+    },
+    toggleMute: function () {
+      return this.setMute(!state.isMuted)
+    },
     skipNext: () =>
       dispatchCommand('skipNext', (epoch, adapter) => adapter.skipNext(epoch)),
     skipPrev: () =>

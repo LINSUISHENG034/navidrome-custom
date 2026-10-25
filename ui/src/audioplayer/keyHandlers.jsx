@@ -2,6 +2,7 @@ import jukeboxClient from './jukeboxClient'
 import { canControlJukebox } from './jukeboxSession'
 import { PlaybackStatus } from './playbackControlModule'
 import { stepRemoteGainByUiDelta } from './volumeProfiles'
+import { stepUiVolume } from './volumeMapping'
 import {
   selectEffectiveCurrentTrack,
   selectEffectiveJukeboxCurrentIndex,
@@ -52,13 +53,13 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
       VOL_UP: () => {
         const { volume } = playbackController.getState()
         playbackController
-          .setVolume(Math.min(1, volume + VOLUME_KEY_STEP))
+          .setVolume(stepUiVolume(volume, VOLUME_KEY_STEP))
           .catch(() => {})
       },
       VOL_DOWN: () => {
         const { volume } = playbackController.getState()
         playbackController
-          .setVolume(Math.max(0, volume - VOLUME_KEY_STEP))
+          .setVolume(stepUiVolume(volume, -VOLUME_KEY_STEP))
           .catch(() => {})
       },
       PREV_SONG: (e) => {

@@ -20,27 +20,38 @@ type mockTrack struct {
 	position         int
 	positionSetCalls int
 	volumeValues     []float32
-	onSetVolume      func(float32)
-	onUnpause        func()
+	onSetVolume      func(float32) error
+	onPause          func() error
+	onUnpause        func() error
 	onClose          func()
 }
 
 func (m *mockTrack) IsPlaying() bool { return m.playing }
-func (m *mockTrack) SetVolume(value float32) {
+func (m *mockTrack) SetVolume(value float32) error {
 	m.volumeValues = append(m.volumeValues, value)
 	if m.onSetVolume != nil {
-		m.onSetVolume(value)
+		return m.onSetVolume(value)
 	}
+	return nil
 }
-func (m *mockTrack) Pause() {
+func (m *mockTrack) Pause() error {
 	m.pauseCalls++
-	m.playing = false
-}
-func (m *mockTrack) Unpause() {
-	m.playing = true
-	if m.onUnpause != nil {
-		m.onUnpause()
+	if m.onPause != nil {
+		if err := m.onPause(); err != nil {
+			return err
+		}
 	}
+	m.playing = false
+	return nil
+}
+func (m *mockTrack) Unpause() error {
+	if m.onUnpause != nil {
+		if err := m.onUnpause(); err != nil {
+			return err
+		}
+	}
+	m.playing = true
+	return nil
 }
 func (m *mockTrack) Position() int { return m.position }
 func (m *mockTrack) SetPosition(offset int) error {
@@ -322,7 +333,7 @@ func newPendingPlaybackHarness(t *testing.T, blockedID string, ids []string) *pe
 	var releaseOnce, resolvedOnce, playedOnce sync.Once
 	h.release = func() { releaseOnce.Do(func() { close(release) }) }
 	h.track.onClose = func() { resolvedOnce.Do(func() { close(h.resolved) }) }
-	h.track.onUnpause = func() {
+	h.track.onUnpause = func() error {
 		playedOnce.Do(func() {
 			gain := float32(0)
 			if len(h.track.volumeValues) > 0 {
@@ -331,14 +342,16 @@ func newPendingPlaybackHarness(t *testing.T, blockedID string, ids []string) *pe
 			h.playedGain <- gain
 		})
 		resolvedOnce.Do(func() { close(h.resolved) })
+		return nil
 	}
 	observe := func(output *mockTrack, id string) *mockTrack {
 		onUnpause := output.onUnpause
-		output.onUnpause = func() {
+		output.onUnpause = func() error {
 			if onUnpause != nil {
-				onUnpause()
+				_ = onUnpause()
 			}
 			h.playedIDs <- id
+			return nil
 		}
 		return output
 	}
@@ -666,5 +679,147 @@ var _ = Describe("playbackDevice concurrency", func() {
 		Expect(pd.ActiveTrack).To(BeNil())
 		Expect(status.Playing).To(BeFalse())
 		Expect(status.Position).To(Equal(0))
+	})
+
+	It("SetGain propagates synchronous IPC error, retains desired gain, but keeps confirmed gain unchanged", func() {
+		errIPC := errors.New("mpv ipc: set_property volume failed")
+		track := &mockTrack{
+			playing: true,
+			onSetVolume: func(float32) error {
+				return errIPC
+			},
+		}
+		pd := &playbackDevice{
+			serviceCtx:     context.Background(),
+			PlaybackQueue:  NewQueue(),
+			PlaybackEvents: make(chan model.PlaybackEvent, 16),
+			ActiveTrack:    track,
+			Gain:           0.64,
+			DesiredGain:    0.64,
+		}
+
+		status, err := pd.SetGain(context.Background(), 0.8)
+
+		Expect(err).To(MatchError(errIPC))
+		Expect(pd.DesiredGain).To(Equal(float32(0.8)))
+		Expect(pd.Gain).To(Equal(float32(0.64)))
+		Expect(status.Gain).To(Equal(float32(0.64)))
+	})
+
+	It("loadTrackLocked confirms initial gain before first Unpause and cleans up pending track on volume failure", func() {
+		errVol := errors.New("mpv ipc: initial volume setting failed")
+		closed := false
+		mockNewTrack := &mockTrack{
+			onSetVolume: func(float32) error {
+				return errVol
+			},
+			onClose: func() {
+				closed = true
+			},
+		}
+		previousNewTrack := newTrack
+		newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+			return mockNewTrack, nil
+		}
+		DeferCleanup(func() { newTrack = previousNewTrack })
+
+		ctx := context.Background()
+		repo := tests.CreateMockMediaFileRepo()
+		repo.SetData(model.MediaFiles{{ID: "t1", Path: "/song.mp3"}})
+		server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
+		pd := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
+		pd.DesiredGain = 0.5
+		pd.PlaybackQueue.Add(model.MediaFiles{{ID: "t1", Path: "/song.mp3"}})
+
+		status, err := pd.Start(ctx)
+
+		Expect(err).To(MatchError(errVol))
+		Expect(closed).To(BeTrue())
+		Expect(pd.ActiveTrack).To(BeNil())
+		Expect(status.Playing).To(BeFalse())
+	})
+
+	It("Stop synchronously propagates Pause error and retains recoverable paused-track semantics without destroying track", func() {
+		errPause := errors.New("mpv ipc: pause command timed out")
+		track := &mockTrack{
+			playing: true,
+			onPause: func() error {
+				return errPause
+			},
+		}
+		pd := &playbackDevice{
+			serviceCtx:     context.Background(),
+			PlaybackQueue:  NewQueue(),
+			PlaybackEvents: make(chan model.PlaybackEvent, 16),
+			ActiveTrack:    track,
+		}
+
+		status, err := pd.Stop(context.Background())
+
+		Expect(err).To(MatchError(errPause))
+		Expect(pd.ActiveTrack).To(BeIdenticalTo(track))
+		Expect(track.closeCalls).To(Equal(0))
+		Expect(status.Playing).To(BeTrue())
+	})
+
+	It("Start synchronously propagates Unpause error without producing false Playing state", func() {
+		errUnpause := errors.New("mpv ipc: unpause rejected")
+		track := &mockTrack{
+			playing: false,
+			onUnpause: func() error {
+				return errUnpause
+			},
+		}
+		pd := &playbackDevice{
+			serviceCtx:     context.Background(),
+			PlaybackQueue:  NewQueue(),
+			PlaybackEvents: make(chan model.PlaybackEvent, 16),
+			ActiveTrack:    track,
+		}
+
+		status, err := pd.Start(context.Background())
+
+		Expect(err).To(MatchError(errUnpause))
+		Expect(status.Playing).To(BeFalse())
+		Expect(pd.isPlaying()).To(BeFalse())
+	})
+
+	It("Deduplicates synchronous failure and subsequent asynchronous PlaybackEventFailure without double advance", func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		DeferCleanup(cancel)
+		errUnpause := errors.New("mpv ipc: unpause socket error")
+		token := model.PlaybackToken(42)
+		track := &mockTrack{
+			playing: false,
+			onUnpause: func() error {
+				return errUnpause
+			},
+		}
+		pd := &playbackDevice{
+			serviceCtx:          ctx,
+			PlaybackQueue:       NewQueue(),
+			PlaybackEvents:      make(chan model.PlaybackEvent, 16),
+			ActiveTrack:         track,
+			activePlaybackToken: token,
+		}
+
+		// Synchronous failure
+		status, err := pd.Start(ctx)
+		Expect(err).To(MatchError(errUnpause))
+		Expect(status.Playing).To(BeFalse())
+
+		// Asynchronous event for the same token arrives later
+		pos := 10
+		pd.handlePlaybackEvent(model.PlaybackEvent{
+			Token:    token,
+			Kind:     model.PlaybackEventFailure,
+			Position: &pos,
+			Err:      errUnpause,
+		})
+
+		// Active track retired safely, recovery position preserved, no panic or second advance
+		Expect(pd.ActiveTrack).To(BeNil())
+		Expect(pd.recoveryPosition).ToNot(BeNil())
+		Expect(*pd.recoveryPosition).To(Equal(10))
 	})
 })

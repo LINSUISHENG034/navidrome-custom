@@ -59,7 +59,12 @@ import {
 import { createBrowserAudioAdapter } from './browserAudioAdapter'
 import { createMockRemoteAudioAdapter } from './mockRemoteAudioAdapter'
 import { UnifiedNativePlayer } from './UnifiedNativePlayer'
-import { audioVolumeToRemoteGain } from './volumeProfiles'
+import {
+  audioVolumeToRemoteGain,
+  remoteGainToAudioVolume,
+  HARDWARE_QUANTIZATION_TOLERANCE,
+} from './volumeProfiles'
+import { audioVolumeToUiVolume } from './volumeMapping'
 import Sortable from 'sortablejs'
 
 function getNativeVolumeBarValue() {
@@ -1009,10 +1014,12 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
 
         await act(async () => document.querySelector('.sounds-icon').click())
         expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 1)
-        expect(controller.getState().volume).toBe(0)
+        expect(controller.getState().isMuted).toBe(true)
+        expect(controller.getState().volume).toBe(0.25)
 
         await act(async () => document.querySelector('.sounds-icon').click())
         expect(controller.getMetrics().intentsIssued).toBe(initialIntents + 2)
+        expect(controller.getState().isMuted).toBe(false)
         expect(controller.getState().volume).toBe(0.25)
       },
     )
@@ -4986,6 +4993,288 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(controller.getState().error).toBeNull()
 
       unmount()
+    })
+
+    it('TC-MIG-29: canonical volume is the only module volume; invalid inputs rejected at module boundary; V=0 does not overwrite lastNonZeroVolume', async () => {
+      const controller = createPlaybackControlModule()
+      const adapter = createBrowserAudioAdapter()
+      controller.setAdapter(adapter)
+
+      // Initial canonical volume
+      expect(controller.getState().volume).toBe(1)
+      expect(controller.getState().lastNonZeroVolume).toBe(1)
+
+      // Invalid numeric inputs rejected at Module boundary
+      await expect(controller.setVolume(NaN)).rejects.toMatchObject({
+        code: 'INVALID_VOLUME',
+      })
+      await expect(controller.setVolume(Infinity)).rejects.toMatchObject({
+        code: 'INVALID_VOLUME',
+      })
+      await expect(controller.setVolume(-0.01)).rejects.toMatchObject({
+        code: 'INVALID_VOLUME',
+      })
+      await expect(controller.setVolume(1.01)).rejects.toMatchObject({
+        code: 'INVALID_VOLUME',
+      })
+      await expect(controller.setVolume('0.5')).rejects.toMatchObject({
+        code: 'INVALID_VOLUME',
+      })
+
+      // Valid volume updates volume and lastNonZeroVolume
+      await controller.setVolume(0.64)
+      expect(controller.getState().volume).toBe(0.64)
+      expect(controller.getState().lastNonZeroVolume).toBe(0.64)
+
+      // V = 0 is valid, but does NOT overwrite lastNonZeroVolume
+      await controller.setVolume(0)
+      expect(controller.getState().volume).toBe(0)
+      expect(controller.getState().lastNonZeroVolume).toBe(0.64)
+
+      // V = 1 is valid
+      await controller.setVolume(1)
+      expect(controller.getState().volume).toBe(1)
+      expect(controller.getState().lastNonZeroVolume).toBe(1)
+    })
+
+    it('TC-MIG-30: mute is an independent authoritative boolean; adjusting volume while muted updates desired value without unmuting; unmute restores output with current volume', async () => {
+      const audio = document.createElement('audio')
+      const adapter = createBrowserAudioAdapter({ audioElement: audio })
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(adapter)
+
+      await controller.setVolume(0.8)
+      expect(controller.getState().volume).toBe(0.8)
+      expect(controller.getState().isMuted).toBe(false)
+      expect(audio.muted).toBe(false)
+
+      // Mute independently
+      await controller.setMute(true)
+      expect(controller.getState().isMuted).toBe(true)
+      expect(controller.getState().volume).toBe(0.8)
+      expect(controller.getState().lastNonZeroVolume).toBe(0.8)
+      expect(audio.muted).toBe(true)
+
+      // Adjusting volume while muted updates V and lastNonZeroVolume without unmuting
+      await controller.setVolume(0.4)
+      expect(controller.getState().volume).toBe(0.4)
+      expect(controller.getState().lastNonZeroVolume).toBe(0.4)
+      expect(controller.getState().isMuted).toBe(true)
+      expect(audio.muted).toBe(true)
+      expect(audio.volume).toBeCloseTo(0.4)
+
+      // Unmute restores sound with current V
+      await controller.setMute(false)
+      expect(controller.getState().isMuted).toBe(false)
+      expect(controller.getState().volume).toBe(0.4)
+      expect(audio.muted).toBe(false)
+      expect(audio.volume).toBeCloseTo(0.4)
+
+      // toggleMute convenience method
+      await controller.toggleMute()
+      expect(controller.getState().isMuted).toBe(true)
+      await controller.toggleMute()
+      expect(controller.getState().isMuted).toBe(false)
+    })
+
+    it('TC-MIG-31: explicit volume profile takes precedence over device hints; unknown profile fails before target startup with VOLUME_PROFILE_UNKNOWN and zero play calls', async () => {
+      const controller = createPlaybackControlModule()
+      const localAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(localAdapter)
+
+      await controller.addQueueItems([
+        { queueItemId: 'item-1', musicSrc: '/test.mp3' },
+      ])
+      await controller.setVolume(0.64)
+      await controller.play()
+
+      const remoteAdapter = createMockRemoteAudioAdapter()
+
+      // Subcase A: Unknown profile fails before target startup with VOLUME_PROFILE_UNKNOWN
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: {
+            name: 'Device with bad profile',
+            volumeProfile: 'unsupported-mystery-curve',
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: 'VOLUME_PROFILE_UNKNOWN',
+      })
+
+      expect(remoteAdapter.getPlayCount()).toBe(0)
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+
+      // Subcase B: Explicit 'default' overrides Bluetooth device hint
+      await controller.play()
+      const remoteAdapterB = createMockRemoteAudioAdapter()
+      const resB = await controller.migrateOutput({
+        targetAdapter: remoteAdapterB,
+        targetDevice: {
+          name: 'BT speaker forced to default',
+          deviceName: 'pulse/bluez_output.sink',
+          isBluetooth: true,
+          volumeProfile: 'default',
+        },
+      })
+      expect(resB.status).toBe(PlaybackStatus.PLAYING)
+      expect(remoteAdapterB.getAppliedVolume()).toBeCloseTo(0.64) // Linear, not 0.9352
+
+      // Subcase C: Explicit 'bluetooth-jukebox' overrides non-Bluetooth device hint
+      const remoteAdapterC = createMockRemoteAudioAdapter()
+      const resC = await controller.migrateOutput({
+        targetAdapter: remoteAdapterC,
+        targetDevice: {
+          name: 'ALSA card forced to bluetooth curve',
+          deviceName: 'pulse/alsa_output.pci',
+          isBluetooth: false,
+          volumeProfile: 'bluetooth-jukebox',
+        },
+      })
+      expect(resC.status).toBe(PlaybackStatus.PLAYING)
+      expect(remoteAdapterC.getAppliedVolume()).toBeCloseTo(
+        Math.pow(0.64, 0.15),
+      )
+    })
+
+    it('TC-MIG-32: repeated equivalent authoritative gain snapshots do not cumulatively remap V; external change outside quantization tolerance inverts once', async () => {
+      const controller = createPlaybackControlModule()
+      const bluetoothAdapter = createMockRemoteAudioAdapter({
+        device: {
+          deviceName: 'pulse/bluez_output.sink',
+          isBluetooth: true,
+        },
+      })
+      controller.setAdapter(bluetoothAdapter)
+
+      await controller.setVolume(0.64)
+      expect(controller.getState().volume).toBe(0.64)
+      const expectedBtGain = Math.pow(0.64, 0.15) // ~0.935235
+      expect(bluetoothAdapter.getAppliedVolume()).toBeCloseTo(expectedBtGain, 5)
+
+      // Repeated snapshots within 0.01 tolerance (e.g. 0.94 due to rounding) reuse confirmed V
+      bluetoothAdapter.pushServerSnapshot({ gain: 0.94 })
+      expect(controller.getState().volume).toBe(0.64)
+
+      bluetoothAdapter.pushServerSnapshot({ gain: expectedBtGain })
+      expect(controller.getState().volume).toBe(0.64)
+
+      bluetoothAdapter.pushServerSnapshot({ gain: 0.93 })
+      expect(controller.getState().volume).toBe(0.64)
+
+      // External change outside tolerance (e.g. 0.5) inverts once
+      bluetoothAdapter.pushServerSnapshot({ gain: 0.5 })
+      const expectedInvertedV = Math.pow(0.5, 1 / 0.15)
+      expect(controller.getState().volume).toBeCloseTo(expectedInvertedV, 6)
+
+      // Subsequent identical feedback at 0.5 does not cumulatively remap
+      bluetoothAdapter.pushServerSnapshot({ gain: 0.5 })
+      expect(controller.getState().volume).toBeCloseTo(expectedInvertedV, 6)
+    })
+
+    it('TC-MIG-33: ordinary -> Bluetooth -> ordinary preserves canonical V = 0.64 and U = 0.8 across runtime adjustments, repeated snapshots, and five reconnects', async () => {
+      const controller = createPlaybackControlModule()
+      const ordinaryAdapter = createMockRemoteAudioAdapter({
+        device: { deviceName: 'pulse/alsa_output.pci' },
+      })
+      controller.setAdapter(ordinaryAdapter)
+
+      await controller.setVolume(0.64)
+      expect(controller.getState().volume).toBe(0.64)
+      expect(audioVolumeToUiVolume(controller.getState().volume)).toBeCloseTo(
+        0.8,
+      )
+
+      const bluetoothAdapter = createMockRemoteAudioAdapter({
+        device: {
+          deviceName: 'pulse/bluez_output.sink',
+          isBluetooth: true,
+        },
+      })
+
+      // Migrate to Bluetooth
+      await controller.migrateOutput({
+        targetAdapter: bluetoothAdapter,
+        targetDevice: {
+          clientId: 'test-client',
+          deviceName: 'pulse/bluez_output.sink',
+          isBluetooth: true,
+        },
+      })
+
+      expect(controller.getState().volume).toBe(0.64)
+      expect(audioVolumeToUiVolume(controller.getState().volume)).toBeCloseTo(
+        0.8,
+      )
+      expect(bluetoothAdapter.getAppliedVolume()).toBeCloseTo(
+        Math.pow(0.64, 0.15),
+        5,
+      )
+
+      // 5 reconnects/re-migrations to same Bluetooth target
+      for (let i = 1; i <= 5; i++) {
+        await controller.migrateOutput({
+          targetAdapter: bluetoothAdapter,
+          targetDevice: {
+            clientId: 'test-client',
+            deviceName: 'pulse/bluez_output.sink',
+            isBluetooth: true,
+          },
+        })
+        expect(controller.getState().volume).toBe(0.64)
+        expect(audioVolumeToUiVolume(controller.getState().volume)).toBeCloseTo(
+          0.8,
+        )
+        expect(bluetoothAdapter.getAppliedVolume()).toBeCloseTo(
+          Math.pow(0.64, 0.15),
+          5,
+        )
+      }
+
+      // Migrate back to Ordinary output
+      const returnOrdinary = createMockRemoteAudioAdapter({
+        device: { deviceName: 'pulse/alsa_output.pci' },
+      })
+      await controller.migrateOutput({
+        targetAdapter: returnOrdinary,
+        targetDevice: {
+          clientId: 'test-client',
+          deviceName: 'pulse/alsa_output.pci',
+        },
+      })
+
+      expect(controller.getState().volume).toBe(0.64)
+      expect(audioVolumeToUiVolume(controller.getState().volume)).toBeCloseTo(
+        0.8,
+      )
+      expect(returnOrdinary.getAppliedVolume()).toBeCloseTo(0.64)
+    })
+
+    it('TC-MIG-34: desired gain and confirmed gain remain distinct on remote adapter; apply failure retains desired value without presenting it as applied', async () => {
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(remoteAdapter)
+
+      // With no active track, setting volume updates desired gain
+      await controller.setVolume(0.7)
+      expect(remoteAdapter.getDesiredGain()).toBeCloseTo(0.7)
+      expect(remoteAdapter.getAppliedVolume()).toBeCloseTo(0.7)
+
+      // Inject failure on volume
+      remoteAdapter.setFailure({
+        action: 'volume',
+        code: 'MPV_SET_VOLUME_FAILED',
+        message: 'Volume IPC failed',
+      })
+
+      await expect(controller.setVolume(0.3)).rejects.toMatchObject({
+        code: 'MPV_SET_VOLUME_FAILED',
+      })
+
+      // Desired gain recorded the requested value, but applied gain retains previous confirmed value
+      expect(remoteAdapter.getDesiredGain()).toBeCloseTo(0.3)
+      expect(remoteAdapter.getAppliedVolume()).toBeCloseTo(0.7)
     })
   })
 })

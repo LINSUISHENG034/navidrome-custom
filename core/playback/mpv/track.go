@@ -370,35 +370,41 @@ func (t *MpvTrack) String() string {
 }
 
 // Used to control the playback volume. A float value between 0.0 and 1.0.
-func (t *MpvTrack) SetVolume(value float32) {
+func (t *MpvTrack) SetVolume(value float32) error {
 	if t == nil {
-		return
+		return errors.New("track is nil")
 	}
 	vol := int(value * 100)
 	if _, err := t.call("set_property", "volume", vol); err != nil {
 		log.Error("Error setting volume", "volume", value, "track", t, err)
 		t.reportCommandFailure(err)
+		return err
 	}
+	return nil
 }
 
-func (t *MpvTrack) Unpause() {
+func (t *MpvTrack) Unpause() error {
 	if t == nil {
-		return
+		return errors.New("track is nil")
 	}
 	if _, err := t.call("set_property", "pause", false); err != nil {
 		log.Error("Error unpausing track", "track", t, err)
 		t.reportCommandFailure(err)
+		return err
 	}
+	return nil
 }
 
-func (t *MpvTrack) Pause() {
+func (t *MpvTrack) Pause() error {
 	if t == nil {
-		return
+		return errors.New("track is nil")
 	}
 	if _, err := t.call("set_property", "pause", true); err != nil {
 		log.Error("Error pausing track", "track", t, err)
 		t.reportCommandFailure(err)
+		return err
 	}
+	return nil
 }
 
 func (t *MpvTrack) Close() {

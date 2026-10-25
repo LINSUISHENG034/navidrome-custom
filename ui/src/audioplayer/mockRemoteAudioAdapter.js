@@ -18,6 +18,10 @@ import {
   applyQueueMove,
   applyQueueClear,
 } from './playbackControlModule'
+import {
+  audioVolumeToRemoteGain,
+  resolveAuthoritativeGain,
+} from './volumeProfiles'
 
 export function createMockRemoteAudioAdapter(options = {}) {
   let activeEpoch = 0
@@ -34,11 +38,27 @@ export function createMockRemoteAudioAdapter(options = {}) {
   const randomFn = options.randomFn || Math.random
   const wireCommands = []
 
+  let targetDevice = options.device || {}
+  const initialV = options.initialVolume
+  let lastConfirmedV = initialV
+  let initialGain = initialV !== undefined ? initialV : undefined
+  if (initialV !== undefined) {
+    try {
+      initialGain = audioVolumeToRemoteGain(initialV, targetDevice)
+    } catch {
+      initialGain = initialV
+    }
+  }
+  let lastConfirmedGain = initialGain
+  let desiredGain = initialGain
+  let appliedGain = initialGain
+
   let remoteState = {
     status: PlaybackStatus.IDLE,
     position: options.initialPosition || 0,
     duration: options.initialDuration || 180,
-    volume: options.initialVolume ?? 1,
+    volume: initialV,
+    isMuted: Boolean(options.initialMuted),
     error: null,
   }
 
@@ -57,14 +77,18 @@ export function createMockRemoteAudioAdapter(options = {}) {
     remoteState = { ...remoteState, ...patch }
     stateSequence = sequence
     if (isActive && stateCallback) {
-      stateCallback(activeEpoch, {
+      const update = {
         ...remoteState,
         queue: [...remoteQueue],
         currentQueueItemId,
         queueVersion,
         playMode,
         stateSequence,
-      })
+      }
+      if (update.volume === undefined) {
+        delete update.volume
+      }
+      stateCallback(activeEpoch, update)
     }
   }
 
@@ -73,7 +97,6 @@ export function createMockRemoteAudioAdapter(options = {}) {
     isActive = true
     stateCallback = onStateChange
     stateSequence = 0
-    publishState()
   }
 
   function deactivate() {
@@ -197,7 +220,6 @@ export function createMockRemoteAudioAdapter(options = {}) {
           status: PlaybackStatus.PLAYING,
           position: remoteState.position,
           duration: remoteState.duration,
-          volume: remoteState.volume,
         }),
         options,
       ),
@@ -233,14 +255,38 @@ export function createMockRemoteAudioAdapter(options = {}) {
         }),
         { position: positionSeconds, ...options },
       ),
-    setVolume: (epoch, volumeFraction, options = {}) =>
-      simulateAction(
+    setVolume: (epoch, canonicalVolume, options = {}) => {
+      const explicitProfile =
+        options.volumeProfile ?? targetDevice.volumeProfile
+      const targetG = audioVolumeToRemoteGain(
+        canonicalVolume,
+        targetDevice,
+        explicitProfile,
+      )
+      desiredGain = targetG
+      return simulateAction(
         epoch,
         'volume',
+        () => {
+          appliedGain = targetG
+          lastConfirmedGain = targetG
+          lastConfirmedV = canonicalVolume
+          return {
+            volume: canonicalVolume,
+            gain: targetG,
+          }
+        },
+        { volume: targetG, canonicalVolume, ...options },
+      )
+    },
+    setMute: (epoch, isMuted, options = {}) =>
+      simulateAction(
+        epoch,
+        'setMute',
         () => ({
-          volume: Math.max(0, Math.min(1, volumeFraction)),
+          isMuted: Boolean(isMuted),
         }),
-        { volume: volumeFraction, ...options },
+        { isMuted: Boolean(isMuted), ...options },
       ),
     setPlayMode: (epoch, mode) => {
       const normalized = normalizePlaybackMode(mode)
@@ -436,7 +482,33 @@ export function createMockRemoteAudioAdapter(options = {}) {
       if (snapshot.playMode !== undefined) {
         playMode = normalizePlaybackMode(snapshot.playMode)
       }
-      publishState(snapshot, snapshot.stateSequence ?? stateSequence + 1)
+      let volumeToPublish = undefined
+      let gainToPublish = undefined
+      if (snapshot.gain !== undefined || snapshot.volume !== undefined) {
+        const reportedG =
+          snapshot.gain !== undefined ? snapshot.gain : snapshot.volume
+        const resolved = resolveAuthoritativeGain(
+          reportedG,
+          lastConfirmedV,
+          lastConfirmedGain,
+          targetDevice,
+        )
+        lastConfirmedV = resolved.volume
+        lastConfirmedGain = resolved.gain
+        appliedGain = resolved.gain
+        desiredGain = resolved.gain
+        volumeToPublish = resolved.volume
+        gainToPublish = resolved.gain
+      }
+      publishState(
+        {
+          ...snapshot,
+          ...(volumeToPublish !== undefined
+            ? { volume: volumeToPublish, gain: gainToPublish }
+            : {}),
+        },
+        snapshot.stateSequence ?? stateSequence + 1,
+      )
     },
     // Simulate autonomous server-side progression (continues even when UI is disconnected)
     triggerNaturalEnd: () => {
@@ -506,10 +578,19 @@ export function createMockRemoteAudioAdapter(options = {}) {
       }
       return true
     },
-    reserveMigration: async (
-      operationId,
-      { migrationId, clientId = 'client', forceTakeover = false } = {},
-    ) => {
+    reserveMigration: async (operationId, options = {}) => {
+      const {
+        migrationId,
+        clientId = 'client',
+        forceTakeover = false,
+      } = options
+      if (
+        options.deviceName ||
+        options.isBluetooth !== undefined ||
+        options.volumeProfile
+      ) {
+        targetDevice = { ...targetDevice, ...options }
+      }
       recordCommand({
         action: 'reserveMigration',
         operationId,
@@ -623,7 +704,13 @@ export function createMockRemoteAudioAdapter(options = {}) {
     getReservations: () => new Map(reservations),
     getPlayCount: () => wireCommands.filter((c) => c.action === 'play').length,
     getStopCount: () => wireCommands.filter((c) => c.action === 'stop').length,
-    getAppliedVolume: () => remoteState.volume,
+    getAppliedVolume: () => appliedGain ?? 1,
+    getDesiredGain: () => desiredGain ?? 1,
+    getConfirmedGain: () => lastConfirmedGain ?? 1,
+    getDevice: () => ({ ...targetDevice }),
+    setDevice: (dev) => {
+      targetDevice = { ...targetDevice, ...dev }
+    },
     getRemoteState: () => ({ ...remoteState }),
   }
 }

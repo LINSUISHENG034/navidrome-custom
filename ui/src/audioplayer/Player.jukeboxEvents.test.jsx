@@ -556,20 +556,20 @@ describe('unified controller hotkey routing (Issue 05, TC-IN-03)', () => {
     expect(audioInstance.togglePlay).not.toHaveBeenCalled()
   })
 
-  it('TC-IN-03: VOL_UP and VOL_DOWN step the authoritative volume instead of mutating the element', () => {
-    const audioInstance = { togglePlay: vi.fn(), volume: 0.5 }
-    const controller = makeController('playing', 0.5)
+  it('TC-IN-03: VOL_UP and VOL_DOWN step the authoritative volume in the U domain instead of mutating the element', () => {
+    const audioInstance = { togglePlay: vi.fn(), volume: 0.64 }
+    const controller = makeController('playing', 0.64)
     const handlers = keyHandlers(audioInstance, playerState, controller)
 
     handlers.VOL_UP()
-    expect(controller.setVolume).toHaveBeenLastCalledWith(0.6)
+    expect(controller.setVolume.mock.calls[0][0]).toBeCloseTo(0.81, 6)
     handlers.VOL_DOWN()
     handlers.VOL_DOWN()
-    expect(controller.setVolume).toHaveBeenLastCalledWith(0.4)
+    expect(controller.setVolume.mock.calls[2][0]).toBeCloseTo(0.49, 6)
     expect(controller.setVolume).toHaveBeenCalledTimes(3)
-    expect(audioInstance.volume).toBe(0.5)
+    expect(audioInstance.volume).toBe(0.64)
 
-    const clamped = makeController('playing', 0.97)
+    const clamped = makeController('playing', 0.95)
     keyHandlers(audioInstance, playerState, clamped).VOL_UP()
     expect(clamped.setVolume).toHaveBeenLastCalledWith(1)
   })

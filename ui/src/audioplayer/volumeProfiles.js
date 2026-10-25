@@ -7,7 +7,17 @@ import {
 export const DEFAULT_VOLUME_PROFILE = 'default'
 export const BLUETOOTH_JUKEBOX_VOLUME_PROFILE = 'bluetooth-jukebox'
 
-const BLUETOOTH_PROFILE_EXPONENT = 0.3
+export const KNOWN_VOLUME_PROFILES = Object.freeze([
+  DEFAULT_VOLUME_PROFILE,
+  BLUETOOTH_JUKEBOX_VOLUME_PROFILE,
+])
+
+export const HARDWARE_QUANTIZATION_TOLERANCE = 0.01
+
+export const isKnownVolumeProfile = (profile) =>
+  typeof profile === 'string' && KNOWN_VOLUME_PROFILES.includes(profile)
+
+const BLUETOOTH_PROFILE_EXPONENT = 0.15
 const BLUETOOTH_MARKERS = ['bluetooth', 'bluez', 'a2dp']
 
 const normalizeDeviceHint = (value) =>
@@ -24,33 +34,94 @@ const resolveDeviceHint = (context = {}) =>
       '',
   )
 
-export const getVolumeProfile = (context = {}) =>
-  hasBluetoothMarker(resolveDeviceHint(context))
-    ? BLUETOOTH_JUKEBOX_VOLUME_PROFILE
-    : DEFAULT_VOLUME_PROFILE
+export const resolveVolumeProfile = (context = {}, explicitProfile = null) => {
+  const profileToResolve =
+    explicitProfile !== null && explicitProfile !== undefined
+      ? explicitProfile
+      : context.volumeProfile
 
-export const uiVolumeToRemoteGain = (uiVolume, context = {}) => {
-  const profile = getVolumeProfile(context)
-  if (profile === BLUETOOTH_JUKEBOX_VOLUME_PROFILE) {
-    return Math.pow(clamp01(uiVolume), BLUETOOTH_PROFILE_EXPONENT)
+  if (profileToResolve !== null && profileToResolve !== undefined) {
+    if (typeof profileToResolve === 'string') {
+      if (isKnownVolumeProfile(profileToResolve)) {
+        return profileToResolve
+      }
+      const err = new Error(`Unknown volume profile: ${profileToResolve}`)
+      err.code = 'VOLUME_PROFILE_UNKNOWN'
+      throw err
+    }
+    if (typeof profileToResolve === 'function') {
+      return profileToResolve
+    }
+    const err = new Error(`Unknown volume profile: ${profileToResolve}`)
+    err.code = 'VOLUME_PROFILE_UNKNOWN'
+    throw err
   }
-  return uiVolumeToAudioVolume(uiVolume)
+
+  if (
+    context.isBluetooth === true ||
+    hasBluetoothMarker(resolveDeviceHint(context))
+  ) {
+    return BLUETOOTH_JUKEBOX_VOLUME_PROFILE
+  }
+
+  return DEFAULT_VOLUME_PROFILE
 }
 
-export const remoteGainToUiVolume = (gain, context = {}) => {
-  const profile = getVolumeProfile(context)
+export const getVolumeProfile = (context = {}) => {
+  try {
+    return resolveVolumeProfile(context)
+  } catch {
+    return DEFAULT_VOLUME_PROFILE
+  }
+}
+
+export const audioVolumeToRemoteGain = (
+  audioVolume,
+  context = {},
+  explicitProfile = null,
+) => {
+  const profile = resolveVolumeProfile(context, explicitProfile)
+  if (typeof profile === 'function') {
+    return clamp01(profile(audioVolume, context))
+  }
+  if (profile === BLUETOOTH_JUKEBOX_VOLUME_PROFILE) {
+    return Math.pow(clamp01(audioVolume), BLUETOOTH_PROFILE_EXPONENT)
+  }
+  return clamp01(audioVolume)
+}
+
+export const remoteGainToAudioVolume = (
+  gain,
+  context = {},
+  explicitProfile = null,
+) => {
+  const profile = resolveVolumeProfile(context, explicitProfile)
+  if (typeof profile === 'function') {
+    return clamp01(gain)
+  }
   if (profile === BLUETOOTH_JUKEBOX_VOLUME_PROFILE) {
     return Math.pow(clamp01(gain), 1 / BLUETOOTH_PROFILE_EXPONENT)
   }
-  return audioVolumeToUiVolume(gain)
+  return clamp01(gain)
 }
 
-export const audioVolumeToRemoteGain = (audioVolume, context = {}) => {
-  if (getVolumeProfile(context) === DEFAULT_VOLUME_PROFILE) {
-    return clamp01(audioVolume)
-  }
-  return uiVolumeToRemoteGain(audioVolumeToUiVolume(audioVolume), context)
-}
+export const uiVolumeToRemoteGain = (
+  uiVolume,
+  context = {},
+  explicitProfile = null,
+) =>
+  audioVolumeToRemoteGain(
+    uiVolumeToAudioVolume(uiVolume),
+    context,
+    explicitProfile,
+  )
+
+export const remoteGainToUiVolume = (
+  gain,
+  context = {},
+  explicitProfile = null,
+) =>
+  audioVolumeToUiVolume(remoteGainToAudioVolume(gain, context, explicitProfile))
 
 export const stepRemoteGainByUiDelta = (gain, delta, context = {}) => {
   if (getVolumeProfile(context) === DEFAULT_VOLUME_PROFILE) {
@@ -60,4 +131,32 @@ export const stepRemoteGainByUiDelta = (gain, delta, context = {}) => {
     remoteGainToUiVolume(gain, context) + delta,
     context,
   )
+}
+
+export const resolveAuthoritativeGain = (
+  reportedGain,
+  lastConfirmedV,
+  lastConfirmedG,
+  context = {},
+  explicitProfile = null,
+) => {
+  const g = clamp01(reportedGain)
+  if (
+    typeof lastConfirmedG === 'number' &&
+    Math.abs(g - lastConfirmedG) <= HARDWARE_QUANTIZATION_TOLERANCE &&
+    typeof lastConfirmedV === 'number'
+  ) {
+    return {
+      volume: lastConfirmedV,
+      gain: g,
+      remapped: false,
+    }
+  }
+
+  const newV = remoteGainToAudioVolume(g, context, explicitProfile)
+  return {
+    volume: newV,
+    gain: g,
+    remapped: true,
+  }
 }

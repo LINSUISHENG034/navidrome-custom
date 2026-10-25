@@ -77,13 +77,14 @@ func TestPlaybackServerPlayingMigrationRestoresBeforeUnpause(t *testing.T) {
 	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, _ model.PlaybackToken, device string, _ model.MediaFile) (Track, error) {
 		track := &mockTrack{}
 		if device == "new" {
-			track.onUnpause = func() {
+			track.onUnpause = func() error {
 				firstPosition <- track.position
 				gain := float32(-1)
 				if len(track.volumeValues) > 0 {
 					gain = track.volumeValues[len(track.volumeValues)-1]
 				}
 				firstGain <- gain
+				return nil
 			}
 		}
 		return track, nil
@@ -407,11 +408,12 @@ func TestPlaybackExplicitTakeoverSerializesWithAdmittedOldOwnerMutation(t *testi
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(unblock)
 	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
-		return &mockTrack{onSetVolume: func(gain float32) {
+		return &mockTrack{onSetVolume: func(gain float32) error {
 			if gain == 0.25 {
 				close(entered)
 				<-release
 			}
+			return nil
 		}}, nil
 	}
 	oldScope := CommandScope{User: "admin", SessionID: "owner", ClientID: "old-tab"}
@@ -484,7 +486,7 @@ func TestPlaybackExplicitTakeoverCancelsInFlightOldOwnerPreparation(t *testing.T
 		if prepareCtx.Err() == nil {
 			return nil, errors.New("takeover did not cancel old-owner preparation")
 		}
-		return &mockTrack{onClose: func() { close(closed) }, onUnpause: func() { unpaused <- struct{}{} }}, nil
+		return &mockTrack{onClose: func() { close(closed) }, onUnpause: func() error { unpaused <- struct{}{}; return nil }}, nil
 	}
 	started := make(chan error, 1)
 	go func() {
@@ -630,7 +632,7 @@ func TestPlaybackScopedStopCancelsPreparingOutputWithoutResurrection(t *testing.
 		close(entered)
 		<-prepareCtx.Done()
 		close(canceled)
-		return &mockTrack{onClose: func() { close(closed) }, onUnpause: func() { unpaused <- struct{}{} }}, nil
+		return &mockTrack{onClose: func() { close(closed) }, onUnpause: func() error { unpaused <- struct{}{}; return nil }}, nil
 	}
 	started := make(chan error, 1)
 	go func() {
@@ -700,7 +702,7 @@ func TestPlaybackScopedMigrationPreparationCanBeCanceledWithoutLateUnpause(t *te
 		if prepareCtx.Err() == nil {
 			return nil, errors.New("stop did not cancel migration preparation context")
 		}
-		return &mockTrack{onClose: func() { close(closed) }, onUnpause: func() { unpaused <- struct{}{} }}, nil
+		return &mockTrack{onClose: func() { close(closed) }, onUnpause: func() error { unpaused <- struct{}{}; return nil }}, nil
 	}
 	switched := make(chan error, 1)
 	go func() { switched <- server.SwitchDeviceForCommand(ctx, scope, "new") }()
@@ -910,11 +912,12 @@ func TestPlaybackSameOwnerLateCommandAcrossDeviceSwitchDoesNotMutateNewScene(t *
 
 	previousNewTrack := newTrack
 	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
-		return &mockTrack{onSetVolume: func(gain float32) {
+		return &mockTrack{onSetVolume: func(gain float32) error {
 			if gain == 0.125 {
 				enterOnce.Do(func() { close(entered) })
 				<-release
 			}
+			return nil
 		}}, nil
 	}
 	t.Cleanup(func() { newTrack = previousNewTrack })
@@ -1049,4 +1052,3 @@ func TestPlaybackServerMigrationTargetStartFailurePreservesFailedSceneWithoutOut
 		t.Fatalf("retry after volume/prep failure did not resume from preserved scene: %#v, %v", resumedStatus, err)
 	}
 }
-

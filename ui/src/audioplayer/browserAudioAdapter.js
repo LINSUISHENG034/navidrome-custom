@@ -627,6 +627,25 @@ export function createBrowserAudioAdapter(options = {}) {
     }
   }
 
+  async function setMute(epoch, isMuted, options = {}) {
+    if (!isActive || epoch !== activeEpoch) return
+    const opId = options.operationId
+    const muted = Boolean(isMuted)
+    if (audioElement) {
+      audioElement.muted = muted
+      publishState({ volume: audioElement.volume, isMuted: audioElement.muted })
+    } else {
+      localState.isMuted = muted
+      publishState({ volume: localState.volume, isMuted: muted })
+    }
+    if (opId) {
+      operations.set(opId, {
+        status: CommandResultStatus.APPLIED,
+        operationId: opId,
+      })
+    }
+  }
+
   async function setPlayMode(epoch, mode, options = {}) {
     if (!isActive || epoch !== activeEpoch) return
     const opId = options.operationId
@@ -914,6 +933,7 @@ export function createBrowserAudioAdapter(options = {}) {
     stop,
     seek,
     setVolume,
+    setMute,
     skipNext,
     skipPrev,
     setPlayMode,

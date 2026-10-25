@@ -13,9 +13,9 @@ import (
 
 type Track interface {
 	IsPlaying() bool
-	SetVolume(value float32) // Used to control the playback volume. A float value between 0.0 and 1.0.
-	Pause()
-	Unpause()
+	SetVolume(value float32) error // Used to control the playback volume. A float value between 0.0 and 1.0.
+	Pause() error
+	Unpause() error
 	Position() int
 	SetPosition(offset int) error
 	Close()
@@ -33,6 +33,7 @@ type playbackDevice struct {
 	PlaybackQueue         *Queue
 	queueVersion          int
 	Gain                  float32
+	DesiredGain           float32
 	PlaybackEvents        chan model.PlaybackEvent
 	ActiveTrack           Track
 	onStateChange         func(DeviceStatus)
@@ -98,6 +99,10 @@ func (pd *playbackDevice) getStatus() DeviceStatus {
 	}
 }
 
+func (pd *playbackDevice) desiredGainLocked() float32 {
+	return pd.DesiredGain
+}
+
 // NewPlaybackDevice creates a new playback device which implements all the basic Jukebox mode commands defined here:
 // http://www.subsonic.org/pages/api.jsp#jukeboxControl
 // Starts the trackSwitcher goroutine for the device.
@@ -109,6 +114,7 @@ func NewPlaybackDevice(ctx context.Context, playbackServer PlaybackServer, name 
 		Name:                  name,
 		DeviceName:            deviceName,
 		Gain:                  DefaultGain,
+		DesiredGain:           DefaultGain,
 		PlaybackQueue:         NewQueue(),
 		PlaybackEvents:        make(chan model.PlaybackEvent, 32),
 		pendingPlaybackTokens: make(map[model.PlaybackToken]chan struct{}),
@@ -171,7 +177,10 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, bool, 
 		if pd.isPlaying() {
 			log.Debug("trying to start an already playing track")
 		} else {
-			pd.ActiveTrack.Unpause()
+			if err := pd.ActiveTrack.Unpause(); err != nil {
+				log.Error(ctx, "error unpausing active track", err)
+				return pd.getStatus(), false, err
+			}
 			changed = true
 		}
 	} else {
@@ -190,7 +199,10 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, bool, 
 			pd.assignTrack(track, token)
 			if pd.ActiveTrack != nil {
 				pd.recoveryPosition = nil
-				pd.ActiveTrack.Unpause()
+				if err := pd.ActiveTrack.Unpause(); err != nil {
+					log.Error(ctx, "error unpausing newly assigned track", err)
+					return pd.getStatus(), false, err
+				}
 				changed = true
 			}
 		}
@@ -212,8 +224,13 @@ func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, bool, e
 	log.Debug(ctx, "Processing Stop action", "device", pd)
 	pd.cancelPreparationLocked()
 	changed := pd.ActiveTrack != nil && pd.isPlaying()
+	var err error
 	if pd.ActiveTrack != nil {
-		pd.ActiveTrack.Pause()
+		err = pd.ActiveTrack.Pause()
+	}
+	if err != nil {
+		log.Error(ctx, "error pausing active track", err)
+		return pd.getStatus(), false, err
 	}
 	return pd.getStatus(), changed, nil
 }
@@ -222,11 +239,16 @@ func (pd *playbackDevice) shutdownLocked(ctx context.Context) (DeviceStatus, boo
 	log.Debug(ctx, "Processing Shutdown action", "device", pd)
 	pd.cancelPreparationLocked()
 	changed := pd.ActiveTrack != nil
+	var err error
 	if pd.ActiveTrack != nil {
-		pd.ActiveTrack.Pause()
+		err = pd.ActiveTrack.Pause()
 	}
 	pd.retireActiveTrackLocked()
 	pd.recoveryPosition = nil
+	if err != nil {
+		log.Error(ctx, "error pausing active track during shutdown", err)
+		return pd.getStatus(), false, err
+	}
 	return pd.getStatus(), changed, nil
 }
 
@@ -247,7 +269,10 @@ func (pd *playbackDevice) skipLocked(ctx context.Context, index int, offset int)
 	wasPlaying := pd.isPlaying()
 
 	if pd.ActiveTrack != nil && wasPlaying {
-		pd.ActiveTrack.Pause()
+		if err := pd.ActiveTrack.Pause(); err != nil {
+			log.Error(ctx, "error pausing active track during skip", err)
+			return pd.getStatus(), false, err
+		}
 	}
 
 	if index != pd.PlaybackQueue.Index {
@@ -419,10 +444,14 @@ func (pd *playbackDevice) SetGain(ctx context.Context, gain float32) (DeviceStat
 
 func (pd *playbackDevice) setGainLocked(ctx context.Context, gain float32) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing SetGain action", "newGain", gain, "device", pd)
-	changed := pd.Gain != gain
+	pd.DesiredGain = gain
 	if pd.ActiveTrack != nil {
-		pd.ActiveTrack.SetVolume(gain)
+		if err := pd.ActiveTrack.SetVolume(gain); err != nil {
+			log.Error(ctx, "error setting active track volume", err)
+			return pd.getStatus(), false, err
+		}
 	}
+	changed := pd.Gain != gain
 	pd.Gain = gain
 	return pd.getStatus(), changed, nil
 }
@@ -496,11 +525,15 @@ func (pd *playbackDevice) isPlaying() bool {
 
 func (pd *playbackDevice) trackSwitcherGoroutine() {
 	log.Debug("Started trackSwitcher goroutine", "device", pd)
+	var done <-chan struct{}
+	if pd.serviceCtx != nil {
+		done = pd.serviceCtx.Done()
+	}
 	for {
 		select {
 		case event := <-pd.PlaybackEvents:
 			pd.handlePlaybackEvent(event)
-		case <-pd.serviceCtx.Done():
+		case <-done:
 			log.Debug("Stopping trackSwitcher goroutine", "device", pd.Name)
 			return
 		}
@@ -540,7 +573,9 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 			} else {
 				pd.assignTrack(track, token)
 				if pd.ActiveTrack != nil {
-					pd.ActiveTrack.Unpause()
+					if err := pd.ActiveTrack.Unpause(); err != nil {
+						log.Error("Error unpausing track on natural advance", err)
+					}
 				}
 			}
 		} else {
@@ -613,7 +648,13 @@ func (pd *playbackDevice) loadTrackLocked(ctx context.Context, index int) (Track
 		closeTrack(track)
 		return nil, 0, true, err
 	}
-	track.SetVolume(pd.Gain)
+	if err := track.SetVolume(pd.DesiredGain); err != nil {
+		log.Error(ctx, "error applying initial volume to new track", err)
+		pd.discardPendingTrack(token)
+		closeTrack(track)
+		return nil, 0, true, err
+	}
+	pd.Gain = pd.DesiredGain
 	return track, token, true, nil
 }
 

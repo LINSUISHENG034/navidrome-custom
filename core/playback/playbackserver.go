@@ -261,6 +261,7 @@ func sessionStatusFromDevice(session Session, device *playbackDevice) SessionSta
 	status.Playing = deviceStatus.Playing
 	status.Position = deviceStatus.Position
 	status.Gain = deviceStatus.Gain
+	status.DesiredGain = device.desiredGainLocked()
 	status.QueueVersion = device.queueVersion
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
@@ -842,6 +843,7 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 			newDev.PlaybackQueue.Set(savedQueue)
 			newDev.PlaybackQueue.SetIndex(savedIndex)
 			newDev.Gain = savedGain
+			newDev.DesiredGain = savedGain
 			newDev.recoveryPosition = savedPosition
 			newDev.incrementQueueVersionLocked()
 			preparationVersion = newDev.preparationVersion

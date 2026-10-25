@@ -110,12 +110,15 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     this.controllerOverridesInstalled = true
 
     this.onAudioMute = () => {
-      this.props.controller?.setVolume(0).catch(() => {})
+      this.props.controller?.setMute(true).catch(() => {})
     }
     this.onResetVolume = () => {
-      this.props.controller
-        ?.setVolume(this.restoreVolume ?? this.props.defaultVolume ?? 1)
-        .catch(() => {})
+      if (this.props.controller?.getState().volume === 0) {
+        this.props.controller
+          ?.setVolume(this.restoreVolume ?? this.props.defaultVolume ?? 1)
+          .catch(() => {})
+      }
+      this.props.controller?.setMute(false).catch(() => {})
     }
 
     this.onProgressChange = (position) => {
@@ -787,13 +790,27 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
           nextState.loading = isLoading
         }
         if (
-          typeof authoritativeState.volume === 'number' &&
-          audioVolumeToUiVolume(authoritativeState.volume) !==
-            prevState.soundValue
+          typeof authoritativeState.isMuted === 'boolean' &&
+          authoritativeState.isMuted !== prevState.isMuted
         ) {
-          nextState.soundValue = audioVolumeToUiVolume(
-            authoritativeState.volume,
-          )
+          nextState.isMuted = authoritativeState.isMuted
+        }
+        if (
+          typeof authoritativeState.volume === 'number' ||
+          typeof authoritativeState.isMuted === 'boolean'
+        ) {
+          const isMuted =
+            authoritativeState.isMuted ?? prevState.isMuted ?? false
+          const currentVol =
+            typeof authoritativeState.volume === 'number'
+              ? authoritativeState.volume
+              : (controller?.getState().volume ?? 1)
+          const targetSoundValue = isMuted
+            ? 0
+            : audioVolumeToUiVolume(currentVol)
+          if (targetSoundValue !== prevState.soundValue) {
+            nextState.soundValue = targetSoundValue
+          }
         }
         if (
           typeof authoritativeState.position === 'number' &&
