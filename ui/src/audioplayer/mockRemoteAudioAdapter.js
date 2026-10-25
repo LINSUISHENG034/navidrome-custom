@@ -50,6 +50,9 @@ export function createMockRemoteAudioAdapter(options = {}) {
   let activeSessionOwner =
     options.activeSessionOwner || (hasActiveSession ? 'other-client' : null)
 
+  const operations = new Map()
+  const reservations = new Map()
+
   function publishState(patch = {}, sequence = stateSequence + 1) {
     remoteState = { ...remoteState, ...patch }
     stateSequence = sequence
@@ -134,39 +137,91 @@ export function createMockRemoteAudioAdapter(options = {}) {
         )
       }
       assertCurrent()
+      const opId = commandExtra.operationId
+      if (failure.responseLost) {
+        const patch =
+          typeof statePatch === 'function' ? statePatch() : statePatch
+        publishState({ ...patch, error: null })
+        if (opId) {
+          operations.set(opId, {
+            status: 'APPLIED',
+            action: actionName,
+            patch,
+          })
+        }
+        const err = {
+          code: 'RESPONSE_LOST',
+          message: `Response lost in transit for ${actionName}`,
+          status: 'UNKNOWN',
+          operationId: opId,
+        }
+        throw err
+      }
+
       const err = {
         code: failure.code || 'REMOTE_ACTION_FAILED',
         message: failure.message || `Remote action ${actionName} was rejected`,
+        status: failure.resultStatus || 'FAILED',
+        operationId: opId,
+      }
+      if (opId) {
+        operations.set(opId, {
+          status: failure.resultStatus || 'FAILED',
+          error: err,
+          action: actionName,
+        })
       }
       publishState({ status: PlaybackStatus.ERROR, error: err })
       throw err
     }
 
     const patch = typeof statePatch === 'function' ? statePatch() : statePatch
+    if (commandExtra.operationId) {
+      operations.set(commandExtra.operationId, {
+        status: 'APPLIED',
+        action: actionName,
+        patch,
+      })
+    }
     publishState({ ...patch, error: null })
   }
 
   return {
     activate,
     deactivate,
-    play: (epoch) =>
-      simulateAction(epoch, 'play', () => ({
-        status: PlaybackStatus.PLAYING,
-        position: remoteState.position,
-        duration: remoteState.duration,
-        volume: remoteState.volume,
-      })),
-    pause: (epoch) =>
-      simulateAction(epoch, 'pause', () => ({
-        status: PlaybackStatus.PAUSED,
-        position: remoteState.position,
-      })),
-    stop: (epoch) =>
-      simulateAction(epoch, 'stop', () => ({
-        status: PlaybackStatus.PAUSED,
-        position: remoteState.position,
-      })),
-    seek: (epoch, positionSeconds) =>
+    play: (epoch, options = {}) =>
+      simulateAction(
+        epoch,
+        'play',
+        () => ({
+          status: PlaybackStatus.PLAYING,
+          position: remoteState.position,
+          duration: remoteState.duration,
+          volume: remoteState.volume,
+        }),
+        options,
+      ),
+    pause: (epoch, options = {}) =>
+      simulateAction(
+        epoch,
+        'pause',
+        () => ({
+          status: PlaybackStatus.PAUSED,
+          position: remoteState.position,
+        }),
+        options,
+      ),
+    stop: (epoch, options = {}) =>
+      simulateAction(
+        epoch,
+        'stop',
+        () => ({
+          status: PlaybackStatus.PAUSED,
+          position: remoteState.position,
+        }),
+        options,
+      ),
+    seek: (epoch, positionSeconds, options = {}) =>
       simulateAction(
         epoch,
         'seek',
@@ -176,16 +231,16 @@ export function createMockRemoteAudioAdapter(options = {}) {
             Math.min(positionSeconds, remoteState.duration),
           ),
         }),
-        { position: positionSeconds },
+        { position: positionSeconds, ...options },
       ),
-    setVolume: (epoch, volumeFraction) =>
+    setVolume: (epoch, volumeFraction, options = {}) =>
       simulateAction(
         epoch,
         'volume',
         () => ({
           volume: Math.max(0, Math.min(1, volumeFraction)),
         }),
-        { volume: volumeFraction },
+        { volume: volumeFraction, ...options },
       ),
     setPlayMode: (epoch, mode) => {
       const normalized = normalizePlaybackMode(mode)
@@ -423,18 +478,149 @@ export function createMockRemoteAudioAdapter(options = {}) {
     admitClient: async ({
       forceTakeover = false,
       clientId = 'client',
+      operationId,
     } = {}) => {
+      recordCommand({
+        action: 'admitClient',
+        forceTakeover,
+        clientId,
+        operationId,
+      })
       if (
         hasActiveSession &&
         !forceTakeover &&
         clientId !== activeSessionOwner
       ) {
+        if (operationId) {
+          operations.set(operationId, {
+            status: 'FAILED',
+            code: 'TARGET_OCCUPIED',
+          })
+        }
         return false
       }
       hasActiveSession = true
       activeSessionOwner = clientId
+      if (operationId) {
+        operations.set(operationId, { status: 'APPLIED', clientId })
+      }
       return true
     },
+    reserveMigration: async (
+      operationId,
+      { migrationId, clientId = 'client', forceTakeover = false } = {},
+    ) => {
+      recordCommand({
+        action: 'reserveMigration',
+        operationId,
+        migrationId,
+        clientId,
+        forceTakeover,
+      })
+      if (failureConfig?.action === 'reserveMigration') {
+        const err = {
+          code: failureConfig.code || 'TARGET_ADMISSION_DENIED',
+          message: failureConfig.message || 'Target reservation rejected',
+        }
+        if (operationId) {
+          operations.set(operationId, { status: 'FAILED', error: err })
+        }
+        throw err
+      }
+      const existingRes = reservations.get(migrationId)
+      if (
+        existingRes &&
+        existingRes.status === 'ACTIVE' &&
+        existingRes.clientId === clientId
+      ) {
+        const res = { status: 'APPLIED', migrationId, clientId }
+        if (operationId) operations.set(operationId, res)
+        return res
+      }
+      if (
+        hasActiveSession &&
+        !forceTakeover &&
+        clientId !== activeSessionOwner
+      ) {
+        const err = {
+          code: 'TARGET_OCCUPIED',
+          message: 'Target device already has an active controller',
+        }
+        if (operationId) {
+          operations.set(operationId, { status: 'FAILED', error: err })
+        }
+        throw err
+      }
+      const previousOwner = activeSessionOwner
+      reservations.set(migrationId, {
+        migrationId,
+        clientId,
+        status: 'ACTIVE',
+        previousOwner,
+        forceTakeover,
+      })
+      hasActiveSession = true
+      activeSessionOwner = clientId
+      const res = { status: 'APPLIED', migrationId, clientId }
+      if (operationId) operations.set(operationId, res)
+      return res
+    },
+    releaseMigrationReservation: async (operationId, { migrationId } = {}) => {
+      recordCommand({
+        action: 'releaseMigrationReservation',
+        operationId,
+        migrationId,
+      })
+      if (failureConfig?.action === 'releaseMigrationReservation') {
+        if (failureConfig.timeout) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, failureConfig.timeoutMs || 10000),
+          )
+        }
+        const err = {
+          code: failureConfig.code || 'RELEASE_FAILED',
+          message:
+            failureConfig.message || 'Failed to release migration reservation',
+          status: 'UNKNOWN',
+        }
+        if (operationId) {
+          operations.set(operationId, { status: 'UNKNOWN', error: err })
+        }
+        throw err
+      }
+      const res = reservations.get(migrationId)
+      if (res && res.status === 'ACTIVE') {
+        res.status = 'RELEASED'
+        if (res.previousOwner !== undefined) {
+          activeSessionOwner = res.previousOwner
+        }
+        const result = { status: 'APPLIED', migrationId }
+        if (operationId) operations.set(operationId, result)
+        return result
+      }
+      const notExec = {
+        status: 'NOT_EXECUTED',
+        migrationId,
+        reason: 'NOT_FOUND_OR_RELEASED',
+      }
+      if (operationId) operations.set(operationId, notExec)
+      return notExec
+    },
+    queryReservation: (migrationId) => {
+      const res = reservations.get(migrationId)
+      if (!res) return { status: 'NOT_FOUND' }
+      return { ...res }
+    },
+    queryOperation: async (operationId) => {
+      if (operations.has(operationId)) {
+        return operations.get(operationId)
+      }
+      return { status: 'UNKNOWN', operationId }
+    },
+    setOperationResult: (operationId, result) => {
+      operations.set(operationId, result)
+    },
+    getReservations: () => new Map(reservations),
     getPlayCount: () => wireCommands.filter((c) => c.action === 'play').length,
     getStopCount: () => wireCommands.filter((c) => c.action === 'stop').length,
     getAppliedVolume: () => remoteState.volume,

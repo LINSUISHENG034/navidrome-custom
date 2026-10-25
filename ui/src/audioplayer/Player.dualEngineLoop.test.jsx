@@ -51,6 +51,7 @@ import {
   createPlaybackControlModule,
   PlaybackStatus,
   PlaybackMode,
+  CommandResultStatus,
   normalizePlaybackMode,
   getNextTrack,
   getPrevTrack,
@@ -4229,6 +4230,461 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(getByRole('alert').textContent).toContain('User gesture required')
 
       unmount()
+    })
+
+    it('TC-MIG-13: PREPARING play intent survives across output migration, starting target automatically', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: false, ended: false })
+
+      await controller.addQueueItems([
+        {
+          queueItemId: 'prep-1',
+          trackId: 't1',
+          name: 'Track 1',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+      ])
+
+      // Emulate starting playback that is currently in PREPARING
+      // (play intent accepted and sequence incremented, but media is still loading)
+      const playPromise = controller.play()
+      expect(controller.getState().status).toBe(PlaybackStatus.PREPARING)
+      expect(controller.getState().acceptedIntent).toBe('play')
+      expect(controller.getState().intentSequence).toBeGreaterThan(0)
+
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+
+      // Invariants:
+      // 1. Accepted play intent survived PREPARING across output migration
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controller.getState().acceptedIntent).toBe('play')
+      // 2. Target adapter started automatically
+      expect(remoteAdapter.getPlayCount()).toBe(1)
+      await playPromise.catch(() => {})
+    })
+
+    it('TC-MIG-14: explicit pause during migration neutralizes automatic startup (zero target play calls); later play intent takes effect through newer intent sequence', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: false, ended: false })
+
+      await controller.addQueueItems([
+        {
+          queueItemId: 'mig-14',
+          trackId: 't14',
+          name: 'Track 14',
+          musicSrc: 'http://example.com/14.mp3',
+        },
+      ])
+      await controller.play()
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controller.getState().acceptedIntent).toBe('play')
+
+      // Subcase A: user pauses during migration
+      let finishOldStopA
+      const stopPromiseA = new Promise((resolve) => {
+        finishOldStopA = resolve
+      })
+      localAdapter.stop = vi.fn(() => stopPromiseA)
+
+      const remoteAdapterA = createMockRemoteAudioAdapter()
+      const migrationPromiseA = controller.migrateOutput({
+        targetAdapter: remoteAdapterA,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+
+      // User pauses while migration is in progress
+      await controller.pause()
+      expect(controller.getState().acceptedIntent).toBe('pause')
+
+      finishOldStopA()
+      await migrationPromiseA
+
+      // Invariants:
+      // 1. Target output stays PAUSED
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      expect(controller.getState().acceptedIntent).toBe('pause')
+      // 2. Target play() was called 0 times
+      expect(remoteAdapterA.getPlayCount()).toBe(0)
+
+      // Subcase B: user pauses, then plays again with newer sequence during migration
+      const localAdapterB = createBrowserAudioAdapter()
+      const controllerB = createPlaybackControlModule()
+      controllerB.setAdapter(localAdapterB)
+
+      const audioB = document.createElement('audio')
+      localAdapterB.attachElement(audioB)
+      setMediaFlags(audioB, { paused: false, ended: false })
+
+      await controllerB.addQueueItems([
+        {
+          queueItemId: 'mig-14b',
+          trackId: 't14b',
+          name: 'Track 14B',
+          musicSrc: 'http://example.com/14b.mp3',
+        },
+      ])
+      await controllerB.play()
+      expect(controllerB.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controllerB.getState().acceptedIntent).toBe('play')
+
+      let finishOldStopB
+      const stopPromiseB = new Promise((resolve) => {
+        finishOldStopB = resolve
+      })
+      localAdapterB.stop = vi.fn(() => stopPromiseB)
+
+      const remoteAdapterB = createMockRemoteAudioAdapter()
+      const migrationPromiseB = controllerB.migrateOutput({
+        targetAdapter: remoteAdapterB,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+
+      await controllerB.pause()
+      const seqPause = controllerB.getState().intentSequence
+      expect(controllerB.getState().acceptedIntent).toBe('pause')
+
+      await controllerB.play()
+      const seqPlay = controllerB.getState().intentSequence
+      expect(seqPlay).toBeGreaterThan(seqPause)
+      expect(controllerB.getState().acceptedIntent).toBe('play')
+
+      finishOldStopB()
+      await migrationPromiseB
+
+      // Invariants:
+      // 1. Newer play intent won over earlier pause
+      expect(controllerB.getState().status).toBe(PlaybackStatus.PLAYING)
+      expect(controllerB.getState().acceptedIntent).toBe('play')
+      expect(remoteAdapterB.getPlayCount()).toBe(1)
+    })
+
+    it('TC-MIG-15: concurrent migration attempts are rejected by explicit migration lock; second migration cannot implicitly supersede running migration', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      let finishOldStop
+      const stopPromise = new Promise((resolve) => {
+        finishOldStop = resolve
+      })
+      localAdapter.stop = vi.fn(() => stopPromise)
+
+      const remoteAdapter1 = createMockRemoteAudioAdapter()
+      const remoteAdapter2 = createMockRemoteAudioAdapter()
+
+      const migration1 = controller.migrateOutput({
+        targetAdapter: remoteAdapter1,
+        targetDevice: { name: 'Speaker 1' },
+      })
+
+      expect(controller.isMigrating()).toBe(true)
+
+      // Second migration attempted concurrently must be rejected immediately
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapter2,
+          targetDevice: { name: 'Speaker 2' },
+        }),
+      ).rejects.toMatchObject({
+        code: 'MIGRATION_IN_PROGRESS',
+      })
+
+      // Finish first migration
+      finishOldStop()
+      await migration1
+
+      expect(controller.isMigrating()).toBe(false)
+      // Second adapter was untouched
+      expect(remoteAdapter2.getPlayCount()).toBe(0)
+    })
+
+    it('TC-MIG-16: commands submitted during migration are isolated; stale seek/queue commands are discarded with COMMAND_SUPERSEDED', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: false, ended: false })
+
+      await controller.addQueueItems([
+        {
+          queueItemId: 'item-1',
+          trackId: 't1',
+          name: 'Track 1',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+      ])
+      await controller.play()
+
+      let finishStop
+      const stopPromise = new Promise((resolve) => {
+        finishStop = resolve
+      })
+      localAdapter.stop = vi.fn(() => stopPromise)
+
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      const migrationPromise = controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+
+      // Issue seek while migration is in progress
+      const isolatedSeek = controller.seek(42)
+
+      // Target adapter migrates with fresh queue/version
+      finishStop()
+      await migrationPromise
+
+      // Target authoritative snapshot was established with version updated
+      remoteAdapter.pushServerSnapshot({
+        queue: [
+          { queueItemId: 'new-item-1', trackId: 't-new', name: 'New Track' },
+        ],
+        currentQueueItemId: 'new-item-1',
+        queueVersion: 99,
+      })
+
+      // Stale seek command submitted against old context rejects with COMMAND_SUPERSEDED
+      await expect(isolatedSeek).rejects.toMatchObject({
+        code: 'COMMAND_SUPERSEDED',
+      })
+    })
+
+    it('TC-MIG-17: UNKNOWN reconciliation via queryOperation: timeout/lost response queries original operation identity rather than blind replay', async () => {
+      const controller = createPlaybackControlModule()
+      const localAdapter = createBrowserAudioAdapter()
+      controller.setAdapter(localAdapter)
+
+      // Subcase A: Response lost on remote volume, but queryOperation confirms APPLIED -> succeeds without retry
+      const remoteAdapterA = createMockRemoteAudioAdapter()
+      remoteAdapterA.setFailure({
+        action: 'volume',
+        responseLost: true,
+      })
+
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapterA,
+        targetDevice: { name: 'Speaker A' },
+      })
+
+      // Migration succeeded because queryOperation reconciled APPLIED
+      expect(controller.getState().status).not.toBe(PlaybackStatus.ERROR)
+
+      // Subcase B: queryOperation returns NOT_EXECUTED -> fails closed with zero play calls
+      const remoteAdapterB = createMockRemoteAudioAdapter()
+      remoteAdapterB.setFailure({
+        action: 'volume',
+        timeout: true,
+        timeoutMs: 5000,
+      })
+      remoteAdapterB.queryOperation = vi.fn(async (opId) => ({
+        status: CommandResultStatus.NOT_EXECUTED,
+        operationId: opId,
+      }))
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapterB,
+          targetDevice: { name: 'Speaker B' },
+          phaseTimeoutMs: 10,
+        }),
+      ).rejects.toMatchObject({
+        code: 'COMMAND_NOT_EXECUTED',
+        status: CommandResultStatus.NOT_EXECUTED,
+      })
+      expect(remoteAdapterB.getPlayCount()).toBe(0)
+
+      // Subcase C: queryOperation returns FAILED -> fails closed
+      const remoteAdapterC = createMockRemoteAudioAdapter()
+      remoteAdapterC.setFailure({
+        action: 'volume',
+        timeout: true,
+        timeoutMs: 5000,
+      })
+      remoteAdapterC.queryOperation = vi.fn(async (opId) => ({
+        status: CommandResultStatus.FAILED,
+        error: { code: 'HARDWARE_SINK_DEAD' },
+        operationId: opId,
+      }))
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapterC,
+          targetDevice: { name: 'Speaker C' },
+          phaseTimeoutMs: 10,
+        }),
+      ).rejects.toMatchObject({
+        code: 'HARDWARE_SINK_DEAD',
+        status: CommandResultStatus.FAILED,
+      })
+      expect(remoteAdapterC.getPlayCount()).toBe(0)
+
+      // Subcase D: queryOperation returns UNKNOWN -> fails closed
+      const remoteAdapterD = createMockRemoteAudioAdapter()
+      remoteAdapterD.setFailure({
+        action: 'volume',
+        timeout: true,
+        timeoutMs: 5000,
+      })
+      remoteAdapterD.queryOperation = vi.fn(async (opId) => ({
+        status: CommandResultStatus.UNKNOWN,
+        operationId: opId,
+      }))
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapterD,
+          targetDevice: { name: 'Speaker D' },
+          phaseTimeoutMs: 10,
+        }),
+      ).rejects.toMatchObject({
+        status: CommandResultStatus.UNKNOWN,
+      })
+      expect(remoteAdapterD.getPlayCount()).toBe(0)
+    })
+
+    it('TC-MIG-18: reservation cleanup only releases reservation owned by current migration; source stop failure leaves target owner & context unchanged and does not resume source output', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      const audio = document.createElement('audio')
+      localAdapter.attachElement(audio)
+      setMediaFlags(audio, { paused: false, ended: false })
+
+      // Target remote device owned by 'initial-owner'
+      const remoteAdapter = createMockRemoteAudioAdapter({
+        hasActiveSession: true,
+        activeSessionOwner: 'initial-owner',
+        initialPosition: 50,
+      })
+      remoteAdapter.pushServerSnapshot({
+        queue: [{ queueItemId: 'rem-orig', trackId: 't-orig' }],
+        currentQueueItemId: 'rem-orig',
+        position: 50,
+      })
+
+      // Inject stop failure on source adapter
+      localAdapter.stop = vi.fn(async () => {
+        throw {
+          code: 'SOURCE_STOP_REJECTED',
+          message: 'Failed to stop local output',
+        }
+      })
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: {
+            name: 'Living Room TV',
+            hasActiveSession: true,
+            activeController: 'initial-owner',
+            clientId: 'migrating-client',
+          },
+          forceTakeover: true,
+        }),
+      ).rejects.toMatchObject({
+        code: 'SOURCE_STOP_REJECTED',
+      })
+
+      // Invariants:
+      // 1. Target reservation cleanup was executed
+      const reservations = remoteAdapter.getReservations()
+      for (const res of reservations.values()) {
+        expect(res.status).toBe('RELEASED')
+      }
+      expect(remoteAdapter.getActiveSessionOwner()).toBe('initial-owner')
+      // 2. Target playback context remains intact
+      expect(remoteAdapter.getCurrentQueueItemId()).toBe('rem-orig')
+      expect(remoteAdapter.getRemoteState().position).toBe(50)
+      // 3. Target play was never called
+      expect(remoteAdapter.getPlayCount()).toBe(0)
+      // 4. Source audio is not resumed
+      expect(audio.paused).toBe(false)
+    })
+
+    it('TC-MIG-19: rejected/timed-out final pause during paused migration produces bounded visible error instead of false success', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      await controller.pause()
+      expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+      expect(controller.getState().acceptedIntent).toBe('pause')
+
+      // Target adapter where pause fails
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      remoteAdapter.setFailure({
+        action: 'pause',
+        code: 'TARGET_PAUSE_HARDWARE_ERROR',
+        message: 'Could not pause target hardware sink',
+      })
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: remoteAdapter,
+          targetDevice: { name: 'Remote Speaker' },
+        }),
+      ).rejects.toMatchObject({
+        code: 'TARGET_PAUSE_HARDWARE_ERROR',
+      })
+
+      // Visible terminal error: NOT false success
+      expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+      expect(controller.getState().error.code).toBe(
+        'TARGET_PAUSE_HARDWARE_ERROR',
+      )
+    })
+
+    it('TC-MIG-20: migration cancellation via AbortSignal propagates cancellation and boundedly releases resources', async () => {
+      const localAdapter = createBrowserAudioAdapter()
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+
+      let finishOldStop
+      const stopPromise = new Promise((resolve) => {
+        finishOldStop = resolve
+      })
+      localAdapter.stop = vi.fn(() => stopPromise)
+
+      const abortController = new AbortController()
+      const remoteAdapter = createMockRemoteAudioAdapter()
+
+      const migrationPromise = controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+        signal: abortController.signal,
+      })
+
+      expect(controller.isMigrating()).toBe(true)
+
+      // Cancel migration while in-flight
+      abortController.abort()
+      finishOldStop()
+
+      await expect(migrationPromise).rejects.toMatchObject({
+        code: 'MIGRATION_CANCELLED',
+      })
+
+      // Lock is released
+      expect(controller.isMigrating()).toBe(false)
+      // Target play was never called
+      expect(remoteAdapter.getPlayCount()).toBe(0)
     })
   })
 })
