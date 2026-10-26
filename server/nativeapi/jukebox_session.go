@@ -248,7 +248,12 @@ func (api *Router) writeJukeboxSessionError(w http.ResponseWriter, err error) {
 	case errors.Is(err, playback.ErrSessionNotFound), errors.Is(err, playback.ErrDeviceNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, playback.ErrSessionOwnership):
-		http.Error(w, err.Error(), http.StatusForbidden)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":  "SESSION_OWNERSHIP",
+			"error": err.Error(),
+		})
 	case errors.Is(err, playback.ErrCommandScope):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	default:

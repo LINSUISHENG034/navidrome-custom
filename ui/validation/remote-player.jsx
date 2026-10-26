@@ -193,7 +193,14 @@ function SessionHandoffValidation() {
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     })
-    return { status: response.status, body: await response.json() }
+    const text = await response.text()
+    let parsed = null
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      parsed = { error: text }
+    }
+    return { status: response.status, body: parsed }
   }
   useEffect(() => {
     const attach = async () => {
