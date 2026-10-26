@@ -544,7 +544,7 @@ export function createBrowserAudioAdapter(options = {}) {
     }
   }
 
-  async function pause(epoch, options = {}) {
+  async function pauseOutput(epoch, options = {}) {
     if (!isActive || epoch !== activeEpoch) return
     const opId = options.operationId
     desiredPlaying = false
@@ -567,27 +567,12 @@ export function createBrowserAudioAdapter(options = {}) {
     }
   }
 
+  async function pause(epoch, options = {}) {
+    return pauseOutput(epoch, options)
+  }
+
   async function stop(epoch, options = {}) {
-    if (!isActive || epoch !== activeEpoch) return
-    const opId = options.operationId
-    desiredPlaying = false
-    invalidateAttempt()
-    if (audioElement) {
-      audioElement.pause()
-    }
-    publishState({
-      status: PlaybackStatus.PAUSED,
-      position: audioElement
-        ? mediaState(audioElement).position
-        : localState.position || 0,
-      error: null,
-    })
-    if (opId) {
-      operations.set(opId, {
-        status: CommandResultStatus.APPLIED,
-        operationId: opId,
-      })
-    }
+    return pauseOutput(epoch, options)
   }
 
   async function seek(epoch, positionSeconds, options = {}) {
@@ -842,13 +827,38 @@ export function createBrowserAudioAdapter(options = {}) {
     }
   }
 
-  async function addQueueItems(epoch, items = [], index = -1) {
+  async function recordCommand(options, execute) {
+    const operationId = options.operationId
+    try {
+      const result = await execute()
+      if (operationId) {
+        operations.set(operationId, {
+          status: CommandResultStatus.APPLIED,
+          operationId,
+        })
+      }
+      return result
+    } catch (error) {
+      if (operationId) {
+        operations.set(operationId, {
+          status: CommandResultStatus.FAILED,
+          operationId,
+          error,
+        })
+      }
+      throw error
+    }
+  }
+
+  async function addQueueItems(epoch, items = [], index = -1, options = {}) {
     if (!isActive || epoch !== activeEpoch) return
-    const result = applyQueueAdd(queue, currentQueueItemId, items, index)
-    queue = result.queue
-    currentQueueItemId = result.currentQueueItemId
-    queueVersion += 1
-    publishState()
+    return recordCommand(options, () => {
+      const result = applyQueueAdd(queue, currentQueueItemId, items, index)
+      queue = result.queue
+      currentQueueItemId = result.currentQueueItemId
+      queueVersion += 1
+      publishState()
+    })
   }
 
   async function removeQueueItem(epoch, queueItemId) {
@@ -900,28 +910,32 @@ export function createBrowserAudioAdapter(options = {}) {
     publishState()
   }
 
-  async function clearQueue(epoch) {
+  async function clearQueue(epoch, options = {}) {
     if (!isActive || epoch !== activeEpoch) return
-    const result = applyQueueClear()
-    resourceReleased = true
-    desiredPlaying = false
-    invalidateAttempt()
-    queue = result.queue
-    currentQueueItemId = result.currentQueueItemId
-    queueVersion += 1
-    if (audioElement) {
-      audioElement.pause()
-      audioElement.removeAttribute('src')
-    }
-    loadedQueueItemId = null
-    publishState({ status: PlaybackStatus.IDLE, position: 0, error: null })
+    return recordCommand(options, () => {
+      const result = applyQueueClear()
+      resourceReleased = true
+      desiredPlaying = false
+      invalidateAttempt()
+      queue = result.queue
+      currentQueueItemId = result.currentQueueItemId
+      queueVersion += 1
+      if (audioElement) {
+        audioElement.pause()
+        audioElement.removeAttribute('src')
+      }
+      loadedQueueItemId = null
+      publishState({ status: PlaybackStatus.IDLE, position: 0, error: null })
+    })
   }
 
-  async function skipToQueueItem(epoch, queueItemId) {
+  async function skipToQueueItem(epoch, queueItemId, options = {}) {
     if (!isActive || epoch !== activeEpoch) return
     if (!queue.some((item) => item.queueItemId === queueItemId)) return
     const wasPlaying = desiredPlaying || (audioElement && !audioElement.paused)
-    return selectQueueItem(epoch, queueItemId, { play: Boolean(wasPlaying) })
+    return recordCommand(options, () =>
+      selectQueueItem(epoch, queueItemId, { play: Boolean(wasPlaying) }),
+    )
   }
 
   return {

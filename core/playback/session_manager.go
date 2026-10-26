@@ -8,6 +8,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/navidrome/navidrome/conf"
 )
 
 var (
@@ -15,7 +17,7 @@ var (
 	ErrSessionOwnership = errors.New("session owned by another client")
 	ErrHandoffInvalid   = errors.New("invalid or expired handoff token")
 	defaultSessionTTL   = 45 * time.Second
-	defaultHandoffTTL   = 30 * time.Second
+	defaultHandoffTTL   = conf.DefaultJukeboxHandoffTTL
 )
 
 const (
@@ -38,16 +40,17 @@ type AttachRequest struct {
 }
 
 type Session struct {
-	SessionID          string     `json:"sessionId"`
-	User               string     `json:"user"`
-	OwnerClientID      string     `json:"ownerClientId"`
-	DeviceName         string     `json:"deviceName"`
-	LastHeartbeat      time.Time  `json:"lastHeartbeat"`
-	OwnershipState     string     `json:"ownershipState"`
-	StaleSince         *time.Time `json:"staleSince,omitempty"`
-	BindingGeneration  uint64     `json:"bindingGeneration"`
-	HandoffTokenHash   string     `json:"-"`
-	HandoffTokenExpiry time.Time  `json:"-"`
+	SessionID                string     `json:"sessionId"`
+	User                     string     `json:"user"`
+	OwnerClientID            string     `json:"ownerClientId"`
+	DeviceName               string     `json:"deviceName"`
+	LastHeartbeat            time.Time  `json:"lastHeartbeat"`
+	OwnershipState           string     `json:"ownershipState"`
+	StaleSince               *time.Time `json:"staleSince,omitempty"`
+	BindingGeneration        uint64     `json:"bindingGeneration"`
+	HandoffTokenHash         string     `json:"-"`
+	HandoffTokenExpiry       time.Time  `json:"-"`
+	OperationFenceGeneration uint64     `json:"-"`
 }
 
 type SessionStatus struct {
@@ -59,7 +62,8 @@ type SessionStatus struct {
 	Playing             bool       `json:"playing"`
 	Position            int        `json:"position"`
 	Gain                float32    `json:"gain"`
-	DesiredGain         float32    `json:"desiredGain,omitempty"`
+	Muted               bool       `json:"muted"`
+	DesiredGain         float32    `json:"desiredGain"`
 	Attached            bool       `json:"attached"`
 	OwnershipState      string     `json:"ownershipState"`
 	TerminationReason   string     `json:"terminationReason,omitempty"`
@@ -68,6 +72,8 @@ type SessionStatus struct {
 	StaleSince          *time.Time `json:"staleSince,omitempty"`
 	BindingGeneration   uint64     `json:"bindingGeneration"`
 	ControlHandoffToken string     `json:"controlHandoffToken,omitempty"`
+	OperationIDFormat   string     `json:"operationIdFormat"`
+	RequiresNewGeneration bool    `json:"requiresNewGeneration"`
 }
 
 type HandoffRequest struct {
@@ -89,11 +95,12 @@ func generateHandoffToken() (string, string, error) {
 }
 
 type SessionManager struct {
-	mu       sync.RWMutex
-	ttl      time.Duration
-	maxStale time.Duration
-	now      func() time.Time
-	sessions map[string]Session
+	mu         sync.RWMutex
+	ttl        time.Duration
+	maxStale   time.Duration
+	handoffTTL time.Duration
+	now        func() time.Time
+	sessions   map[string]Session
 }
 
 func NewSessionManager(ttl time.Duration, maxStale ...time.Duration) *SessionManager {
@@ -101,11 +108,16 @@ func NewSessionManager(ttl time.Duration, maxStale ...time.Duration) *SessionMan
 	if len(maxStale) > 0 {
 		sessionMaxStale = maxStale[0]
 	}
+	handoffTTL := conf.Server.Jukebox.HandoffTTL
+	if handoffTTL <= 0 {
+		handoffTTL = defaultHandoffTTL
+	}
 	return &SessionManager{
-		ttl:      ttl,
-		maxStale: sessionMaxStale,
-		now:      time.Now,
-		sessions: make(map[string]Session),
+		ttl:        ttl,
+		maxStale:   sessionMaxStale,
+		handoffTTL: handoffTTL,
+		now:        time.Now,
+		sessions:   make(map[string]Session),
 	}
 }
 
@@ -114,13 +126,15 @@ func (sm *SessionManager) Attach(req AttachRequest) (Session, string) {
 	defer sm.mu.Unlock()
 
 	generation := uint64(1)
+	fenceGeneration := uint64(0)
 	if previous, ok := sm.sessions[req.SessionID]; ok {
-		if previous.OwnerClientID == req.ClientID {
-			// Ordinary same-owner reattach preserves generation
-			generation = max(1, previous.BindingGeneration)
-		} else if req.Takeover {
-			// Explicit takeover increments generation
+		fenceGeneration = previous.OperationFenceGeneration
+		if req.Takeover {
+			// Explicit takeover establishes a new write generation, even when the
+			// existing owner explicitly renews authority after history loss.
 			generation = max(1, previous.BindingGeneration) + 1
+		} else if previous.OwnerClientID == req.ClientID {
+			generation = max(1, previous.BindingGeneration)
 		}
 	}
 
@@ -128,15 +142,16 @@ func (sm *SessionManager) Attach(req AttachRequest) (Session, string) {
 	now := sm.now().UTC()
 
 	session := Session{
-		SessionID:          req.SessionID,
-		User:               req.User,
-		OwnerClientID:      req.ClientID,
-		DeviceName:         req.DeviceName,
-		LastHeartbeat:      now,
-		OwnershipState:     SessionOwnershipAttached,
-		BindingGeneration:  generation,
-		HandoffTokenHash:   hash,
-		HandoffTokenExpiry: now.Add(defaultHandoffTTL),
+		SessionID:                req.SessionID,
+		User:                     req.User,
+		OwnerClientID:            req.ClientID,
+		DeviceName:               req.DeviceName,
+		LastHeartbeat:            now,
+		OwnershipState:           SessionOwnershipAttached,
+		BindingGeneration:        generation,
+		OperationFenceGeneration: fenceGeneration,
+		HandoffTokenHash:         hash,
+		HandoffTokenExpiry:       now.Add(sm.handoffTTL),
 	}
 	sm.sessions[req.SessionID] = session
 	return session, token
@@ -161,7 +176,7 @@ func (sm *SessionManager) Heartbeat(sessionID, clientID string) (string, error) 
 	session.OwnershipState = SessionOwnershipAttached
 	session.StaleSince = nil
 	session.HandoffTokenHash = hash
-	session.HandoffTokenExpiry = now.Add(defaultHandoffTTL)
+	session.HandoffTokenExpiry = now.Add(sm.handoffTTL)
 	sm.sessions[sessionID] = session
 	return token, nil
 }
@@ -205,7 +220,7 @@ func (sm *SessionManager) Handoff(req HandoffRequest) (Session, string, error) {
 	session.OwnershipState = SessionOwnershipAttached
 	session.StaleSince = nil
 	session.HandoffTokenHash = newHash
-	session.HandoffTokenExpiry = now.Add(defaultHandoffTTL)
+	session.HandoffTokenExpiry = now.Add(sm.handoffTTL)
 	sm.sessions[req.SessionID] = session
 
 	return session, newToken, nil
@@ -214,7 +229,38 @@ func (sm *SessionManager) Handoff(req HandoffRequest) (Session, string, error) {
 func (sm *SessionManager) Update(session Session) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if previous, ok := sm.sessions[session.SessionID]; ok {
+		session.OperationFenceGeneration = max(session.OperationFenceGeneration, previous.OperationFenceGeneration)
+	}
 	sm.sessions[session.SessionID] = session
+}
+
+func (sm *SessionManager) FenceOperations(sessionID string, generation uint64) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if session, ok := sm.sessions[sessionID]; ok {
+		session.OperationFenceGeneration = max(session.OperationFenceGeneration, generation)
+		sm.sessions[sessionID] = session
+	}
+}
+
+func (sm *SessionManager) RevokeDeviceOwners(deviceName, exceptSessionID string) []Session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	var revoked []Session
+	for id, session := range sm.sessions {
+		if id == exceptSessionID || session.DeviceName != deviceName || session.OwnerClientID == "" {
+			continue
+		}
+		session.OwnerClientID = ""
+		session.BindingGeneration++
+		session.OwnershipState = SessionOwnershipDetached
+		session.HandoffTokenHash = ""
+		session.HandoffTokenExpiry = time.Time{}
+		sm.sessions[id] = session
+		revoked = append(revoked, session)
+	}
+	return revoked
 }
 
 func (sm *SessionManager) Detach(sessionID, clientID string) error {

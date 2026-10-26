@@ -288,7 +288,7 @@ export function createMockRemoteAudioAdapter(options = {}) {
         }),
         { isMuted: Boolean(isMuted), ...options },
       ),
-    setPlayMode: (epoch, mode) => {
+    setPlayMode: (epoch, mode, options = {}) => {
       const normalized = normalizePlaybackMode(mode)
       return simulateAction(
         epoch,
@@ -297,7 +297,7 @@ export function createMockRemoteAudioAdapter(options = {}) {
           playMode = normalized
           return { playMode }
         },
-        { mode: normalized },
+        { mode: normalized, ...options },
       )
     },
     skipNext: (epoch) =>
@@ -339,7 +339,7 @@ export function createMockRemoteAudioAdapter(options = {}) {
           status: PlaybackStatus.PLAYING,
         }
       }),
-    addQueueItems: (epoch, items = [], index = -1) =>
+    addQueueItems: (epoch, items = [], index = -1, options = {}) =>
       simulateAction(
         epoch,
         'addQueueItems',
@@ -365,6 +365,7 @@ export function createMockRemoteAudioAdapter(options = {}) {
             trackId: i.trackId,
           })),
           index,
+          ...options,
         },
         'add',
       ),
@@ -424,7 +425,7 @@ export function createMockRemoteAudioAdapter(options = {}) {
         { queueItemId, toIndex, expectedQueueVersion },
         'move',
       ),
-    clearQueue: (epoch) =>
+    clearQueue: (epoch, options = {}) =>
       simulateAction(
         epoch,
         'clearQueue',
@@ -441,10 +442,10 @@ export function createMockRemoteAudioAdapter(options = {}) {
             position: 0,
           }
         },
-        {},
+        options,
         'clear',
       ),
-    skipToQueueItem: (epoch, queueItemId) =>
+    skipToQueueItem: (epoch, queueItemId, options = {}) =>
       simulateAction(
         epoch,
         'skipToQueueItem',
@@ -457,7 +458,7 @@ export function createMockRemoteAudioAdapter(options = {}) {
             position: 0,
           }
         },
-        { queueItemId },
+        { queueItemId, ...options },
         'skip',
       ),
     // Direct injection of authoritative server push (e.g. position progress or track change)

@@ -67,6 +67,14 @@ import {
 import { audioVolumeToUiVolume } from './volumeMapping'
 import Sortable from 'sortablejs'
 
+function deferredResult() {
+  let resolve
+  const promise = new Promise((complete) => {
+    resolve = complete
+  })
+  return { promise, resolve }
+}
+
 function getNativeVolumeBarValue() {
   return Number(
     document
@@ -178,6 +186,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    vi.useRealTimers()
   })
 
   describe('Zero Browser Audio Engine Lifecycle Detection (Remote Mode)', () => {
@@ -4698,6 +4707,514 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(remoteAdapter.getPlayCount()).toBe(0)
     })
 
+    const migrationWriteMethods = [
+      'clearQueue',
+      'addQueueItems',
+      'skipToQueueItem',
+      'seek',
+      'setPlayMode',
+      'setVolume',
+      'pause',
+    ]
+
+    async function prepareHungMigration(method, options = {}) {
+      const controller = createPlaybackControlModule()
+      const source = createMockRemoteAudioAdapter()
+      controller.setAdapter(source)
+      await controller.addQueueItems([
+        { queueItemId: 'deadline-track', trackId: 'deadline-media' },
+      ])
+      await controller.seek(7)
+      await controller.pause()
+      const target = createMockRemoteAudioAdapter()
+      const pending = deferredResult()
+      const writes = Object.fromEntries(
+        migrationWriteMethods.map((name) => [name, vi.spyOn(target, name)]),
+      )
+      const hanging = writes[method] || vi.spyOn(target, method)
+      hanging.mockImplementation(() => pending.promise)
+      const query = vi.spyOn(target, 'queryOperation').mockResolvedValue({
+        status: CommandResultStatus.UNKNOWN,
+      })
+      vi.useFakeTimers()
+      const result = controller
+        .migrateOutput({
+          targetAdapter: target,
+          phaseTimeoutMs: 20,
+          overallTimeoutMs: 1000,
+          ...options,
+        })
+        .catch((error) => error)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(hanging).toHaveBeenCalledTimes(1)
+      return { controller, source, target, writes, pending, query, result }
+    }
+
+    it.each(migrationWriteMethods)(
+      'TC-MIG-35: a hung %s is phase-bounded and its late result cannot continue migration',
+      async (method) => {
+        const { controller, writes, pending, query, result } =
+          await prepareHungMigration(method)
+        await vi.advanceTimersByTimeAsync(20)
+        const error = await result
+        expect(error.status).toBe(CommandResultStatus.UNKNOWN)
+        expect(query).toHaveBeenCalledTimes(1)
+        expect(query.mock.calls[0][0]).toMatch(/^mig_.*:phase[345]:/)
+        expect(controller.getState()).toMatchObject({
+          status: PlaybackStatus.ERROR,
+          error: { status: CommandResultStatus.UNKNOWN },
+          pendingOutputTarget: null,
+        })
+        expect(controller.isMigrating()).toBe(false)
+        const counts = Object.values(writes).map((spy) => spy.mock.calls.length)
+        pending.resolve()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(
+          Object.values(writes).map((spy) => spy.mock.calls.length),
+        ).toEqual(counts)
+        vi.useRealTimers()
+      },
+    )
+
+    it('TC-MIG-36: the overall deadline fences a hung context import, rejects isolated intents, and preserves a later migration', async () => {
+      const { controller, target, writes, pending, result } =
+        await prepareHungMigration('clearQueue', {
+          phaseTimeoutMs: 1000,
+          overallTimeoutMs: 20,
+        })
+      const isolatedSettled = vi.fn()
+      const isolated = controller.seek(99).catch((error) => {
+        isolatedSettled(error)
+        return error
+      })
+      await vi.advanceTimersByTimeAsync(20)
+      expect(await result).toMatchObject({ code: 'MIGRATION_TIMEOUT' })
+      expect(controller.getState()).toMatchObject({
+        status: PlaybackStatus.ERROR,
+        error: { code: 'MIGRATION_TIMEOUT' },
+      })
+      expect(isolatedSettled).toHaveBeenCalledTimes(1)
+      expect(await isolated).toMatchObject({ code: 'MIGRATION_TIMEOUT' })
+      const next = createMockRemoteAudioAdapter()
+      await controller.migrateOutput({ targetAdapter: next })
+      const settled = controller.getState()
+      const counts = Object.values(writes).map((spy) => spy.mock.calls.length)
+      pending.resolve()
+      target.pushServerSnapshot({
+        status: PlaybackStatus.PLAYING,
+        position: 99,
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(Object.values(writes).map((spy) => spy.mock.calls.length)).toEqual(
+        counts,
+      )
+      expect(controller.getState()).toEqual(settled)
+      expect(controller.isMigrating()).toBe(false)
+      vi.useRealTimers()
+    })
+
+    it.each(['reserveMigration', 'clearQueue', 'setVolume', 'pause'])(
+      'TC-MIG-37: cancellation while %s is hung rejects without waiting for its promise',
+      async (method) => {
+        const abortController = new AbortController()
+        const { controller, target, writes, pending, result } =
+          await prepareHungMigration(method, {
+            signal: abortController.signal,
+          })
+        abortController.abort()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(await result).toMatchObject({ code: 'MIGRATION_CANCELLED' })
+        expect(controller.getState()).toMatchObject({
+          status: PlaybackStatus.ERROR,
+          error: { code: 'MIGRATION_CANCELLED' },
+        })
+        expect(controller.isMigrating()).toBe(false)
+        const counts = Object.values(writes).map((spy) => spy.mock.calls.length)
+        pending.resolve({ status: CommandResultStatus.APPLIED })
+        await vi.advanceTimersByTimeAsync(0)
+        expect(
+          Object.values(writes).map((spy) => spy.mock.calls.length),
+        ).toEqual(counts)
+        expect(target.getPlayCount()).toBe(0)
+        vi.useRealTimers()
+      },
+    )
+
+    it('TC-MIG-40: explicit user play recovers a committed target after timeout without continuing the retired chain', async () => {
+      const { controller, target, writes, pending, result } =
+        await prepareHungMigration('setVolume')
+      await vi.advanceTimersByTimeAsync(20)
+      expect(await result).toMatchObject({
+        status: CommandResultStatus.UNKNOWN,
+      })
+      const counts = Object.values(writes).map((spy) => spy.mock.calls.length)
+      pending.resolve()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(Object.values(writes).map((spy) => spy.mock.calls.length)).toEqual(
+        counts,
+      )
+      const play = vi.spyOn(target, 'play')
+      await controller.play()
+      expect(play).toHaveBeenCalledTimes(1)
+      expect(play.mock.calls[0][0]).toBe(controller.getEpoch())
+      expect(controller.getState()).toMatchObject({
+        status: PlaybackStatus.PLAYING,
+        acceptedIntent: 'play',
+        error: null,
+      })
+      vi.useRealTimers()
+    })
+
+    it('TC-MIG-41: intents arriving during reservation cleanup are rejected, never left pending', async () => {
+      const controller = createPlaybackControlModule()
+      const source = createMockRemoteAudioAdapter()
+      const target = createMockRemoteAudioAdapter()
+      const pendingStop = deferredResult()
+      const pendingRelease = deferredResult()
+      vi.spyOn(source, 'stop').mockImplementation(() => pendingStop.promise)
+      const release = vi
+        .spyOn(target, 'releaseMigrationReservation')
+        .mockImplementation(() => pendingRelease.promise)
+      controller.setAdapter(source)
+      await controller.addQueueItems([
+        { queueItemId: 'cleanup-track', trackId: 'cleanup-media' },
+      ])
+      vi.useFakeTimers()
+      const migration = controller
+        .migrateOutput({ targetAdapter: target, phaseTimeoutMs: 20 })
+        .catch((error) => error)
+      await vi.advanceTimersByTimeAsync(20)
+      expect(release).toHaveBeenCalledTimes(1)
+      await expect(controller.seek(42)).rejects.toMatchObject({
+        code: 'MIGRATION_TERMINAL',
+      })
+      await expect(controller.play()).rejects.toMatchObject({
+        code: 'MIGRATION_TERMINAL',
+      })
+      pendingRelease.resolve({ status: CommandResultStatus.APPLIED })
+      expect(await migration).toMatchObject({
+        status: CommandResultStatus.UNKNOWN,
+      })
+      expect(controller.isMigrating()).toBe(false)
+      pendingStop.resolve()
+      vi.useRealTimers()
+    })
+
+    it('TC-MIG-42: an overall deadline does not start a new unbounded cleanup wait', async () => {
+      const controller = createPlaybackControlModule()
+      const source = createMockRemoteAudioAdapter()
+      const target = createMockRemoteAudioAdapter()
+      const pending = deferredResult()
+      vi.spyOn(source, 'stop').mockImplementation(() => pending.promise)
+      controller.setAdapter(source)
+      await controller.addQueueItems([
+        { queueItemId: 'deadline-cleanup', trackId: 'deadline-cleanup-media' },
+      ])
+      vi.useFakeTimers()
+      const result = controller
+        .migrateOutput({
+          targetAdapter: target,
+          phaseTimeoutMs: 1000,
+          overallTimeoutMs: 20,
+        })
+        .catch((error) => error)
+      await vi.advanceTimersByTimeAsync(0)
+      const isolated = controller.seek(99).catch((error) => error)
+      const release = vi.spyOn(target, 'releaseMigrationReservation')
+      await vi.advanceTimersByTimeAsync(20)
+      expect(await result).toMatchObject({ code: 'MIGRATION_TIMEOUT' })
+      expect(await isolated).toMatchObject({
+        code: 'MIGRATION_TIMEOUT',
+      })
+      expect(release).not.toHaveBeenCalled()
+      expect(controller.getState().error.reservationCleanupError).toMatchObject(
+        {
+          code: 'RESERVATION_CLEANUP_UNKNOWN',
+        },
+      )
+      expect(controller.isMigrating()).toBe(false)
+      pending.resolve()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(target.getPlayCount()).toBe(0)
+      vi.useRealTimers()
+    })
+
+    it('TC-MIG-38: a native toggle while preparing sends pause rather than a second play', async () => {
+      const pending = deferredResult()
+      playSpy.mockImplementation(() => pending.promise)
+      const { controller } = await renderControlledPlayer()
+      const pause = vi.spyOn(controller, 'pause')
+      const play = vi.spyOn(controller, 'play')
+      await act(async () => document.querySelector('.play-btn').click())
+      expect(controller.getState()).toMatchObject({
+        status: PlaybackStatus.PREPARING,
+        acceptedIntent: 'play',
+      })
+      await act(async () => document.querySelector('.loading-icon').click())
+      expect(play).toHaveBeenCalledTimes(1)
+      expect(pause).toHaveBeenCalledTimes(1)
+      expect(controller.getState().acceptedIntent).toBe('pause')
+      pending.resolve()
+      await act(async () => {})
+    })
+
+    it('TC-MIG-39: separate documents at the same time never reuse command or migration identities', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(12345)
+      const identities = []
+      for (let documentIndex = 0; documentIndex < 2; documentIndex += 1) {
+        const controller = createPlaybackControlModule()
+        const source = createMockRemoteAudioAdapter()
+        const play = vi.spyOn(source, 'play')
+        controller.setAdapter(source)
+        await controller.play()
+        const target = createMockRemoteAudioAdapter()
+        const reserve = vi.spyOn(target, 'reserveMigration')
+        await controller.migrateOutput({ targetAdapter: target })
+        identities.push({
+          command: play.mock.calls[0][1].operationId,
+          migration: reserve.mock.calls[0][1].migrationId,
+        })
+      }
+      expect(new Set(identities.map((identity) => identity.command)).size).toBe(
+        2,
+      )
+      expect(
+        new Set(identities.map((identity) => identity.migration)).size,
+      ).toBe(2)
+    })
+
+    it.each(['pause', 'stop'])(
+      'TC-MIG-45: %s during pending target startup promptly pauses and wins over the late play result',
+      async (intent) => {
+        const controller = createPlaybackControlModule()
+        const source = createMockRemoteAudioAdapter()
+        controller.setAdapter(source)
+        await controller.addQueueItems([{ queueItemId: 'startup-track' }])
+        await controller.play()
+        const target = createMockRemoteAudioAdapter()
+        const pending = deferredResult()
+        const originalPlay = target.play
+        const play = vi
+          .spyOn(target, 'play')
+          .mockImplementation(async (...args) => {
+            await originalPlay(...args)
+            await pending.promise
+          })
+        const pause = vi.spyOn(target, 'pause')
+        vi.useFakeTimers()
+        const migration = controller.migrateOutput({ targetAdapter: target })
+        await vi.advanceTimersByTimeAsync(0)
+        expect(play).toHaveBeenCalledTimes(1)
+        await controller[intent]()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(pause).toHaveBeenCalledTimes(1)
+        pending.resolve()
+        await migration
+        expect(controller.getState()).toMatchObject({
+          status: PlaybackStatus.PAUSED,
+          acceptedIntent: 'pause',
+        })
+        expect(target.getRemoteState().status).toBe(PlaybackStatus.PAUSED)
+        expect(play).toHaveBeenCalledTimes(1)
+      },
+    )
+
+    it('TC-MIG-46: an old migration cleanup cannot publish an error over a newly selected adapter', async () => {
+      const controller = createPlaybackControlModule()
+      const source = createMockRemoteAudioAdapter()
+      controller.setAdapter(source)
+      const target = createMockRemoteAudioAdapter()
+      const pendingRelease = deferredResult()
+      vi.spyOn(source, 'stop').mockRejectedValue({ code: 'STOP_REJECTED' })
+      const release = vi
+        .spyOn(target, 'releaseMigrationReservation')
+        .mockImplementation(() => pendingRelease.promise)
+      const migration = controller
+        .migrateOutput({ targetAdapter: target })
+        .catch((error) => error)
+      await waitFor(() => expect(release).toHaveBeenCalledTimes(1))
+      const replacement = createMockRemoteAudioAdapter()
+      controller.setAdapter(replacement)
+      const fresh = controller.getState()
+      pendingRelease.resolve({ status: CommandResultStatus.APPLIED })
+      await migration
+      expect(controller.getState()).toEqual(fresh)
+      expect(controller.getState().error).toBeNull()
+    })
+
+    it.each([
+      ['source stop', CommandResultStatus.FAILED],
+      ['source stop', CommandResultStatus.NOT_EXECUTED],
+      ['source stop', CommandResultStatus.UNKNOWN],
+      ['target gain', CommandResultStatus.FAILED],
+      ['target gain', CommandResultStatus.NOT_EXECUTED],
+      ['target gain', CommandResultStatus.UNKNOWN],
+    ])(
+      'TC-MIG-47: resolved %s outcome %s cannot cross the startup gates',
+      async (gate, status) => {
+        const controller = createPlaybackControlModule()
+        const source = createMockRemoteAudioAdapter()
+        controller.setAdapter(source)
+        await controller.addQueueItems([
+          { queueItemId: 'resolved-result-track' },
+        ])
+        await controller.play()
+        const target = createMockRemoteAudioAdapter()
+        const adapter = gate === 'source stop' ? source : target
+        const command = gate === 'source stop' ? 'stop' : 'setVolume'
+        vi.spyOn(adapter, command).mockResolvedValue({ status })
+        const query = vi.spyOn(adapter, 'queryOperation').mockResolvedValue({
+          status: CommandResultStatus.UNKNOWN,
+        })
+        const result = await controller
+          .migrateOutput({ targetAdapter: target })
+          .catch((error) => error)
+        expect(result.status).toBe(status)
+        expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+        expect(target.getPlayCount()).toBe(0)
+        expect(query).toHaveBeenCalledTimes(
+          status === CommandResultStatus.UNKNOWN ? 1 : 0,
+        )
+      },
+    )
+
+    it.each(['browser', 'remote'])(
+      'TC-MIG-48: %s Phase3 executors receive stable operation identities and journal real response-lost application',
+      async (kind) => {
+        const controller = createPlaybackControlModule()
+        const source = createMockRemoteAudioAdapter()
+        controller.setAdapter(source)
+        await controller.addQueueItems([
+          {
+            queueItemId: 'journal-track',
+            musicSrc: 'http://localhost/journal.wav',
+          },
+        ])
+        await controller.seek(7)
+        await controller.play()
+        const target =
+          kind === 'browser'
+            ? createBrowserAudioAdapter({
+                audioElement: document.createElement('audio'),
+              })
+            : createMockRemoteAudioAdapter()
+        const methods = [
+          'clearQueue',
+          'addQueueItems',
+          'skipToQueueItem',
+          'seek',
+          'setPlayMode',
+        ]
+        const calls = new Map()
+        for (const method of methods) {
+          const original = target[method]
+          calls.set(
+            method,
+            vi.spyOn(target, method).mockImplementation(async (...args) => {
+              await original(...args)
+              throw {
+                code: 'RESPONSE_LOST',
+                status: CommandResultStatus.UNKNOWN,
+              }
+            }),
+          )
+        }
+        const query = vi.spyOn(target, 'queryOperation')
+        const result = await controller
+          .migrateOutput({ targetAdapter: target })
+          .catch((error) => error)
+        for (const [method, spy] of calls) {
+          expect(spy).toHaveBeenCalledTimes(1)
+          const options = spy.mock.calls[0].at(-1)
+          expect(options.operationId).toMatch(/^mig_.*:phase3:/)
+          expect(options.signal).toBeInstanceOf(AbortSignal)
+          expect(
+            await target.queryOperation(options.operationId),
+          ).toMatchObject({
+            status: CommandResultStatus.APPLIED,
+          })
+        }
+        expect(query).toHaveBeenCalled()
+        expect(result.status).toBe(PlaybackStatus.PLAYING)
+      },
+    )
+
+    it('TC-MIG-49: the actual native mobile loading control pauses a preparing play intent once', async () => {
+      window.matchMedia.mockImplementation((query) => ({
+        matches: query.includes('max-width'),
+        media: query,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }))
+      const pending = deferredResult()
+      playSpy.mockImplementation(() => pending.promise)
+      const { controller } = await renderControlledPlayer()
+      expect(
+        document.querySelector('.react-jinke-music-player-mobile'),
+      ).not.toBeNull()
+      const play = vi.spyOn(controller, 'play')
+      const pause = vi.spyOn(controller, 'pause')
+      await act(async () =>
+        document
+          .querySelector('.react-jinke-music-player-mobile .play-btn')
+          .click(),
+      )
+      expect(controller.getState().status).toBe(PlaybackStatus.PREPARING)
+      await act(async () =>
+        document
+          .querySelector('.react-jinke-music-player-mobile .loading-icon')
+          .click(),
+      )
+      expect(pause).toHaveBeenCalledTimes(1)
+      expect(play).toHaveBeenCalledTimes(1)
+      expect(controller.getState().acceptedIntent).toBe('pause')
+      pending.resolve()
+      await act(async () => {})
+    })
+
+    it('TC-MIG-50: the native loading control preserves and cancels the final BrowserAdapter startup intent', async () => {
+      const { controller, rerenderPlayer } =
+        await renderControlledPlayer('remote')
+      await act(async () => controller.play())
+      const pending = deferredResult()
+      playSpy.mockImplementation(function () {
+        setMediaFlags(this, { paused: false, ended: false })
+        return pending.promise
+      })
+      const target = createBrowserAudioAdapter({ unattached: true })
+      const pause = vi.spyOn(target, 'pause')
+      const migration = controller
+        .migrateOutput({
+          targetAdapter: target,
+          targetDevice: { name: 'Browser Local', type: 'browser' },
+        })
+        .catch((error) => error)
+      await waitFor(() =>
+        expect(controller.getState().pendingOutputTarget).not.toBeNull(),
+      )
+      rerenderPlayer({ engineMode: 'local', browserAdapter: target })
+      await waitFor(() => expect(playSpy).toHaveBeenCalledTimes(1))
+      expect(controller.getState()).toMatchObject({
+        status: PlaybackStatus.PREPARING,
+        acceptedIntent: 'play',
+      })
+      const sequence = controller.getState().intentSequence
+      await act(async () => document.querySelector('.loading-icon').click())
+      expect(controller.getState().intentSequence).toBe(sequence + 1)
+      expect(controller.getState().acceptedIntent).toBe('pause')
+      expect(pause).toHaveBeenCalledTimes(1)
+      expect(playSpy).toHaveBeenCalledTimes(1)
+      pending.resolve()
+      await act(async () => {
+        await migration
+      })
+      expect(controller.getState()).toMatchObject({
+        status: PlaybackStatus.PAUSED,
+        acceptedIntent: 'pause',
+      })
+      expect(target.getAudioElement().paused).toBe(true)
+    })
+
     it('TC-MIG-21: pendingOutputTarget is published before waiting for browser readiness, enabling host/UnifiedNativePlayer to mount <audio> element and satisfy readiness immediately', async () => {
       const ref = React.createRef()
       const { controller, rerenderPlayer, unmount } =
@@ -4747,6 +5264,78 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(document.querySelector('audio')).not.toBeNull()
 
       unmount()
+    })
+
+    it('TC-MIG-43: the pending browser target stays mounted through context commit until migration settles', async () => {
+      const { controller, rerenderPlayer } =
+        await renderControlledPlayer('remote')
+      const target = createBrowserAudioAdapter({ unattached: true })
+      const pending = deferredResult()
+      const setVolume = vi
+        .spyOn(target, 'setVolume')
+        .mockImplementation(() => pending.promise)
+      const migration = controller.migrateOutput({
+        targetAdapter: target,
+        targetDevice: { name: 'Browser Local', type: 'browser' },
+        phaseTimeoutMs: 1000,
+      })
+      await waitFor(() => {
+        expect(controller.getState().pendingOutputTarget).not.toBeNull()
+      })
+      rerenderPlayer({ browserAdapter: target })
+      await waitFor(() => {
+        expect(document.querySelector('audio')).not.toBeNull()
+      })
+      await waitFor(() => expect(setVolume).toHaveBeenCalledTimes(1))
+      expect(controller.getState().pendingOutputTarget).toMatchObject({
+        name: 'Browser Local',
+      })
+      expect(document.querySelector('audio')).not.toBeNull()
+      pending.resolve()
+      await migration
+      expect(controller.getState().pendingOutputTarget).toBeNull()
+    })
+
+    it('TC-MIG-44: final migration settlement preserves the adapter-owned source, volume, and playing state', async () => {
+      const { controller, rerenderPlayer } =
+        await renderControlledPlayer('remote')
+      await controller.play()
+      await controller.setVolume(0.64)
+      const target = createBrowserAudioAdapter({ unattached: true })
+      const pending = deferredResult()
+      const originalPlay = target.play
+      const play = vi
+        .spyOn(target, 'play')
+        .mockImplementation(async (...args) => {
+          const result = await originalPlay(...args)
+          await pending.promise
+          return result
+        })
+      const migration = controller.migrateOutput({
+        targetAdapter: target,
+        targetDevice: { name: 'Browser Local', type: 'browser' },
+      })
+      await waitFor(() => {
+        expect(controller.getState().pendingOutputTarget).not.toBeNull()
+      })
+      rerenderPlayer({ browserAdapter: target })
+      await waitFor(() => expect(target.getAudioElement()).not.toBeNull())
+      const audio = target.getAudioElement()
+      await waitFor(() => expect(play).toHaveBeenCalledTimes(1))
+      await waitFor(() => expect(audio.getAttribute('src')).toBeTruthy())
+      const source = audio.getAttribute('src')
+      expect(audio.volume).toBeCloseTo(0.64)
+      expect(audio.paused).toBe(false)
+      rerenderPlayer({ engineMode: 'local', browserAdapter: target })
+      await act(async () => {
+        pending.resolve()
+        await migration
+      })
+      expect(target.getAudioElement()).toBe(audio)
+      expect(audio.getAttribute('src')).toBe(source)
+      expect(audio.volume).toBeCloseTo(0.64)
+      expect(audio.paused).toBe(false)
+      expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
     })
 
     it('TC-MIG-22: valid attached element satisfies migration preparation immediately, while unattached target waits and produces TARGET_NOT_READY on readiness watchdog timeout', async () => {

@@ -12,6 +12,8 @@ type JukeboxStateUpdated struct {
 	Playing           bool       `json:"playing"`
 	Position          int        `json:"position"`
 	Gain              float32    `json:"gain"`
+	DesiredGain       float32    `json:"desiredGain"`
+	Muted             bool       `json:"muted"`
 	Attached          bool       `json:"attached"`
 	OwnershipState    string     `json:"ownershipState"`
 	TerminationReason string     `json:"terminationReason,omitempty"`

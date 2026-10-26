@@ -3,8 +3,10 @@ package playback
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +15,15 @@ import (
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/tests"
 )
+
+var migrationOperationSequence atomic.Uint64
+
+func migrationCommandScope(scope CommandScope) CommandScope {
+	if scope.SessionID != "" && scope.BindingGeneration != nil {
+		scope.OperationID = fmt.Sprintf("g%d:validation-%d", *scope.BindingGeneration, migrationOperationSequence.Add(1))
+	}
+	return scope
+}
 
 func newMigrationValidationServer(t *testing.T) (context.Context, *playbackServer) {
 	t.Helper()
@@ -349,7 +360,7 @@ func TestPlaybackExplicitTakeoverPreservesPlaybackAndRevokesAllOldOwnerMutations
 		{Action: CommandSeek, Position: 17},
 		{Action: CommandGain, Gain: 0.375},
 	} {
-		if _, err := server.ExecuteCommand(ctx, oldScope, command); err != nil {
+		if _, err := server.ExecuteCommand(ctx, migrationCommandScope(oldScope), command); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -364,11 +375,11 @@ func TestPlaybackExplicitTakeoverPreservesPlaybackAndRevokesAllOldOwnerMutations
 		t.Fatalf("explicit takeover changed playback: %#v before=%#v err=%v", takenOver, before, err)
 	}
 	for _, command := range playbackAuthorityValidationCommands() {
-		if _, err := server.ExecuteCommand(ctx, oldScope, command); !errors.Is(err, ErrSessionOwnership) {
+		if _, err := server.ExecuteCommand(ctx, migrationCommandScope(oldScope), command); !errors.Is(err, ErrSessionOwnership) {
 			t.Fatalf("old owner retained %s after explicit takeover: %v", command.Action, err)
 		}
 	}
-	if err := server.SwitchDeviceForCommand(ctx, oldScope, "new"); !errors.Is(err, ErrSessionOwnership) {
+	if err := server.SwitchDeviceForCommand(ctx, migrationCommandScope(oldScope), "new"); !errors.Is(err, ErrSessionOwnership) {
 		t.Fatalf("old owner retained device switch: %v", err)
 	}
 	if _, err := server.HeartbeatSession(ctx, "owner", "old-tab"); !errors.Is(err, ErrSessionOwnership) {
@@ -392,7 +403,7 @@ func TestPlaybackExplicitTakeoverPreservesPlaybackAndRevokesAllOldOwnerMutations
 	newScope := oldScope
 	newScope.ClientID = "new-tab"
 	newScope.BindingGeneration = &takenOver.BindingGeneration
-	if status, err := server.ExecuteCommand(ctx, newScope, PlaybackCommand{Action: CommandPause}); err != nil || status.Playing || status.Position != 17 {
+	if status, err := server.ExecuteCommand(ctx, migrationCommandScope(newScope), PlaybackCommand{Action: CommandPause}); err != nil || status.Playing || status.Position != 17 {
 		t.Fatalf("new owner cannot control preserved playback: %#v err=%v", status, err)
 	}
 }
@@ -419,13 +430,13 @@ func TestPlaybackExplicitTakeoverSerializesWithAdmittedOldOwnerMutation(t *testi
 	}
 	oldScope := CommandScope{User: "admin", SessionID: "owner", ClientID: "old-tab", BindingGeneration: &status.BindingGeneration}
 	for _, command := range []PlaybackCommand{{Action: CommandSet, IDs: []string{"track"}}, {Action: CommandStart}} {
-		if _, err := server.ExecuteCommand(ctx, oldScope, command); err != nil {
+		if _, err := server.ExecuteCommand(ctx, migrationCommandScope(oldScope), command); err != nil {
 			t.Fatal(err)
 		}
 	}
 	mutated := make(chan error, 1)
 	go func() {
-		_, err := server.ExecuteCommand(ctx, oldScope, PlaybackCommand{Action: CommandGain, Gain: 0.25})
+		_, err := server.ExecuteCommand(ctx, migrationCommandScope(oldScope), PlaybackCommand{Action: CommandGain, Gain: 0.25})
 		mutated <- err
 	}()
 	select {
@@ -458,7 +469,7 @@ func TestPlaybackExplicitTakeoverSerializesWithAdmittedOldOwnerMutation(t *testi
 	if err != nil || state.SessionStatus.OwnerClientID != "new-tab" || state.SessionStatus.Gain != 0.25 || len(state.JukeboxPlaylist.Entry) != 1 {
 		t.Fatalf("serialized takeover lost admitted playback state: %#v err=%v", state, err)
 	}
-	if _, err := server.ExecuteCommand(ctx, oldScope, PlaybackCommand{Action: CommandGain, Gain: 0.5}); !errors.Is(err, ErrSessionOwnership) {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(oldScope), PlaybackCommand{Action: CommandGain, Gain: 0.5}); !errors.Is(err, ErrSessionOwnership) {
 		t.Fatalf("old owner mutated after takeover completion: %v", err)
 	}
 }
@@ -470,7 +481,7 @@ func TestPlaybackExplicitTakeoverCancelsInFlightOldOwnerPreparation(t *testing.T
 		t.Fatal(err)
 	}
 	oldScope := CommandScope{User: "admin", SessionID: "owner", ClientID: "old-tab", BindingGeneration: &status.BindingGeneration}
-	if _, err := server.ExecuteCommand(ctx, oldScope, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(oldScope), PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
 		t.Fatal(err)
 	}
 	entered := make(chan struct{})
@@ -491,7 +502,7 @@ func TestPlaybackExplicitTakeoverCancelsInFlightOldOwnerPreparation(t *testing.T
 	}
 	started := make(chan error, 1)
 	go func() {
-		_, err := server.ExecuteCommand(ctx, oldScope, PlaybackCommand{Action: CommandStart})
+		_, err := server.ExecuteCommand(ctx, migrationCommandScope(oldScope), PlaybackCommand{Action: CommandStart})
 		started <- err
 	}()
 	select {
@@ -505,7 +516,7 @@ func TestPlaybackExplicitTakeoverCancelsInFlightOldOwnerPreparation(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.ExecuteCommand(ctx, oldScope, PlaybackCommand{Action: CommandStop}); !errors.Is(err, ErrSessionOwnership) {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(oldScope), PlaybackCommand{Action: CommandStop}); !errors.Is(err, ErrSessionOwnership) {
 		t.Fatalf("old owner retained command authority during retirement: %v", err)
 	}
 	unblock()
@@ -531,7 +542,7 @@ func TestPlaybackExplicitTakeoverCancelsInFlightOldOwnerPreparation(t *testing.T
 	newScope := oldScope
 	newScope.ClientID = "new-tab"
 	newScope.BindingGeneration = &takeoverStatus.BindingGeneration
-	if status, err := server.ExecuteCommand(ctx, newScope, PlaybackCommand{Action: CommandStart}); err != nil || !status.Playing {
+	if status, err := server.ExecuteCommand(ctx, migrationCommandScope(newScope), PlaybackCommand{Action: CommandStart}); err != nil || !status.Playing {
 		t.Fatalf("new owner could not retry logical playback: %#v err=%v", status, err)
 	}
 }
@@ -551,15 +562,15 @@ func TestPlaybackCommandAuthorityValidation(t *testing.T) {
 		}
 		wrongOwner := scope
 		wrongOwner.ClientID = "other"
-		if _, err := server.ExecuteCommand(ctx, wrongOwner, command); !errors.Is(err, ErrSessionOwnership) {
+		if _, err := server.ExecuteCommand(ctx, migrationCommandScope(wrongOwner), command); !errors.Is(err, ErrSessionOwnership) {
 			t.Fatalf("non-owner %s accepted: %v", command.Action, err)
 		}
 		wrongUser := scope
 		wrongUser.User = "other-user"
-		if _, err := server.ExecuteCommand(ctx, wrongUser, command); !errors.Is(err, ErrSessionOwnership) {
+		if _, err := server.ExecuteCommand(ctx, migrationCommandScope(wrongUser), command); !errors.Is(err, ErrSessionOwnership) {
 			t.Fatalf("forged user %s accepted: %v", command.Action, err)
 		}
-		status, err := server.ExecuteCommand(ctx, scope, command)
+		status, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), command)
 		if err != nil {
 			t.Fatalf("owner %s failed: %v", command.Action, err)
 		}
@@ -593,14 +604,14 @@ func TestPlaybackScopedSwitchRejectsBypassAndRebindsAuthority(t *testing.T) {
 	}
 	scope := CommandScope{User: "admin", SessionID: "owner", ClientID: "tab", BindingGeneration: &status.BindingGeneration}
 	for _, denied := range []CommandScope{{User: "admin"}, {User: "admin", SessionID: "owner", ClientID: "other"}} {
-		if err := server.SwitchDeviceForCommand(ctx, denied, "new"); !errors.Is(err, ErrSessionOwnership) {
+		if err := server.SwitchDeviceForCommand(ctx, migrationCommandScope(denied), "new"); !errors.Is(err, ErrSessionOwnership) {
 			t.Fatalf("switch bypass accepted: %#v err=%v", denied, err)
 		}
 	}
-	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.SwitchDeviceForCommand(ctx, scope, "new"); err != nil {
+	if err := server.SwitchDeviceForCommand(ctx, migrationCommandScope(scope), "new"); err != nil {
 		t.Fatal(err)
 	}
 	snapAfterSwitch, err := server.SessionSnapshot(ctx, "owner", "admin")
@@ -608,7 +619,7 @@ func TestPlaybackScopedSwitchRejectsBypassAndRebindsAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	scope.BindingGeneration = &snapAfterSwitch.SessionStatus.BindingGeneration
-	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandGain, Gain: 0.375}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandGain, Gain: 0.375}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := server.SessionSnapshot(ctx, "owner", "admin")
@@ -628,7 +639,7 @@ func TestPlaybackScopedStopCancelsPreparingOutputWithoutResurrection(t *testing.
 		t.Fatal(err)
 	}
 	scope := CommandScope{User: "admin", SessionID: "owner", ClientID: "tab", BindingGeneration: &status.BindingGeneration}
-	_, err = server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}})
+	_, err = server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandSet, IDs: []string{"track"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +655,7 @@ func TestPlaybackScopedStopCancelsPreparingOutputWithoutResurrection(t *testing.
 	}
 	started := make(chan error, 1)
 	go func() {
-		_, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandStart})
+		_, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandStart})
 		started <- err
 	}()
 	select {
@@ -652,7 +663,7 @@ func TestPlaybackScopedStopCancelsPreparingOutputWithoutResurrection(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("preparation did not start")
 	}
-	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandStop}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandStop}); err != nil {
 		t.Fatal(err)
 	}
 	for name, done := range map[string]<-chan struct{}{"cancellation": canceled, "retirement": closed} {
@@ -689,7 +700,7 @@ func TestPlaybackScopedMigrationPreparationCanBeCanceledWithoutLateUnpause(t *te
 	}
 	scope := CommandScope{User: "admin", SessionID: "owner", ClientID: "tab", BindingGeneration: &status.BindingGeneration}
 	for _, command := range []PlaybackCommand{{Action: CommandSet, IDs: []string{"track"}}, {Action: CommandStart}} {
-		if _, err := server.ExecuteCommand(ctx, scope, command); err != nil {
+		if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), command); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -713,7 +724,7 @@ func TestPlaybackScopedMigrationPreparationCanBeCanceledWithoutLateUnpause(t *te
 		return &mockTrack{onClose: func() { close(closed) }, onUnpause: func() error { unpaused <- struct{}{}; return nil }}, nil
 	}
 	switched := make(chan error, 1)
-	go func() { switched <- server.SwitchDeviceForCommand(ctx, scope, "new") }()
+	go func() { switched <- server.SwitchDeviceForCommand(ctx, migrationCommandScope(scope), "new") }()
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -722,7 +733,7 @@ func TestPlaybackScopedMigrationPreparationCanBeCanceledWithoutLateUnpause(t *te
 	stopScope := scope
 	gen2 := uint64(2)
 	stopScope.BindingGeneration = &gen2
-	if _, err := server.ExecuteCommand(ctx, stopScope, PlaybackCommand{Action: CommandStop}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(stopScope), PlaybackCommand{Action: CommandStop}); err != nil {
 		t.Fatal(err)
 	}
 	unblock()
@@ -750,7 +761,7 @@ func TestPlaybackScopedMigrationPreparationCanBeCanceledWithoutLateUnpause(t *te
 	}
 	newTrack = previous
 	scope.BindingGeneration = &state.SessionStatus.BindingGeneration
-	if status, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandStart}); err != nil || !status.Playing {
+	if status, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandStart}); err != nil || !status.Playing {
 		t.Fatalf("logical session cannot retry after canceled migration: %#v err=%v", status, err)
 	}
 }
@@ -873,10 +884,10 @@ func TestPlaybackServerScopedSwitchToTargetWithExistingSessionRejected(t *testin
 		t.Fatal(err)
 	}
 	scope1 := CommandScope{User: "admin", SessionID: "owner-session", ClientID: "tab-1", BindingGeneration: &st1.BindingGeneration}
-	if _, err := server.ExecuteCommand(ctx, scope1, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope1), PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.ExecuteCommand(ctx, scope1, PlaybackCommand{Action: CommandStart}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope1), PlaybackCommand{Action: CommandStart}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -885,17 +896,17 @@ func TestPlaybackServerScopedSwitchToTargetWithExistingSessionRejected(t *testin
 		t.Fatal(err)
 	}
 	scope2 := CommandScope{User: "admin", SessionID: "target-session", ClientID: "other-tab", BindingGeneration: &st2.BindingGeneration}
-	if _, err := server.ExecuteCommand(ctx, scope2, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope2), PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.ExecuteCommand(ctx, scope2, PlaybackCommand{Action: CommandStart}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope2), PlaybackCommand{Action: CommandStart}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.ExecuteCommand(ctx, scope2, PlaybackCommand{Action: CommandSeek, Position: 12}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope2), PlaybackCommand{Action: CommandSeek, Position: 12}); err != nil {
 		t.Fatal(err)
 	}
 
-	err = server.SwitchDeviceForCommand(ctx, scope1, "new")
+	err = server.SwitchDeviceForCommand(ctx, migrationCommandScope(scope1), "new")
 	if !errors.Is(err, ErrSessionOwnership) {
 		t.Fatalf("expected ErrSessionOwnership when target has active session, got: %v", err)
 	}
@@ -937,13 +948,13 @@ func TestPlaybackSameOwnerLateCommandAcrossDeviceSwitchDoesNotMutateNewScene(t *
 	}
 	t.Cleanup(func() { newTrack = previousNewTrack })
 
-	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandStart}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandStart}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandSeek, Position: 10}); err != nil {
+	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandSeek, Position: 10}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -962,7 +973,7 @@ func TestPlaybackSameOwnerLateCommandAcrossDeviceSwitchDoesNotMutateNewScene(t *
 
 	switched := make(chan error, 1)
 	go func() {
-		switched <- server.SwitchDeviceForCommand(ctx, scope, "new")
+		switched <- server.SwitchDeviceForCommand(ctx, migrationCommandScope(scope), "new")
 	}()
 
 	select {

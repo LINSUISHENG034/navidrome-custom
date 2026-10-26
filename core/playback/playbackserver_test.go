@@ -430,6 +430,7 @@ var _ = Describe("PlaybackServer", func() {
 			CurrentIndex: 1,
 			Playing:      true,
 			Gain:         DefaultGain,
+			DesiredGain:  DefaultGain,
 			Position:     0,
 		})))
 	})

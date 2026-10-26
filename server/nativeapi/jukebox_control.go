@@ -17,6 +17,8 @@ type jukeboxStatusResponse struct {
 	CurrentIndex int     `json:"currentIndex"`
 	Playing      bool    `json:"playing"`
 	Gain         float32 `json:"gain"`
+	DesiredGain  float32 `json:"desiredGain"`
+	Muted        bool    `json:"muted"`
 	Position     int     `json:"position"`
 }
 
@@ -27,6 +29,7 @@ type jukeboxCommandRequest struct {
 	Offset   int      `json:"offset"`
 	Position int      `json:"position"`
 	Gain     float32  `json:"gain"`
+	Muted    *bool    `json:"muted"`
 	From     int      `json:"from"`
 	To       int      `json:"to"`
 }
@@ -46,6 +49,7 @@ func (api *Router) addJukeboxControlRoute(r chi.Router) {
 	r.Post("/jukebox/skip", api.jukeboxSkip)
 	r.Post("/jukebox/seek", api.jukeboxSeek)
 	r.Post("/jukebox/volume", api.jukeboxVolume)
+	r.Post("/jukebox/mute", api.jukeboxMute)
 	r.Post("/jukebox/add", api.jukeboxAdd)
 	r.Post("/jukebox/remove", api.jukeboxRemove)
 	r.Post("/jukebox/move", api.jukeboxMove)
@@ -56,6 +60,8 @@ func toStatusResponse(s playback.DeviceStatus) *jukeboxStatusResponse {
 		CurrentIndex: s.CurrentIndex,
 		Playing:      s.Playing,
 		Gain:         s.Gain,
+		DesiredGain:  s.DesiredGain,
+		Muted:        s.Muted,
 		Position:     s.Position,
 	}
 }
@@ -77,7 +83,7 @@ func (api *Router) jukeboxStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		status := snapshot.SessionStatus
 		api.writeJukeboxJSON(w, r, toStatusResponse(playback.DeviceStatus{
-			CurrentIndex: status.CurrentIndex, Playing: status.Playing, Position: status.Position, Gain: status.Gain,
+			CurrentIndex: status.CurrentIndex, Playing: status.Playing, Position: status.Position, Gain: status.Gain, DesiredGain: status.DesiredGain, Muted: status.Muted,
 		}))
 		return
 	}
@@ -111,6 +117,8 @@ func commandScopeFromRequest(r *http.Request, scope playback.CommandScope) (play
 		if qGen := query.Get("bindingGeneration"); qGen != "" {
 			if val, err := strconv.ParseUint(qGen, 10, 64); err == nil {
 				scope.BindingGeneration = &val
+			} else {
+				return playback.CommandScope{}, playback.ErrGenerationRequired
 			}
 		}
 	}
@@ -133,12 +141,19 @@ func (api *Router) jukeboxCommand(w http.ResponseWriter, r *http.Request, action
 		api.writeJukeboxSessionError(w, err)
 		return
 	}
+	if action == playback.CommandMute && req.Muted == nil {
+		http.Error(w, "muted boolean is required", http.StatusBadRequest)
+		return
+	}
 	if action == playback.CommandSeek && req.Position < 0 {
 		http.Error(w, "position must be >= 0", http.StatusBadRequest)
 		return
 	}
 	command := playback.PlaybackCommand{
 		Action: action, IDs: req.IDs, Offset: req.Offset, Position: req.Position, Gain: req.Gain, From: req.From, To: req.To,
+	}
+	if req.Muted != nil {
+		command.Muted = *req.Muted
 	}
 	if req.Index != nil {
 		command.Index = *req.Index
@@ -176,6 +191,10 @@ func (api *Router) jukeboxSkip(w http.ResponseWriter, r *http.Request) {
 
 func (api *Router) jukeboxVolume(w http.ResponseWriter, r *http.Request) {
 	api.jukeboxCommand(w, r, playback.CommandGain, true)
+}
+
+func (api *Router) jukeboxMute(w http.ResponseWriter, r *http.Request) {
+	api.jukeboxCommand(w, r, playback.CommandMute, true)
 }
 
 func (api *Router) jukeboxSeek(w http.ResponseWriter, r *http.Request) {
@@ -221,6 +240,9 @@ func (api *Router) jukeboxMigrationReserve(w http.ResponseWriter, r *http.Reques
 	}
 	user, _ := request.UserFrom(r.Context())
 	req.User = user.UserName
+	if req.ExpectedFingerprint != "" {
+		req.ForceTakeover = true
+	}
 	res, err := api.playback.ReserveMigration(r.Context(), req)
 	if err != nil {
 		api.writeJukeboxSessionError(w, err)
@@ -239,7 +261,9 @@ func (api *Router) jukeboxMigrationRelease(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "migrationId is required", http.StatusBadRequest)
 		return
 	}
-	res, err := api.playback.ReleaseMigrationReservation(r.Context(), req.MigrationID, req.ClientID)
+	user, _ := request.UserFrom(r.Context())
+	req.User = user.UserName
+	res, err := api.playback.ReleaseMigrationReservation(r.Context(), req)
 	if err != nil {
 		api.writeJukeboxSessionError(w, err)
 		return

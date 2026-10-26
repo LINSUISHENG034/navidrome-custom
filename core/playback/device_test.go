@@ -20,6 +20,9 @@ type mockTrack struct {
 	position         int
 	positionSetCalls int
 	volumeValues     []float32
+	muted            bool
+	muteCalls        int
+	onSetMute        func(bool) error
 	onSetVolume      func(float32) error
 	onPause          func() error
 	onUnpause        func() error
@@ -31,6 +34,14 @@ func (m *mockTrack) SetVolume(value float32) error {
 	m.volumeValues = append(m.volumeValues, value)
 	if m.onSetVolume != nil {
 		return m.onSetVolume(value)
+	}
+	return nil
+}
+func (m *mockTrack) SetMute(value bool) error {
+	m.muteCalls++
+	m.muted = value
+	if m.onSetMute != nil {
+		return m.onSetMute(value)
 	}
 	return nil
 }
@@ -110,6 +121,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		CurrentIndex: 0,
 		Playing:      false,
 		Gain:         DefaultGain,
+		DesiredGain:  DefaultGain,
 		Position:     position,
 		QueueVersion: 1,
 	})
@@ -134,6 +146,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		CurrentIndex: 0,
 		Playing:      true,
 		Gain:         DefaultGain,
+		DesiredGain:  DefaultGain,
 		Position:     position,
 		QueueVersion: 1,
 	}, 100*time.Millisecond)
@@ -151,6 +164,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		CurrentIndex: 0,
 		Playing:      false,
 		Gain:         DefaultGain,
+		DesiredGain:  DefaultGain,
 		Position:     retiredPosition,
 		QueueVersion: 1,
 	})
@@ -196,6 +210,7 @@ func TestPlaybackDeviceUnknownFailurePositionDoesNotInventSeekOffset(t *testing.
 		CurrentIndex: 0,
 		Playing:      false,
 		Gain:         DefaultGain,
+		DesiredGain:  DefaultGain,
 		Position:     0,
 		QueueVersion: 1,
 	})
@@ -823,3 +838,49 @@ var _ = Describe("playbackDevice concurrency", func() {
 		Expect(*pd.recoveryPosition).To(Equal(10))
 	})
 })
+
+func TestPlaybackDeviceMuteRemainsIndependentAndPrecedesFirstUnpause(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/mute-test")
+	track := &mockTrack{}
+	device.ActiveTrack = track
+	device.Gain = .64
+	device.DesiredGain = .64
+
+	status, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandMute, Muted: true})
+	if err != nil || !status.Muted || status.Gain != .64 || !track.muted {
+		t.Fatalf("mute changed gain or was not confirmed: status=%#v track=%#v err=%v", status, track, err)
+	}
+	status, err = device.executeCommand(ctx, PlaybackCommand{Action: CommandGain, Gain: .2})
+	if err != nil || !status.Muted || status.Gain != .2 {
+		t.Fatalf("gain adjustment destroyed mute: %#v err=%v", status, err)
+	}
+	status, err = device.executeCommand(ctx, PlaybackCommand{Action: CommandMute, Muted: false})
+	if err != nil || status.Muted || status.Gain != .2 || track.muted {
+		t.Fatalf("unmute did not preserve current gain: %#v track=%#v err=%v", status, track, err)
+	}
+
+	sequence := []string{}
+	initial := &mockTrack{
+		onSetVolume: func(value float32) error { sequence = append(sequence, "volume"); return nil },
+		onSetMute:   func(value bool) error { sequence = append(sequence, "mute"); return nil },
+		onUnpause:   func() error { sequence = append(sequence, "unpause"); return nil },
+	}
+	previousNewTrack := newTrack
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		return initial, nil
+	}
+	defer func() { newTrack = previousNewTrack }()
+	device.ActiveTrack = nil
+	device.Muted = true
+	device.DesiredGain = .64
+	device.PlaybackQueue.Set(model.MediaFiles{{ID: "mute-track", Path: "/mute.mp3"}})
+	status, err = device.Start(ctx)
+	if err != nil || !status.Playing || !status.Muted {
+		t.Fatalf("initial muted track did not start with authoritative state: %#v err=%v", status, err)
+	}
+	if len(sequence) != 3 || sequence[0] != "volume" || sequence[1] != "mute" || sequence[2] != "unpause" {
+		t.Fatalf("initial output commands were not confirmed before unpause: %v", sequence)
+	}
+}

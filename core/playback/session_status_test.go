@@ -53,7 +53,7 @@ func (s *sessionStatusStubServer) HandoffSession(context.Context, HandoffRequest
 func (s *sessionStatusStubServer) ReserveMigration(context.Context, ReserveMigrationRequest) (CommandResult, error) {
 	return CommandResult{}, nil
 }
-func (s *sessionStatusStubServer) ReleaseMigrationReservation(context.Context, string, string) (CommandResult, error) {
+func (s *sessionStatusStubServer) ReleaseMigrationReservation(context.Context, ReleaseMigrationRequest) (CommandResult, error) {
 	return CommandResult{}, nil
 }
 func (s *sessionStatusStubServer) QueryReservation(context.Context, string) (ReservationInfo, error) {

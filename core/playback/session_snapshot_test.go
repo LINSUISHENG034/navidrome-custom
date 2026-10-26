@@ -15,6 +15,7 @@ type snapshotTrack struct {
 
 func (t *snapshotTrack) IsPlaying() bool           { return t.playing }
 func (t *snapshotTrack) SetVolume(float32) error   { return nil }
+func (t *snapshotTrack) SetMute(bool) error        { return nil }
 func (t *snapshotTrack) Pause() error              { t.playing = false; return nil }
 func (t *snapshotTrack) Unpause() error            { t.playing = true; return nil }
 func (t *snapshotTrack) Position() int             { return t.position }

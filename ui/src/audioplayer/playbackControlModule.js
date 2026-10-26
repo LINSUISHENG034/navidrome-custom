@@ -8,6 +8,7 @@
  * and generation epoch invalidation across engine/mode switches.
  */
 
+import { v4 as uuidv4 } from 'uuid'
 import { audioVolumeToRemoteGain, resolveVolumeProfile } from './volumeProfiles'
 
 export const PlaybackStatus = {
@@ -290,6 +291,7 @@ export function createPlaybackControlModule(config = {}) {
   let intentCounter = 0
   let migrationCounter = 0
   let activeMigration = null
+  const operationNamespace = config.operationNamespace ?? uuidv4()
   const defaultTimeoutMs = config.commandTimeoutMs || 5000
   const initialVolume = config.initialVolume ?? 1
 
@@ -351,6 +353,10 @@ export function createPlaybackControlModule(config = {}) {
   }
 
   function setAdapter(newAdapter) {
+    activeMigration?.abortController.abort({
+      code: 'COMMAND_SUPERSEDED',
+      message: 'Playback engine changed during output migration',
+    })
     // 1. Advance epoch to invalidate any late asynchronous callbacks from old adapter
     currentEpoch += 1
     const newEpoch = currentEpoch
@@ -507,6 +513,10 @@ export function createPlaybackControlModule(config = {}) {
       hasChange = true
     }
 
+    if (activeMigration && !activeMigration.terminal) {
+      nextState.acceptedIntent = activeMigration.acceptedIntent
+      nextState.intentSequence = activeMigration.intentSequence
+    }
     if (hasChange) {
       state = nextState
       // State backfill strictly updates UI/subscribers, NEVER re-emits intents
@@ -514,34 +524,76 @@ export function createPlaybackControlModule(config = {}) {
     }
   }
 
-  async function executeWithTimeout(promise, timeoutMs, opId, adapter) {
+  async function waitForCommand(promise, timeoutMs, opId, signal) {
     let timer
-    const timeoutPromise = new Promise((_, reject) => {
-      timer = setTimeout(() => {
-        reject({
-          code: 'COMMAND_TIMEOUT',
-          message: `Playback command timed out after ${timeoutMs}ms`,
-          status: CommandResultStatus.UNKNOWN,
-          operationId: opId,
-        })
-      }, timeoutMs)
+    let onAbort
+    const interrupted = new Promise((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject({
+            code: 'COMMAND_TIMEOUT',
+            message: `Playback command timed out after ${timeoutMs}ms`,
+            status: CommandResultStatus.UNKNOWN,
+            operationId: opId,
+          }),
+        timeoutMs,
+      )
+      if (signal) {
+        onAbort = () =>
+          reject({
+            ...signal.reason,
+            code: signal.reason?.code || 'MIGRATION_CANCELLED',
+            status: CommandResultStatus.UNKNOWN,
+            operationId: opId,
+          })
+        if (signal.aborted) onAbort()
+        else signal.addEventListener('abort', onAbort, { once: true })
+      }
     })
-
     try {
-      return await Promise.race([promise, timeoutPromise])
+      return await Promise.race([promise, interrupted])
+    } finally {
+      clearTimeout(timer)
+      if (onAbort) signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  async function executeWithTimeout(promise, timeoutMs, opId, adapter, signal) {
+    try {
+      const result = await waitForCommand(promise, timeoutMs, opId, signal)
+      const outcome = result?.outcome ?? result?.status
+      if (
+        outcome === CommandResultStatus.FAILED ||
+        outcome === CommandResultStatus.NOT_EXECUTED ||
+        outcome === CommandResultStatus.UNKNOWN
+      ) {
+        throw {
+          code: result.error?.code || result.errorCode || `COMMAND_${outcome}`,
+          message:
+            result.error?.message ||
+            result.errorMessage ||
+            `Operation ${opId} returned ${outcome}`,
+          status: outcome,
+          operationId: opId,
+        }
+      }
+      return result
     } catch (err) {
       const isUnknown =
         err?.code === 'COMMAND_TIMEOUT' ||
         err?.code === 'RESPONSE_LOST' ||
         err?.status === CommandResultStatus.UNKNOWN
-
-      if (
-        isUnknown &&
-        adapter &&
-        typeof adapter.queryOperation === 'function' &&
-        opId
-      ) {
-        const queryResult = await adapter.queryOperation(opId)
+      if (isUnknown && adapter?.queryOperation && opId && !signal?.aborted) {
+        let queryResult
+        try {
+          queryResult = await waitForCommand(
+            adapter.queryOperation(opId),
+            timeoutMs,
+            opId,
+          )
+        } catch {
+          // An unavailable result query cannot prove execution did not happen.
+        }
         if (queryResult?.status === CommandResultStatus.APPLIED) {
           return queryResult
         }
@@ -555,26 +607,25 @@ export function createPlaybackControlModule(config = {}) {
         }
         if (queryResult?.status === CommandResultStatus.FAILED) {
           throw {
-            code: queryResult.error?.code || 'COMMAND_FAILED',
+            code:
+              queryResult.error?.code ||
+              queryResult.errorCode ||
+              'COMMAND_FAILED',
             message:
               queryResult.error?.message ||
+              queryResult.errorMessage ||
               `Operation ${opId} failed on the adapter`,
             status: CommandResultStatus.FAILED,
             operationId: opId,
           }
         }
         throw {
-          code: err?.code || 'COMMAND_UNKNOWN',
-          message:
-            err?.message ||
-            `Operation ${opId} status remains UNKNOWN after query`,
+          ...err,
           status: CommandResultStatus.UNKNOWN,
           operationId: opId,
         }
       }
       throw err
-    } finally {
-      clearTimeout(timer)
     }
   }
 
@@ -654,12 +705,23 @@ export function createPlaybackControlModule(config = {}) {
     return result
   }
 
-  async function dispatchCommand(commandName, executor, isPlayIntent = false) {
-    intentCounter += 1
-    const seq = intentCounter
-    state.intentSequence = seq
+  async function dispatchCommand(
+    commandName,
+    executor,
+    isPlayIntent = false,
+    acceptedSequence,
+  ) {
+    if (activeMigration?.terminal) {
+      throw {
+        code: 'MIGRATION_TERMINAL',
+        message: 'Migration has reached a terminal outcome; retry explicitly',
+        migrationId: activeMigration.migrationId,
+      }
+    }
+    const seq = acceptedSequence ?? ++intentCounter
+    if (acceptedSequence === undefined) state.intentSequence = seq
 
-    if (activeMigration) {
+    if (activeMigration && acceptedSequence === undefined) {
       if (commandName === 'play') {
         state.acceptedIntent = 'play'
         activeMigration.acceptedIntent = 'play'
@@ -671,6 +733,7 @@ export function createPlaybackControlModule(config = {}) {
         state.acceptedIntent = 'pause'
         activeMigration.acceptedIntent = 'pause'
         activeMigration.intentSequence = seq
+        activeMigration.pauseStartup?.(seq)
         notifySubscribers()
         return Promise.resolve()
       }
@@ -698,7 +761,7 @@ export function createPlaybackControlModule(config = {}) {
       state.acceptedIntent = 'pause'
     }
 
-    const opId = `op_${commandName}_${seq}`
+    const opId = `op_${operationNamespace}_${commandName}_${seq}`
     return runOperation(operation, commandName, () =>
       sendCommand(
         operation,
@@ -711,20 +774,12 @@ export function createPlaybackControlModule(config = {}) {
   }
 
   function failMigration(err, fallbackCode, fallbackMessage) {
-    const formatted = {
+    throw {
       code: err?.code || fallbackCode,
       message: err?.message || fallbackMessage,
       status: err?.status,
       operationId: err?.operationId,
     }
-    state = {
-      ...state,
-      pendingOutputTarget: null,
-      status: PlaybackStatus.ERROR,
-      error: formatted,
-    }
-    notifySubscribers()
-    throw formatted
   }
 
   function assertMigrationEpoch(newEpoch, targetAdapter) {
@@ -766,9 +821,16 @@ export function createPlaybackControlModule(config = {}) {
     }
 
     const migrationId =
-      options.migrationId || `mig_${Date.now()}_${++migrationCounter}`
+      options.migrationId ||
+      `mig_${operationNamespace}_${Date.now()}_${++migrationCounter}`
     const sourceAdapter = activeAdapter
+    const sourceEpoch = currentEpoch
     const abortController = new AbortController()
+    const forwardCancellation = () =>
+      abortController.abort({
+        code: 'MIGRATION_CANCELLED',
+        message: 'Migration transaction was cancelled',
+      })
 
     if (signal) {
       if (signal.aborted) {
@@ -778,16 +840,21 @@ export function createPlaybackControlModule(config = {}) {
           migrationId,
         }
       }
-      signal.addEventListener('abort', () => abortController.abort(), {
+      signal.addEventListener('abort', forwardCancellation, {
         once: true,
       })
     }
 
     const checkAborted = () => {
       if (abortController.signal.aborted) {
+        const reason = abortController.signal.reason
         throw {
-          code: 'MIGRATION_CANCELLED',
-          message: 'Migration transaction was cancelled',
+          ...reason,
+          code:
+            typeof reason?.code === 'string'
+              ? reason.code
+              : 'MIGRATION_CANCELLED',
+          message: reason?.message || 'Migration transaction was cancelled',
           migrationId,
         }
       }
@@ -804,18 +871,71 @@ export function createPlaybackControlModule(config = {}) {
       intentSequence: state.intentSequence,
       isolatedCommands: [],
       reservationOwned: false,
+      committed: false,
+      terminal: false,
+      targetEpoch: null,
     }
     activeMigration = migrationTx
 
+    const assertActive = () => {
+      checkAborted()
+      if (migrationTx.terminal || activeMigration !== migrationTx) {
+        throw {
+          code: 'COMMAND_SUPERSEDED',
+          message: 'Migration reached a terminal state or was superseded',
+          migrationId,
+        }
+      }
+      if (
+        migrationTx.committed &&
+        (currentEpoch !== migrationTx.targetEpoch ||
+          activeAdapter !== targetAdapter)
+      ) {
+        throw {
+          code: 'COMMAND_SUPERSEDED',
+          message: 'Migration target is no longer the current playback scene',
+          migrationId,
+        }
+      }
+    }
+    const runStep = (
+      executor,
+      operationId,
+      timeoutMs = phaseTimeoutMs,
+      adapter = targetAdapter,
+    ) => {
+      assertActive()
+      return executeWithTimeout(
+        Promise.resolve().then(() => {
+          assertActive()
+          return executor({
+            operationId,
+            migrationId,
+            signal: abortController.signal,
+          })
+        }),
+        timeoutMs,
+        operationId,
+        adapter,
+        abortController.signal,
+      ).then((result) => {
+        assertActive()
+        return result
+      })
+    }
+
+    const migrationDeadline = Date.now() + overallTimeoutMs
     let overallTimer
     const overallTimeoutPromise = new Promise((_, reject) => {
       overallTimer = setTimeout(() => {
-        abortController.abort()
-        reject({
+        const error = {
           code: 'MIGRATION_TIMEOUT',
           message: `Output migration timed out after ${overallTimeoutMs}ms`,
           migrationId,
-        })
+          status: CommandResultStatus.UNKNOWN,
+        }
+        abortController.abort(error)
+        reject(error)
       }, overallTimeoutMs)
     })
 
@@ -848,7 +968,10 @@ export function createPlaybackControlModule(config = {}) {
       let takeoverAllowed = forceTakeover
       if (hasActive && !takeoverAllowed) {
         if (typeof requestConfirmation === 'function') {
-          const confirmed = await requestConfirmation(targetDevice)
+          const confirmed = await runStep(
+            () => requestConfirmation(targetDevice),
+            opId('phase1', 'confirmation'),
+          )
           if (!confirmed) {
             throw {
               code: 'TARGET_CONFIRMATION_REJECTED',
@@ -871,18 +994,18 @@ export function createPlaybackControlModule(config = {}) {
         const reserveTimeout = readinessTimeoutMs
           ? Math.max(phaseTimeoutMs, readinessTimeoutMs + 1000)
           : phaseTimeoutMs
-        const reserveRes = await executeWithTimeout(
-          targetAdapter.reserveMigration(opIdAdmission, {
-            migrationId,
-            clientId: targetDevice.clientId,
-            forceTakeover: takeoverAllowed,
-            signal: abortController.signal,
-            readinessTimeoutMs,
-            ...targetDevice,
-          }),
-          reserveTimeout,
+        const reserveRes = await runStep(
+          () =>
+            targetAdapter.reserveMigration(opIdAdmission, {
+              migrationId,
+              clientId: targetDevice.clientId,
+              forceTakeover: takeoverAllowed,
+              signal: abortController.signal,
+              readinessTimeoutMs,
+              ...targetDevice,
+            }),
           opIdAdmission,
-          targetAdapter,
+          reserveTimeout,
         )
         if (
           reserveRes?.status === CommandResultStatus.FAILED ||
@@ -895,16 +1018,15 @@ export function createPlaybackControlModule(config = {}) {
         }
         migrationTx.reservationOwned = true
       } else if (typeof targetAdapter.admitClient === 'function') {
-        const admitted = await executeWithTimeout(
-          targetAdapter.admitClient({
-            forceTakeover: takeoverAllowed,
-            migrationId,
-            operationId: opIdAdmission,
-            ...targetDevice,
-          }),
-          phaseTimeoutMs,
+        const admitted = await runStep(
+          () =>
+            targetAdapter.admitClient({
+              forceTakeover: takeoverAllowed,
+              migrationId,
+              operationId: opIdAdmission,
+              ...targetDevice,
+            }),
           opIdAdmission,
-          targetAdapter,
         )
         if (!admitted) {
           throw {
@@ -941,41 +1063,22 @@ export function createPlaybackControlModule(config = {}) {
         const opIdStop = opId('phase2', 'stop')
         try {
           if (typeof sourceAdapter.stop === 'function') {
-            await executeWithTimeout(
-              sourceAdapter.stop(currentEpoch, { operationId: opIdStop }),
-              phaseTimeoutMs,
+            await runStep(
+              () => sourceAdapter.stop(currentEpoch, { operationId: opIdStop }),
               opIdStop,
+              phaseTimeoutMs,
               sourceAdapter,
             )
           } else if (typeof sourceAdapter.pause === 'function') {
-            await executeWithTimeout(
-              sourceAdapter.pause(currentEpoch, { operationId: opIdStop }),
-              phaseTimeoutMs,
+            await runStep(
+              () =>
+                sourceAdapter.pause(currentEpoch, { operationId: opIdStop }),
               opIdStop,
+              phaseTimeoutMs,
               sourceAdapter,
             )
           }
         } catch (err) {
-          if (migrationTx.reservationOwned) {
-            const opIdRelease = opId('cleanup', 'release')
-            try {
-              if (
-                typeof targetAdapter.releaseMigrationReservation === 'function'
-              ) {
-                await executeWithTimeout(
-                  targetAdapter.releaseMigrationReservation(opIdRelease, {
-                    migrationId,
-                  }),
-                  phaseTimeoutMs,
-                  opIdRelease,
-                  targetAdapter,
-                )
-              }
-            } catch {
-              // reservation cleanup failure recorded
-            }
-            migrationTx.reservationOwned = false
-          }
           failMigration(
             err,
             'OLD_OUTPUT_STOP_FAILED',
@@ -987,8 +1090,10 @@ export function createPlaybackControlModule(config = {}) {
       checkAborted()
 
       // Phase 3: Scene Migration (Context Commit)
+      migrationTx.committed = true
       currentEpoch += 1
       const newEpoch = currentEpoch
+      migrationTx.targetEpoch = newEpoch
 
       if (sourceAdapter && typeof sourceAdapter.deactivate === 'function') {
         try {
@@ -1013,6 +1118,7 @@ export function createPlaybackControlModule(config = {}) {
         isMuted: snapshot.isMuted,
         playMode: snapshot.playMode,
         status: PlaybackStatus.PREPARING,
+        pendingOutputTarget: targetDevice,
         acceptedIntent: migrationTx.acceptedIntent ?? snapshot.acceptedIntent,
         intentSequence: migrationTx.intentSequence ?? snapshot.intentSequence,
         playbackInstanceId: snapshot.playbackInstanceId,
@@ -1025,6 +1131,7 @@ export function createPlaybackControlModule(config = {}) {
         targetAdapter.activate(newEpoch, (epoch, stateUpdate) => {
           if (
             epoch !== newEpoch ||
+            migrationTx.terminal ||
             currentEpoch !== newEpoch ||
             activeAdapter !== targetAdapter
           ) {
@@ -1036,32 +1143,57 @@ export function createPlaybackControlModule(config = {}) {
 
       if (snapshot.queue.length > 0) {
         if (typeof targetAdapter.clearQueue === 'function') {
-          await targetAdapter.clearQueue(newEpoch)
+          await runStep(
+            (context) => targetAdapter.clearQueue(newEpoch, context),
+            opId('phase3', 'clear'),
+          )
           assertMigrationEpoch(newEpoch, targetAdapter)
         }
         if (typeof targetAdapter.addQueueItems === 'function') {
-          await targetAdapter.addQueueItems(newEpoch, snapshot.queue)
+          await runStep(
+            (context) =>
+              targetAdapter.addQueueItems(
+                newEpoch,
+                snapshot.queue,
+                -1,
+                context,
+              ),
+            opId('phase3', 'queue'),
+          )
           assertMigrationEpoch(newEpoch, targetAdapter)
         }
         if (
           snapshot.currentQueueItemId &&
           typeof targetAdapter.skipToQueueItem === 'function'
         ) {
-          await targetAdapter.skipToQueueItem(
-            newEpoch,
-            snapshot.currentQueueItemId,
+          await runStep(
+            (context) =>
+              targetAdapter.skipToQueueItem(
+                newEpoch,
+                snapshot.currentQueueItemId,
+                context,
+              ),
+            opId('phase3', 'select'),
           )
           assertMigrationEpoch(newEpoch, targetAdapter)
         }
         if (snapshot.position > 0 && typeof targetAdapter.seek === 'function') {
-          await targetAdapter.seek(newEpoch, snapshot.position)
+          await runStep(
+            (context) =>
+              targetAdapter.seek(newEpoch, snapshot.position, context),
+            opId('phase3', 'seek'),
+          )
           assertMigrationEpoch(newEpoch, targetAdapter)
         }
         if (
           snapshot.playMode &&
           typeof targetAdapter.setPlayMode === 'function'
         ) {
-          await targetAdapter.setPlayMode(newEpoch, snapshot.playMode)
+          await runStep(
+            (context) =>
+              targetAdapter.setPlayMode(newEpoch, snapshot.playMode, context),
+            opId('phase3', 'mode'),
+          )
           assertMigrationEpoch(newEpoch, targetAdapter)
         }
       }
@@ -1085,26 +1217,24 @@ export function createPlaybackControlModule(config = {}) {
       const opIdVolume = opId('phase4', 'volume')
       try {
         if (typeof targetAdapter.setVolume === 'function') {
-          await executeWithTimeout(
-            targetAdapter.setVolume(newEpoch, snapshot.volume, {
-              operationId: opIdVolume,
-              volumeProfile: explicitProfile,
-            }),
-            phaseTimeoutMs,
+          await runStep(
+            () =>
+              targetAdapter.setVolume(newEpoch, snapshot.volume, {
+                operationId: opIdVolume,
+                volumeProfile: explicitProfile,
+              }),
             opIdVolume,
-            targetAdapter,
           )
           assertMigrationEpoch(newEpoch, targetAdapter)
         }
         if (snapshot.isMuted && typeof targetAdapter.setMute === 'function') {
           const opIdMute = opId('phase4', 'mute')
-          await executeWithTimeout(
-            targetAdapter.setMute(newEpoch, true, {
-              operationId: opIdMute,
-            }),
-            phaseTimeoutMs,
+          await runStep(
+            () =>
+              targetAdapter.setMute(newEpoch, true, {
+                operationId: opIdMute,
+              }),
             opIdMute,
-            targetAdapter,
           )
           assertMigrationEpoch(newEpoch, targetAdapter)
         }
@@ -1119,6 +1249,21 @@ export function createPlaybackControlModule(config = {}) {
       checkAborted()
 
       // Phase 5: Conditional Startup based on final acceptedIntent
+      let startupActive = false
+      migrationTx.pauseStartup = (pauseSeq) => {
+        if (startupActive && typeof targetAdapter.pause === 'function') {
+          const pauseOpId = opId(
+            'phase5',
+            `pause_${pauseSeq ?? ++intentCounter}`,
+          )
+          try {
+            targetAdapter.pause(newEpoch, { operationId: pauseOpId })
+          } catch {
+            // ignore synchronous throw
+          }
+        }
+      }
+
       const effectiveIntent =
         migrationTx.acceptedIntent ??
         (wasPlayingOrPreparingPlay ? 'play' : 'pause')
@@ -1144,34 +1289,51 @@ export function createPlaybackControlModule(config = {}) {
         notifySubscribers()
       } else if (shouldPlayTarget) {
         try {
-          await executeWithTimeout(
-            targetAdapter.play(newEpoch, { operationId: opIdStart }),
-            phaseTimeoutMs,
+          startupActive = true
+          await runStep(
+            () => targetAdapter.play(newEpoch, { operationId: opIdStart }),
             opIdStart,
-            targetAdapter,
           )
           assertMigrationEpoch(newEpoch, targetAdapter)
-          state = {
-            ...state,
-            status: PlaybackStatus.PLAYING,
-            acceptedIntent: 'play',
+          if (migrationTx.acceptedIntent === 'pause') {
+            state = {
+              ...state,
+              status: PlaybackStatus.PAUSED,
+              acceptedIntent: 'pause',
+            }
+          } else {
+            state = {
+              ...state,
+              status: PlaybackStatus.PLAYING,
+              acceptedIntent: 'play',
+            }
           }
           notifySubscribers()
         } catch (playErr) {
-          failMigration(
-            playErr,
-            'TARGET_START_FAILED',
-            'Failed to start playback on target device',
-          )
+          if (migrationTx.acceptedIntent === 'pause') {
+            state = {
+              ...state,
+              status: PlaybackStatus.PAUSED,
+              acceptedIntent: 'pause',
+            }
+            notifySubscribers()
+          } else {
+            failMigration(
+              playErr,
+              'TARGET_START_FAILED',
+              'Failed to start playback on target device',
+            )
+          }
+        } finally {
+          startupActive = false
+          migrationTx.pauseStartup = null
         }
       } else {
         if (typeof targetAdapter.pause === 'function') {
           try {
-            await executeWithTimeout(
-              targetAdapter.pause(newEpoch, { operationId: opIdStart }),
-              phaseTimeoutMs,
+            await runStep(
+              () => targetAdapter.pause(newEpoch, { operationId: opIdStart }),
               opIdStart,
-              targetAdapter,
             )
           } catch (pauseErr) {
             failMigration(
@@ -1212,7 +1374,12 @@ export function createPlaybackControlModule(config = {}) {
           })
         } else {
           try {
-            const res = await dispatchCommand(cmd.commandName, cmd.executor)
+            const res = await dispatchCommand(
+              cmd.commandName,
+              cmd.executor,
+              false,
+              cmd.intentSequence,
+            )
             cmd.resolve(res)
           } catch (err) {
             cmd.reject(err)
@@ -1230,17 +1397,100 @@ export function createPlaybackControlModule(config = {}) {
     }
 
     try {
-      return await Promise.race([runTransaction(), overallTimeoutPromise])
+      const transactionPromise = runTransaction()
+      // The overall deadline may win while the fenced transaction is settling.
+      // Observe its rejection so a late adapter result cannot become unhandled.
+      transactionPromise.catch(() => {})
+      return await Promise.race([transactionPromise, overallTimeoutPromise])
+    } catch (err) {
+      const formatted = {
+        code: err?.code || 'MIGRATION_FAILED',
+        message: err?.message || 'Output migration failed',
+        status: err?.status,
+        operationId: err?.operationId,
+        migrationId,
+      }
+      migrationTx.terminal = true
+      for (const command of migrationTx.isolatedCommands) {
+        command.reject(formatted)
+      }
+      migrationTx.isolatedCommands = []
+
+      if (
+        !migrationTx.committed &&
+        migrationTx.reservationOwned &&
+        typeof targetAdapter.releaseMigrationReservation === 'function'
+      ) {
+        const opIdRelease = opId('cleanup', 'release')
+        const remainingMs = Math.max(0, migrationDeadline - Date.now())
+        if (remainingMs === 0) {
+          formatted.reservationCleanupError = {
+            code: 'RESERVATION_CLEANUP_UNKNOWN',
+            operationId: opIdRelease,
+          }
+        } else {
+          try {
+            await waitForCommand(
+              executeWithTimeout(
+                targetAdapter.releaseMigrationReservation(opIdRelease, {
+                  migrationId,
+                }),
+                remainingMs,
+                opIdRelease,
+                targetAdapter,
+              ),
+              remainingMs,
+              opIdRelease,
+            )
+            migrationTx.reservationOwned = false
+          } catch (cleanupError) {
+            formatted.reservationCleanupError = {
+              code: cleanupError?.code || 'RESERVATION_CLEANUP_UNKNOWN',
+              operationId: opIdRelease,
+            }
+          }
+        }
+      }
+
+      const failureAdapter = migrationTx.committed
+        ? targetAdapter
+        : sourceAdapter
+      const failureEpoch = migrationTx.committed
+        ? migrationTx.targetEpoch
+        : sourceEpoch
+      if (activeAdapter === failureAdapter && currentEpoch === failureEpoch) {
+        let errorEpoch = failureEpoch
+        if (migrationTx.committed) {
+          // Retire old callbacks without clearing the migrated scene. New explicit
+          // intents bind to this epoch and can recover the still-current target.
+          errorEpoch = ++currentEpoch
+          const recoveryEpoch = errorEpoch
+          state = { ...state, stateSequence: null }
+          targetAdapter.activate(recoveryEpoch, (epoch, update) => {
+            if (
+              epoch !== recoveryEpoch ||
+              currentEpoch !== recoveryEpoch ||
+              activeAdapter !== targetAdapter
+            )
+              return
+            handleAuthoritativeStateUpdate(update)
+          })
+        }
+        if (activeAdapter === failureAdapter && currentEpoch === errorEpoch) {
+          state = {
+            ...state,
+            pendingOutputTarget: null,
+            status: PlaybackStatus.ERROR,
+            error: formatted,
+          }
+          notifySubscribers()
+        }
+      }
+      throw formatted
     } finally {
       clearTimeout(overallTimer)
-      activeMigration = null
-      if (state.pendingOutputTarget) {
-        state = {
-          ...state,
-          pendingOutputTarget: null,
-        }
-        notifySubscribers()
-      }
+      signal?.removeEventListener('abort', forwardCancellation)
+      if (activeMigration === migrationTx) activeMigration = null
     }
   }
 
@@ -1249,7 +1499,10 @@ export function createPlaybackControlModule(config = {}) {
     migrateOutput,
     cancelMigration: (reason) => {
       if (activeMigration) {
-        activeMigration.abortController.abort()
+        activeMigration.abortController.abort({
+          code: 'MIGRATION_CANCELLED',
+          message: typeof reason === 'string' ? reason : 'Migration cancelled',
+        })
         return true
       }
       return false

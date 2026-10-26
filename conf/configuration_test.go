@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -463,6 +464,30 @@ var _ = Describe("Configuration", func() {
 			conf.Load(true)
 
 			Expect(conf.Server.EnforceNonRootUser).To(BeTrue())
+		})
+	})
+
+	Describe("Jukebox control retention policies", func() {
+		It("loads configurable bounded operation, reservation and handoff policies", func() {
+			viper.SetConfigType("toml")
+			Expect(viper.ReadConfig(bytes.NewBufferString(`[Jukebox]
+OperationCapacity = 17
+OperationTTL = "2m"
+ReservationTTL = "9s"
+HandoffTTL = "11s"
+`))).To(Succeed())
+			conf.Load(true)
+			policy := reflect.ValueOf(conf.Server.Jukebox)
+			for name, expected := range map[string]int64{
+				"OperationCapacity": 17,
+				"OperationTTL":      int64(2 * time.Minute),
+				"ReservationTTL":    int64(9 * time.Second),
+				"HandoffTTL":        int64(11 * time.Second),
+			} {
+				field := policy.FieldByName(name)
+				Expect(field.IsValid()).To(BeTrue(), "configuration field %s must exist", name)
+				Expect(field.Int()).To(Equal(expected), "configuration field %s must load", name)
+			}
 		})
 	})
 

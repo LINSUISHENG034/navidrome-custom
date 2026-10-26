@@ -65,6 +65,7 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 	detachSnapshotID := uniqueSessionID("detach-snapshot")
 	handoffID := uniqueSessionID("handoff")
 	handoffSuccessID := uniqueSessionID("handoff-success")
+	operationQueryID := uniqueSessionID("op-query")
 	var handoffSuccessToken string
 
 	tests := []struct {
@@ -383,9 +384,21 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:       "operation query returns UNKNOWN for unrecorded operation",
-			method:     http.MethodGet,
-			path:       "/jukebox/session/operation?sessionId=s1&operationId=unknown-op",
+			name:   "operation query returns UNKNOWN for unrecorded operation",
+			method: http.MethodGet,
+			path:   "/jukebox/session/operation?sessionId=" + operationQueryID + "&operationId=unknown-op",
+			setup: func(t *testing.T) {
+				t.Helper()
+				_, err := api.playback.AttachSession(context.Background(), playback.AttachRequest{
+					SessionID:  operationQueryID,
+					User:       "admin",
+					ClientID:   "tab-1",
+					DeviceName: "pulse/test",
+				})
+				if err != nil {
+					t.Fatalf("attach setup: %v", err)
+				}
+			},
 			handler:    (*Router).jukeboxOperation,
 			wantStatus: http.StatusOK,
 			assertJSON: func(t *testing.T, body []byte) {
@@ -404,8 +417,9 @@ func TestJukeboxSessionHandlers(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Cleanup(func() {
-				for _, sessionID := range []string{attachID, forbiddenHeartbeatID, forbiddenDetachID, snapshotID, forbiddenSnapshotID, detachSnapshotID, handoffID, handoffSuccessID} {
+				for _, sessionID := range []string{attachID, forbiddenHeartbeatID, forbiddenDetachID, snapshotID, forbiddenSnapshotID, detachSnapshotID, handoffID, handoffSuccessID, operationQueryID} {
 					_, _ = ps.DetachSession(context.Background(), sessionID, "tab-1")
+					_, _ = ps.DetachSession(context.Background(), sessionID, "tab-2")
 				}
 			})
 			if tt.setup != nil {

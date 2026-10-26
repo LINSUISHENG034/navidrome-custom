@@ -681,21 +681,52 @@ class AppSmokeEvidenceTests(unittest.TestCase):
         self.assertIs(browser["console_details"], details)
         self.assertEqual(browser["status"], "running")
 
+    def test_software_only_mode_never_requires_or_configures_mpv(self):
+        with patch.object(self.smoke, "source_fingerprint", return_value={"commit": "fixture"}):
+            app = self.smoke.AppSmoke(
+                self.output, Path("/fake/navidrome"), "/fake/chrome", None,
+                software_only=True)
+        self.addCleanup(app.cleanup)
+        env = app.server_env()
+        self.assertEqual(env["ND_MPVPATH"], "/usr/bin/false")
+        self.assertNotIn("--ao=null", env["ND_MPVCMDTEMPLATE"])
+        self.assertEqual(app.summary["evidence_levels"]["level4"], "UNVERIFIED")
+        self.assertFalse(app.summary["real_mpv_authorized"])
+
+    def test_software_only_run_does_not_enter_mpv_playback_flow(self):
+        self.app.software_only = True
+        with patch.object(self.app, "start_server"), \
+                patch.object(self.app, "create_admin_and_scan"), \
+                patch.object(self.app, "start_vite"), \
+                patch.object(self.app, "media_ids", return_value=["one", "two"]), \
+                patch.object(self.app, "jukebox_api") as playback, \
+                patch.object(self.app, "run_browser") as legacy_browser, \
+                patch.object(self.app, "run_software_browser") as software_browser:
+            self.app.run()
+        playback.assert_not_called()
+        legacy_browser.assert_not_called()
+        software_browser.assert_called_once()
+
     def test_commands_include_explicit_current_controller_scope(self):
+        self.app.binding_generation = 3
         with patch.object(self.app, "native", return_value=(200, {})) as native:
-            self.app.command("/api/jukebox/play")
+            self.app.command("/api/jukebox/play", operation_id="stable-play")
             native.assert_called_once_with("POST", "/api/jukebox/play", body={
                 "sessionId": self.app.session_id,
                 "clientId": self.app.client_id,
+                "bindingGeneration": 3,
+                "operationId": "g3:stable-play",
             })
 
     def test_observer_probe_cannot_inherit_owner_identity(self):
         with patch.object(self.app, "native", return_value=(403, {})) as native:
-            self.app.command("/api/jukebox/volume", {"gain": 0.25}, client_id="observer")
+            self.app.command("/api/jukebox/volume", {"gain": 0.25}, client_id="observer", operation_id="observer-probe")
             native.assert_called_once_with("POST", "/api/jukebox/volume", body={
                 "gain": 0.25,
                 "sessionId": self.app.session_id,
                 "clientId": "observer",
+                "bindingGeneration": 1,
+                "operationId": "g1:observer-probe",
             })
 
     def test_command_payload_cannot_override_controller_scope(self):

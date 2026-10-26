@@ -173,7 +173,34 @@ func (api *Router) jukeboxSessionHandoff(w http.ResponseWriter, r *http.Request)
 
 func (api *Router) writeJukeboxSessionError(w http.ResponseWriter, err error) {
 	var targetOccupied *playback.TargetOccupiedError
+	var historyUnknown *playback.OperationHistoryError
 	switch {
+	case errors.As(err, &historyUnknown):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": "OPERATION_UNKNOWN", "status": playback.OperationStatusUnknown,
+			"error": err.Error(), "bindingGeneration": historyUnknown.BindingGeneration,
+			"requiresNewGeneration": true,
+		})
+	case errors.Is(err, playback.ErrOperationUnknown):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": "OPERATION_UNKNOWN", "status": playback.OperationStatusUnknown, "error": err.Error(),
+		})
+	case errors.Is(err, playback.ErrOperationRequired):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "OPERATION_ID_REQUIRED", "error": err.Error()})
+	case errors.Is(err, playback.ErrOperationIdentity):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "OPERATION_ID_INVALID", "error": err.Error()})
+	case errors.Is(err, playback.ErrOperationCapacity):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "OPERATION_CAPACITY", "error": err.Error()})
 	case errors.As(err, &targetOccupied):
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)

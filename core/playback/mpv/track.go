@@ -383,6 +383,18 @@ func (t *MpvTrack) SetVolume(value float32) error {
 	return nil
 }
 
+func (t *MpvTrack) SetMute(muted bool) error {
+	if t == nil {
+		return errors.New("track is nil")
+	}
+	if _, err := t.call("set_property", "mute", muted); err != nil {
+		log.Error("Error setting mute", "muted", muted, "track", t, err)
+		t.reportCommandFailure(err)
+		return err
+	}
+	return nil
+}
+
 func (t *MpvTrack) Unpause() error {
 	if t == nil {
 		return errors.New("track is nil")

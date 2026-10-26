@@ -256,7 +256,18 @@ type prometheusOptions struct {
 
 type AudioDeviceDefinition []string
 
+const (
+	DefaultJukeboxOperationCapacity = 1000
+	DefaultJukeboxOperationTTL      = 10 * time.Minute
+	DefaultJukeboxReservationTTL    = 30 * time.Second
+	DefaultJukeboxHandoffTTL        = 30 * time.Second
+)
+
 type jukeboxOptions struct {
+	OperationCapacity        int
+	OperationTTL             time.Duration
+	ReservationTTL           time.Duration
+	HandoffTTL               time.Duration
 	Enabled                  bool
 	Devices                  []AudioDeviceDefinition
 	Default                  string
@@ -434,6 +445,18 @@ func Load(noConfigDump bool) {
 	log.SetLogSourceLine(Server.DevLogSourceLine)
 	log.SetRedacting(Server.EnableLogRedacting)
 
+	if Server.Jukebox.OperationCapacity <= 0 {
+		Server.Jukebox.OperationCapacity = DefaultJukeboxOperationCapacity
+	}
+	for value, fallback := range map[*time.Duration]time.Duration{
+		&Server.Jukebox.OperationTTL:   DefaultJukeboxOperationTTL,
+		&Server.Jukebox.ReservationTTL: DefaultJukeboxReservationTTL,
+		&Server.Jukebox.HandoffTTL:     DefaultJukeboxHandoffTTL,
+	} {
+		if *value <= 0 {
+			*value = fallback
+		}
+	}
 	durationNonNegativeOrDefault(&Server.SessionTimeout, consts.DefaultSessionTimeout)
 	durationNonNegativeOrDefault(&Server.SmartPlaylistRefreshDelay, consts.DefaultSmartRefresh)
 	durationNonNegativeOrDefault(&Server.DefaultShareExpiration, consts.DefaultShareExpiration)
@@ -1061,6 +1084,10 @@ func setViperDefaults() {
 	viper.SetDefault("prometheus.enabled", false)
 	viper.SetDefault("prometheus.metricspath", consts.PrometheusDefaultPath)
 	viper.SetDefault("prometheus.password", "")
+	viper.SetDefault("jukebox.operationcapacity", DefaultJukeboxOperationCapacity)
+	viper.SetDefault("jukebox.operationttl", DefaultJukeboxOperationTTL)
+	viper.SetDefault("jukebox.reservationttl", DefaultJukeboxReservationTTL)
+	viper.SetDefault("jukebox.handoffttl", DefaultJukeboxHandoffTTL)
 	viper.SetDefault("jukebox.enabled", false)
 	viper.SetDefault("jukebox.devices", []AudioDeviceDefinition{})
 	viper.SetDefault("jukebox.default", "")

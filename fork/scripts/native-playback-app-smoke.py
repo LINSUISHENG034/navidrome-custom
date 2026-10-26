@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import hashlib
 import importlib.util
+import importlib.metadata
 import os
 from pathlib import Path
 import re
@@ -18,6 +19,7 @@ import sys
 import threading
 import tempfile
 import time
+import traceback
 import wave
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
@@ -172,11 +174,17 @@ def source_fingerprint():
 
 
 class AppSmoke:
-    def __init__(self, output, binary, chrome, mpv, trace_processes=False):
+    def __init__(self, output, binary, chrome, mpv, trace_processes=False, software_only=False,
+                 allow_dirty_source=False, dependency_receipt=None):
         self.output = output.resolve()
         self.binary = binary.resolve()
         self.chrome = chrome
-        self.mpv = mpv.resolve()
+        self.mpv = mpv.resolve() if mpv else None
+        self.software_only = software_only
+        self.allow_dirty_source = allow_dirty_source
+        self.dependency_receipt = dependency_receipt
+        self.binding_generation = 1
+        self.command_sequence = 0
         self.trace_processes = trace_processes
         self.trace_prefix = None
         self.transcript = []
@@ -209,6 +217,9 @@ class AppSmoke:
             "server_url": self.server_url,
             "vite_url": self.vite_url,
             "phases": {},
+            "software_only": software_only,
+            "real_mpv_authorized": not software_only,
+            "evidence_levels": {"level3": "UNVERIFIED", "level4": "UNVERIFIED", "level5": "UNVERIFIED"},
             "mpv_stop_observations": self.mpv_stop_observations,
             "browser": {
                 "status": "not_run",
@@ -238,9 +249,14 @@ class AppSmoke:
         work = self.output / "work"
         home = work / "home"
         temp = work / "tmp"
-        for path in (home, temp, self.output / "cache/xdg"):
+        runtime = work / "runtime"
+        for path in (home, temp, runtime, self.output / "cache/xdg"):
             path.mkdir(parents=True, exist_ok=True)
-        path_env = os.pathsep.join((str(self.mpv.parent), "/usr/bin", "/bin"))
+        runtime.chmod(0o700)
+        mpv = Path("/usr/bin/false") if self.software_only else self.mpv
+        if mpv is None:
+            raise SmokeFailure("MPV is required only for the separately authorized real-output mode")
+        path_env = os.pathsep.join((str(mpv.parent), "/usr/bin", "/bin"))
         return {
             "PATH": path_env,
             "HOME": str(home),
@@ -249,6 +265,11 @@ class AppSmoke:
             "TMP": str(self.short_temp),
             "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_CACHE_HOME": str(self.output / "cache/xdg"),
+            "XDG_RUNTIME_DIR": str(runtime),
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(runtime / "disabled-session-bus"),
+            "DBUS_SYSTEM_BUS_ADDRESS": "unix:path=" + str(runtime / "disabled-system-bus"),
+            "PULSE_SERVER": "unix:" + str(runtime / "disabled-pulse"),
+            "PIPEWIRE_REMOTE": str(runtime / "disabled-pipewire"),
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "CI": "1",
@@ -265,8 +286,8 @@ class AppSmoke:
             "ND_JUKEBOX_AUTODISCOVERBLUETOOTH": "false",
             "ND_JUKEBOX_BLUETOOTHMANAGEMENT": "false",
             "ND_SCANNER_SCANONSTARTUP": "false",
-            "ND_MPVCMDTEMPLATE": MPV_TEMPLATE,
-            "ND_MPVPATH": str(self.mpv),
+            "ND_MPVCMDTEMPLATE": "/usr/bin/false" if self.software_only else MPV_TEMPLATE,
+            "ND_MPVPATH": str(mpv),
         }
 
     def start_server(self):
@@ -368,13 +389,24 @@ class AppSmoke:
             raise SmokeFailure(f"{route} returned HTTP {status}, expected {expected}")
 
     def native(self, method, path, *, body=None):
-        return self.request(method, self.server_url + path, path, body=body, token=self.token)
+        result = self.request(method, self.server_url + path, path, body=body, token=self.token)
+        status, response = result
+        if status == 200 and isinstance(response, dict) and response.get("bindingGeneration"):
+            if body and (body.get("clientId") == self.client_id or body.get("newClientId") == self.client_id):
+                self.binding_generation = response["bindingGeneration"]
+        return result
 
-    def command(self, path, body=None, *, client_id=None):
+    def command(self, path, body=None, *, client_id=None, operation_id=None):
         payload = dict(body or {})
-        if "sessionId" in payload or "clientId" in payload:
+        if any(key in payload for key in ("sessionId", "clientId", "bindingGeneration", "operationId")):
             raise SmokeFailure("command payload must not override controller scope")
-        payload.update(sessionId=self.session_id, clientId=client_id or self.client_id)
+        self.command_sequence += 1
+        suffix = operation_id or f"smoke-{self.command_sequence}-{secrets.token_hex(8)}"
+        wire_generation = re.match(r"^g([1-9][0-9]*):.+$", suffix)
+        generation = int(wire_generation.group(1)) if wire_generation else self.binding_generation
+        wire_id = suffix if wire_generation else f"g{generation}:{suffix}"
+        payload.update(sessionId=self.session_id, clientId=client_id or self.client_id,
+                       bindingGeneration=generation, operationId=wire_id)
         return self.native("POST", path, body=payload)
 
     def subsonic(self, path, *, parameters=None):
@@ -694,6 +726,67 @@ class AppSmoke:
         })
         return response
 
+    def capture_software_identity(self):
+        status = subprocess.check_output(["git", "status", "--porcelain=v1"], cwd=REPO, text=True)
+        if status and not self.allow_dirty_source:
+            raise SmokeFailure("final Level 3 acceptance requires a clean frozen source commit")
+        (self.output / "source.diff").write_bytes(subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=REPO))
+        package = json.loads((REPO / "ui/package.json").read_text())
+        lock_path = REPO / "ui/package-lock.json"
+        lock = json.loads(lock_path.read_text())["packages"]["node_modules/navidrome-music-player"]
+        installed_root = REPO / "ui/node_modules/navidrome-music-player"
+        installed = json.loads((installed_root / "package.json").read_text())
+        if package["dependencies"]["navidrome-music-player"] != lock["version"] or installed["version"] != lock["version"]:
+            raise SmokeFailure("declared, locked and installed native player versions differ")
+        installed_hashes = {str(path.relative_to(installed_root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                            for path in sorted(installed_root.rglob("*")) if path.is_file() and not path.is_symlink()}
+        receipt_path = Path(self.dependency_receipt) if self.dependency_receipt else None
+        if receipt_path is None:
+            for parent in self.output.parents:
+                candidate = parent / f"package-{lock['version']}/restoration-receipt.json"
+                if candidate.is_file():
+                    receipt_path = candidate
+                    break
+                if parent == OUTPUT_ROOT:
+                    break
+        if not receipt_path or not receipt_path.is_file():
+            raise SmokeFailure("software acceptance requires an integrity-verified dependency payload receipt")
+        receipt = json.loads(receipt_path.read_text())
+        if receipt.get("integrity") != lock["integrity"] or receipt.get("installed_file_sha256") != installed_hashes:
+            raise SmokeFailure("installed native player payload differs from the verified locked archive")
+        self.summary["artifact"] = {
+            "frozen_clean_commit": not bool(status), "worktree_status": status,
+            "source_diff": str(self.output / "source.diff"),
+            "binary": str(self.binary), "binary_sha256": hashlib.sha256(self.binary.read_bytes()).hexdigest(),
+            "package_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+            "native_player": {"declared": package["dependencies"]["navidrome-music-player"],
+                              "locked": lock["version"], "installed": installed["version"],
+                              "integrity": lock["integrity"], "payload_receipt": str(receipt_path),
+                              "installed_file_sha256": installed_hashes},
+            "node": subprocess.check_output([shutil.which("node"), "--version"], text=True).strip(),
+            "browser": subprocess.check_output([self.chrome, "--version"], text=True).strip(),
+            "scope": "native UI/browser media contracts plus idle real Native API; no production RemoteAudioAdapter claim",
+        }
+
+    def build_software_fixture(self, env):
+        self.capture_software_identity()
+        bundle = self.output / "bundle"
+        script = ("import {build} from 'vite'; await build({root:" + json.dumps(str(REPO / "ui"))
+                  + ",configFile:" + json.dumps(str(REPO / "ui/vite.config.js"))
+                  + ",cacheDir:" + json.dumps(str(self.output / "cache/vite"))
+                  + ",base:'/',build:{outDir:" + json.dumps(str(bundle))
+                  + ",emptyOutDir:false,rollupOptions:{input:{validation:"
+                  + json.dumps(str(REPO / "ui/validation/remote-player.html")) + "}}}})")
+        command = [shutil.which("node"), "--input-type=module", "-e", script]
+        with (self.output / "build.log").open("w") as log:
+            subprocess.run(command, cwd=REPO / "ui", env=env, stdout=log, stderr=subprocess.STDOUT,
+                           check=True, timeout=180)
+        self.summary["artifact"]["build_command"] = command
+        self.summary["artifact"]["bundle_sha256"] = {
+            str(path.relative_to(bundle)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(bundle.rglob("*")) if path.is_file()}
+        return bundle
+
     def start_vite(self):
         vite = REPO / "ui/node_modules/.bin/vite"
         if not vite.is_file():
@@ -713,9 +806,14 @@ class AppSmoke:
             "NODE_OPTIONS": "--dns-result-order=ipv4first",
         }
         self.vite_log = (self.output / "vite.log").open("w", encoding="utf-8")
+        if self.software_only:
+            bundle = self.build_software_fixture(env)
+            command = [str(vite), "preview", "--outDir", str(bundle), "--host", "127.0.0.1",
+                       "--port", str(self.frontend_port), "--strictPort"]
+        else:
+            command = [str(vite), "--host", "127.0.0.1", "--port", str(self.frontend_port), "--strictPort"]
         self.vite = subprocess.Popen(
-            [str(vite), "--host", "127.0.0.1", "--port", str(self.frontend_port), "--strictPort"],
-            cwd=REPO / "ui", env=env, stdin=subprocess.DEVNULL,
+            command, cwd=REPO / "ui", env=env, stdin=subprocess.DEVNULL,
             stdout=self.vite_log, stderr=subprocess.STDOUT, start_new_session=True,
         )
         self.summary["vite_pid"] = self.vite.pid
@@ -726,13 +824,414 @@ class AppSmoke:
                 raise SmokeFailure(f"Vite exited during startup (code {self.vite.returncode})")
             try:
                 code, body = self.request("GET", fixture_url, "/validation/remote-player.html")
-                if code == 200 and "remote-player.jsx" in str(body):
-                    self.summary["phases"]["validation-fixture"] = {"status": "pass", "path": "/validation/remote-player.html"}
+                if code == 200 and ("remote-player.jsx" in str(body) or self.software_only):
+                    self.summary["phases"]["validation-fixture"] = {"status": "pass", "path": "/validation/remote-player.html",
+                                                                       "bundle": bool(self.software_only)}
                     return
             except (URLError, TimeoutError, OSError, SmokeFailure):
                 pass
             time.sleep(0.25)
         raise SmokeFailure("Vite did not serve the independent validation fixture")
+
+    def open_software_contract(self, context, browser_dir, errors, details, **params):
+        from playwright.sync_api import expect
+        page = context.new_page()
+        self._track_page_errors(page, errors, details)
+        media_requests = []
+        page.pending_media = []
+
+        def media_response(route):
+            media = params.get("media", "valid")
+            request = route.request
+            if media == "slow":
+                page.pending_media.append(route)
+                media_requests.append({"url": request.url, "resource": media, "held": True})
+                return
+            if media == "404":
+                route.fulfill(status=404, body="isolated missing media", content_type="text/plain")
+            elif media == "invalid":
+                route.fulfill(status=200, body=b"not an audio stream", content_type="audio/wav")
+            else:
+                route.fulfill(status=200, path=str(self.output / "music/Validation Artist/Validation Album/01 - Smoke One.wav"),
+                              content_type="audio/wav")
+            media_requests.append({"url": request.url, "resource": media, "is_navigation": request.is_navigation_request()})
+
+        page.route("**/validation/contract-*.wav", media_response)
+        query = urlencode({"contracts": "unified-control", **params})
+        page.goto(f"{self.vite_url}/validation/remote-player.html?{query}", wait_until="domcontentloaded")
+        expect(page.locator("#contract-ready")).to_have_text("true", timeout=15000)
+        page.media_requests = media_requests
+        if params.get('autostart') != '1' and page.evaluate("window.__mediaProbe.createdAudio !== 0"):
+            raise SmokeFailure("remote fixture created browser media before pending target publication")
+        return page
+
+    @staticmethod
+    def contract_snapshot(page):
+        return page.evaluate("window.__unifiedControlValidation.snapshot()")
+
+    @staticmethod
+    def set_native_slider(page, perceptual_volume):
+        bounds = page.locator(".sound-operation").bounding_box()
+        page.mouse.click(bounds["x"] + bounds["width"] * perceptual_volume, bounds["y"] + bounds["height"] / 2)
+        page.wait_for_function("v => Math.abs(window.__unifiedControlValidation.snapshot().volume - v * v) < 0.001", arg=perceptual_volume)
+
+    def software_ui_contracts(self, context, browser_dir, errors, details):
+        checks = {}
+        self.summary["browser"]["checks"]["native_ui_and_media"] = checks
+        self.summary["browser"]["current_case"] = "mounted_playback"
+        page = self.open_software_contract(context, browser_dir, errors, details, preparePlay="1")
+        page.locator("#migrate-browser").click()
+        page.wait_for_function("document.querySelectorAll('audio').length === 1")
+        page.wait_for_function("window.__unifiedControlValidation.browserAdapter.getAudioElement()?.isConnected")
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().status === 'playing'", timeout=15000)
+        mounted = page.evaluate("""() => ({
+          connected: window.__unifiedControlValidation.browserAdapter.getAudioElement().isConnected,
+          count: document.querySelectorAll('audio').length,
+          status: window.__unifiedControlValidation.snapshot().status,
+          volume: window.__unifiedControlValidation.snapshot().volume,
+          slider: Number(document.querySelector('.sound-operation .rc-slider-handle').getAttribute('aria-valuenow'))
+        })""")
+        if mounted["count"] != 1 or not mounted["connected"] or abs(mounted["volume"] - 0.64) > 0.0001 or abs(mounted["slider"] - 0.8) > 0.0001:
+            raise SmokeFailure(f"native mounted playback contract failed: {mounted}")
+        checks["pending_target_real_react_mount"] = mounted
+
+        slider = page.locator(".sound-operation .rc-slider-handle")
+        self.summary["browser"]["current_case"] = "native_slider_keyboard"
+        slider.focus()
+        slider.press("Home")
+        slider.press("ArrowUp")
+        volume = self.contract_snapshot(page)
+        if abs(volume["volume"] - 0.0001) > 0.000001:
+            raise SmokeFailure(f"keyboard did not adjust canonical volume in the U domain: {volume}")
+        checks["native_slider_keyboard_u_domain"] = {"volume": volume["volume"], "slider_u": 0.01}
+        self.set_native_slider(page, 0.8)
+        page.locator(".sounds-icon").click()
+        self.summary["browser"]["current_case"] = "native_mute_independence"
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().isMuted === true")
+        before = self.contract_snapshot(page)["volume"]
+        slider.press("ArrowUp")
+        after = self.contract_snapshot(page)
+        if after["volume"] == before or not after["isMuted"]:
+            raise SmokeFailure("muted volume adjustment did not preserve independent mute")
+        page.locator(".sounds-icon").click()
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().isMuted === false")
+        checks["native_mute_independence"] = {"volume_while_muted": after["volume"], "unmuted": True}
+        self.set_native_slider(page, 0.8)
+        migration_volume = self.contract_snapshot(page)["volume"]
+        page.locator("#migrate-remote").click()
+        self.summary["browser"]["current_case"] = "migration_volume_display"
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().pendingOutputTarget === null")
+        page.wait_for_timeout(200)
+        snapshot = self.contract_snapshot(page)
+        if abs(snapshot["volume"] - migration_volume) > 0.0001:
+            raise SmokeFailure(f"round-trip canonical volume drifted: {migration_volume} -> {snapshot['volume']}")
+        page.locator("#migrate-browser").click()
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().pendingOutputTarget === null && document.querySelector('audio')")
+        restored = self.contract_snapshot(page)
+        if abs(restored["volume"] - migration_volume) > 0.0001:
+            raise SmokeFailure(f"return migration canonical volume drifted: {restored['volume']}")
+        checks["migration_volume_display"] = {"canonical_v": restored["volume"],
+            "slider_u": restored["volume"] ** 0.5, "mock_remote_profile": "bluetooth-jukebox"}
+        checks["mounted_playback_media_probe"] = self.assert_media_probe(page)
+        page.screenshot(path=str(browser_dir / "native-controls-volume.png"), full_page=True)
+        page.close()
+
+        checks["preparing_native_pause"] = self.software_preparing_contract(
+            context, browser_dir, errors, details)
+
+        page = self.open_software_contract(context, browser_dir, errors, details, autostart="1")
+        self.summary["browser"]["current_case"] = "actual_autoplay_rejection"
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().status === 'error'", timeout=15000)
+        rejected = self.contract_snapshot(page)
+        if rejected["status"] == "playing" or not rejected["error"]:
+            raise SmokeFailure("Chrome autoplay policy rejection was not visible")
+        if page.evaluate("document.querySelector('audio').play.toString().includes('Promise.reject')"):
+            raise SmokeFailure("autoplay check overwrote the native play method")
+        probe = self.assert_media_probe(page)
+        if not any(error["name"] == "NotAllowedError" for error in probe["rejections"]):
+            raise SmokeFailure(f"autoplay case did not observe a real native NotAllowedError: {probe}")
+        checks["actual_autoplay_rejection"] = {"status": rejected["status"], "error": rejected["error"],
+            "native_rejections": probe["rejections"], "policy": "document-user-activation-required", "synthetic_rejection": False}
+        page.locator(".play-btn").click()
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().status === 'playing'", timeout=15000)
+        checks["trusted_click_recovery"] = {"status": self.contract_snapshot(page)["status"], "gesture": "Playwright native click"}
+        page.close()
+
+        for media in ("404", "invalid"):
+            self.summary["browser"]["current_case"] = "real_media_" + media
+            page = self.open_software_contract(context, browser_dir, errors, details, media=media, preparePlay="1")
+            page.locator("#migrate-browser").click()
+            page.wait_for_function("window.__unifiedControlValidation.snapshot().status === 'error'", timeout=15000)
+            page.wait_for_function("[3,4].includes(document.querySelector('audio')?.error?.code)", timeout=15000)
+            result = self.contract_snapshot(page)
+            real_error = page.evaluate("({code:document.querySelector('audio').error.code,message:document.querySelector('audio').error.message})")
+            if result["status"] == "playing" or not result["error"] or not page.media_requests:
+                raise SmokeFailure(f"real {media} media failure was not observed")
+            checks[f"real_media_{media}"] = {"error": result["error"], "real_media_error": real_error, "requests": page.media_requests}
+            page.close()
+        return checks
+
+    def software_preparing_contract(self, context, browser_dir, errors, details, mobile=False):
+        case = "mobile_preparing_native_pause" if mobile else "preparing_native_pause"
+        self.summary["browser"]["current_case"] = case
+        page = self.open_software_contract(context, browser_dir, errors, details,
+            media="slow", mountDelayMs="300", preparePlay="1", position="7", mobile="1" if mobile else "0")
+        page.locator("#migrate-browser").click()
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().pendingOutputTarget !== null")
+        if page.locator("audio").count():
+            raise SmokeFailure("media element mounted before the controlled late-attachment boundary")
+        page.wait_for_function("document.querySelectorAll('audio').length === 1")
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().status === 'preparing' && window.__unifiedControlValidation.snapshot().acceptedIntent === 'play'")
+        if mobile and not page.locator(".react-jinke-music-player-mobile").is_visible():
+            raise SmokeFailure("narrow-viewport case did not render the real native mobile component")
+        history = page.evaluate("window.__unifiedControlValidation.history")
+        if not any(row["pendingOutputTarget"] and row["mountedAudio"] == 0 for row in history):
+            raise SmokeFailure("pending target was not published before native media attachment")
+        before = self.contract_snapshot(page)
+        metrics_before = page.evaluate("window.__unifiedControlValidation.controller.getMetrics()")
+        page.locator(".loading-icon").click(timeout=5000)
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().acceptedIntent === 'pause'")
+        after = self.contract_snapshot(page)
+        metrics = page.evaluate("window.__unifiedControlValidation.controller.getMetrics()")
+        if metrics["commandsSent"]["play"] != metrics_before["commandsSent"]["play"] or after["intentSequence"] != before["intentSequence"] + 1:
+            raise SmokeFailure(f"native preparing control did not issue exactly one pause: {metrics}")
+        for route in page.pending_media:
+            route.fulfill(status=200, path=str(self.output / "music/Validation Artist/Validation Album/01 - Smoke One.wav"), content_type="audio/wav")
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().status === 'paused'", timeout=15000)
+        if page.evaluate("!document.querySelector('audio').paused"):
+            raise SmokeFailure("cancelled preparing play resumed after the held media response arrived")
+        settled = self.contract_snapshot(page)
+        if settled["currentQueueItemId"] != "contract-track" or abs(settled["position"] - 7) > 0.5:
+            raise SmokeFailure(f"late mount replaced or rewound the migrated context: {settled}")
+        result = {"commands": metrics["commandsSent"], "accepted_intent": "pause", "intent_sequence_delta": 1,
+                  "held_response_released_after_pause": True, "preserved_queue_item": settled["currentQueueItemId"],
+                  "preserved_position": settled["position"], "native_mobile": mobile, "media_probe": self.assert_media_probe(page)}
+        page.screenshot(path=str(browser_dir / (case + ".png")), full_page=True)
+        page.close()
+        return result
+
+    def seed_auth(self, context):
+        seed = json.dumps({"token": self.token, "username": self.username, "userId": str(auth_id(self.transcript)),
+                           "name": self.username, "subsonicSalt": self.subsonic_salt, "subsonicToken": self.subsonic_token})
+        context.add_init_script("const auth=" + seed + ";localStorage.setItem('token',auth.token);"
+                                "localStorage.setItem('username',auth.username);localStorage.setItem('userId',auth.userId);"
+                                "localStorage.setItem('name',auth.name);localStorage.setItem('subsonicSalt',auth.subsonicSalt);"
+                                "localStorage.setItem('subsonicToken',auth.subsonicToken);localStorage.setItem('is-authenticated','true');")
+
+    def software_handoff_contracts(self, context, browser_dir, errors, details):
+        checks = {}
+        self.summary["browser"]["checks"]["native_api_handoff"] = checks
+        self.summary["browser"]["current_case"] = "native_api_handoff"
+        self.seed_auth(context)
+        base = f"{self.vite_url}/validation/remote-player.html?" + urlencode({"contracts": "session-handoff", "sessionId": self.session_id})
+        parent = context.new_page()
+        self._track_page_errors(parent, errors, details)
+        parent.goto(base)
+        parent.wait_for_function("JSON.parse(document.querySelector('#handoff-state').textContent).status === 'attached'", timeout=15000)
+        state = json.loads(parent.locator("#handoff-state").inner_text())
+        generation = state["generation"]
+        parent.locator("#session-volume").click()
+        parent.wait_for_function("JSON.parse(document.querySelector('#handoff-state').textContent).lastWriteStatus === 200")
+        checks["protected_idle_volume"] = {"http": 200, "generation": generation, "active_track": False}
+        _, before_snapshot = self.native("GET", f"/api/jukebox/session/snapshot?sessionId={quote(self.session_id)}")
+        def semantic_scene(snapshot):
+            status = snapshot.get("sessionStatus", {})
+            return {key: status.get(key) for key in ("currentIndex", "trackId", "playing", "position", "gain", "desiredGain", "queueVersion")} | {
+                "queueCount": len((snapshot.get("jukeboxPlaylist") or {}).get("entry", []))}
+        before_scene = semantic_scene(before_snapshot)
+
+        def browser_write(client, generation, operation):
+            return parent.evaluate("""async ({client, generation, operation, token, session}) => {
+              const response = await fetch('/api/jukebox/volume', {method:'POST',headers:{
+                'Content-Type':'application/json','X-ND-Authorization':'Bearer '+token},
+                body:JSON.stringify({sessionId:session,clientId:client,bindingGeneration:generation,
+                  operationId:'g'+generation+':'+operation,gain:0.64})})
+              return {status:response.status,body:await response.json()}
+            }""", {"client": client, "generation": generation, "operation": operation,
+                    "token": self.token, "session": self.session_id})
+        parent.screenshot(path=str(browser_dir / "native-handoff-owner.png"), full_page=True)
+
+        clone = context.new_page()
+        self._track_page_errors(clone, errors, details)
+        clone.goto(base)
+        clone.wait_for_function("['observer','attached'].includes(JSON.parse(document.querySelector('#handoff-state').textContent).status)", timeout=15000)
+        observer = json.loads(clone.locator("#handoff-state").inner_text())
+        if observer["status"] != "observer" or not observer["readOnly"]:
+            raise SmokeFailure("new document without a handoff token acquired control")
+        checks["untokened_document_read_only"] = observer
+        clone.screenshot(path=str(browser_dir / "native-handoff-observer.png"), full_page=True)
+        clone.close()
+
+        parent.reload(wait_until="domcontentloaded")
+        parent.wait_for_function("JSON.parse(document.querySelector('#handoff-state').textContent).status === 'attached'", timeout=15000)
+        refreshed = json.loads(parent.locator("#handoff-state").inner_text())
+        if refreshed["documentId"] == state["documentId"] or refreshed["generation"] != generation + 1:
+            raise SmokeFailure("refresh did not atomically hand off to a new document identity")
+        checks["refresh_handoff"] = {"old_document": state["documentId"], "new_document": refreshed["documentId"],
+                                    "old_generation": generation, "new_generation": refreshed["generation"]}
+        _, after_snapshot = self.native("GET", f"/api/jukebox/session/snapshot?sessionId={quote(self.session_id)}")
+        if semantic_scene(after_snapshot) != before_scene:
+            raise SmokeFailure("refresh changed the preserved idle playback scene")
+        checks["refresh_scene_preserved"] = before_scene
+        old_write = browser_write(state["documentId"], generation, "old-document-after-refresh")
+        if old_write["status"] != 403:
+            raise SmokeFailure(f"old document retained write authority after refresh: {old_write}")
+        checks["old_document_write_rejected"] = old_write
+        parent.locator("#session-volume").click()
+        parent.wait_for_function("JSON.parse(document.querySelector('#handoff-state').textContent).lastWriteStatus === 200")
+        checks["refreshed_owner_can_write"] = True
+
+        prior_pages = set(context.pages)
+        parent.evaluate("""url => {
+          window.__clonedDocuments = [window.open(url,'clone-race-one'),window.open(url,'clone-race-two')]
+        }""", base + "&deferHandoff=1")
+        parent.wait_for_function("window.__clonedDocuments.every(page => typeof page.__releaseValidationHandoff === 'function')")
+        clones = [page for page in context.pages if page not in prior_pages]
+        if len(clones) != 2:
+            raise SmokeFailure("clone competition did not open two independent documents")
+        for clone in clones:
+            self._track_page_errors(clone, errors, details)
+            if not clone.evaluate("Boolean(window.opener)"):
+                raise SmokeFailure("clone competition did not use real opener-cloned documents")
+        copied_tokens = parent.evaluate("""key => window.__clonedDocuments.map(page => page.sessionStorage.getItem(key))""",
+                                        "validation-handoff:" + self.session_id)
+        if not copied_tokens[0] or copied_tokens[0] != copied_tokens[1]:
+            raise SmokeFailure("opener clone did not copy the same one-time token into both documents")
+        parent.evaluate("window.__clonedDocuments.forEach(page => page.__releaseValidationHandoff())")
+        race = []
+        for clone in clones:
+            clone.wait_for_function("['attached','observer'].includes(JSON.parse(document.querySelector('#handoff-state').textContent).status)")
+            race.append((clone, json.loads(clone.locator("#handoff-state").inner_text())))
+        winners = [(page, value) for page, value in race if value["status"] == "attached"]
+        losers = [(page, value) for page, value in race if value["status"] == "observer"]
+        if len(winners) != 1 or len(losers) != 1:
+            raise SmokeFailure("single-use opener-clone race did not produce exactly one attached document")
+        winner_page, winner = winners[0]
+        loser_page, loser = losers[0]
+        if winner["documentId"] == loser["documentId"] or not loser["readOnly"] or loser["responseStatus"] != 403:
+            raise SmokeFailure("clone identities/loser read-only response were not isolated")
+        loser_page.locator("#session-volume").click()
+        loser_page.wait_for_function("JSON.parse(document.querySelector('#handoff-state').textContent).lastWriteStatus === 403")
+        parent.locator("#session-volume").click()
+        parent.wait_for_function("JSON.parse(document.querySelector('#handoff-state').textContent).lastWriteStatus === 403")
+        winner_page.locator("#session-volume").click()
+        winner_page.wait_for_function("JSON.parse(document.querySelector('#handoff-state').textContent).lastWriteStatus === 200")
+        _, race_snapshot = self.native("GET", f"/api/jukebox/session/snapshot?sessionId={quote(self.session_id)}")
+        if semantic_scene(race_snapshot) != before_scene:
+            raise SmokeFailure("clone handoff changed the preserved playback scene")
+        checks["clone_token_race"] = {"winner_document": winner["documentId"], "loser_document": loser["documentId"],
+            "handoff_http": [200, loser["responseStatus"]], "winner_write": 200, "loser_write": 403,
+            "old_document_write": 403, "same_copied_token": True, "real_opener_documents": True, "scene_preserved": True}
+        checks["clone_loser_read_only"] = loser
+        loser_page.screenshot(path=str(browser_dir / "native-clone-loser-readonly.png"), full_page=True)
+        for clone in clones:
+            clone.close()
+        parent.close()
+
+        context.clear_cookies()
+        return checks
+
+    @staticmethod
+    def install_media_probe(context):
+        context.add_init_script("""(() => {
+          const probe = window.__mediaProbe = {createdAudio:0,audioConstructors:0,audioContexts:0,plays:[],pauses:0,rejections:[]}
+          const create = document.createElement.bind(document)
+          document.createElement = (...args) => {
+            if (String(args[0]).toLowerCase() === 'audio') probe.createdAudio++
+            return create(...args)
+          }
+          if (window.Audio) window.Audio = new Proxy(window.Audio, {construct(target,args,newTarget) {
+            probe.audioConstructors++; return Reflect.construct(target,args,newTarget)
+          }})
+          for (const key of ['AudioContext','webkitAudioContext']) {
+            if (window[key]) window[key] = new Proxy(window[key], {construct(target,args,newTarget) {
+              probe.audioContexts++; return Reflect.construct(target,args,newTarget)
+            }})
+          }
+          const play = HTMLMediaElement.prototype.play
+          HTMLMediaElement.prototype.play = function(...args) {
+            probe.plays.push({connected:this.isConnected,src:this.currentSrc || this.src})
+            const result = play.apply(this,args)
+            if (result?.catch) result.catch(error => probe.rejections.push({name:error.name,message:error.message}))
+            return result
+          }
+          const pause = HTMLMediaElement.prototype.pause
+          HTMLMediaElement.prototype.pause = function(...args) {probe.pauses++;return pause.apply(this,args)}
+        })()""")
+
+    def install_output_guard(self, context):
+        forbidden = self.summary.setdefault("safety", {}).setdefault("forbidden_output_requests", [])
+
+        def guard(route):
+            path = route.request.url.split("?", 1)[0]
+            if route.request.method == "POST" and path.rsplit("/", 1)[-1] in {"start", "play", "skip", "switch"}:
+                forbidden.append({"method": route.request.method, "url": path})
+                route.abort("blockedbyclient")
+            else:
+                route.continue_()
+        context.route("**/api/jukebox/**", guard)
+
+    @staticmethod
+    def assert_media_probe(page):
+        probe = page.evaluate("window.__mediaProbe")
+        if probe["audioConstructors"] or probe["audioContexts"] or any(not row["connected"] for row in probe["plays"]):
+            raise SmokeFailure(f"detached or hidden browser engine activity: {probe}")
+        return probe
+
+    def run_software_browser(self):
+        errors, checks, details = self.begin_browser_evidence()
+        if not self.software_only:
+            raise SmokeFailure("software browser entry requires explicit software-only gating")
+        from playwright.sync_api import sync_playwright
+        browser_dir = self.output / "browser"
+        browser_dir.mkdir(exist_ok=True)
+        with sync_playwright() as playwright:
+            self.summary["artifact"]["playwright_python"] = importlib.metadata.version("playwright")
+            browser = playwright.chromium.launch(executable_path=self.chrome, headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-audio-output", "--autoplay-policy=document-user-activation-required"],
+                env=self.server_env())
+            context = browser.new_context(viewport={"width": 1440, "height": 1100}, service_workers="block")
+            self.install_media_probe(context)
+            try:
+                checks["native_ui_and_media"] = self.software_ui_contracts(context, browser_dir, errors, details)
+                checks["native_api_handoff"] = self.software_handoff_contracts(context, browser_dir, errors, details)
+                mobile = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+                    user_agent="Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+                    service_workers="block")
+                self.install_media_probe(mobile)
+                try:
+                    checks["mobile_native_preparing"] = self.software_preparing_contract(mobile, browser_dir, errors, details, mobile=True)
+                finally:
+                    mobile.close()
+                unexpected_console = [row for row in details["playwright"] if row["type"] == "error" and not (
+                    "403 (Forbidden)" in row["text"] and "contracts=session-handoff" in row.get("page", "")) and not (
+                    "404 (Not Found)" in row["text"] and "contract-404.wav" in row.get("location", {}).get("url", ""))]
+                if unexpected_console or details["page_errors"]:
+                    raise SmokeFailure("unexpected browser console/page errors: " + self.redact(str(unexpected_console + details["page_errors"])))
+                if self.active_mpv_processes() or self.child_pids():
+                    raise SmokeFailure("software-only acceptance spawned an output process")
+                self.summary["browser"]["status"] = "pass"
+                self.summary["browser"]["functional_contract_status"] = "pass"
+                self.summary["evidence_levels"]["level3"] = "PASS" if not self.allow_dirty_source else "DEBUG_ONLY"
+            except Exception:
+                self.summary["browser"]["failure_traceback"] = traceback.format_exc()
+                failure_pages = []
+                for index, page in enumerate(context.pages):
+                    if page.is_closed():
+                        continue
+                    image = browser_dir / f"failure-page-{index}.png"
+                    page.screenshot(path=str(image), full_page=True)
+                    failure_pages.append({"url": page.url, "screenshot": str(image),
+                                          "text": page.locator("body").inner_text()[:12000],
+                                          "history": page.evaluate("window.__unifiedControlValidation?.history || []"),
+                                          "audio_attached": page.evaluate("Boolean(window.__unifiedControlValidation?.browserAdapter.getAudioElement())"),
+                                          "audio_state": page.evaluate("(() => { const a=document.querySelector('audio'); return a ? {src:a.currentSrc || a.src, volume:a.volume, paused:a.paused, readyState:a.readyState} : null })()")})
+                self.summary["browser"]["failure_pages"] = failure_pages
+                raise
+            finally:
+                self.summary["browser"]["checks"] = checks
+                context.close()
+                browser.close()
 
     def begin_browser_evidence(self):
         errors, checks = [], {}
@@ -1535,10 +2034,13 @@ class AppSmoke:
         try:
             self.start_server()
             self.create_admin_and_scan()
-            ids = self.media_ids()
-            self.jukebox_api(ids)
             self.start_vite()
-            self.run_browser()
+            if self.software_only:
+                self.run_software_browser()
+            else:
+                ids = self.media_ids()
+                self.jukebox_api(ids)
+                self.run_browser()
         except Exception as error:
             self.errors.append(self.redact(f"{type(error).__name__}: {error}"))
             self.summary["status"] = "fail"
@@ -1570,6 +2072,11 @@ def parse_args(argv=None):
     parser.add_argument("--output", required=True, help="new run directory under tmp/native-playback-validation/app-smoke")
     parser.add_argument("--chrome", default=shutil.which("google-chrome"), help="installed Chrome executable")
     parser.add_argument("--mpv", default=shutil.which("mpv"), help="installed MPV executable")
+    parser.add_argument("--software-only", action="store_true",
+                        help="isolated native UI/API acceptance without MPV, PipeWire or Bluetooth")
+    parser.add_argument("--allow-dirty-source", action="store_true",
+                        help="debugging only; never records final Level 3 acceptance")
+    parser.add_argument("--dependency-receipt", help="integrity-verified installed package restoration receipt")
     parser.add_argument("--trace-processes", action="store_true",
                         help="trace child process exit status with the existing strace utility")
     return parser.parse_args(argv)
@@ -1589,10 +2096,14 @@ def main(argv=None):
     if not binary.is_file() or not os.access(binary, os.X_OK):
         print("error: Navidrome binary is not executable", file=sys.stderr)
         return 2
-    if not args.mpv:
-        print("error: MPV executable is unavailable", file=sys.stderr)
+    if not args.software_only and not args.mpv:
+        print("error: MPV executable is required for real-output mode", file=sys.stderr)
         return 2
-    runner = AppSmoke(output, binary, args.chrome, Path(args.mpv), args.trace_processes)
+    if args.software_only and args.trace_processes:
+        print("error: process tracing is reserved for the separately authorized MPV mode", file=sys.stderr)
+        return 2
+    runner = AppSmoke(output, binary, args.chrome, Path(args.mpv) if args.mpv else None,
+                      args.trace_processes, args.software_only, args.allow_dirty_source, args.dependency_receipt)
     result = runner.run()
     print(json.dumps({
         "status": runner.summary.get("status"),

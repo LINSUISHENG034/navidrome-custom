@@ -137,7 +137,11 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     this.onTogglePlay = () => {
       const { controller } = this.props
       if (!controller) return
-      if (controller.getState().status === PlaybackStatus.PLAYING) {
+      const { status, acceptedIntent } = controller.getState()
+      if (
+        status === PlaybackStatus.PLAYING ||
+        (status === PlaybackStatus.PREPARING && acceptedIntent === 'play')
+      ) {
         controller.pause().catch(() => {})
       } else {
         controller.play().catch(() => {})
@@ -865,6 +869,22 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
     )
   }
 
+  handlePreparingControlClick(event) {
+    const state = this.props.controller?.getState()
+    const loadingControl = event.target?.closest?.('.loading-icon')
+    if (
+      !loadingControl ||
+      !event.currentTarget.contains(loadingControl) ||
+      state?.status !== PlaybackStatus.PREPARING ||
+      state.acceptedIntent !== 'play'
+    ) {
+      return
+    }
+    event.preventDefault()
+    event.stopPropagation()
+    this.onTogglePlay()
+  }
+
   get audioDuration() {
     if (this.props.engineMode === 'remote') {
       return this.state.remoteDuration || this.props.duration || 0
@@ -888,13 +908,20 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
         ) {
           return null
         }
-        // Preserve the native element/ref; only the Adapter may assign its source.
-        return React.cloneElement(child, { src: undefined })
+        // Preserve the Adapter-owned DOM source across controlled rerenders.
+        // Passing undefined here can make Chrome reload and pause the element.
+        const currentMediaSource = this.audio?.getAttribute('src') || undefined
+        return React.cloneElement(child, { src: currentMediaSource })
       })
       return ReactDOM.createPortal(
         React.cloneElement(
           rootDiv,
-          {},
+          this.props.controller
+            ? {
+                onClickCapture: (event) =>
+                  this.handlePreparingControlClick(event),
+              }
+            : {},
           children,
           this.state.playbackError ? (
             <div className="music-player-error" role="alert">

@@ -14,6 +14,7 @@ import (
 type Track interface {
 	IsPlaying() bool
 	SetVolume(value float32) error // Used to control the playback volume. A float value between 0.0 and 1.0.
+	SetMute(muted bool) error
 	Pause() error
 	Unpause() error
 	Position() int
@@ -34,6 +35,7 @@ type playbackDevice struct {
 	queueVersion          int
 	Gain                  float32
 	DesiredGain           float32
+	Muted                 bool
 	PlaybackEvents        chan model.PlaybackEvent
 	ActiveTrack           Track
 	onStateChange         func(DeviceStatus)
@@ -54,6 +56,8 @@ type DeviceStatus struct {
 	CurrentIndex int
 	Playing      bool
 	Gain         float32
+	DesiredGain  float32
+	Muted        bool
 	Position     int
 	QueueVersion int
 }
@@ -119,6 +123,8 @@ func (pd *playbackDevice) getStatus() DeviceStatus {
 		CurrentIndex: pd.PlaybackQueue.Index,
 		Playing:      pd.isPlaying(),
 		Gain:         pd.Gain,
+		DesiredGain:  pd.DesiredGain,
+		Muted:        pd.Muted,
 		Position:     pos,
 		QueueVersion: pd.queueVersion,
 	}
@@ -502,6 +508,28 @@ func (pd *playbackDevice) setGainLocked(ctx context.Context, gain float32) (Devi
 	return pd.getStatus(), changed, nil
 }
 
+func (pd *playbackDevice) setMuteLocked(ctx context.Context, muted bool) (DeviceStatus, bool, error) {
+	log.Debug(ctx, "Processing SetMute action", "muted", muted, "device", pd)
+	if pd.ActiveTrack != nil {
+		if !muted {
+			if err := pd.ActiveTrack.SetVolume(pd.DesiredGain); err != nil {
+				return pd.getStatus(), false, err
+			}
+			pd.Gain = pd.DesiredGain
+		}
+		if err := pd.ActiveTrack.SetMute(muted); err != nil {
+			log.Error(ctx, "error setting active track mute", err)
+			return pd.getStatus(), false, err
+		}
+	}
+	changed := pd.Muted != muted
+	if changed {
+		pd.Muted = muted
+		pd.incrementSceneRevisionLocked()
+	}
+	return pd.getStatus(), changed, nil
+}
+
 func (pd *playbackDevice) executeCommand(ctx context.Context, command PlaybackCommand) (DeviceStatus, error) {
 	pd.mu.Lock()
 	return pd.finishCommandLocked(ctx, command)
@@ -561,6 +589,8 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 		return pd.shuffleLocked(ctx)
 	case CommandGain:
 		return pd.setGainLocked(ctx, command.Gain)
+	case CommandMute:
+		return pd.setMuteLocked(ctx, command.Muted)
 	default:
 		return pd.getStatus(), false, fmt.Errorf("unknown playback command: %s", command.Action)
 	}
@@ -698,6 +728,12 @@ func (pd *playbackDevice) loadTrackLocked(ctx context.Context, index int) (Track
 	}
 	if err := track.SetVolume(pd.DesiredGain); err != nil {
 		log.Error(ctx, "error applying initial volume to new track", err)
+		pd.discardPendingTrack(token)
+		closeTrack(track)
+		return nil, 0, true, err
+	}
+	if err := track.SetMute(pd.Muted); err != nil {
+		log.Error(ctx, "error applying initial mute to new track", err)
 		pd.discardPendingTrack(token)
 		closeTrack(track)
 		return nil, 0, true, err

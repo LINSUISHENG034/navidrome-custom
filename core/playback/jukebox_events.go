@@ -18,6 +18,8 @@ func NewJukeboxStateUpdatedEvent(status SessionStatus) *serverevents.JukeboxStat
 		Playing:           status.Playing,
 		Position:          status.Position,
 		Gain:              status.Gain,
+		DesiredGain:       status.DesiredGain,
+		Muted:             status.Muted,
 		Attached:          status.Attached,
 		OwnershipState:    status.OwnershipState,
 		TerminationReason: status.TerminationReason,
