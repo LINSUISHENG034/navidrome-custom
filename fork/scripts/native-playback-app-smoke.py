@@ -1830,7 +1830,7 @@ class AppSmoke:
 
     def _track_page_errors(self, page, errors, details):
         def page_url():
-            return self.redact(page.url.split("?", 1)[0])
+            return self.redact(page.url)
 
         def argument_text(argument):
             if argument.get("type") == "undefined":
