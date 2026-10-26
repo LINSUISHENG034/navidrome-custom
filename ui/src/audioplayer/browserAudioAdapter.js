@@ -79,18 +79,22 @@ export function createBrowserAudioAdapter(options = {}) {
   }
 
   function mediaState(el) {
-    const pos =
-      el && (el.currentTime > 0 || el.readyState > 0)
-        ? el.currentTime
-        : localState.position
+    let pos = localState.position || 0
+    if (el && !el.seeking) {
+      if (Number.isFinite(el.currentTime) && el.currentTime > 0) {
+        pos = el.currentTime
+      } else if (el.currentTime === 0 && !localState.position) {
+        pos = 0
+      }
+    }
     return {
       position: Number.isFinite(pos) ? pos : 0,
       duration:
-        Number.isFinite(el.duration) && el.duration > 0
+        Number.isFinite(el?.duration) && el.duration > 0
           ? el.duration
           : localState.duration || 0,
-      volume: el.volume,
-      isMuted: el.muted,
+      volume: el?.volume ?? localState.volume ?? 1,
+      isMuted: el?.muted ?? localState.isMuted ?? false,
     }
   }
 
@@ -316,19 +320,28 @@ export function createBrowserAudioAdapter(options = {}) {
           desiredPlaying = false
           publishState({
             status: PlaybackStatus.PAUSED,
-            position: mediaState(el).position,
+            position:
+              localState.position > 0 && el.currentTime === 0
+                ? localState.position
+                : mediaState(el).position,
           })
         }
         break
       case 'loadedmetadata':
-        if (localState.position > 0 && el.currentTime === 0) {
+        if (
+          localState.position > 0 &&
+          Math.abs(el.currentTime - localState.position) > 0.5
+        ) {
           try {
             el.currentTime = localState.position
           } catch {
             // ignore
           }
         }
-        publishState(mediaState(el))
+        publishState({
+          ...mediaState(el),
+          position: localState.position,
+        })
         break
       case 'durationchange':
       case 'seeked':
@@ -481,10 +494,18 @@ export function createBrowserAudioAdapter(options = {}) {
           }
         }
         if (localState.position > 0) {
-          el.currentTime = localState.position
+          try {
+            el.currentTime = localState.position
+          } catch {
+            // ignore
+          }
         }
         publishState({
           ...mediaState(el),
+          position:
+            localState.position > 0 && el.currentTime === 0
+              ? localState.position
+              : mediaState(el).position,
           status: desiredPlaying
             ? PlaybackStatus.PLAYING
             : PlaybackStatus.PAUSED,
