@@ -79,9 +79,16 @@ export function createBrowserAudioAdapter(options = {}) {
   }
 
   function mediaState(el) {
+    const pos =
+      el && (el.currentTime > 0 || el.readyState > 0)
+        ? el.currentTime
+        : localState.position
     return {
-      position: Number.isFinite(el.currentTime) ? el.currentTime : 0,
-      duration: Number.isFinite(el.duration) ? el.duration : 0,
+      position: Number.isFinite(pos) ? pos : 0,
+      duration:
+        Number.isFinite(el.duration) && el.duration > 0
+          ? el.duration
+          : localState.duration || 0,
       volume: el.volume,
       isMuted: el.muted,
     }
@@ -314,6 +321,15 @@ export function createBrowserAudioAdapter(options = {}) {
         }
         break
       case 'loadedmetadata':
+        if (localState.position > 0 && el.currentTime === 0) {
+          try {
+            el.currentTime = localState.position
+          } catch {
+            // ignore
+          }
+        }
+        publishState(mediaState(el))
+        break
       case 'durationchange':
       case 'seeked':
       case 'timeupdate':
