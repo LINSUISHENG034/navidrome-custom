@@ -751,6 +751,37 @@ func newMigrationRepairFixture(t *testing.T) (*durableScenarioHarness, *playback
 	return h, target, reserve, commit
 }
 
+func captureMigrationInvariant(t *testing.T, h *durableScenarioHarness, migrationID string) func() {
+	t.Helper()
+	reservation, err := h.server.QueryReservation(h.ctx, migrationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		t.Helper()
+		afterReservation, err := h.server.QueryReservation(h.ctx, migrationID)
+		if err != nil || !reflect.DeepEqual(reservation, afterReservation) {
+			t.Errorf("rejected request changed reservation: before=%#v after=%#v err=%v", reservation, afterReservation, err)
+		}
+		afterTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
+		if err != nil || !reflect.DeepEqual(target, afterTarget) {
+			t.Errorf("rejected request changed target: before=%#v after=%#v err=%v", target, afterTarget, err)
+		}
+		afterSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
+		if err != nil || !reflect.DeepEqual(source, afterSource) {
+			t.Errorf("rejected request changed source: before=%#v after=%#v err=%v", source, afterSource, err)
+		}
+	}
+}
+
 func TestDurableSessionMigrationGenerationAdmission(t *testing.T) {
 	for _, operation := range []string{"reserve", "release", "commit"} {
 		for _, tc := range []struct {
@@ -777,18 +808,8 @@ func TestDurableSessionMigrationGenerationAdmission(t *testing.T) {
 						t.Fatalf("create valid active reservation: %v", err)
 					}
 				}
-				beforeReservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				beforeTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
-				if err != nil {
-					t.Fatal(err)
-				}
-				beforeSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
-				if err != nil {
-					t.Fatal(err)
-				}
+				assertUnchanged := captureMigrationInvariant(t, h, reserve.MigrationID)
+				var err error
 				generation := tc.generation(current.BindingGeneration)
 				switch operation {
 				case "reserve":
@@ -813,18 +834,7 @@ func TestDurableSessionMigrationGenerationAdmission(t *testing.T) {
 				if !errors.Is(err, tc.wantErr) {
 					t.Errorf("got %v; want %v", err, tc.wantErr)
 				}
-				afterReservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
-				if err != nil || !reflect.DeepEqual(beforeReservation, afterReservation) {
-					t.Errorf("rejected request changed reservation: before=%#v after=%#v err=%v", beforeReservation, afterReservation, err)
-				}
-				afterTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
-				if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
-					t.Errorf("rejected request changed target: before=%#v after=%#v err=%v", beforeTarget, afterTarget, err)
-				}
-				afterSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
-				if err != nil || !reflect.DeepEqual(beforeSource, afterSource) {
-					t.Errorf("rejected request changed source: before=%#v after=%#v err=%v", beforeSource, afterSource, err)
-				}
+				assertUnchanged()
 			})
 		}
 	}
@@ -847,18 +857,8 @@ func TestDurableSessionMigrationRequiresOperationIdentity(t *testing.T) {
 						t.Fatalf("create valid active reservation: %v", err)
 					}
 				}
-				beforeReservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				beforeTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
-				if err != nil {
-					t.Fatal(err)
-				}
-				beforeSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
-				if err != nil {
-					t.Fatal(err)
-				}
+				assertUnchanged := captureMigrationInvariant(t, h, reserve.MigrationID)
+				var err error
 				switch operation {
 				case "reserve":
 					reserve.OperationID = tc.id
@@ -875,18 +875,7 @@ func TestDurableSessionMigrationRequiresOperationIdentity(t *testing.T) {
 				if !errors.Is(err, ErrOperationRequired) {
 					t.Errorf("got %v; want %v", err, ErrOperationRequired)
 				}
-				afterReservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
-				if err != nil || !reflect.DeepEqual(beforeReservation, afterReservation) {
-					t.Errorf("rejected request changed reservation: before=%#v after=%#v err=%v", beforeReservation, afterReservation, err)
-				}
-				afterTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
-				if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
-					t.Errorf("rejected request changed target: before=%#v after=%#v err=%v", beforeTarget, afterTarget, err)
-				}
-				afterSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
-				if err != nil || !reflect.DeepEqual(beforeSource, afterSource) {
-					t.Errorf("rejected request changed source: before=%#v after=%#v err=%v", beforeSource, afterSource, err)
-				}
+				assertUnchanged()
 			})
 		}
 	}
@@ -900,12 +889,39 @@ func TestDurableSessionMigrationOperationReconciliation(t *testing.T) {
 		if _, err := h.server.ReserveMigration(h.ctx, reserve); !errors.As(err, &first) {
 			t.Fatalf("expected occupied target: %v", err)
 		}
-		if _, err := h.server.ReserveMigration(h.ctx, reserve); !errors.As(err, &second) || !reflect.DeepEqual(first, second) {
-			t.Fatalf("failed retry did not retain original conflict: first=%#v second=%#v err=%v", first, second, err)
+		original := *first
+		first.SceneFingerprint = "caller-modified"
+		first.QueueCount = 99
+		if _, err := h.server.ReserveMigration(h.ctx, reserve); !errors.As(err, &second) || *second != original {
+			t.Fatalf("failed retry did not retain original conflict: first=%#v second=%#v err=%v", original, second, err)
+		}
+		second.SceneFingerprint = "retry-modified"
+		second.QueueCount = 88
+		if _, err := h.server.ReserveMigration(h.ctx, reserve); !errors.As(err, &second) || *second != original {
+			t.Fatalf("caller changed a replayed conflict: original=%#v second=%#v err=%v", original, second, err)
 		}
 		record, err := h.server.QueryOperation(h.ctx, reserve.SessionID, reserve.OperationID)
 		if err != nil || record.Status != OperationStatusFailed || record.ErrorCode != "TARGET_OCCUPIED" {
 			t.Fatalf("failed reservation not queryable: %#v err=%v", record, err)
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(encoded, &result); err != nil {
+			t.Fatal(err)
+		}
+		if original.QueueCount != 1 || result["sceneFingerprint"] != original.SceneFingerprint || result["queueCount"] != float64(original.QueueCount) {
+			t.Errorf("query omitted original occupied scene: original=%#v result=%s", original, encoded)
+		}
+		if record.QueueCount == nil {
+			t.Fatal("query omitted queue count")
+		}
+		*record.QueueCount = 99
+		again, err := h.server.QueryOperation(h.ctx, reserve.SessionID, reserve.OperationID)
+		if err != nil || again.QueueCount == nil || *again.QueueCount != original.QueueCount {
+			t.Errorf("caller changed recorded conflict details: %#v err=%v", again, err)
 		}
 		reserve.ForceTakeover = true
 		if _, err := h.server.ReserveMigration(h.ctx, reserve); !errors.Is(err, ErrOperationIdentity) {

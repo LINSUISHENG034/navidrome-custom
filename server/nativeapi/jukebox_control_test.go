@@ -525,15 +525,16 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resReserveOcc := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+	occupiedRequest := map[string]any{
 		"migrationId": "mig-http-1", "operationId": "g1:reserve-occupied", "sessionId": sessionID, "clientId": "tab-1", "deviceName": "mig-target", "bindingGeneration": attachPayload.BindingGeneration,
-	})
+	}
+	resReserveOcc := serve(t, http.MethodPost, "/jukebox/migration/reserve", occupiedRequest)
 	if resReserveOcc.Code != http.StatusConflict {
 		t.Fatalf("expected 409 TARGET_OCCUPIED, got %d %s", resReserveOcc.Code, resReserveOcc.Body.String())
 	}
 	var occResp map[string]any
 	_ = json.Unmarshal(resReserveOcc.Body.Bytes(), &occResp)
-	if occResp["code"] != "TARGET_OCCUPIED" || occResp["sceneFingerprint"] == nil {
+	if occResp["code"] != "TARGET_OCCUPIED" || occResp["sceneFingerprint"] == nil || occResp["queueCount"] != float64(0) {
 		t.Fatalf("unexpected occupied response: %#v", occResp)
 	}
 	fp := occResp["sceneFingerprint"].(string)
@@ -584,6 +585,32 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Run("lost occupied response retains structured conflict", func(t *testing.T) {
+		query := serve(t, http.MethodGet, "/jukebox/operation?sessionId="+sessionID+"&operationId=g1:reserve-occupied", nil)
+		var result map[string]any
+		if err := json.Unmarshal(query.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if query.Code != http.StatusOK || result["status"] != "FAILED" || result["errorCode"] != "TARGET_OCCUPIED" || result["sceneFingerprint"] != occResp["sceneFingerprint"] || result["queueCount"] != occResp["queueCount"] {
+			t.Errorf("lost conflict details: original=%#v queried=%#v status=%d", occResp, result, query.Code)
+		}
+		retry := serve(t, http.MethodPost, "/jukebox/migration/reserve", occupiedRequest)
+		var retryBody map[string]any
+		if err := json.Unmarshal(retry.Body.Bytes(), &retryBody); err != nil {
+			t.Fatal(err)
+		}
+		if retry.Code != http.StatusConflict || !reflect.DeepEqual(occResp, retryBody) {
+			t.Errorf("retry changed original conflict: original=%#v retried=%#v status=%d", occResp, retryBody, retry.Code)
+		}
+		reservation, err := ps.QueryReservation(context.Background(), "mig-http-1")
+		if err != nil || reservation.Status != "NOT_FOUND" {
+			t.Errorf("query or retry created reservation: %#v err=%v", reservation, err)
+		}
+		after, err := ps.SessionSnapshot(context.Background(), targetSessionID, "admin")
+		if err != nil || !reflect.DeepEqual(targetBefore, after) {
+			t.Errorf("query or retry changed newer target: before=%#v after=%#v err=%v", targetBefore, after, err)
+		}
+	})
 	stale := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
 		"migrationId": "mig-http-1", "operationId": "g1:reserve-stale", "sessionId": sessionID, "clientId": "tab-1", "deviceName": "mig-target",
 		"bindingGeneration": attachPayload.BindingGeneration, "expectedFingerprint": fp, "forceTakeover": true,

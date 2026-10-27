@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"os"
+	"strconv"
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core/playback"
@@ -114,7 +115,7 @@ var _ = Describe("JukeboxControl", func() {
 		device, err := ps.GetDeviceForUser("admin")
 		Expect(err).ToNot(HaveOccurred())
 		sessionID := "validation-all-subsonic-commands"
-		_, err = ps.AttachSession(ctx, playback.AttachRequest{
+		attachment, err := ps.AttachSession(ctx, playback.AttachRequest{
 			SessionID: sessionID, ClientID: "owner", User: "admin", DeviceName: device.DeviceName,
 		})
 		Expect(err).ToNot(HaveOccurred())
@@ -139,12 +140,12 @@ var _ = Describe("JukeboxControl", func() {
 				assertDenied(action, scope, "admin")
 			}
 		}
-		ownerScope := "&sessionId=" + sessionID + "&clientId=owner"
+		ownerScope := "&sessionId=" + sessionID + "&clientId=owner&bindingGeneration=" + strconv.FormatUint(attachment.BindingGeneration, 10) + "&operationId=g1:subsonic-set-gain"
 		assertDenied("setGain&gain=0.25", ownerScope, "other-user")
 		response, err := serve("setGain&gain=0.25", ownerScope, "admin")
 		Expect(err).ToNot(HaveOccurred())
 		Expect(response.JukeboxStatus.Gain).To(Equal(float32(0.25)))
-		_, err = ps.AttachSession(ctx, playback.AttachRequest{
+		attachment, err = ps.AttachSession(ctx, playback.AttachRequest{
 			SessionID: sessionID, ClientID: "new-owner", User: "admin", DeviceName: device.DeviceName, Takeover: true,
 		})
 		Expect(err).ToNot(HaveOccurred())
@@ -155,7 +156,8 @@ var _ = Describe("JukeboxControl", func() {
 		for _, action := range subsonicMutationValidationActions() {
 			assertDenied(action, ownerScope, "admin")
 		}
-		response, err = serve("setGain&gain=0.5", "&sessionId="+sessionID+"&clientId=new-owner", "admin")
+		newOwnerScope := "&sessionId=" + sessionID + "&clientId=new-owner&bindingGeneration=" + strconv.FormatUint(attachment.BindingGeneration, 10) + "&operationId=g2:subsonic-set-gain"
+		response, err = serve("setGain&gain=0.5", newOwnerScope, "admin")
 		Expect(err).ToNot(HaveOccurred())
 		Expect(response.JukeboxStatus.Gain).To(Equal(float32(0.5)))
 	})

@@ -158,6 +158,8 @@ type OperationRecord struct {
 	CommandResult     *CommandResult `json:"commandResult,omitempty"`
 	ErrorCode         string         `json:"errorCode,omitempty"`
 	ErrorMessage      string         `json:"errorMessage,omitempty"`
+	SceneFingerprint  string         `json:"sceneFingerprint,omitempty"`
+	QueueCount        *int           `json:"queueCount,omitempty"`
 	CreatedAt         time.Time      `json:"createdAt"`
 	user              string
 	clientID          string
@@ -269,6 +271,10 @@ func (s *OperationStore) lookup(sessionID, operationID string) (OperationRecord,
 	}
 	if !ok {
 		rec = OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}
+	}
+	if rec.QueueCount != nil {
+		queueCount := *rec.QueueCount
+		rec.QueueCount = &queueCount
 	}
 	return rec, ok
 }
@@ -1176,6 +1182,9 @@ func operationErrorCode(err error) string {
 }
 
 func operationRecordError(rec OperationRecord) error {
+	if rec.ErrorCode == "TARGET_OCCUPIED" && rec.QueueCount != nil {
+		return &TargetOccupiedError{SceneFingerprint: rec.SceneFingerprint, QueueCount: *rec.QueueCount}
+	}
 	if rec.err != nil {
 		return rec.err
 	}
@@ -1309,6 +1318,12 @@ func (ps *playbackServer) executeProtectedOperation(
 		rec.err = executionErr
 		rec.ErrorCode = operationErrorCode(executionErr)
 		rec.ErrorMessage = executionErr.Error()
+		var occupied *TargetOccupiedError
+		if errors.As(executionErr, &occupied) {
+			rec.SceneFingerprint = occupied.SceneFingerprint
+			queueCount := occupied.QueueCount
+			rec.QueueCount = &queueCount
+		}
 	} else if rec.Status == "" || rec.Status == OperationStatusUnknown {
 		rec.Status = OperationStatusApplied
 	}

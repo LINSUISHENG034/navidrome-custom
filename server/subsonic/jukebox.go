@@ -106,8 +106,17 @@ func (api *Router) JukeboxControl(r *http.Request) (*responses.Subsonic, error) 
 	default:
 		return nil, newError(responses.ErrorMissingParameter, "Unknown action: %s", actionString)
 	}
+	var bindingGeneration *uint64
+	if encodedGeneration := p.StringOr("bindingGeneration", ""); encodedGeneration != "" {
+		generation, parseErr := strconv.ParseUint(encodedGeneration, 10, 64)
+		if parseErr != nil {
+			return nil, newError(responses.ErrorMissingParameter, "invalid parameter bindingGeneration, err: %s", parseErr)
+		}
+		bindingGeneration = &generation
+	}
 	scope := playback.CommandScope{
 		User: user.UserName, SessionID: p.StringOr("sessionId", ""), ClientID: p.StringOr("clientId", ""),
+		BindingGeneration: bindingGeneration, OperationID: p.StringOr("operationId", ""),
 	}
 	status, err := api.playback.ExecuteCommand(ctx, scope, command)
 	if errors.Is(err, playback.ErrSessionOwnership) {
