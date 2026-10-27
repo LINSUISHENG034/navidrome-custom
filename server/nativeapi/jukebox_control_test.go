@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -209,7 +210,7 @@ func TestJukeboxSessionCommandAuthorityValidation(t *testing.T) {
 	serve := func(t *testing.T, path string, body any) *httptest.ResponseRecorder {
 		return serveAs(t, path, body, "validation-admin")
 	}
-	attach := func(t *testing.T, sessionID, clientID, deviceName string) {
+	attach := func(t *testing.T, sessionID, clientID, deviceName string) uint64 {
 		t.Helper()
 		response := serve(t, "/jukebox/session/attach", map[string]any{
 			"sessionId": sessionID, "clientId": clientID, "deviceName": deviceName,
@@ -217,7 +218,12 @@ func TestJukeboxSessionCommandAuthorityValidation(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("attach: %d %s", response.Code, response.Body.String())
 		}
+		var status playback.SessionStatus
+		if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil || status.BindingGeneration == 0 {
+			t.Fatalf("attach generation: %#v err=%v", status, err)
+		}
 		t.Cleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, clientID) })
+		return status.BindingGeneration
 	}
 	t.Run("non-owner cannot mutate after heartbeat denial", func(t *testing.T) {
 		sessionID := uniqueSessionID("validation-command-owner")
@@ -247,7 +253,7 @@ func TestJukeboxSessionCommandAuthorityValidation(t *testing.T) {
 	})
 	t.Run("owner command targets session-bound non-default device", func(t *testing.T) {
 		sessionID := uniqueSessionID("validation-command-bound")
-		attach(t, sessionID, "bound-owner", "validation-authority-bound")
+		generation := attach(t, sessionID, "bound-owner", "validation-authority-bound")
 		defaultDevice, err := ps.GetDeviceForUser("validation-admin")
 		if err != nil {
 			t.Fatal(err)
@@ -257,7 +263,7 @@ func TestJukeboxSessionCommandAuthorityValidation(t *testing.T) {
 			t.Fatal(err)
 		}
 		response := serve(t, "/jukebox/volume", map[string]any{
-			"sessionId": sessionID, "clientId": "bound-owner", "bindingGeneration": 1, "gain": 0.5,
+			"sessionId": sessionID, "clientId": "bound-owner", "bindingGeneration": generation, "operationId": "bound-owner-volume", "gain": 0.5,
 		})
 		bound, err := ps.SessionSnapshot(ctx, sessionID, "validation-admin")
 		if err != nil {
@@ -334,8 +340,8 @@ func TestJukeboxSessionCommandAuthorityValidation(t *testing.T) {
 	})
 	t.Run("explicit same-user takeover preserves state and revokes every old-owner route", func(t *testing.T) {
 		sessionID := uniqueSessionID("explicit-takeover")
-		attach(t, sessionID, "old-owner", "validation-authority-default")
-		response := serve(t, "/jukebox/volume", map[string]any{"sessionId": sessionID, "clientId": "old-owner", "bindingGeneration": 1, "gain": 0.625})
+		generation := attach(t, sessionID, "old-owner", "validation-authority-default")
+		response := serve(t, "/jukebox/volume", map[string]any{"sessionId": sessionID, "clientId": "old-owner", "bindingGeneration": generation, "operationId": "old-owner-volume", "gain": 0.625})
 		if response.Code != http.StatusOK {
 			t.Fatalf("seed owner state: %d %s", response.Code, response.Body.String())
 		}
@@ -372,7 +378,7 @@ func TestJukeboxSessionCommandAuthorityValidation(t *testing.T) {
 		if response.Code != http.StatusForbidden {
 			t.Fatalf("alternate session takeover stole device: %d %s", response.Code, response.Body.String())
 		}
-		response = serve(t, "/jukebox/volume", map[string]any{"sessionId": sessionID, "clientId": "new-owner", "bindingGeneration": 2, "gain": 0.5})
+		response = serve(t, "/jukebox/volume", map[string]any{"sessionId": sessionID, "clientId": "new-owner", "bindingGeneration": after.SessionStatus.BindingGeneration, "operationId": "new-owner-volume", "gain": 0.5})
 		if response.Code != http.StatusOK {
 			t.Fatalf("new owner cannot mutate: %d %s", response.Code, response.Body.String())
 		}
@@ -383,7 +389,7 @@ func TestJukeboxSessionCommandAuthorityValidation(t *testing.T) {
 			t.Fatalf("unclaimed legacy gain: %d %s", response.Code, response.Body.String())
 		}
 		sessionID := uniqueSessionID("scope-validation")
-		attach(t, sessionID, "owner", "validation-authority-default")
+		generation := attach(t, sessionID, "owner", "validation-authority-default")
 		for _, test := range []struct {
 			path string
 			body map[string]any
@@ -392,7 +398,7 @@ func TestJukeboxSessionCommandAuthorityValidation(t *testing.T) {
 			{"/jukebox/volume", map[string]any{"sessionId": sessionID, "gain": 0.2}, http.StatusBadRequest},
 			{"/jukebox/volume", map[string]any{"sessionId": "missing", "clientId": "owner", "gain": 0.2}, http.StatusNotFound},
 			{"/jukebox/volume?sessionId=conflict&clientId=owner", map[string]any{"sessionId": sessionID, "clientId": "owner", "gain": 0.2}, http.StatusBadRequest},
-			{"/jukebox/volume?sessionId=" + sessionID + "&clientId=owner&bindingGeneration=1", map[string]any{"gain": 0.3}, http.StatusOK},
+			{"/jukebox/volume?sessionId=" + sessionID + "&clientId=owner&bindingGeneration=" + strconv.FormatUint(generation, 10) + "&operationId=scope-volume", map[string]any{"gain": 0.3}, http.StatusOK},
 		} {
 			response := serve(t, test.path, test.body)
 			if response.Code != test.code {
@@ -720,6 +726,85 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 						if response.Code != http.StatusOK {
 							t.Fatalf("release fixture reservation: %d %s", response.Code, response.Body.String())
 						}
+					}
+				}
+			})
+		}
+	}
+
+	current, err := ps.SessionStatus(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"reserve", "release", "commit"} {
+		for _, tc := range []struct {
+			name string
+			id   *string
+		}{
+			{"missing", nil},
+			{"empty", func() *string { s := ""; return &s }()},
+			{"spaces", func() *string { s := "   "; return &s }()},
+			{"whitespace", func() *string { s := "\t\n"; return &s }()},
+		} {
+			t.Run("migration operation identity "+operation+"/"+tc.name, func(t *testing.T) {
+				migrationID := "identity-" + operation + "-" + tc.name
+				if operation != "reserve" {
+					response := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+						"migrationId": migrationID, "operationId": "g3:setup-" + migrationID,
+						"sessionId": sessionID, "clientId": "tab-1", "bindingGeneration": current.BindingGeneration, "deviceName": "mig-target",
+					})
+					if response.Code != http.StatusOK {
+						t.Fatalf("create active reservation: %d %s", response.Code, response.Body.String())
+					}
+				}
+				beforeReservation, err := ps.QueryReservation(context.Background(), migrationID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeSource, err := ps.SessionSnapshot(context.Background(), sessionID, "admin")
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeTarget, err := ps.SessionSnapshot(context.Background(), targetSessionID, "admin")
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := map[string]any{
+					"migrationId": migrationID, "sessionId": sessionID, "clientId": "tab-1", "bindingGeneration": current.BindingGeneration,
+				}
+				if tc.id != nil {
+					body["operationId"] = *tc.id
+				}
+				if operation == "reserve" {
+					body["deviceName"] = "mig-target"
+				} else if operation == "commit" {
+					body["targetDeviceName"] = "mig-target"
+				}
+				response := serve(t, http.MethodPost, "/jukebox/migration/"+operation, body)
+				var payload map[string]any
+				_ = json.Unmarshal(response.Body.Bytes(), &payload)
+				if response.Code != http.StatusBadRequest || payload["code"] != "OPERATION_ID_REQUIRED" {
+					t.Errorf("unexpected identity response: %d %s", response.Code, response.Body.String())
+				}
+				afterReservation, err := ps.QueryReservation(context.Background(), migrationID)
+				if err != nil || !reflect.DeepEqual(beforeReservation, afterReservation) {
+					t.Errorf("rejected request changed reservation: before=%#v after=%#v err=%v", beforeReservation, afterReservation, err)
+				}
+				afterSource, err := ps.SessionSnapshot(context.Background(), sessionID, "admin")
+				if err != nil || !reflect.DeepEqual(beforeSource, afterSource) {
+					t.Errorf("rejected request changed source: before=%#v after=%#v err=%v", beforeSource, afterSource, err)
+				}
+				afterTarget, err := ps.SessionSnapshot(context.Background(), targetSessionID, "admin")
+				if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
+					t.Errorf("rejected request changed target: before=%#v after=%#v err=%v", beforeTarget, afterTarget, err)
+				}
+				if beforeReservation.Status == "ACTIVE" {
+					response = serve(t, http.MethodPost, "/jukebox/migration/release", map[string]any{
+						"migrationId": migrationID, "operationId": "g3:cleanup-" + migrationID,
+						"sessionId": sessionID, "clientId": "tab-1", "bindingGeneration": current.BindingGeneration,
+					})
+					if response.Code != http.StatusOK {
+						t.Fatalf("release fixture reservation: %d %s", response.Code, response.Body.String())
 					}
 				}
 			})

@@ -593,15 +593,15 @@ func (ps *playbackServer) statusFromSession(session Session) SessionStatus {
 
 func newSessionStatus(session Session) SessionStatus {
 	status := SessionStatus{
-		SessionID:         session.SessionID,
-		DeviceName:        session.DeviceName,
-		OwnerClientID:     session.OwnerClientID,
-		Attached:          true,
-		OwnershipState:    session.OwnershipState,
-		LastHeartbeat:     session.LastHeartbeat,
-		StaleSince:        session.StaleSince,
-		BindingGeneration: session.BindingGeneration,
-		OperationIDFormat: OperationIDFormat,
+		SessionID:             session.SessionID,
+		DeviceName:            session.DeviceName,
+		OwnerClientID:         session.OwnerClientID,
+		Attached:              true,
+		OwnershipState:        session.OwnershipState,
+		LastHeartbeat:         session.LastHeartbeat,
+		StaleSince:            session.StaleSince,
+		BindingGeneration:     session.BindingGeneration,
+		OperationIDFormat:     OperationIDFormat,
 		RequiresNewGeneration: session.OperationFenceGeneration >= session.BindingGeneration,
 	}
 	if status.OwnershipState == "" {
@@ -1449,16 +1449,8 @@ func (ps *playbackServer) ReserveMigration(ctx context.Context, req ReserveMigra
 		return OperationRecord{CommandResult: &result}, nil
 	}
 
-	if req.OperationID != "" {
-		scope := CommandScope{User: req.User, SessionID: req.SessionID, ClientID: req.ClientID, BindingGeneration: req.BindingGeneration, OperationID: req.OperationID}
-		rec, err := ps.executeProtectedOperation(ctx, scope, "migration.reserve", req, execReserve)
-		if rec.CommandResult != nil {
-			return *rec.CommandResult, err
-		}
-		return CommandResult{Status: rec.Status, MigrationID: req.MigrationID, OperationID: req.OperationID}, err
-	}
-
-	rec, err := execReserve()
+	scope := CommandScope{User: req.User, SessionID: req.SessionID, ClientID: req.ClientID, BindingGeneration: req.BindingGeneration, OperationID: req.OperationID}
+	rec, err := ps.executeProtectedOperation(ctx, scope, "migration.reserve", req, execReserve)
 	if rec.CommandResult != nil {
 		return *rec.CommandResult, err
 	}
@@ -1501,16 +1493,8 @@ func (ps *playbackServer) ReleaseMigrationReservation(ctx context.Context, req R
 		return OperationRecord{Status: result.Status, CommandResult: &result}, nil
 	}
 
-	if req.OperationID != "" {
-		scope := CommandScope{User: req.User, SessionID: req.SessionID, ClientID: req.ClientID, BindingGeneration: req.BindingGeneration, OperationID: req.OperationID}
-		rec, err := ps.executeProtectedOperation(ctx, scope, "migration.release", req, execRelease)
-		if rec.CommandResult != nil {
-			return *rec.CommandResult, err
-		}
-		return CommandResult{Status: rec.Status, MigrationID: req.MigrationID, OperationID: req.OperationID}, err
-	}
-
-	rec, err := execRelease()
+	scope := CommandScope{User: req.User, SessionID: req.SessionID, ClientID: req.ClientID, BindingGeneration: req.BindingGeneration, OperationID: req.OperationID}
+	rec, err := ps.executeProtectedOperation(ctx, scope, "migration.release", req, execRelease)
 	if rec.CommandResult != nil {
 		return *rec.CommandResult, err
 	}
@@ -1629,13 +1613,7 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		return OperationRecord{SessionStatus: &status}, nil
 	}
 
-	var rec OperationRecord
-	var err error
-	if req.OperationID != "" {
-		rec, err = ps.executeProtectedOperation(ctx, scope, "migration.commit", normalized, execCommit)
-	} else {
-		rec, err = execCommit()
-	}
+	rec, err := ps.executeProtectedOperation(ctx, scope, "migration.commit", normalized, execCommit)
 	for _, oldOwner := range revoked {
 		status := ps.statusFromSession(oldOwner)
 		status.Attached = false

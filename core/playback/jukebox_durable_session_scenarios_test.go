@@ -830,6 +830,231 @@ func TestDurableSessionMigrationGenerationAdmission(t *testing.T) {
 	}
 }
 
+func TestDurableSessionMigrationRequiresOperationIdentity(t *testing.T) {
+	for _, operation := range []string{"reserve", "release", "commit"} {
+		for _, tc := range []struct {
+			name string
+			id   string
+		}{
+			{"empty", ""},
+			{"spaces", "   "},
+			{"whitespace", "\t\n"},
+		} {
+			t.Run(operation+"/"+tc.name, func(t *testing.T) {
+				h, _, reserve, commit := newMigrationRepairFixture(t)
+				if operation != "reserve" {
+					if _, err := h.server.ReserveMigration(h.ctx, reserve); err != nil {
+						t.Fatalf("create valid active reservation: %v", err)
+					}
+				}
+				beforeReservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch operation {
+				case "reserve":
+					reserve.OperationID = tc.id
+					_, err = h.server.ReserveMigration(h.ctx, reserve)
+				case "release":
+					_, err = h.server.ReleaseMigrationReservation(h.ctx, ReleaseMigrationRequest{
+						MigrationID: reserve.MigrationID, OperationID: tc.id, SessionID: reserve.SessionID,
+						ClientID: reserve.ClientID, User: reserve.User, BindingGeneration: reserve.BindingGeneration,
+					})
+				case "commit":
+					commit.OperationID = tc.id
+					_, err = h.server.CommitMigration(h.ctx, commit)
+				}
+				if !errors.Is(err, ErrOperationRequired) {
+					t.Errorf("got %v; want %v", err, ErrOperationRequired)
+				}
+				afterReservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+				if err != nil || !reflect.DeepEqual(beforeReservation, afterReservation) {
+					t.Errorf("rejected request changed reservation: before=%#v after=%#v err=%v", beforeReservation, afterReservation, err)
+				}
+				afterTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
+				if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
+					t.Errorf("rejected request changed target: before=%#v after=%#v err=%v", beforeTarget, afterTarget, err)
+				}
+				afterSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
+				if err != nil || !reflect.DeepEqual(beforeSource, afterSource) {
+					t.Errorf("rejected request changed source: before=%#v after=%#v err=%v", beforeSource, afterSource, err)
+				}
+			})
+		}
+	}
+}
+
+func TestDurableSessionMigrationOperationReconciliation(t *testing.T) {
+	t.Run("failed reservation retains its result and rejects a changed payload", func(t *testing.T) {
+		h, _, reserve, _ := newMigrationRepairFixture(t)
+		reserve.ForceTakeover = false
+		var first, second *TargetOccupiedError
+		if _, err := h.server.ReserveMigration(h.ctx, reserve); !errors.As(err, &first) {
+			t.Fatalf("expected occupied target: %v", err)
+		}
+		if _, err := h.server.ReserveMigration(h.ctx, reserve); !errors.As(err, &second) || !reflect.DeepEqual(first, second) {
+			t.Fatalf("failed retry did not retain original conflict: first=%#v second=%#v err=%v", first, second, err)
+		}
+		record, err := h.server.QueryOperation(h.ctx, reserve.SessionID, reserve.OperationID)
+		if err != nil || record.Status != OperationStatusFailed || record.ErrorCode != "TARGET_OCCUPIED" {
+			t.Fatalf("failed reservation not queryable: %#v err=%v", record, err)
+		}
+		reserve.ForceTakeover = true
+		if _, err := h.server.ReserveMigration(h.ctx, reserve); !errors.Is(err, ErrOperationIdentity) {
+			t.Fatalf("changed payload reused operation identity: %v", err)
+		}
+		reservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+		if err != nil || reservation.Status != string(ReservationNotFound) {
+			t.Fatalf("failed reservation changed target admission: %#v err=%v", reservation, err)
+		}
+	})
+
+	t.Run("concurrent reservation and release retries retain original results", func(t *testing.T) {
+		h, _, reserve, _ := newMigrationRepairFixture(t)
+		const attempts = 8
+		results := make([]CommandResult, attempts)
+		errs := make([]error, attempts)
+		var wg sync.WaitGroup
+		for i := range results {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				results[i], errs[i] = h.server.ReserveMigration(h.ctx, reserve)
+			}(i)
+		}
+		wg.Wait()
+		for i := range results {
+			if errs[i] != nil || results[i].Status != OperationStatusApplied || !reflect.DeepEqual(results[0], results[i]) {
+				t.Fatalf("reserve retry %d: result=%#v err=%v", i, results[i], errs[i])
+			}
+		}
+		active, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+		if err != nil || active.Status != string(ReservationActive) {
+			t.Fatalf("missing active reservation: %#v err=%v", active, err)
+		}
+		if _, err := h.server.ReserveMigration(h.ctx, reserve); err != nil {
+			t.Fatalf("sequential reserve retry: %v", err)
+		}
+		afterRetry, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+		if err != nil || !reflect.DeepEqual(active, afterRetry) {
+			t.Fatalf("reserve retry changed reservation or expiry: %#v -> %#v err=%v", active, afterRetry, err)
+		}
+		release := ReleaseMigrationRequest{MigrationID: reserve.MigrationID, OperationID: "g1:reconcile-release", SessionID: reserve.SessionID, ClientID: reserve.ClientID, User: reserve.User, BindingGeneration: reserve.BindingGeneration}
+		for i := range results {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				results[i], errs[i] = h.server.ReleaseMigrationReservation(h.ctx, release)
+			}(i)
+		}
+		wg.Wait()
+		for i := range results {
+			if errs[i] != nil || results[i].Status != OperationStatusApplied || !reflect.DeepEqual(results[0], results[i]) {
+				t.Fatalf("release retry %d: result=%#v err=%v", i, results[i], errs[i])
+			}
+		}
+		for _, id := range []string{reserve.OperationID, release.OperationID} {
+			record, err := h.server.QueryOperation(h.ctx, reserve.SessionID, id)
+			if err != nil || record.Status != OperationStatusApplied || record.CommandResult == nil {
+				t.Fatalf("operation %s not queryable: %#v err=%v", id, record, err)
+			}
+		}
+		released, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+		if err != nil || released.Status != string(ReservationReleased) {
+			t.Fatalf("release not observable: %#v err=%v", released, err)
+		}
+	})
+
+	t.Run("lost commit response is queryable but old-generation retry is rejected", func(t *testing.T) {
+		h, _, reserve, commit := newMigrationRepairFixture(t)
+		if _, err := h.server.ReserveMigration(h.ctx, reserve); err != nil {
+			t.Fatal(err)
+		}
+		committed, err := h.server.CommitMigration(h.ctx, commit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := h.server.QueryOperation(h.ctx, commit.SessionID, commit.OperationID)
+		if err != nil || record.Status != OperationStatusApplied || record.SessionStatus == nil || record.SessionStatus.BindingGeneration != committed.BindingGeneration {
+			t.Fatalf("commit result cannot be reconciled: %#v err=%v", record, err)
+		}
+		before, err := h.server.SessionSnapshot(h.ctx, commit.SessionID, commit.User)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.server.CommitMigration(h.ctx, commit); !errors.Is(err, ErrCommandSuperseded) {
+			t.Fatalf("old generation commit retry not rejected: %v", err)
+		}
+		after, err := h.server.SessionSnapshot(h.ctx, commit.SessionID, commit.User)
+		if err != nil || !reflect.DeepEqual(before, after) {
+			t.Fatalf("stale retry changed committed scene: before=%#v after=%#v err=%v", before, after, err)
+		}
+	})
+
+	t.Run("unknown reservation does not imply a safe release", func(t *testing.T) {
+		h, _, reserve, _ := newMigrationRepairFixture(t)
+		release := ReleaseMigrationRequest{MigrationID: reserve.MigrationID, OperationID: "g1:release-unknown", SessionID: reserve.SessionID, ClientID: reserve.ClientID, User: reserve.User, BindingGeneration: reserve.BindingGeneration}
+		result, err := h.server.ReleaseMigrationReservation(h.ctx, release)
+		if !errors.Is(err, ErrOperationUnknown) || result.Status != OperationStatusUnknown || result.Reason != "NOT_FOUND" {
+			t.Fatalf("missing reservation must remain unknown: %#v err=%v", result, err)
+		}
+		record, err := h.server.QueryOperation(h.ctx, release.SessionID, release.OperationID)
+		if err != nil || record.Status != OperationStatusUnknown {
+			t.Fatalf("missing release result must remain unknown: %#v err=%v", record, err)
+		}
+		reservation, err := h.server.QueryReservation(h.ctx, release.MigrationID)
+		if err != nil || reservation.Status != string(ReservationNotFound) {
+			t.Fatalf("expected ambiguous not-found status: %#v err=%v", reservation, err)
+		}
+	})
+
+	for _, eviction := range []string{"ttl", "capacity"} {
+		t.Run(eviction+" eviction and prior query retain the history fence", func(t *testing.T) {
+			h, _, reserve, _ := newMigrationRepairFixture(t)
+			h.server.operationStore = NewOperationStore(1, time.Second, func() time.Time { return h.now })
+			if _, err := h.server.ReserveMigration(h.ctx, reserve); err != nil {
+				t.Fatal(err)
+			}
+			if eviction == "ttl" {
+				h.advance(2 * time.Second)
+			} else {
+				release := ReleaseMigrationRequest{MigrationID: reserve.MigrationID, OperationID: "g1:eviction-release", SessionID: reserve.SessionID, ClientID: reserve.ClientID, User: reserve.User, BindingGeneration: reserve.BindingGeneration}
+				if _, err := h.server.ReleaseMigrationReservation(h.ctx, release); err != nil {
+					t.Fatal(err)
+				}
+			}
+			record, err := h.server.QueryOperation(h.ctx, reserve.SessionID, reserve.OperationID)
+			if err != nil || record.Status != OperationStatusUnknown {
+				t.Fatalf("evicted result must be unknown: %#v err=%v", record, err)
+			}
+			before, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			missingID := ReleaseMigrationRequest{MigrationID: reserve.MigrationID, SessionID: reserve.SessionID, ClientID: reserve.ClientID, User: reserve.User, BindingGeneration: reserve.BindingGeneration}
+			if _, err := h.server.ReleaseMigrationReservation(h.ctx, missingID); !errors.Is(err, ErrOperationRequired) {
+				t.Fatalf("missing identity bypassed history fence: %v", err)
+			}
+			missingID.OperationID = "g1:after-eviction"
+			if _, err := h.server.ReleaseMigrationReservation(h.ctx, missingID); !errors.Is(err, ErrOperationUnknown) {
+				t.Fatalf("eviction allowed a new mutation: %v", err)
+			}
+			after, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("eviction retries changed reservation: %#v -> %#v err=%v", before, after, err)
+			}
+		})
+	}
+}
+
 func TestDurableSessionMigrationRepair(t *testing.T) {
 	t.Run("reserve validates source owner before target resolution", func(t *testing.T) {
 		h, target, reserve, _ := newMigrationRepairFixture(t)
