@@ -1355,14 +1355,6 @@ func (ps *playbackServer) ExecuteCommand(ctx context.Context, scope CommandScope
 }
 
 func (ps *playbackServer) ReserveMigration(ctx context.Context, req ReserveMigrationRequest) (CommandResult, error) {
-	if req.BindingGeneration == nil && req.SessionID != "" {
-		ps.mu.Lock()
-		if session, ok := ps.ensureSessionManagerLocked().Get(req.SessionID); ok {
-			gen := session.BindingGeneration
-			req.BindingGeneration = &gen
-		}
-		ps.mu.Unlock()
-	}
 	execReserve := func() (OperationRecord, error) {
 		ps.mu.Lock()
 		defer ps.mu.Unlock()
@@ -1474,14 +1466,6 @@ func (ps *playbackServer) ReserveMigration(ctx context.Context, req ReserveMigra
 }
 
 func (ps *playbackServer) ReleaseMigrationReservation(ctx context.Context, req ReleaseMigrationRequest) (CommandResult, error) {
-	if req.BindingGeneration == nil && req.SessionID != "" {
-		ps.mu.Lock()
-		if session, ok := ps.ensureSessionManagerLocked().Get(req.SessionID); ok {
-			gen := session.BindingGeneration
-			req.BindingGeneration = &gen
-		}
-		ps.mu.Unlock()
-	}
 	execRelease := func() (OperationRecord, error) {
 		ps.mu.Lock()
 		defer ps.mu.Unlock()

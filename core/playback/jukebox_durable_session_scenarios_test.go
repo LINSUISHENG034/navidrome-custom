@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -748,6 +749,85 @@ func newMigrationRepairFixture(t *testing.T) (*durableScenarioHarness, *playback
 		TargetDeviceName: "target", ExpectedGeneration: source.BindingGeneration,
 	}
 	return h, target, reserve, commit
+}
+
+func TestDurableSessionMigrationGenerationAdmission(t *testing.T) {
+	for _, operation := range []string{"reserve", "release", "commit"} {
+		for _, tc := range []struct {
+			name       string
+			generation func(uint64) *uint64
+			wantErr    error
+		}{
+			{"missing", func(uint64) *uint64 { return nil }, ErrGenerationRequired},
+			{"zero", func(uint64) *uint64 { n := uint64(0); return &n }, ErrGenerationRequired},
+			{"old", func(n uint64) *uint64 { n--; return &n }, ErrCommandSuperseded},
+			{"equal", func(n uint64) *uint64 { return &n }, nil},
+			{"future", func(n uint64) *uint64 { n++; return &n }, ErrCommandSuperseded},
+		} {
+			t.Run(operation+"/"+tc.name, func(t *testing.T) {
+				h, _, reserve, commit := newMigrationRepairFixture(t)
+				// The same owner explicitly renews before this request arrives.
+				// This is not an already-admitted operation serialized by a lock.
+				current := h.attach(t, "source-owner", true)
+				reserve.BindingGeneration = &current.BindingGeneration
+				reserve.OperationID = "g2:reserve-generation"
+				commit.OperationID = "g2:commit-generation"
+				if operation != "reserve" {
+					if _, err := h.server.ReserveMigration(h.ctx, reserve); err != nil {
+						t.Fatalf("create valid active reservation: %v", err)
+					}
+				}
+				beforeReservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
+				if err != nil {
+					t.Fatal(err)
+				}
+				generation := tc.generation(current.BindingGeneration)
+				switch operation {
+				case "reserve":
+					reserve.BindingGeneration = generation
+					_, err = h.server.ReserveMigration(h.ctx, reserve)
+				case "release":
+					_, err = h.server.ReleaseMigrationReservation(h.ctx, ReleaseMigrationRequest{
+						MigrationID: reserve.MigrationID, OperationID: "g2:release-generation", SessionID: reserve.SessionID,
+						ClientID: reserve.ClientID, User: reserve.User, BindingGeneration: generation,
+					})
+				case "commit":
+					commit.ExpectedGeneration = 0
+					commit.BindingGeneration = generation
+					_, err = h.server.CommitMigration(h.ctx, commit)
+				}
+				if tc.wantErr == nil {
+					if err != nil {
+						t.Fatalf("current generation rejected: %v", err)
+					}
+					return
+				}
+				if !errors.Is(err, tc.wantErr) {
+					t.Errorf("got %v; want %v", err, tc.wantErr)
+				}
+				afterReservation, err := h.server.QueryReservation(h.ctx, reserve.MigrationID)
+				if err != nil || !reflect.DeepEqual(beforeReservation, afterReservation) {
+					t.Errorf("rejected request changed reservation: before=%#v after=%#v err=%v", beforeReservation, afterReservation, err)
+				}
+				afterTarget, err := h.server.SessionSnapshot(h.ctx, "target-session", "other-user")
+				if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
+					t.Errorf("rejected request changed target: before=%#v after=%#v err=%v", beforeTarget, afterTarget, err)
+				}
+				afterSource, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
+				if err != nil || !reflect.DeepEqual(beforeSource, afterSource) {
+					t.Errorf("rejected request changed source: before=%#v after=%#v err=%v", beforeSource, afterSource, err)
+				}
+			})
+		}
+	}
 }
 
 func TestDurableSessionMigrationRepair(t *testing.T) {

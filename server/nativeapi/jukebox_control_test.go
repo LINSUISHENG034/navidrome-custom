@@ -630,4 +630,99 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 	if commitPayload["bindingGeneration"] != float64(2) || commitPayload["deviceName"] != "mig-target" {
 		t.Fatalf("unexpected commit response: %#v", commitPayload)
 	}
+
+	currentGeneration := uint64(commitPayload["bindingGeneration"].(float64))
+	oldTarget, err := ps.GetDeviceForUser("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"reserve", "release", "commit"} {
+		for _, tc := range []struct {
+			name       string
+			generation *uint64
+			code       string
+		}{
+			{"missing", nil, "GENERATION_REQUIRED"},
+			{"zero", func() *uint64 { n := uint64(0); return &n }(), "GENERATION_REQUIRED"},
+			{"old", &attachPayload.BindingGeneration, "COMMAND_SUPERSEDED"},
+			{"future", func() *uint64 { n := currentGeneration + 1; return &n }(), "COMMAND_SUPERSEDED"},
+			{"equal", &currentGeneration, ""},
+		} {
+			t.Run("migration generation "+operation+"/"+tc.name, func(t *testing.T) {
+				migrationID := "generation-" + operation + "-" + tc.name
+				base := map[string]any{
+					"migrationId": migrationID, "sessionId": sessionID, "clientId": "tab-1",
+				}
+				if operation != "reserve" {
+					response := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+						"migrationId": migrationID, "operationId": "g2:setup-" + migrationID,
+						"sessionId": sessionID, "clientId": "tab-1", "bindingGeneration": currentGeneration, "deviceName": "mig-default",
+					})
+					if response.Code != http.StatusOK {
+						t.Fatalf("create active reservation: %d %s", response.Code, response.Body.String())
+					}
+				}
+				beforeReservation, err := ps.QueryReservation(context.Background(), migrationID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeSource, err := ps.SessionSnapshot(context.Background(), sessionID, "admin")
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeQueue, beforeDevice, err := oldTarget.Get(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				base["operationId"] = "g2:" + operation + "-" + tc.name
+				if tc.generation != nil {
+					base["bindingGeneration"] = *tc.generation
+				}
+				if operation == "reserve" {
+					base["deviceName"] = "mig-default"
+				} else if operation == "commit" {
+					base["targetDeviceName"] = "mig-default"
+				}
+				response := serve(t, http.MethodPost, "/jukebox/migration/"+operation, base)
+				if tc.code == "" {
+					if response.Code != http.StatusOK {
+						t.Fatalf("current generation rejected: %d %s", response.Code, response.Body.String())
+					}
+				} else {
+					var payload map[string]any
+					_ = json.Unmarshal(response.Body.Bytes(), &payload)
+					wantStatus := http.StatusConflict
+					if tc.code == "GENERATION_REQUIRED" {
+						wantStatus = http.StatusBadRequest
+					}
+					if response.Code != wantStatus || payload["code"] != tc.code {
+						t.Errorf("unexpected generation response: %d %s", response.Code, response.Body.String())
+					}
+					afterReservation, err := ps.QueryReservation(context.Background(), migrationID)
+					if err != nil || !reflect.DeepEqual(beforeReservation, afterReservation) {
+						t.Errorf("rejected request changed reservation: before=%#v after=%#v err=%v", beforeReservation, afterReservation, err)
+					}
+					afterSource, err := ps.SessionSnapshot(context.Background(), sessionID, "admin")
+					if err != nil || !reflect.DeepEqual(beforeSource, afterSource) {
+						t.Errorf("rejected request changed source: before=%#v after=%#v err=%v", beforeSource, afterSource, err)
+					}
+					afterQueue, afterDevice, err := oldTarget.Get(context.Background())
+					if err != nil || !reflect.DeepEqual(beforeQueue, afterQueue) || !reflect.DeepEqual(beforeDevice, afterDevice) {
+						t.Errorf("rejected request changed target: queue=%#v -> %#v device=%#v -> %#v err=%v", beforeQueue, afterQueue, beforeDevice, afterDevice, err)
+					}
+				}
+				if operation != "commit" || tc.code != "" {
+					if beforeReservation.Status == "ACTIVE" || (operation == "reserve" && tc.code == "") {
+						response := serve(t, http.MethodPost, "/jukebox/migration/release", map[string]any{
+							"migrationId": migrationID, "operationId": "g2:cleanup-" + migrationID,
+							"sessionId": sessionID, "clientId": "tab-1", "bindingGeneration": currentGeneration,
+						})
+						if response.Code != http.StatusOK {
+							t.Fatalf("release fixture reservation: %d %s", response.Code, response.Body.String())
+						}
+					}
+				}
+			})
+		}
+	}
 }
