@@ -508,15 +508,19 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 
 	// 5. Reservation of occupied target without confirmation -> 409 TARGET_OCCUPIED
 	targetSessionID := uniqueSessionID("target-occ")
-	serve(t, http.MethodPost, "/jukebox/session/attach", map[string]any{
+	targetAttach := serve(t, http.MethodPost, "/jukebox/session/attach", map[string]any{
 		"sessionId": targetSessionID, "clientId": "target-owner", "deviceName": "mig-target",
 	})
-	serve(t, http.MethodPost, "/jukebox/volume", map[string]any{
-		"sessionId": targetSessionID, "clientId": "target-owner", "bindingGeneration": 1, "gain": 0.3,
-	})
+	if targetAttach.Code != http.StatusOK {
+		t.Fatalf("target attach failed: %d %s", targetAttach.Code, targetAttach.Body.String())
+	}
+	targetBefore, err := ps.SessionSnapshot(context.Background(), targetSessionID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	resReserveOcc := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
-		"migrationId": "mig-http-1", "sessionId": sessionID, "clientId": "tab-1", "deviceName": "mig-target",
+		"migrationId": "mig-http-1", "operationId": "g1:reserve-occupied", "sessionId": sessionID, "clientId": "tab-1", "deviceName": "mig-target", "bindingGeneration": attachPayload.BindingGeneration,
 	})
 	if resReserveOcc.Code != http.StatusConflict {
 		t.Fatalf("expected 409 TARGET_OCCUPIED, got %d %s", resReserveOcc.Code, resReserveOcc.Body.String())
@@ -528,13 +532,78 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 	}
 	fp := occResp["sceneFingerprint"].(string)
 
-	// 6. Reservation with expected fingerprint -> 200 APPLIED
+	// A fingerprint is a concurrency token, not consent to take over the target.
+	for _, tc := range []struct {
+		name  string
+		force any
+	}{
+		{name: "missing"},
+		{name: "false", force: false},
+	} {
+		t.Run("fingerprint without takeover "+tc.name, func(t *testing.T) {
+			body := map[string]any{
+				"migrationId": "mig-http-1", "operationId": "g1:reserve-no-takeover-" + tc.name,
+				"sessionId": sessionID, "clientId": "tab-1", "deviceName": "mig-target",
+				"bindingGeneration": attachPayload.BindingGeneration, "expectedFingerprint": fp,
+			}
+			if tc.force != nil {
+				body["forceTakeover"] = tc.force
+			}
+			response := serve(t, http.MethodPost, "/jukebox/migration/reserve", body)
+			var payload map[string]any
+			_ = json.Unmarshal(response.Body.Bytes(), &payload)
+			if response.Code != http.StatusConflict || payload["code"] != "TARGET_OCCUPIED" {
+				t.Fatalf("fingerprint without explicit takeover: %d %s", response.Code, response.Body.String())
+			}
+			reservation, err := ps.QueryReservation(context.Background(), "mig-http-1")
+			if err != nil || reservation.Status != "NOT_FOUND" {
+				t.Fatalf("denied request created reservation: %#v, %v", reservation, err)
+			}
+			after, err := ps.SessionSnapshot(context.Background(), targetSessionID, "admin")
+			if err != nil || !reflect.DeepEqual(targetBefore, after) {
+				t.Fatalf("denied request changed target: before=%#v after=%#v err=%v", targetBefore, after, err)
+			}
+		})
+	}
+
+	// Renewing the target owner's binding changes its scene and invalidates the
+	// previously issued fingerprint, without starting output.
+	renew := serve(t, http.MethodPost, "/jukebox/session/attach", map[string]any{
+		"sessionId": targetSessionID, "clientId": "target-owner", "deviceName": "mig-target", "takeover": true,
+	})
+	if renew.Code != http.StatusOK {
+		t.Fatalf("renew target binding: %d %s", renew.Code, renew.Body.String())
+	}
+	targetBefore, err = ps.SessionSnapshot(context.Background(), targetSessionID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+		"migrationId": "mig-http-1", "operationId": "g1:reserve-stale", "sessionId": sessionID, "clientId": "tab-1", "deviceName": "mig-target",
+		"bindingGeneration": attachPayload.BindingGeneration, "expectedFingerprint": fp, "forceTakeover": true,
+	})
+	var stalePayload map[string]any
+	_ = json.Unmarshal(stale.Body.Bytes(), &stalePayload)
+	if stale.Code != http.StatusConflict || stalePayload["code"] != "TARGET_OCCUPIED" {
+		t.Fatalf("stale confirmation must conflict: %d %s", stale.Code, stale.Body.String())
+	}
+	newFingerprint, ok := stalePayload["sceneFingerprint"].(string)
+	if !ok || newFingerprint == "" || newFingerprint == fp {
+		t.Fatalf("expected a changed target fingerprint: %s", stale.Body.String())
+	}
+	fp = newFingerprint
+
+	// 6. Explicit takeover with the current fingerprint is non-destructive.
 	resReserveConfirm := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
-		"migrationId": "mig-http-1", "sessionId": sessionID, "clientId": "tab-1", "deviceName": "mig-target",
-		"expectedFingerprint": fp,
+		"migrationId": "mig-http-1", "operationId": "g1:reserve-confirm", "sessionId": sessionID, "clientId": "tab-1", "deviceName": "mig-target",
+		"bindingGeneration": attachPayload.BindingGeneration, "expectedFingerprint": fp, "forceTakeover": true,
 	})
 	if resReserveConfirm.Code != http.StatusOK {
 		t.Fatalf("expected 200 after confirmation, got %d %s", resReserveConfirm.Code, resReserveConfirm.Body.String())
+	}
+	targetAfter, err := ps.SessionSnapshot(context.Background(), targetSessionID, "admin")
+	if err != nil || !reflect.DeepEqual(targetBefore, targetAfter) {
+		t.Fatalf("reservation changed target: before=%#v after=%#v err=%v", targetBefore, targetAfter, err)
 	}
 
 	// 7. Query reservation via GET /jukebox/migration/reservation
@@ -550,8 +619,8 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 
 	// 8. Commit migration via POST /jukebox/migration/commit
 	resCommit := serve(t, http.MethodPost, "/jukebox/migration/commit", map[string]any{
-		"migrationId": "mig-http-1", "sessionId": sessionID, "clientId": "tab-1", "targetDeviceName": "mig-target",
-		"expectedGeneration": 1, "expectedFingerprint": fp,
+		"migrationId": "mig-http-1", "operationId": "g1:commit", "sessionId": sessionID, "clientId": "tab-1", "targetDeviceName": "mig-target",
+		"expectedGeneration": attachPayload.BindingGeneration, "expectedFingerprint": fp,
 	})
 	if resCommit.Code != http.StatusOK {
 		t.Fatalf("commit failed: %d %s", resCommit.Code, resCommit.Body.String())

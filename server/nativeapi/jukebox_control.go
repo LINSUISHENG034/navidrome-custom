@@ -240,9 +240,6 @@ func (api *Router) jukeboxMigrationReserve(w http.ResponseWriter, r *http.Reques
 	}
 	user, _ := request.UserFrom(r.Context())
 	req.User = user.UserName
-	if req.ExpectedFingerprint != "" {
-		req.ForceTakeover = true
-	}
 	res, err := api.playback.ReserveMigration(r.Context(), req)
 	if err != nil {
 		api.writeJukeboxSessionError(w, err)

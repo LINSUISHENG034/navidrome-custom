@@ -999,10 +999,10 @@ export function createPlaybackControlModule(config = {}) {
             targetAdapter.reserveMigration(opIdAdmission, {
               migrationId,
               clientId: targetDevice.clientId,
-              forceTakeover: takeoverAllowed,
               signal: abortController.signal,
               readinessTimeoutMs,
               ...targetDevice,
+              forceTakeover: takeoverAllowed,
             }),
           opIdAdmission,
           reserveTimeout,
@@ -1021,10 +1021,10 @@ export function createPlaybackControlModule(config = {}) {
         const admitted = await runStep(
           () =>
             targetAdapter.admitClient({
-              forceTakeover: takeoverAllowed,
               migrationId,
               operationId: opIdAdmission,
               ...targetDevice,
+              forceTakeover: takeoverAllowed,
             }),
           opIdAdmission,
         )

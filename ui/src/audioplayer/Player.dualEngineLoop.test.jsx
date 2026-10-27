@@ -3816,6 +3816,73 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
     })
 
+    it('TC-MIG-03: device metadata cannot authorize an unconfirmed takeover', async () => {
+      const controller = createPlaybackControlModule()
+      const source = createMockRemoteAudioAdapter()
+      controller.setAdapter(source)
+      const occupiedTarget = createMockRemoteAudioAdapter({
+        hasActiveSession: true,
+        activeSessionOwner: 'other-owner',
+      })
+      // Simulate an adapter whose occupancy observation is stale, while the
+      // reservation endpoint still knows the target is occupied.
+      const target = { ...occupiedTarget, hasActiveSession: undefined }
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: target,
+          targetDevice: { name: 'Target', forceTakeover: true },
+        }),
+      ).rejects.toMatchObject({ code: 'TARGET_OCCUPIED' })
+      expect(occupiedTarget.getActiveSessionOwner()).toBe('other-owner')
+      expect(source.getStopCount()).toBe(0)
+      expect(occupiedTarget.getPlayCount()).toBe(0)
+    })
+
+    it('TC-MIG-03: device metadata cannot cancel explicit takeover consent', async () => {
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(createMockRemoteAudioAdapter())
+      const target = createMockRemoteAudioAdapter({
+        hasActiveSession: true,
+        activeSessionOwner: 'other-owner',
+      })
+
+      await controller.migrateOutput({
+        targetAdapter: target,
+        targetDevice: { name: 'Target', forceTakeover: false },
+        forceTakeover: true,
+      })
+      expect([...target.getReservations().values()]).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ forceTakeover: true }),
+        ]),
+      )
+    })
+
+    it('TC-MIG-03: fallback admission does not infer consent from device metadata', async () => {
+      const controller = createPlaybackControlModule()
+      const source = createMockRemoteAudioAdapter()
+      controller.setAdapter(source)
+      const occupiedTarget = createMockRemoteAudioAdapter({
+        hasActiveSession: true,
+        activeSessionOwner: 'other-owner',
+      })
+      const target = {
+        ...occupiedTarget,
+        hasActiveSession: undefined,
+        reserveMigration: undefined,
+      }
+
+      await expect(
+        controller.migrateOutput({
+          targetAdapter: target,
+          targetDevice: { name: 'Target', forceTakeover: true },
+        }),
+      ).rejects.toMatchObject({ code: 'TARGET_ADMISSION_DENIED' })
+      expect(occupiedTarget.getActiveSessionOwner()).toBe('other-owner')
+      expect(source.getStopCount()).toBe(0)
+    })
+
     it('TC-MIG-04: old device stop confirmation failure prevents target startup (no parallel output)', async () => {
       const localAdapter = createBrowserAudioAdapter()
       const controller = createPlaybackControlModule()
