@@ -726,6 +726,9 @@ export function createPlaybackControlModule(config = {}) {
         state.acceptedIntent = 'play'
         activeMigration.acceptedIntent = 'play'
         activeMigration.intentSequence = seq
+        // A newer play intent supersedes any pause/stop waiting on in-flight startup
+        activeMigration.startupInterrupt = null
+        activeMigration.intentInterrupt = { commandName, intentSequence: seq }
         notifySubscribers()
         return Promise.resolve()
       }
@@ -733,7 +736,15 @@ export function createPlaybackControlModule(config = {}) {
         state.acceptedIntent = 'pause'
         activeMigration.acceptedIntent = 'pause'
         activeMigration.intentSequence = seq
-        activeMigration.pauseStartup?.(seq)
+        activeMigration.startupInterrupt = { commandName, intentSequence: seq }
+        activeMigration.intentInterrupt = { commandName, intentSequence: seq }
+        try {
+          // Promptly reaches a pending target startup; the bounded result is
+          // reconciled by phase 5 before any PAUSED is reported.
+          activeMigration.pauseStartup?.(seq)
+        } catch {
+          // Synchronous callback errors must not break intent acceptance
+        }
         notifySubscribers()
         return Promise.resolve()
       }
@@ -874,6 +885,10 @@ export function createPlaybackControlModule(config = {}) {
       committed: false,
       terminal: false,
       targetEpoch: null,
+      // Pause/stop issued while a target startup play confirmation is in flight
+      startupInterrupt: null,
+      // Play/pause/stop that must still reach the target during phase 6 settle
+      intentInterrupt: null,
     }
     activeMigration = migrationTx
 
@@ -1250,18 +1265,35 @@ export function createPlaybackControlModule(config = {}) {
 
       // Phase 5: Conditional Startup based on final acceptedIntent
       let startupActive = false
+      // Ticket 09: the pause must reach a pending startup promptly, but its
+      // confirmation is bounded by the phase deadline and reconciled through
+      // queryOperation semantics; the recorded promise is awaited before any
+      // PAUSED is reported, so a rejected or UNKNOWN confirmation can never
+      // surface as a false success.
+      let startupPauseConfirmation = null
       migrationTx.pauseStartup = (pauseSeq) => {
-        if (startupActive && typeof targetAdapter.pause === 'function') {
-          const pauseOpId = opId(
-            'phase5',
-            `pause_${pauseSeq ?? ++intentCounter}`,
+        if (!startupActive || typeof targetAdapter.pause !== 'function') return
+        const pauseOpId = opId('phase5', `pause_${pauseSeq ?? ++intentCounter}`)
+        let confirmation
+        try {
+          confirmation = executeWithTimeout(
+            targetAdapter.pause(newEpoch, { operationId: pauseOpId }),
+            phaseTimeoutMs,
+            pauseOpId,
+            targetAdapter,
           )
-          try {
-            targetAdapter.pause(newEpoch, { operationId: pauseOpId })
-          } catch {
-            // ignore synchronous throw
-          }
+        } catch {
+          // Synchronous adapter throw: recorded as an immediate rejection
+          confirmation = Promise.reject({
+            code: 'TARGET_INTERRUPT_FAILED',
+            message: 'Pause issued during target startup failed synchronously',
+            operationId: pauseOpId,
+          })
         }
+        // Observed immediately so a late rejection is never unhandled; phase 5
+        // still awaits the original promise for reconciliation.
+        confirmation.catch(() => {})
+        startupPauseConfirmation = confirmation
       }
 
       const effectiveIntent =
@@ -1295,20 +1327,6 @@ export function createPlaybackControlModule(config = {}) {
             opIdStart,
           )
           assertMigrationEpoch(newEpoch, targetAdapter)
-          if (migrationTx.acceptedIntent === 'pause') {
-            state = {
-              ...state,
-              status: PlaybackStatus.PAUSED,
-              acceptedIntent: 'pause',
-            }
-          } else {
-            state = {
-              ...state,
-              status: PlaybackStatus.PLAYING,
-              acceptedIntent: 'play',
-            }
-          }
-          notifySubscribers()
         } catch (playErr) {
           if (migrationTx.acceptedIntent === 'pause') {
             state = {
@@ -1327,6 +1345,49 @@ export function createPlaybackControlModule(config = {}) {
         } finally {
           startupActive = false
           migrationTx.pauseStartup = null
+        }
+
+        // Ticket 09: a pause/stop that reached a pending startup must be
+        // reconciled before settlement. The confirmation is awaited (bounded by
+        // the phase deadline, UNKNOWN preserved via queryOperation); failure
+        // surfaces an error instead of a false PAUSED. If a newer play intent
+        // superseded the pause, the confirmed startup play remains authoritative.
+        if (startupPauseConfirmation) {
+          const stillPaused =
+            migrationTx.acceptedIntent === 'pause' &&
+            migrationTx.startupInterrupt
+          try {
+            await startupPauseConfirmation
+            assertMigrationEpoch(newEpoch, targetAdapter)
+          } catch (pauseErr) {
+            if (stillPaused) {
+              failMigration(
+                pauseErr,
+                'TARGET_INTERRUPT_FAILED',
+                'Failed to confirm pause/stop issued during target startup',
+              )
+            }
+          }
+          state = {
+            ...state,
+            status: stillPaused ? PlaybackStatus.PAUSED : PlaybackStatus.PLAYING,
+            acceptedIntent: stillPaused ? 'pause' : 'play',
+          }
+          notifySubscribers()
+        } else if (migrationTx.acceptedIntent === 'pause') {
+          state = {
+            ...state,
+            status: PlaybackStatus.PAUSED,
+            acceptedIntent: 'pause',
+          }
+          notifySubscribers()
+        } else {
+          state = {
+            ...state,
+            status: PlaybackStatus.PLAYING,
+            acceptedIntent: 'play',
+          }
+          notifySubscribers()
         }
       } else {
         if (typeof targetAdapter.pause === 'function') {
@@ -1356,6 +1417,9 @@ export function createPlaybackControlModule(config = {}) {
       }
 
       // Phase 6: Settle isolated commands submitted during migration
+      // Only intents recorded after phase 5 settled still need to reach the
+      // target; anything older was already applied by phase 5 semantics.
+      const phase5ExitSequence = migrationTx.intentSequence
       const isolated = migrationTx.isolatedCommands
       for (const cmd of isolated) {
         const isStale =
@@ -1374,16 +1438,93 @@ export function createPlaybackControlModule(config = {}) {
           })
         } else {
           try {
-            const res = await dispatchCommand(
-              cmd.commandName,
-              cmd.executor,
-              false,
-              cmd.intentSequence,
+            const opIdIsolated = opId(
+              'phase6',
+              `${cmd.commandName}_${cmd.intentSequence}`,
             )
+            const res = await executeWithTimeout(
+              cmd.executor(currentEpoch, activeAdapter, {
+                operationId: opIdIsolated,
+              }),
+              phaseTimeoutMs,
+              opIdIsolated,
+              activeAdapter,
+            )
+            assertMigrationEpoch(currentEpoch, targetAdapter)
             cmd.resolve(res)
           } catch (err) {
             cmd.reject(err)
           }
+        }
+      }
+
+      // Spec F1: a play/pause/stop issued while phase 6 awaited an isolated
+      // command must reach the target with bounded operation semantics, not
+      // only update acceptedIntent. Failure/UNKNOWN surfaces an error instead
+      // of a false success, exactly like the phase 5 interrupt confirmation.
+      const lateInterrupt = migrationTx.intentInterrupt
+      if (
+        lateInterrupt &&
+        typeof lateInterrupt.intentSequence === 'number' &&
+        lateInterrupt.intentSequence > phase5ExitSequence
+      ) {
+        if (lateInterrupt.commandName === 'play') {
+          const opIdLatePlay = opId('phase6', 'play')
+          try {
+            await executeWithTimeout(
+              targetAdapter.play(newEpoch, { operationId: opIdLatePlay }),
+              phaseTimeoutMs,
+              opIdLatePlay,
+              targetAdapter,
+            )
+          } catch (latePlayErr) {
+            failMigration(
+              latePlayErr,
+              'TARGET_START_FAILED',
+              'Failed to start playback on target device',
+            )
+          }
+          assertMigrationEpoch(newEpoch, targetAdapter)
+          state = {
+            ...state,
+            status: PlaybackStatus.PLAYING,
+            acceptedIntent: 'play',
+          }
+          notifySubscribers()
+        } else {
+          const lateCommand =
+            lateInterrupt.commandName === 'stop' &&
+            typeof targetAdapter.stop === 'function'
+              ? 'stop'
+              : typeof targetAdapter.pause === 'function'
+                ? 'pause'
+                : null
+          if (lateCommand) {
+            const opIdLateInterrupt = opId('phase6', lateCommand)
+            try {
+              await executeWithTimeout(
+                targetAdapter[lateCommand](newEpoch, {
+                  operationId: opIdLateInterrupt,
+                }),
+                phaseTimeoutMs,
+                opIdLateInterrupt,
+                targetAdapter,
+              )
+            } catch (lateInterruptErr) {
+              failMigration(
+                lateInterruptErr,
+                'TARGET_INTERRUPT_FAILED',
+                'Failed to confirm pause/stop issued during migration settle',
+              )
+            }
+            assertMigrationEpoch(newEpoch, targetAdapter)
+          }
+          state = {
+            ...state,
+            status: PlaybackStatus.PAUSED,
+            acceptedIntent: 'pause',
+          }
+          notifySubscribers()
         }
       }
 

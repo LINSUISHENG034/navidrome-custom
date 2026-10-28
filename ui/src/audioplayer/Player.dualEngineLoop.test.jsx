@@ -4738,6 +4738,330 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       )
     })
 
+    it('TC-MIG-51: explicit pause/stop during in-flight target startup is confirmed boundedly; rejection or UNKNOWN surfaces an error instead of false PAUSED', async () => {
+      const setupInFlightStartup = async ({ phaseTimeoutMs } = {}) => {
+        const sourceAdapter = createMockRemoteAudioAdapter()
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(sourceAdapter)
+        await controller.addQueueItems([
+          {
+            queueItemId: 't09-1',
+            trackId: 't1',
+            name: 'Track 1',
+            musicSrc: 'http://example.com/1.mp3',
+          },
+        ])
+        await controller.play()
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+        expect(controller.getState().acceptedIntent).toBe('play')
+
+        // Startup play on the target stays in flight until the test resolves it
+        let resolvePlay
+        const playGate = new Promise((resolve) => {
+          resolvePlay = resolve
+        })
+        let signalPlayCalled
+        const playCalled = new Promise((resolve) => {
+          signalPlayCalled = resolve
+        })
+        const targetAdapter = createMockRemoteAudioAdapter()
+        const playSpy = vi.fn(() => {
+          signalPlayCalled()
+          return playGate
+        })
+        targetAdapter.play = playSpy
+
+        const migrationPromise = controller.migrateOutput({
+          targetAdapter,
+          targetDevice: { name: 'Remote Speaker' },
+          ...(phaseTimeoutMs ? { phaseTimeoutMs } : {}),
+        })
+        // Resolve in a microtask as soon as phase 5 dispatches the startup play,
+        // keeping the play in flight even with very small phase timeouts
+        await playCalled
+
+        return {
+          controller,
+          targetAdapter,
+          resolvePlay,
+          migrationPromise,
+          playSpy,
+        }
+      }
+
+      // Subcase A: a pause issued while startup play is in flight is confirmed on the target
+      {
+        const {
+          controller,
+          targetAdapter,
+          resolvePlay,
+          migrationPromise,
+          playSpy,
+        } = await setupInFlightStartup()
+        const pauseSpy = vi.spyOn(targetAdapter, 'pause')
+
+        await controller.pause()
+        expect(controller.getState().acceptedIntent).toBe('pause')
+        expect(controller.isMigrating()).toBe(true)
+
+        resolvePlay()
+        await migrationPromise
+
+        // Invariants: pause reached the target promptly via a bounded phase5
+        // operation and was reconciled before PAUSED was reported
+        expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+        expect(controller.getState().acceptedIntent).toBe('pause')
+        expect(playSpy).toHaveBeenCalledTimes(1)
+        expect(pauseSpy).toHaveBeenCalledTimes(1)
+        expect(pauseSpy.mock.calls[0][1].operationId).toMatch(/:phase5:pause_/)
+      }
+
+      // Subcase B: a rejected pause confirmation surfaces a bounded error, never false PAUSED
+      {
+        const { controller, targetAdapter, resolvePlay, migrationPromise } =
+          await setupInFlightStartup()
+        targetAdapter.pause = vi.fn(async (epoch, options) => {
+          throw {
+            code: 'TARGET_PAUSE_REJECTED',
+            message: 'Target sink refused pause',
+            status: CommandResultStatus.FAILED,
+            operationId: options.operationId,
+          }
+        })
+
+        await controller.pause()
+        resolvePlay()
+
+        await expect(migrationPromise).rejects.toMatchObject({
+          code: 'TARGET_PAUSE_REJECTED',
+          status: CommandResultStatus.FAILED,
+        })
+        expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+        expect(controller.getState().status).not.toBe(PlaybackStatus.PAUSED)
+        expect(controller.getState().error.code).toBe('TARGET_PAUSE_REJECTED')
+      }
+
+      // Subcase C: a hanging pause confirmation is bounded by the phase deadline and stays UNKNOWN
+      {
+        const { controller, targetAdapter, resolvePlay, migrationPromise } =
+          await setupInFlightStartup({ phaseTimeoutMs: 20 })
+        const pauseSpy = vi.fn(() => new Promise(() => {}))
+        targetAdapter.pause = pauseSpy
+
+        await controller.pause()
+        resolvePlay()
+
+        await expect(migrationPromise).rejects.toMatchObject({
+          code: 'COMMAND_TIMEOUT',
+          status: CommandResultStatus.UNKNOWN,
+        })
+        expect(pauseSpy).toHaveBeenCalledTimes(1)
+        expect(controller.getState().status).toBe(PlaybackStatus.ERROR)
+        expect(controller.getState().status).not.toBe(PlaybackStatus.PAUSED)
+        expect(controller.getState().error.status).toBe(
+          CommandResultStatus.UNKNOWN,
+        )
+      }
+
+      // Subcase D: stop during in-flight startup confirms via the target pause operation
+      {
+        const { controller, targetAdapter, resolvePlay, migrationPromise } =
+          await setupInFlightStartup()
+        const pauseSpy = vi.spyOn(targetAdapter, 'pause')
+
+        await controller.stop()
+        expect(controller.getState().acceptedIntent).toBe('pause')
+        resolvePlay()
+        await migrationPromise
+
+        expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+        expect(pauseSpy).toHaveBeenCalledTimes(1)
+        expect(pauseSpy.mock.calls[0][1].operationId).toMatch(/:phase5:pause_/)
+      }
+
+      // Subcase E: a newer play intent during in-flight startup wins; the
+      // transient pause was already dispatched but the confirmed play settles
+      {
+        const {
+          controller,
+          targetAdapter,
+          resolvePlay,
+          migrationPromise,
+          playSpy,
+        } = await setupInFlightStartup()
+
+        await controller.pause()
+        await controller.play()
+        expect(controller.getState().acceptedIntent).toBe('play')
+
+        resolvePlay()
+        await migrationPromise
+
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+        expect(controller.getState().acceptedIntent).toBe('play')
+        expect(playSpy).toHaveBeenCalledTimes(1)
+      }
+    })
+
+    it('TC-MIG-52 (Spec F1): pause/play issued while phase 6 awaits an isolated command must reach the target boundedly, not only update acceptedIntent', async () => {
+      const setupPhaseSixIsolated = async ({ phaseTimeoutMs } = {}) => {
+        const sourceAdapter = createMockRemoteAudioAdapter()
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(sourceAdapter)
+        await controller.addQueueItems([
+          {
+            queueItemId: 'f1-1',
+            trackId: 't1',
+            name: 'Track 1',
+            musicSrc: 'http://example.com/1.mp3',
+          },
+        ])
+        await controller.play()
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+
+        const targetAdapter = createMockRemoteAudioAdapter()
+
+        // Gate the phase 5 startup play so an isolated command can be submitted
+        // against the already rebuilt scene (non-stale queue baseline)
+        let resolvePlay
+        const playGate = new Promise((resolve) => {
+          resolvePlay = resolve
+        })
+        let signalPlayCalled
+        const playCalled = new Promise((resolve) => {
+          signalPlayCalled = resolve
+        })
+        const playSpy = vi.fn(() => {
+          signalPlayCalled()
+          return playGate
+        })
+        targetAdapter.play = playSpy
+
+        // Gate the phase 6 isolated seek so a later intent lands mid-settle
+        let resolveSeek
+        const seekGate = new Promise((resolve) => {
+          resolveSeek = resolve
+        })
+        let signalSeekCalled
+        const seekCalled = new Promise((resolve) => {
+          signalSeekCalled = resolve
+        })
+        const seekSpy = vi.fn(() => {
+          signalSeekCalled()
+          return seekGate
+        })
+        targetAdapter.seek = seekSpy
+
+        const migrationPromise = controller.migrateOutput({
+          targetAdapter,
+          targetDevice: { name: 'Remote Speaker' },
+          ...(phaseTimeoutMs ? { phaseTimeoutMs } : {}),
+        })
+        await playCalled
+
+        return {
+          controller,
+          targetAdapter,
+          resolvePlay,
+          resolveSeek,
+          seekCalled,
+          migrationPromise,
+          playSpy,
+          seekSpy,
+        }
+      }
+
+      // Subcase A: pause issued while phase 6 awaits the isolated seek reaches the target
+      {
+        const {
+          controller,
+          targetAdapter,
+          resolvePlay,
+          resolveSeek,
+          seekCalled,
+          migrationPromise,
+        } = await setupPhaseSixIsolated()
+        const pauseSpy = vi.spyOn(targetAdapter, 'pause')
+
+        const isolatedSeek = controller.seek(30)
+        resolvePlay()
+        await seekCalled
+        expect(controller.isMigrating()).toBe(true)
+
+        await controller.pause()
+        expect(controller.getState().acceptedIntent).toBe('pause')
+
+        resolveSeek()
+        await isolatedSeek
+        await migrationPromise
+
+        // Invariants: pause reached the target via a bounded phase6 operation
+        expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+        expect(controller.getState().acceptedIntent).toBe('pause')
+        expect(pauseSpy).toHaveBeenCalledTimes(1)
+        expect(pauseSpy.mock.calls[0][1].operationId).toMatch(/:phase6:pause$/)
+      }
+
+      // Subcase B: play issued while phase 6 awaits the isolated seek reaches the target
+      {
+        const {
+          controller,
+          targetAdapter,
+          resolvePlay,
+          resolveSeek,
+          seekCalled,
+          migrationPromise,
+          playSpy,
+        } = await setupPhaseSixIsolated()
+
+        const isolatedSeek = controller.seek(30)
+        resolvePlay()
+        await seekCalled
+
+        await controller.play()
+        expect(controller.getState().acceptedIntent).toBe('play')
+
+        resolveSeek()
+        await isolatedSeek
+        await migrationPromise
+
+        // Invariants: second play reached the target; scene stays PLAYING
+        expect(controller.getState().status).toBe(PlaybackStatus.PLAYING)
+        expect(controller.getState().acceptedIntent).toBe('play')
+        expect(playSpy).toHaveBeenCalledTimes(2)
+        expect(playSpy.mock.calls[1][1].operationId).toMatch(/:phase6:play$/)
+      }
+
+      // Subcase C: a hanging isolated seek is bounded by the phase deadline; the
+      // subsequent pause still reaches the target and UNKNOWN stays UNKNOWN
+      {
+        const {
+          controller,
+          targetAdapter,
+          resolvePlay,
+          seekCalled,
+          migrationPromise,
+        } = await setupPhaseSixIsolated({ phaseTimeoutMs: 20 })
+        const pauseSpy = vi.spyOn(targetAdapter, 'pause')
+
+        const isolatedSeek = controller.seek(30)
+        resolvePlay()
+        await seekCalled
+
+        await controller.pause()
+
+        await expect(isolatedSeek).rejects.toMatchObject({
+          code: 'COMMAND_TIMEOUT',
+          status: CommandResultStatus.UNKNOWN,
+        })
+        await migrationPromise
+
+        expect(controller.getState().status).toBe(PlaybackStatus.PAUSED)
+        expect(controller.getState().acceptedIntent).toBe('pause')
+        expect(pauseSpy).toHaveBeenCalledTimes(1)
+      }
+    })
+
     it('TC-MIG-20: migration cancellation via AbortSignal propagates cancellation and boundedly releases resources', async () => {
       const localAdapter = createBrowserAudioAdapter()
       const controller = createPlaybackControlModule()
