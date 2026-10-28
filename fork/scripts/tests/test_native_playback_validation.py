@@ -357,24 +357,191 @@ class ValidationRunnerTests(unittest.TestCase):
         self.assertTrue(all(call[1]["env"]["GOTOOLCHAIN"] == "local" for call in calls))
         self.assertTrue(all(call[1]["env"]["GOPROXY"] == "off" for call in calls))
 
-    def test_cli_writes_report_and_returns_unaccepted_without_hardware(self):
+    def run_cli(self, *args, process=None, which=None):
         output = io.StringIO()
         errors = io.StringIO()
         env = {key: value for key, value in os.environ.items() if key in {"PATH", "HOME"}}
         with patch.dict(os.environ, env, clear=True):
-            with patch.object(validation.shutil, "which", side_effect=self.which):
+            with patch.object(validation.shutil, "which", side_effect=which or self.which):
                 status = validation.main(
                     ["--repo", str(self.root), "--output", str(self.output), "--go", str(self.go),
-                     "--timeout", "5", "--stress-count", "2"],
-                    run=self.process,
+                     "--timeout", "5", "--stress-count", "2", *args],
+                    run=process or self.process,
                     stdout=output,
                     stderr=errors,
                 )
-        self.assertEqual(status, 1)
+        self.assertEqual(errors.getvalue(), "")
         summary = json.loads(output.getvalue())
         report_path = Path(summary["report"])
         self.assertTrue(report_path.is_file())
-        report = json.loads(report_path.read_text(encoding="utf-8"))
+        return status, summary, json.loads(report_path.read_text(encoding="utf-8"))
+
+    def test_cli_phase_selection_skips_unselected_commands_and_go_discovery(self):
+        status, _, report = self.run_cli("--phase", "diff-check", "--phase", "diff-check")
+        self.assertEqual(status, 1)
+        executed = [phase for phase in report["phases"] if phase["commands"]]
+        self.assertEqual([phase["id"] for phase in executed], ["diff-check"])
+        self.assertEqual(len(executed[0]["commands"]), 2)
+        for phase in report["phases"]:
+            if phase["category"] == "software" and phase["id"] != "diff-check":
+                self.assertEqual(phase["status"], "not_run")
+                self.assertIn("not selected", phase["reason"])
+        self.assertTrue(self.process.calls)
+        for argv, _ in self.process.calls:
+            self.assertEqual(Path(argv[0]).name, "git")
+            self.assertNotIn("--name-only", argv)
+            if "ls-files" in argv:
+                self.assertIn("-z", argv)
+        self.assertIn("physical-output-hardware", report["gate"]["critical_not_run"])
+
+    def test_cli_phase_selection_preserves_canonical_order(self):
+        _, _, report = self.run_cli("--phase", "diff-check", "--phase", "ui-audioplayer")
+        self.assertEqual([phase["id"] for phase in report["phases"] if phase["commands"]],
+                         ["ui-audioplayer", "diff-check"])
+        self.assertFalse(any(Path(argv[0]).name == "go" for argv, _ in self.process.calls))
+
+    def test_cli_selected_go_formatting_still_discovers_and_checks_sources(self):
+        _, _, report = self.run_cli("--phase", "go-formatting")
+        executed = [phase for phase in report["phases"] if phase["commands"]]
+        self.assertEqual([phase["id"] for phase in executed], ["go-formatting"])
+        self.assertEqual(executed[0]["status"], "pass")
+        self.assertEqual(len(executed[0]["commands"]), 3)
+        self.assertTrue(any(Path(argv[0]).name == "go" and "env" in argv
+                            for argv, _ in self.process.calls))
+
+    def test_cli_unknown_or_hardware_phase_is_rejected_before_probes(self):
+        for phase in ("unknown-phase", "physical-output-hardware"):
+            with self.subTest(phase=phase):
+                with patch.object(sys, "stderr", io.StringIO()):
+                    with patch.object(validation.shutil, "which", side_effect=AssertionError("unexpected probe")):
+                        with self.assertRaises(SystemExit) as error:
+                            validation.main(["--repo", str(self.root), "--phase", phase], run=self.process)
+                self.assertEqual(error.exception.code, 2)
+        self.assertEqual(self.process.calls, [])
+        self.assertFalse(self.output.exists())
+
+    def test_cli_scoped_verification_pass_does_not_waive_full_acceptance(self):
+        status, summary, report = self.run_cli("--phase", "diff-check")
+        self.assertEqual(status, 1)
+        self.assertEqual(report["scoped_verification"], {
+            "mode": "selected", "status": "passed", "selected_phases": ["diff-check"], "reasons": [],
+        })
+        self.assertEqual(report["source_stability"], {"status": "stable", "reasons": []})
+        self.assertFalse(report["gate"]["accepted"])
+        self.assertEqual(summary["scoped_verification"], report["scoped_verification"])
+        self.assertEqual(summary["source_stability"], report["source_stability"])
+        self.assertEqual(summary["source_content_sha256"], report["source_content_fingerprint"]["sha256"])
+        self.assertEqual(summary["reasons"], report["gate"]["reasons"])
+
+    def test_cli_source_content_drift_invalidates_evidence(self):
+        def change_source(argv, **kwargs):
+            if "diff" in argv and "--check" in argv:
+                (self.root / "go.mod").write_text("module changed\ngo 1.25.0\n", encoding="utf-8")
+            return self.process(argv, **kwargs)
+
+        status, _, report = self.run_cli("--phase", "diff-check", process=change_source)
+        self.assertEqual(status, 1)
+        self.assertIn("source_content_fingerprint_changed", report["gate"]["reasons"])
+        self.assertEqual(report["source_stability"]["status"], "changed")
+        self.assertEqual(report["scoped_verification"]["status"], "not_verified")
+        self.assertNotEqual(report["source_content_fingerprint"]["sha256"],
+                            report["source_identity_after"]["source_content_fingerprint"]["sha256"])
+        phases = {phase["id"]: phase for phase in report["phases"]}
+        self.assertEqual(phases["diff-check"]["status"], "pass")
+
+    def test_cli_scoped_failure_and_missing_dependency_are_not_verified(self):
+        for unavailable in (False, True):
+            with self.subTest(unavailable=unavailable):
+                def fail_ui(argv, **kwargs):
+                    if Path(argv[0]).name == "npm":
+                        return subprocess.CompletedProcess(argv, 1, "", "synthetic assertion failure")
+                    return self.process(argv, **kwargs)
+
+                def tools(name, path=None):
+                    return None if unavailable and name == "npm" else self.which(name, path)
+
+                _, _, report = self.run_cli("--phase", "ui-audioplayer", process=fail_ui, which=tools)
+                phase = next(phase for phase in report["phases"] if phase["id"] == "ui-audioplayer")
+                expected = "blocked" if unavailable else "fail"
+                self.assertEqual(phase["status"], expected)
+                self.assertEqual(report["scoped_verification"]["status"], "not_verified")
+                self.assertIn(f"ui-audioplayer={expected}", report["scoped_verification"]["reasons"])
+                self.assertEqual(report["source_stability"]["status"], "stable")
+
+    def test_cli_selected_null_phase_still_requires_opt_in_and_executed_spec(self):
+        phase_id = "mpv-null-lifecycle"
+        for opt_in, skip in ((False, False), (True, False), (True, True)):
+            with self.subTest(opt_in=opt_in, skip=skip):
+                def null_process(argv, **kwargs):
+                    if skip and any(arg.startswith("-ginkgo.focus=") for arg in argv):
+                        return subprocess.CompletedProcess(argv, 0, "Ran 0 of 5 Specs in 0s\n", "")
+                    return self.process(argv, **kwargs)
+
+                args = ("--mpv-null",) if opt_in else ()
+                _, _, report = self.run_cli("--phase", phase_id, *args, process=null_process)
+                phase = next(phase for phase in report["phases"] if phase["id"] == phase_id)
+                expected = "blocked" if skip else "pass" if opt_in else "not_run"
+                self.assertEqual(phase["status"], expected)
+                self.assertEqual(report["scoped_verification"]["status"],
+                                 "passed" if expected == "pass" else "not_verified")
+                if not opt_in:
+                    self.assertIn("opt-in omitted", phase["reason"])
+                    self.assertEqual(phase["commands"], [])
+                self.assertFalse(report["gate"]["accepted"])
+
+    def test_cli_commit_or_status_drift_invalidates_scoped_verification(self):
+        for command, field in (("rev-parse", "source_commit"), ("status", "dirty_scope_fingerprint")):
+            with self.subTest(field=field):
+                checked = False
+
+                def change_identity(argv, **kwargs):
+                    nonlocal checked
+                    if "diff" in argv and "--check" in argv:
+                        checked = True
+                    result = self.process(argv, **kwargs)
+                    if checked and command in argv:
+                        text = "b" * 40 + "\n" if command == "rev-parse" else result.stdout + "?? changed/\n"
+                        return subprocess.CompletedProcess(argv, 0, text, "")
+                    return result
+
+                _, _, report = self.run_cli("--phase", "diff-check", process=change_identity)
+                self.assertEqual(report["source_stability"]["status"], "changed")
+                self.assertEqual(report["scoped_verification"]["status"], "not_verified")
+                self.assertIn(f"{field}_changed", report["gate"]["reasons"])
+                self.assertEqual(report["source_commit"], self.source_commit)
+
+    def test_cli_missing_identity_at_either_boundary_is_not_verified(self):
+        for boundary in ("before", "after"):
+            for command, field in (("rev-parse", "source_commit"), ("status", "dirty_scope_fingerprint"),
+                                   ("ls-files", "source_content_fingerprint")):
+                with self.subTest(boundary=boundary, field=field):
+                    checked = False
+
+                    def missing_identity(argv, **kwargs):
+                        nonlocal checked
+                        if "diff" in argv and "--check" in argv:
+                            checked = True
+                        if command in argv and checked == (boundary == "after"):
+                            return subprocess.CompletedProcess(argv, 1, "", "synthetic identity failure")
+                        return self.process(argv, **kwargs)
+
+                    status, _, report = self.run_cli("--phase", "diff-check", process=missing_identity)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(report["source_stability"]["status"], "unavailable")
+                    self.assertEqual(report["scoped_verification"]["status"], "not_verified")
+                    self.assertIn(f"{field}_{boundary}_unavailable", report["gate"]["reasons"])
+                    phase = next(phase for phase in report["phases"] if phase["id"] == "diff-check")
+                    self.assertEqual(phase["status"], "pass")
+
+    def test_cli_writes_report_and_returns_unaccepted_without_hardware(self):
+        status, _, report = self.run_cli()
+        self.assertEqual(status, 1)
+        self.assertEqual(report["scoped_verification"], {
+            "mode": "full", "status": "not_applicable", "selected_phases": [], "reasons": [],
+        })
+        self.assertEqual(report["source_stability"]["status"], "stable")
+        self.assertEqual([phase["id"] for phase in report["phases"] if phase["category"] == "software"],
+                         list(validation.PHASE_IDS))
         self.assertEqual(report["source_commit"], self.source_commit)
         dirty_scope = report["dirty_scope_fingerprint"]
         status_text = (
@@ -391,7 +558,6 @@ class ValidationRunnerTests(unittest.TestCase):
         ).hexdigest())
         self.assertEqual(report["gate"]["decision"], "not_accepted")
         self.assertIn("physical-output-hardware", report["gate"]["critical_not_run"])
-        self.assertEqual(errors.getvalue(), "")
 
     def test_source_content_fingerprint_changes_without_status_change(self):
         with patch.object(validation.shutil, "which", side_effect=self.which):

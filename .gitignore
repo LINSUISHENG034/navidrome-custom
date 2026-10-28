@@ -29,6 +29,7 @@ binaries
 navidrome-*
 /ndpgen
 AGENTS.md
+!/AGENTS.md
 .github/prompts
 .github/instructions
 .github/git-commit-instructions.md

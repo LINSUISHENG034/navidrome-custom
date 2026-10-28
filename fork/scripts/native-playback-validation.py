@@ -37,6 +37,12 @@ NULL_MPV_SPECS = {
     "mpv-null-explicit-close": "reports explicit close as retirement, never as natural EOF",
     "mpv-null-context-cancel": "releases the output process when its context is canceled",
 }
+PHASE_IDS = (
+    "playback-normal", "playback-race", "playback-pipewire-private", "playback-pending-service-retirement",
+    "playback-stress", "nativeapi-subsonic", "nativeapi-command-authority", "nativeapi-subsonic-command-authority",
+    *NULL_MPV_SPECS,
+    "ui-full-suite", "ui-audioplayer", "ui-eventstream", "diff-check", "go-formatting", "ui-formatting",
+)
 BLOCKED_OUTPUTS = (
     "cannot embed directory build/3rdparty: contains no embeddable files",
     "module lookup disabled by GOPROXY=off",
@@ -362,7 +368,7 @@ def write_json(path, value):
 class ValidationRunner:
     def __init__(self, repo, output, *, go_binary, go_details, timeout, phase_timeouts,
                  stress_count, mpv_null, run=isolated_run, source_commit=None, provenance=None,
-                 dirty_scope_fingerprint=None, source_content_fingerprint=None):
+                 dirty_scope_fingerprint=None, source_content_fingerprint=None, selected_phases=None):
         self.repo = Path(repo).resolve()
         self.output = Path(output).resolve()
         self.go_binary = go_binary
@@ -376,9 +382,17 @@ class ValidationRunner:
         self.provenance = provenance or {}
         self.dirty_scope_fingerprint = dirty_scope_fingerprint or {}
         self.source_content_fingerprint = source_content_fingerprint or {}
+        self.source_identity_after = None
+        self.selected_phases = None if selected_phases is None else frozenset(selected_phases)
+        if self.selected_phases is not None:
+            if not self.selected_phases or self.selected_phases.difference(PHASE_IDS):
+                raise ValidationError("select at least one known validation phase")
         self.results = []
         self.started_at = utc_now()
         self.run_directory = None
+
+    def phase_selected(self, phase_id):
+        return self.selected_phases is None or phase_id in self.selected_phases
 
     def _phase(self, phase_id, title, *, critical=True, category="software", commands=None,
                blocked_reason=None, not_run_reason=None, expected_failure=False, env=None,
@@ -395,6 +409,8 @@ class ValidationRunner:
             "duration_seconds": 0.0,
             "reason": None,
         }
+        if category == "software" and not self.phase_selected(phase_id):
+            not_run_reason = "not selected by --phase"
         if not_run_reason:
             phase["reason"] = not_run_reason
             self.results.append(phase)
@@ -634,13 +650,18 @@ class ValidationRunner:
             category="hardware",
             not_run_reason="not run: this software-only runner never accesses Bluetooth, D-Bus, audio devices, or production containers",
         )
+        self.source_identity_after = capture_source_identity(self.repo, self.run)
         return self.report()
 
     def _run_gofmt_phase(self, go_error, git):
+        phase_id = "go-formatting"
+        title = "Go formatting check on changed Go files"
+        if not self.phase_selected(phase_id):
+            return self._phase(phase_id, title)
         phase_started = time.monotonic()
         phase = {
-            "id": "go-formatting",
-            "title": "Go formatting check on changed Go files",
+            "id": phase_id,
+            "title": title,
             "critical": True,
             "category": "software",
             "status": "blocked",
@@ -711,6 +732,26 @@ class ValidationRunner:
         record["stdout_log"] = str(stdout_path)
         record["stderr_log"] = str(stderr_path)
 
+    def scoped_verification(self, source_stability):
+        selected = [phase_id for phase_id in PHASE_IDS
+                    if self.selected_phases is not None and phase_id in self.selected_phases]
+        result = {
+            "mode": "full" if self.selected_phases is None else "selected",
+            "selected_phases": selected,
+            "status": "not_applicable",
+            "reasons": [],
+        }
+        if self.selected_phases is None:
+            return result
+        reasons = list(source_stability["reasons"])
+        phases = {phase["id"]: phase for phase in self.results}
+        for phase_id in selected:
+            status = phases.get(phase_id, {}).get("status", "not_run")
+            if status != "pass":
+                reasons.append(f"{phase_id}={status}")
+        result.update(status="not_verified" if reasons else "passed", reasons=reasons)
+        return result
+
     def report(self):
         hard_failures = [phase["id"] for phase in self.results
                          if phase["critical"] and phase["status"] in {"fail", "expectedfail"}]
@@ -733,6 +774,13 @@ class ValidationRunner:
             reasons.append("dirty_scope_fingerprint_unavailable")
         if not self.source_content_fingerprint.get("sha256"):
             reasons.append("source_content_fingerprint_unavailable")
+        source_stability = compare_source_identities({
+            "source_commit": self.source_commit,
+            "provenance": self.provenance,
+            "dirty_scope_fingerprint": self.dirty_scope_fingerprint,
+            "source_content_fingerprint": self.source_content_fingerprint,
+        }, self.source_identity_after)
+        reasons.extend(source_stability["reasons"])
         accepted = not reasons
         return {
             "schema_version": SCHEMA_VERSION,
@@ -743,6 +791,9 @@ class ValidationRunner:
             "dirty_scope_fingerprint": self.dirty_scope_fingerprint,
             "source_content_fingerprint": self.source_content_fingerprint,
             "provenance": self.provenance,
+            "source_identity_after": self.source_identity_after,
+            "source_stability": source_stability,
+            "scoped_verification": self.scoped_verification(source_stability),
             "go_toolchain": self.go_details,
             "gate": {
                 "decision": "accepted" if accepted else "not_accepted",
@@ -851,6 +902,37 @@ def capture_source_content_fingerprint(repo, run):
     return result
 
 
+def capture_source_identity(repo, run):
+    source_commit, provenance = capture_source_commit(repo, run)
+    return {
+        "source_commit": source_commit,
+        "provenance": provenance,
+        "dirty_scope_fingerprint": capture_dirty_scope_fingerprint(repo, run),
+        "source_content_fingerprint": capture_source_content_fingerprint(repo, run),
+    }
+
+
+def compare_source_identities(before, after):
+    fingerprints = ("dirty_scope_fingerprint", "source_content_fingerprint")
+    reasons = []
+    for boundary, identity in (("before", before), ("after", after)):
+        identity = identity or {}
+        if not identity.get("source_commit") or identity.get("provenance", {}).get("error"):
+            reasons.append(f"source_commit_{boundary}_unavailable")
+        for name in fingerprints:
+            fingerprint = identity.get(name, {})
+            if not fingerprint.get("sha256") or fingerprint.get("error"):
+                reasons.append(f"{name}_{boundary}_unavailable")
+    if reasons:
+        return {"status": "unavailable", "reasons": reasons}
+    if before["source_commit"] != after["source_commit"]:
+        reasons.append("source_commit_changed")
+    for name in fingerprints:
+        if before[name]["sha256"] != after[name]["sha256"]:
+            reasons.append(f"{name}_changed")
+    return {"status": "changed" if reasons else "stable", "reasons": reasons}
+
+
 def parse_phase_timeout(value):
     match = re.fullmatch(r"([a-z][a-z0-9-]*)=([1-9][0-9]*)", value)
     if match is None:
@@ -859,15 +941,8 @@ def parse_phase_timeout(value):
 
 
 def phase_timeout_values(overrides):
-    phase_ids = {
-        "playback-normal", "playback-race", "playback-pipewire-private", "playback-stress", "nativeapi-subsonic",
-        "nativeapi-command-authority", "nativeapi-subsonic-command-authority", "playback-pending-service-retirement",
-        "mpv-null-lifecycle", "mpv-null-paused-seek-candidate", "mpv-null-transport-recovery", "mpv-null-natural-eof",
-        "mpv-null-explicit-close", "mpv-null-context-cancel", "ui-full-suite", "ui-audioplayer",
-        "ui-eventstream", "diff-check", "go-formatting", "ui-formatting",
-    }
     values = {}
-    for phase_id in phase_ids:
+    for phase_id in PHASE_IDS:
         key = "ND_VALIDATION_TIMEOUT_" + phase_id.upper().replace("-", "_")
         if os.environ.get(key):
             try:
@@ -878,7 +953,7 @@ def phase_timeout_values(overrides):
                 raise ValidationError(f"{key} must be a positive integer")
             values[phase_id] = seconds
     for phase_id, seconds in overrides:
-        if phase_id not in phase_ids:
+        if phase_id not in PHASE_IDS:
             raise ValidationError(f"unknown validation phase for timeout: {phase_id}")
         values[phase_id] = seconds
     return values
@@ -895,6 +970,9 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=int, default=int(os.environ["ND_VALIDATION_TIMEOUT"])
                         if os.environ.get("ND_VALIDATION_TIMEOUT") else None,
                         help="override all phase timeouts in seconds")
+    parser.add_argument("--phase", action="append", choices=PHASE_IDS, metavar="ID",
+                        help="run only a selected phase (repeatable); other phases remain not_run. "
+                             "Choices: " + ", ".join(PHASE_IDS))
     parser.add_argument("--phase-timeout", action="append", type=parse_phase_timeout, default=[],
                         metavar="PHASE=SECONDS", help="override one phase timeout (repeatable)")
     parser.add_argument("--stress-count", type=int,
@@ -931,10 +1009,15 @@ def main(argv=None, *, run=isolated_run, stdout=None, stderr=None):
         print(f"error: {error}", file=stderr)
         return 2
 
-    source_commit, provenance = capture_source_commit(repo, run)
-    dirty_scope_fingerprint = capture_dirty_scope_fingerprint(repo, run)
-    source_content_fingerprint = capture_source_content_fingerprint(repo, run)
-    go_binary, go_details = discover_go(repo, run, args.go_binary)
+    source_identity = capture_source_identity(repo, run)
+    needs_go = args.phase is None or any(
+        phase.startswith(("playback-", "nativeapi-", "mpv-null-")) or phase == "go-formatting"
+        for phase in args.phase
+    )
+    if needs_go:
+        go_binary, go_details = discover_go(repo, run, args.go_binary)
+    else:
+        go_binary, go_details = None, {"selected": None, "reason": "not required by selected phases"}
     runner = ValidationRunner(
         repo, output,
         go_binary=go_binary,
@@ -944,10 +1027,8 @@ def main(argv=None, *, run=isolated_run, stdout=None, stderr=None):
         stress_count=args.stress_count,
         mpv_null=args.mpv_null,
         run=run,
-        source_commit=source_commit,
-        provenance=provenance,
-        dirty_scope_fingerprint=dirty_scope_fingerprint,
-        source_content_fingerprint=source_content_fingerprint,
+        selected_phases=args.phase,
+        **source_identity,
     )
     try:
         report = runner.run_all()
@@ -959,8 +1040,12 @@ def main(argv=None, *, run=isolated_run, stdout=None, stderr=None):
 
     summary = {
         "decision": report["gate"]["decision"],
-        "source_commit": source_commit,
-        "dirty_scope_sha256": dirty_scope_fingerprint["sha256"],
+        "source_commit": report["source_commit"],
+        "dirty_scope_sha256": report["dirty_scope_fingerprint"]["sha256"],
+        "source_content_sha256": report["source_content_fingerprint"]["sha256"],
+        "source_stability": report["source_stability"],
+        "scoped_verification": report["scoped_verification"],
+        "reasons": report["gate"]["reasons"],
         "report": str(report_path),
         "phases": {phase["id"]: phase["status"] for phase in report["phases"]},
     }
