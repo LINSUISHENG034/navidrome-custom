@@ -5565,6 +5565,81 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       },
     )
 
+    it('TC-MIG-63: a definitively reported startup-pause fence rejects newer intents without a settle write', async () => {
+      const controller = createPlaybackControlModule()
+      const sourceAdapter = createMockRemoteAudioAdapter()
+      controller.setAdapter(sourceAdapter)
+      await controller.addQueueItems([
+        {
+          queueItemId: 't63-1',
+          trackId: 't1',
+          name: 'Track 1',
+          musicSrc: 'http://example.com/1.mp3',
+        },
+      ])
+      await controller.play()
+
+      const targetAdapter = createMockRemoteAudioAdapter()
+      const startupGate = deferredResult()
+      const originalPlay = targetAdapter.play
+      const playSpy = vi
+        .spyOn(targetAdapter, 'play')
+        .mockImplementation(async (...args) => {
+          await originalPlay(...args)
+          await startupGate.promise
+        })
+      const pauseSpy = vi.fn((epoch, options) =>
+        Promise.reject({
+          code: 'COMMAND_SUPERSEDED',
+          message: 'Pause fenced by target authority/epoch change',
+          status: CommandResultStatus.NOT_EXECUTED,
+          operationId: options.operationId,
+        }),
+      )
+      targetAdapter.pause = pauseSpy
+
+      const migrationPromise = controller.migrateOutput({
+        targetAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+      const migrationOutcome = migrationPromise.then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      )
+      await waitFor(() => expect(playSpy).toHaveBeenCalledTimes(1))
+
+      await controller.pause()
+      expect(pauseSpy).toHaveBeenCalledTimes(1)
+      const pauseOperationId = pauseSpy.mock.calls[0][1].operationId
+      expect(pauseOperationId).toMatch(/:phase5:pause_\d+$/)
+      await controller.play()
+      expect(controller.getState().acceptedIntent).toBe('play')
+
+      startupGate.resolve()
+      const outcome = await migrationOutcome
+
+      expect(playSpy).toHaveBeenCalledTimes(1)
+      expect(pauseSpy).toHaveBeenCalledTimes(1)
+      expect(
+        playSpy.mock.calls.some(([, options]) =>
+          options.operationId.includes(':phase5:settle_play_'),
+        ),
+      ).toBe(false)
+      expect(outcome.error).toMatchObject({
+        code: 'COMMAND_SUPERSEDED',
+        status: CommandResultStatus.NOT_EXECUTED,
+        operationId: pauseOperationId,
+      })
+      expect(controller.getState()).toMatchObject({
+        status: PlaybackStatus.ERROR,
+        error: {
+          code: 'COMMAND_SUPERSEDED',
+          status: CommandResultStatus.NOT_EXECUTED,
+          operationId: pauseOperationId,
+        },
+      })
+    })
+
     it('TC-MIG-62: cancellation remains terminal when a startup pause later fails', async () => {
       const controller = createPlaybackControlModule()
       const sourceAdapter = createMockRemoteAudioAdapter()

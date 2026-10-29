@@ -1356,7 +1356,12 @@ export function createPlaybackControlModule(config = {}) {
             // a new operation ID would hide the original failure, and
             // unclassified errors must not be swallowed either; in both
             // cases the original code/message/status/operationId propagate.
+            const isFencingError =
+              pauseErr?.code === 'COMMAND_SUPERSEDED' ||
+              pauseErr?.code === 'MIGRATION_CANCELLED' ||
+              pauseErr?.code === 'MIGRATION_TERMINAL'
             const supersedingIntent =
+              !isFencingError &&
               typeof interruptSeq === 'number' &&
               migrationTx.intentSequence > interruptSeq &&
               (pauseErr?.status === CommandResultStatus.FAILED ||
