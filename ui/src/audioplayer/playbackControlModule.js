@@ -889,6 +889,10 @@ export function createPlaybackControlModule(config = {}) {
       startupInterrupt: null,
       // Play/pause/stop that must still reach the target during phase 6 settle
       intentInterrupt: null,
+      // Watermark of the intent sequence whose effect is confirmed on the
+      // target. Never advances at a phase boundary by copying the latest
+      // accepted sequence; only a confirmed bounded command advances it.
+      lastConfirmedIntentSequence: state.intentSequence,
     }
     activeMigration = migrationTx
 
@@ -1271,9 +1275,12 @@ export function createPlaybackControlModule(config = {}) {
       // PAUSED is reported, so a rejected or UNKNOWN confirmation can never
       // surface as a false success.
       let startupPauseConfirmation = null
+      let startupInterruptSeq = null
       migrationTx.pauseStartup = (pauseSeq) => {
         if (!startupActive || typeof targetAdapter.pause !== 'function') return
-        const pauseOpId = opId('phase5', `pause_${pauseSeq ?? ++intentCounter}`)
+        const effectivePauseSeq = pauseSeq ?? ++intentCounter
+        startupInterruptSeq = effectivePauseSeq
+        const pauseOpId = opId('phase5', `pause_${effectivePauseSeq}`)
         let confirmation
         try {
           confirmation = executeWithTimeout(
@@ -1296,11 +1303,149 @@ export function createPlaybackControlModule(config = {}) {
         startupPauseConfirmation = confirmation
       }
 
+      const publishConfirmedIntent = (intent) => {
+        state = {
+          ...state,
+          status:
+            intent === 'play' ? PlaybackStatus.PLAYING : PlaybackStatus.PAUSED,
+          acceptedIntent: intent,
+        }
+        notifySubscribers()
+      }
+
+      // Ticket 09 round 3: shared bounded intent reconciliation for phases 5
+      // and 6. Tracks the intent sequence actually confirmed on the target
+      // (migrationTx.lastConfirmedIntentSequence) separately from the latest
+      // accepted intent sequence, and keeps executing the latest accepted
+      // intent — bounded by the phase deadline, fenced by runStep terminal /
+      // epoch / abort checks — until that intent has confirmed execution.
+      // Newer accepted intents are re-read after every await, so an older
+      // in-flight result can never overwrite them or consume them via a
+      // boundary snapshot.
+      const reconcileIntents = async (phaseLabel) => {
+        // A pause/stop that reached a pending startup settles first: only its
+        // own bounded confirmation may classify the target state.
+        if (startupPauseConfirmation) {
+          const interruptSeq = startupInterruptSeq
+          let interruptApplied = false
+          try {
+            await startupPauseConfirmation
+            assertMigrationEpoch(newEpoch, targetAdapter)
+            interruptApplied = true
+          } catch (pauseErr) {
+            assertActive()
+            const interruptUnknown =
+              pauseErr?.status === CommandResultStatus.UNKNOWN ||
+              pauseErr?.code === 'COMMAND_TIMEOUT' ||
+              pauseErr?.code === 'RESPONSE_LOST'
+            if (interruptUnknown) {
+              // Fail-closed: the pause may still be in flight on the target,
+              // so dispatching a different new operation ID is NOT
+              // reconciliation. Only a FAILED/NOT_EXECUTED classification lets
+              // the loop re-execute the latest intent under its own identity.
+              failMigration(
+                pauseErr,
+                'TARGET_INTERRUPT_FAILED',
+                'Pause/stop issued during target startup has an UNKNOWN outcome',
+              )
+            }
+            // Definitive FAILED / NOT_EXECUTED: terminal for that intent.
+            // Only a strictly newer accepted intent (re-read after the await)
+            // may supersede it through the reconciliation loop below, under
+            // its own operation identity. Redispatching the same intent under
+            // a new operation ID would hide the original failure, and
+            // unclassified errors must not be swallowed either; in both
+            // cases the original code/message/status/operationId propagate.
+            const supersedingIntent =
+              typeof interruptSeq === 'number' &&
+              migrationTx.intentSequence > interruptSeq &&
+              (pauseErr?.status === CommandResultStatus.FAILED ||
+                pauseErr?.status === CommandResultStatus.NOT_EXECUTED)
+            if (!supersedingIntent) {
+              failMigration(
+                pauseErr,
+                'TARGET_INTERRUPT_FAILED',
+                'Pause/stop issued during target startup failed definitively on the target',
+              )
+            }
+          } finally {
+            startupPauseConfirmation = null
+          }
+          if (
+            interruptApplied &&
+            typeof interruptSeq === 'number' &&
+            interruptSeq > migrationTx.lastConfirmedIntentSequence
+          ) {
+            migrationTx.lastConfirmedIntentSequence = interruptSeq
+            if (migrationTx.intentSequence === interruptSeq) {
+              publishConfirmedIntent('pause')
+            }
+          }
+        }
+
+        while (
+          migrationTx.intentSequence > migrationTx.lastConfirmedIntentSequence
+        ) {
+          if (Date.now() >= migrationDeadline) {
+            failMigration(
+              {
+                code: 'MIGRATION_TIMEOUT',
+                status: CommandResultStatus.UNKNOWN,
+                message: `Output migration timed out after ${overallTimeoutMs}ms`,
+              },
+              'MIGRATION_TIMEOUT',
+              'Intent reconciliation exceeded the migration deadline',
+            )
+          }
+          const seq = migrationTx.intentSequence
+          const intent =
+            migrationTx.acceptedIntent === 'play' ? 'play' : 'pause'
+          const latestInterrupt = migrationTx.intentInterrupt
+          const commandName =
+            intent === 'play'
+              ? 'play'
+              : latestInterrupt?.intentSequence === seq &&
+                  latestInterrupt?.commandName === 'stop' &&
+                  typeof targetAdapter.stop === 'function'
+                ? 'stop'
+                : 'pause'
+          const settleOpId = opId(phaseLabel, `settle_${commandName}_${seq}`)
+          try {
+            await runStep(
+              () =>
+                targetAdapter[commandName](newEpoch, {
+                  operationId: settleOpId,
+                }),
+              settleOpId,
+            )
+            assertMigrationEpoch(newEpoch, targetAdapter)
+          } catch (err) {
+            failMigration(
+              err,
+              intent === 'play'
+                ? 'TARGET_START_FAILED'
+                : 'TARGET_INTERRUPT_FAILED',
+              `Failed to confirm the latest ${intent} intent on the target device`,
+            )
+          }
+          // Confirmed execution advances the watermark; the loop condition
+          // then re-reads the latest accepted intent, so a newer intent is
+          // never marked consumed by copying a boundary sequence.
+          migrationTx.lastConfirmedIntentSequence = seq
+          if (migrationTx.intentSequence === seq) {
+            publishConfirmedIntent(intent)
+          }
+        }
+      }
+
       const effectiveIntent =
         migrationTx.acceptedIntent ??
         (wasPlayingOrPreparingPlay ? 'play' : 'pause')
       const shouldPlayTarget = effectiveIntent === 'play'
       const opIdStart = opId('phase5', shouldPlayTarget ? 'play' : 'pause')
+      // The startup command confirms every intent accepted up to this
+      // sequence; anything newer is settled by reconcileIntents.
+      const phase5EntrySequence = migrationTx.intentSequence
 
       if (
         snapshot.queue.length === 0 &&
@@ -1309,16 +1454,20 @@ export function createPlaybackControlModule(config = {}) {
       ) {
         const targetState = targetAdapter.getRemoteState()
         assertMigrationEpoch(newEpoch, targetAdapter)
-        state = {
-          ...state,
-          status: PlaybackStatus.PLAYING,
-          position:
-            typeof targetState.position === 'number'
-              ? targetState.position
-              : state.position,
-          acceptedIntent: 'play',
+        migrationTx.lastConfirmedIntentSequence = phase5EntrySequence
+        if (migrationTx.intentSequence === phase5EntrySequence) {
+          state = {
+            ...state,
+            status: PlaybackStatus.PLAYING,
+            position:
+              typeof targetState.position === 'number'
+                ? targetState.position
+                : state.position,
+            acceptedIntent: 'play',
+          }
+          notifySubscribers()
         }
-        notifySubscribers()
+        await reconcileIntents('phase5')
       } else if (shouldPlayTarget) {
         try {
           startupActive = true
@@ -1327,14 +1476,23 @@ export function createPlaybackControlModule(config = {}) {
             opIdStart,
           )
           assertMigrationEpoch(newEpoch, targetAdapter)
+          migrationTx.lastConfirmedIntentSequence = phase5EntrySequence
+          if (migrationTx.intentSequence === phase5EntrySequence) {
+            publishConfirmedIntent('play')
+          }
         } catch (playErr) {
           if (migrationTx.acceptedIntent === 'pause') {
-            state = {
-              ...state,
-              status: PlaybackStatus.PAUSED,
-              acceptedIntent: 'pause',
+            // A pause that never reached the pending startup settles as
+            // PAUSED only while it is still the latest intent; a pause whose
+            // bounded confirmation is pending is reconciled below and PAUSED
+            // is published strictly after that confirmation settles APPLIED.
+            if (
+              !startupPauseConfirmation &&
+              migrationTx.intentSequence === phase5EntrySequence
+            ) {
+              migrationTx.lastConfirmedIntentSequence = phase5EntrySequence
+              publishConfirmedIntent('pause')
             }
-            notifySubscribers()
           } else {
             failMigration(
               playErr,
@@ -1346,49 +1504,7 @@ export function createPlaybackControlModule(config = {}) {
           startupActive = false
           migrationTx.pauseStartup = null
         }
-
-        // Ticket 09: a pause/stop that reached a pending startup must be
-        // reconciled before settlement. The confirmation is awaited (bounded by
-        // the phase deadline, UNKNOWN preserved via queryOperation); failure
-        // surfaces an error instead of a false PAUSED. If a newer play intent
-        // superseded the pause, the confirmed startup play remains authoritative.
-        if (startupPauseConfirmation) {
-          const stillPaused =
-            migrationTx.acceptedIntent === 'pause' &&
-            migrationTx.startupInterrupt
-          try {
-            await startupPauseConfirmation
-            assertMigrationEpoch(newEpoch, targetAdapter)
-          } catch (pauseErr) {
-            if (stillPaused) {
-              failMigration(
-                pauseErr,
-                'TARGET_INTERRUPT_FAILED',
-                'Failed to confirm pause/stop issued during target startup',
-              )
-            }
-          }
-          state = {
-            ...state,
-            status: stillPaused ? PlaybackStatus.PAUSED : PlaybackStatus.PLAYING,
-            acceptedIntent: stillPaused ? 'pause' : 'play',
-          }
-          notifySubscribers()
-        } else if (migrationTx.acceptedIntent === 'pause') {
-          state = {
-            ...state,
-            status: PlaybackStatus.PAUSED,
-            acceptedIntent: 'pause',
-          }
-          notifySubscribers()
-        } else {
-          state = {
-            ...state,
-            status: PlaybackStatus.PLAYING,
-            acceptedIntent: 'play',
-          }
-          notifySubscribers()
-        }
+        await reconcileIntents('phase5')
       } else {
         if (typeof targetAdapter.pause === 'function') {
           try {
@@ -1396,6 +1512,7 @@ export function createPlaybackControlModule(config = {}) {
               () => targetAdapter.pause(newEpoch, { operationId: opIdStart }),
               opIdStart,
             )
+            migrationTx.lastConfirmedIntentSequence = phase5EntrySequence
           } catch (pauseErr) {
             failMigration(
               pauseErr,
@@ -1403,23 +1520,32 @@ export function createPlaybackControlModule(config = {}) {
               'Failed to confirm target pause',
             )
           }
+        } else {
+          migrationTx.lastConfirmedIntentSequence = phase5EntrySequence
         }
         assertMigrationEpoch(newEpoch, targetAdapter)
-        state = {
-          ...state,
-          status:
-            snapshot.status === PlaybackStatus.IDLE
-              ? PlaybackStatus.IDLE
-              : PlaybackStatus.PAUSED,
-          acceptedIntent: 'pause',
+        // A newer intent accepted while the initial pause awaited is settled
+        // by reconcileIntents; never publish a stale PAUSED over it.
+        if (migrationTx.intentSequence === phase5EntrySequence) {
+          state = {
+            ...state,
+            status:
+              snapshot.status === PlaybackStatus.IDLE
+                ? PlaybackStatus.IDLE
+                : PlaybackStatus.PAUSED,
+            acceptedIntent: 'pause',
+          }
+          notifySubscribers()
         }
-        notifySubscribers()
+        await reconcileIntents('phase5')
       }
 
-      // Phase 6: Settle isolated commands submitted during migration
-      // Only intents recorded after phase 5 settled still need to reach the
-      // target; anything older was already applied by phase 5 semantics.
-      const phase5ExitSequence = migrationTx.intentSequence
+      // Phase 6: Settle isolated commands submitted during migration, then
+      // reconcile the latest accepted play/pause/stop through the shared
+      // bounded mechanism. Intents are never consumed by copying the latest
+      // sequence at this boundary: anything not yet confirmed on the target
+      // (accepted during phase 5 awaits, isolated awaits, or reconciliation
+      // itself) is executed here with its own bounded operation identity.
       const isolated = migrationTx.isolatedCommands
       for (const cmd of isolated) {
         const isStale =
@@ -1460,73 +1586,12 @@ export function createPlaybackControlModule(config = {}) {
 
       // Spec F1: a play/pause/stop issued while phase 6 awaited an isolated
       // command must reach the target with bounded operation semantics, not
-      // only update acceptedIntent. Failure/UNKNOWN surfaces an error instead
-      // of a false success, exactly like the phase 5 interrupt confirmation.
-      const lateInterrupt = migrationTx.intentInterrupt
-      if (
-        lateInterrupt &&
-        typeof lateInterrupt.intentSequence === 'number' &&
-        lateInterrupt.intentSequence > phase5ExitSequence
-      ) {
-        if (lateInterrupt.commandName === 'play') {
-          const opIdLatePlay = opId('phase6', 'play')
-          try {
-            await executeWithTimeout(
-              targetAdapter.play(newEpoch, { operationId: opIdLatePlay }),
-              phaseTimeoutMs,
-              opIdLatePlay,
-              targetAdapter,
-            )
-          } catch (latePlayErr) {
-            failMigration(
-              latePlayErr,
-              'TARGET_START_FAILED',
-              'Failed to start playback on target device',
-            )
-          }
-          assertMigrationEpoch(newEpoch, targetAdapter)
-          state = {
-            ...state,
-            status: PlaybackStatus.PLAYING,
-            acceptedIntent: 'play',
-          }
-          notifySubscribers()
-        } else {
-          const lateCommand =
-            lateInterrupt.commandName === 'stop' &&
-            typeof targetAdapter.stop === 'function'
-              ? 'stop'
-              : typeof targetAdapter.pause === 'function'
-                ? 'pause'
-                : null
-          if (lateCommand) {
-            const opIdLateInterrupt = opId('phase6', lateCommand)
-            try {
-              await executeWithTimeout(
-                targetAdapter[lateCommand](newEpoch, {
-                  operationId: opIdLateInterrupt,
-                }),
-                phaseTimeoutMs,
-                opIdLateInterrupt,
-                targetAdapter,
-              )
-            } catch (lateInterruptErr) {
-              failMigration(
-                lateInterruptErr,
-                'TARGET_INTERRUPT_FAILED',
-                'Failed to confirm pause/stop issued during migration settle',
-              )
-            }
-            assertMigrationEpoch(newEpoch, targetAdapter)
-          }
-          state = {
-            ...state,
-            status: PlaybackStatus.PAUSED,
-            acceptedIntent: 'pause',
-          }
-          notifySubscribers()
-        }
-      }
+      // only update acceptedIntent. The shared reconciliation loop keeps
+      // re-reading the latest accepted intent after every confirmed command,
+      // so an intent accepted during phase 6 (or during reconciliation
+      // itself) is always executed through runStep terminal/epoch/abort
+      // fencing with full error/UNKNOWN semantics.
+      await reconcileIntents('phase6')
 
       state = {
         ...state,
