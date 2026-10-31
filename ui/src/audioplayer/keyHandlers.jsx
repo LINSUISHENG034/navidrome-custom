@@ -97,7 +97,10 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
           )
           .catch(() => {})
       } else {
-        audioInstance.volume = Math.min(1, audioInstance.volume + 0.1)
+        audioInstance.volume = stepUiVolume(
+          audioInstance.volume,
+          VOLUME_KEY_STEP,
+        )
       }
     },
     VOL_DOWN: () => {
@@ -109,7 +112,10 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
           )
           .catch(() => {})
       } else {
-        audioInstance.volume = Math.max(0, audioInstance.volume - 0.1)
+        audioInstance.volume = stepUiVolume(
+          audioInstance.volume,
+          -VOLUME_KEY_STEP,
+        )
       }
     },
     PREV_SONG: (e) => {

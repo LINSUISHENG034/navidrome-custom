@@ -49,9 +49,6 @@ export const resolveVolumeProfile = (context = {}, explicitProfile = null) => {
       err.code = 'VOLUME_PROFILE_UNKNOWN'
       throw err
     }
-    if (typeof profileToResolve === 'function') {
-      return profileToResolve
-    }
     const err = new Error(`Unknown volume profile: ${profileToResolve}`)
     err.code = 'VOLUME_PROFILE_UNKNOWN'
     throw err
@@ -67,23 +64,12 @@ export const resolveVolumeProfile = (context = {}, explicitProfile = null) => {
   return DEFAULT_VOLUME_PROFILE
 }
 
-export const getVolumeProfile = (context = {}) => {
-  try {
-    return resolveVolumeProfile(context)
-  } catch {
-    return DEFAULT_VOLUME_PROFILE
-  }
-}
-
 export const audioVolumeToRemoteGain = (
   audioVolume,
   context = {},
   explicitProfile = null,
 ) => {
   const profile = resolveVolumeProfile(context, explicitProfile)
-  if (typeof profile === 'function') {
-    return clamp01(profile(audioVolume, context))
-  }
   if (profile === BLUETOOTH_JUKEBOX_VOLUME_PROFILE) {
     return Math.pow(clamp01(audioVolume), BLUETOOTH_PROFILE_EXPONENT)
   }
@@ -96,9 +82,6 @@ export const remoteGainToAudioVolume = (
   explicitProfile = null,
 ) => {
   const profile = resolveVolumeProfile(context, explicitProfile)
-  if (typeof profile === 'function') {
-    return clamp01(gain)
-  }
   if (profile === BLUETOOTH_JUKEBOX_VOLUME_PROFILE) {
     return Math.pow(clamp01(gain), 1 / BLUETOOTH_PROFILE_EXPONENT)
   }
@@ -123,15 +106,8 @@ export const remoteGainToUiVolume = (
 ) =>
   audioVolumeToUiVolume(remoteGainToAudioVolume(gain, context, explicitProfile))
 
-export const stepRemoteGainByUiDelta = (gain, delta, context = {}) => {
-  if (getVolumeProfile(context) === DEFAULT_VOLUME_PROFILE) {
-    return clamp01(gain + delta)
-  }
-  return uiVolumeToRemoteGain(
-    remoteGainToUiVolume(gain, context) + delta,
-    context,
-  )
-}
+export const stepRemoteGainByUiDelta = (gain, delta, context = {}) =>
+  uiVolumeToRemoteGain(remoteGainToUiVolume(gain, context) + delta, context)
 
 export const resolveAuthoritativeGain = (
   reportedGain,

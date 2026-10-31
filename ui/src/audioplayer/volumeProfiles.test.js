@@ -3,7 +3,6 @@ import {
   audioVolumeToRemoteGain,
   DEFAULT_VOLUME_PROFILE,
   BLUETOOTH_JUKEBOX_VOLUME_PROFILE,
-  getVolumeProfile,
   HARDWARE_QUANTIZATION_TOLERANCE,
   remoteGainToAudioVolume,
   remoteGainToUiVolume,
@@ -20,7 +19,9 @@ import {
 describe('volumeProfiles', () => {
   it('keeps the upstream default mapping for non-Bluetooth devices', () => {
     expect(
-      getVolumeProfile({ deviceName: 'pulse/alsa_output.pci-0000_00_1f.3' }),
+      resolveVolumeProfile({
+        deviceName: 'pulse/alsa_output.pci-0000_00_1f.3',
+      }),
     ).toBe('default')
     expect(
       uiVolumeToRemoteGain(0.6, {
@@ -36,7 +37,9 @@ describe('volumeProfiles', () => {
 
   it('uses the Bluetooth profile for bluez and a2dp device markers', () => {
     expect(
-      getVolumeProfile({ deviceName: 'pulse/bluez_output.24_C4.a2dp-sink' }),
+      resolveVolumeProfile({
+        deviceName: 'pulse/bluez_output.24_C4.a2dp-sink',
+      }),
     ).toBe('bluetooth-jukebox')
     expect(
       uiVolumeToRemoteGain(0.6, {
@@ -52,7 +55,7 @@ describe('volumeProfiles', () => {
 
   it('falls back to the jukebox device label when remote deviceName is unavailable', () => {
     expect(
-      getVolumeProfile({ jukeboxDevice: 'Bluetooth Living Room Speaker' }),
+      resolveVolumeProfile({ jukeboxDevice: 'Bluetooth Living Room Speaker' }),
     ).toBe('bluetooth-jukebox')
     expect(
       uiVolumeToRemoteGain(0.6, {
@@ -117,7 +120,7 @@ describe('volumeProfiles', () => {
       isBluetooth: true,
       deviceName: 'pulse/bluez_output.24_C4.a2dp-sink',
     }
-    expect(getVolumeProfile(explicitDefault)).toBe(DEFAULT_VOLUME_PROFILE)
+    expect(resolveVolumeProfile(explicitDefault)).toBe(DEFAULT_VOLUME_PROFILE)
     expect(audioVolumeToRemoteGain(0.64, explicitDefault)).toBeCloseTo(0.64)
 
     // Explicit 'bluetooth-jukebox' overrides ordinary device marker and isBluetooth: false
@@ -126,7 +129,7 @@ describe('volumeProfiles', () => {
       isBluetooth: false,
       deviceName: 'pulse/alsa_output.pci',
     }
-    expect(getVolumeProfile(explicitBluetooth)).toBe(
+    expect(resolveVolumeProfile(explicitBluetooth)).toBe(
       BLUETOOTH_JUKEBOX_VOLUME_PROFILE,
     )
     expect(audioVolumeToRemoteGain(0.64, explicitBluetooth)).toBeCloseTo(
@@ -139,6 +142,19 @@ describe('volumeProfiles', () => {
     expect(() =>
       resolveVolumeProfile({ volumeProfile: 'custom-unsupported-curve' }),
     ).toThrow(expect.objectContaining({ code: 'VOLUME_PROFILE_UNKNOWN' }))
+  })
+
+  it('rejects unreviewed function profiles at the mapping boundary', () => {
+    const customProfile = (volume) => Math.sqrt(volume)
+    for (const applyProfile of [
+      () => resolveVolumeProfile({}, customProfile),
+      () => audioVolumeToRemoteGain(0.64, {}, customProfile),
+      () => remoteGainToAudioVolume(0.8, {}, customProfile),
+    ]) {
+      expect(applyProfile).toThrow(
+        expect.objectContaining({ code: 'VOLUME_PROFILE_UNKNOWN' }),
+      )
+    }
   })
 
   it('reuses confirmed V within quantization tolerance and inverts external changes once', () => {

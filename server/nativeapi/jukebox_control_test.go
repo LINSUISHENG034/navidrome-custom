@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -418,6 +419,57 @@ func TestJukeboxSessionPlaybackAPIsCompile(t *testing.T) {
 	_, _ = api.playback.HeartbeatSession(context.Background(), "s1", "tab-1")
 	_, _ = api.playback.DetachSession(context.Background(), "s1", "tab-1")
 	_, _ = api.playback.SessionStatus(context.Background(), "s1")
+}
+
+type jukeboxExecutionErrorServer struct {
+	playback.PlaybackServer
+	err     error
+	command playback.PlaybackCommand
+	calls   int
+}
+
+func (s *jukeboxExecutionErrorServer) ExecuteCommand(_ context.Context, _ playback.CommandScope, command playback.PlaybackCommand) (playback.DeviceStatus, error) {
+	s.calls++
+	s.command = command
+	return playback.DeviceStatus{}, s.err
+}
+
+func TestJukeboxExecutionErrorsPropagate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		path    string
+		action  string
+		body    map[string]any
+		failure string
+	}{
+		{name: "source stop", path: "/jukebox/pause", action: playback.CommandPause, body: map[string]any{}, failure: "pause IPC rejected"},
+		{name: "target start", path: "/jukebox/start", action: playback.CommandStart, body: map[string]any{}, failure: "unpause IPC rejected"},
+		{name: "target volume", path: "/jukebox/volume", action: playback.CommandGain, body: map[string]any{"gain": 0.25}, failure: "volume IPC rejected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			executionErr := errors.New(tc.failure)
+			server := &jukeboxExecutionErrorServer{err: executionErr}
+			api := &Router{playback: server}
+			router := chi.NewRouter()
+			api.addJukeboxControlRoute(router)
+
+			encoded, err := json.Marshal(tc.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(encoded))
+			r = r.WithContext(request.WithUser(r.Context(), model.User{ID: "admin", UserName: "admin", IsAdmin: true}))
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, r)
+
+			if response.Code != http.StatusInternalServerError || response.Body.String() != tc.failure+"\n" {
+				t.Fatalf("execution error did not propagate unchanged: status=%d body=%q", response.Code, response.Body.String())
+			}
+			if server.calls != 1 || server.command.Action != tc.action {
+				t.Fatalf("unexpected command execution: calls=%d command=%#v", server.calls, server.command)
+			}
+		})
+	}
 }
 
 func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {

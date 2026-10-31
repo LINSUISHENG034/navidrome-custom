@@ -431,7 +431,7 @@ describe('remote-state-first jukebox controls', () => {
     expect(jukeboxClient.skip).toHaveBeenCalledWith(2, 0)
   })
 
-  it('uses remote session gain for volume changes', () => {
+  it('uses remote session gain for volume changes in the U domain', () => {
     const handlers = keyHandlers(
       { togglePlay: vi.fn(), volume: 0.5 },
       {
@@ -439,13 +439,13 @@ describe('remote-state-first jukebox controls', () => {
         queue: [],
         current: {},
         jukeboxControl: { ownershipState: 'attached' },
-        jukeboxRemote: { gain: 0.8 },
+        jukeboxRemote: { gain: 0.64 },
       },
     )
 
     handlers.VOL_DOWN()
     expect(jukeboxClient.volume).toHaveBeenCalledTimes(1)
-    expect(jukeboxClient.volume.mock.calls[0][0]).toBeCloseTo(0.7)
+    expect(jukeboxClient.volume.mock.calls[0][0]).toBeCloseTo(0.49)
   })
 
   it('uses the Bluetooth profile for remote keyboard volume changes', () => {
@@ -597,15 +597,15 @@ describe('unified controller hotkey routing (Issue 05, TC-IN-03)', () => {
     expect(controller.skipPrev).toHaveBeenCalledTimes(1)
   })
 
-  it('TC-IN-03: without a controller the two-argument call keeps the existing host behavior', () => {
-    const audioInstance = { togglePlay: vi.fn(), volume: 0.5 }
+  it('TC-IN-03: without a controller the two-argument local path also steps in the U domain', () => {
+    const audioInstance = { togglePlay: vi.fn(), volume: 0.64 }
     const handlers = keyHandlers(audioInstance, playerState)
 
     handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
     expect(audioInstance.togglePlay).toHaveBeenCalledTimes(1)
 
     handlers.VOL_UP()
-    expect(audioInstance.volume).toBeCloseTo(0.6)
+    expect(audioInstance.volume).toBeCloseTo(0.81)
   })
 })
 
