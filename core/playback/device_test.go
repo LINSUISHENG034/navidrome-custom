@@ -824,6 +824,7 @@ var _ = Describe("playbackDevice concurrency", func() {
 		Expect(status.Playing).To(BeFalse())
 
 		// Asynchronous event for the same token arrives later
+		fingerprintBeforeFailure := pd.SceneFingerprint()
 		pos := 10
 		pd.handlePlaybackEvent(model.PlaybackEvent{
 			Token:    token,
@@ -836,6 +837,7 @@ var _ = Describe("playbackDevice concurrency", func() {
 		Expect(pd.ActiveTrack).To(BeNil())
 		Expect(pd.recoveryPosition).ToNot(BeNil())
 		Expect(*pd.recoveryPosition).To(Equal(10))
+		Expect(pd.SceneFingerprint()).ToNot(Equal(fingerprintBeforeFailure))
 	})
 })
 

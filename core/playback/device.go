@@ -669,6 +669,7 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 			log.Error("Playback output failed", "token", event.Token, "positionKnown", event.Position != nil, event.Err)
 		}
 		pd.retireActiveTrackLocked()
+		pd.incrementSceneRevisionLocked()
 		notify = pd.stateChangeNotifierLocked()
 	default:
 		log.Warn("Ignoring unknown playback event", "kind", event.Kind, "token", event.Token)

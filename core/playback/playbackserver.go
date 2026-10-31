@@ -1590,6 +1590,18 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 			return OperationRecord{}, &TargetOccupiedError{SceneFingerprint: currentFp, QueueCount: targetDevice.PlaybackQueue.Size()}
 		}
 
+		items := make(model.MediaFiles, 0, len(req.Queue))
+		for _, id := range req.Queue {
+			mf, err := ps.GetMediaFile(id)
+			if err != nil {
+				return OperationRecord{}, fmt.Errorf("load migration media file %q: %w", id, err)
+			}
+			if mf == nil {
+				return OperationRecord{}, fmt.Errorf("migration media file %q not found", id)
+			}
+			items = append(items, *mf)
+		}
+
 		sessionManager := ps.ensureSessionManagerLocked()
 		revoked = sessionManager.RevokeDeviceOwners(req.TargetDeviceName, req.SessionID)
 		reservation.Status = ReservationReleased
@@ -1599,15 +1611,7 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		sessionManager.Update(session)
 
 		targetDevice.clearLocked(ctx)
-		if len(req.Queue) > 0 {
-			items := model.MediaFiles{}
-			for _, id := range req.Queue {
-				if mf, err := ps.GetMediaFile(id); err == nil && mf != nil {
-					items = append(items, *mf)
-				} else {
-					items = append(items, model.MediaFile{ID: id, Path: "/" + id + ".mp3"})
-				}
-			}
+		if len(items) > 0 {
 			targetDevice.PlaybackQueue.Set(items)
 			targetDevice.PlaybackQueue.SetIndex(req.CurrentIndex)
 		}
@@ -1828,10 +1832,11 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 		}
 		oldDev.clearLocked(ctx)
 		oldDev.incrementQueueVersionLocked()
+		oldDev.incrementSceneRevisionLocked()
 		oldDev.mu.Unlock()
 
+		newDev.mu.Lock()
 		if len(savedQueue) > 0 {
-			newDev.mu.Lock()
 			newDev.clearLocked(ctx)
 			newDev.PlaybackQueue.Set(savedQueue)
 			newDev.PlaybackQueue.SetIndex(savedIndex)
@@ -1840,8 +1845,9 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 			newDev.recoveryPosition = savedPosition
 			newDev.incrementQueueVersionLocked()
 			preparationVersion = newDev.preparationVersion
-			newDev.mu.Unlock()
 		}
+		newDev.incrementSceneRevisionLocked()
+		newDev.mu.Unlock()
 	}
 
 	for idx := range ps.playbackDevices {

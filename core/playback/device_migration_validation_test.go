@@ -611,8 +611,13 @@ func TestPlaybackScopedSwitchRejectsBypassAndRebindsAuthority(t *testing.T) {
 	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
 		t.Fatal(err)
 	}
+	oldFingerprint := server.playbackDevices[0].SceneFingerprint()
+	newFingerprint := server.playbackDevices[1].SceneFingerprint()
 	if err := server.SwitchDeviceForCommand(ctx, migrationCommandScope(scope), "new"); err != nil {
 		t.Fatal(err)
+	}
+	if server.playbackDevices[0].SceneFingerprint() == oldFingerprint || server.playbackDevices[1].SceneFingerprint() == newFingerprint {
+		t.Fatal("device rebind did not advance both scene fingerprints")
 	}
 	snapAfterSwitch, err := server.SessionSnapshot(ctx, "owner", "admin")
 	if err != nil {

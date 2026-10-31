@@ -232,6 +232,36 @@ func TestDurableSessionTakeoverRejectsOldOwnerWithoutRewindingRemoteState(t *tes
 	}
 }
 
+func TestDurableSessionTakeoverWhileRecoveringRequiresExplicitConsent(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	h.startPlayback(t)
+	attached := h.attach(t, "owner")
+
+	h.advance(80 * time.Millisecond)
+	h.server.reapExpiredSessions()
+	if _, err := h.server.AttachSession(h.ctx, AttachRequest{
+		SessionID: "s1", User: "admin", ClientID: "competitor", DeviceName: "pulse/test",
+	}); !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("recovering session allowed an implicit takeover: %v", err)
+	}
+	status, err := h.server.SessionStatus(h.ctx, "s1")
+	if err != nil || status.OwnerClientID != "owner" || status.OwnershipState != SessionOwnershipRecovering || !status.Playing {
+		t.Fatalf("denied recovering takeover changed playback: %#v err=%v", status, err)
+	}
+
+	recovered := h.attach(t, "owner")
+	if recovered.BindingGeneration != attached.BindingGeneration || recovered.OwnershipState != SessionOwnershipAttached {
+		t.Fatalf("original owner could not reattach without changing generation: %#v", recovered)
+	}
+	h.advance(80 * time.Millisecond)
+	h.server.reapExpiredSessions()
+	takenOver := h.attach(t, "competitor", true)
+	if takenOver.OwnerClientID != "competitor" || takenOver.BindingGeneration != attached.BindingGeneration+1 || !takenOver.Playing {
+		t.Fatalf("explicit recovering takeover did not preserve playback: %#v", takenOver)
+	}
+}
+
 func TestDurableSessionPageReloadRehydratesRemoteStateForNewOwner(t *testing.T) {
 	h := newDurableScenarioHarness(t)
 	h.configureQueue("1", "2")
@@ -444,6 +474,34 @@ func TestDurableSessionOperationStoreDeduplicationAndEviction(t *testing.T) {
 	now = now.Add(60 * time.Millisecond)
 	if rec, found := storeWithClock.Get("s1", "op-ttl"); found || rec.Status != OperationStatusUnknown {
 		t.Fatalf("expected expired op-ttl to return UNKNOWN, got found=%v, status=%s", found, rec.Status)
+	}
+}
+
+func TestDurableSessionOperationResultsDoNotSurviveRestart(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.attach(t, "owner")
+	generation := uint64(1)
+	scope := CommandScope{
+		User: "admin", SessionID: "s1", ClientID: "owner",
+		BindingGeneration: &generation, OperationID: "g1:before-restart",
+	}
+	if _, err := h.server.ExecuteCommand(h.ctx, scope, PlaybackCommand{Action: CommandGain, Gain: .4}); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := &playbackServer{
+		ctx: &h.ctx, sessionManager: NewSessionManager(time.Minute),
+		playbackDevices: h.server.playbackDevices,
+	}
+	if _, err := restarted.QueryOperation(h.ctx, scope.SessionID, scope.OperationID); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("restart restored operation history: %v", err)
+	}
+	scope.OperationID = "g1:blind-replay"
+	if _, err := restarted.ExecuteCommand(h.ctx, scope, PlaybackCommand{Action: CommandGain, Gain: .8}); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("restart permitted a blind replay: %v", err)
+	}
+	if h.device.Gain != .4 {
+		t.Fatalf("blind replay changed the device after restart: gain=%v", h.device.Gain)
 	}
 }
 
@@ -1081,6 +1139,18 @@ func TestDurableSessionMigrationRepair(t *testing.T) {
 		if target.PlaybackQueue.Size() != 1 || len(h.server.reservations) != 0 {
 			t.Fatal("non-owner reservation changed target or reservation state")
 		}
+	})
+	t.Run("unavailable media cannot partially commit a migration", func(t *testing.T) {
+		h, _, reserve, commit := newMigrationRepairFixture(t)
+		if _, err := h.server.ReserveMigration(h.ctx, reserve); err != nil {
+			t.Fatal(err)
+		}
+		commit.Queue = []string{"missing-track"}
+		assertUnchanged := captureMigrationInvariant(t, h, reserve.MigrationID)
+		if _, err := h.server.CommitMigration(h.ctx, commit); err == nil {
+			t.Fatal("commit fabricated media instead of rejecting an unavailable queue item")
+		}
+		assertUnchanged()
 	})
 	for _, missing := range []string{"client", "generation"} {
 		t.Run("commit rejects missing "+missing, func(t *testing.T) {
