@@ -938,6 +938,8 @@ class AppSmoke:
 
         checks["preparing_native_pause"] = self.software_preparing_contract(
             context, browser_dir, errors, details)
+        checks["migration_response_loss_reconciled"] = self.software_response_loss_contract(
+            context, browser_dir, errors, details)
 
         page = self.open_software_contract(context, browser_dir, errors, details, autostart="1")
         self.summary["browser"]["current_case"] = "actual_autoplay_rejection"
@@ -1007,6 +1009,44 @@ class AppSmoke:
                   "held_response_released_after_pause": True, "preserved_queue_item": settled["currentQueueItemId"],
                   "preserved_position": settled["position"], "native_mobile": mobile, "media_probe": self.assert_media_probe(page)}
         page.screenshot(path=str(browser_dir / (case + ".png")), full_page=True)
+        page.close()
+        return result
+
+    def software_response_loss_contract(self, context, browser_dir, errors, details):
+        self.summary["browser"]["current_case"] = "migration_response_loss_reconciled"
+        page = self.open_software_contract(context, browser_dir, errors, details,
+            preparePlay="1", responseLoss="volume")
+        page.locator("#migrate-remote").click()
+        page.wait_for_function("window.__unifiedControlValidation.snapshot().pendingOutputTarget === null")
+        page.wait_for_function("JSON.parse(document.querySelector('#contract-result').textContent).outcome === 'APPLIED'")
+        evidence = page.evaluate("""() => {
+          const validation = window.__unifiedControlValidation
+          const reconciliation = validation.responseLoss
+          return {
+            queries: reconciliation?.operationIds || [],
+            queryResults: reconciliation?.operationResults || [],
+            commands: reconciliation?.target.getWireCommands() || [],
+            targetPlayCount: reconciliation?.target.getPlayCount() || 0,
+            state: validation.snapshot(),
+          }
+        }""")
+        volume_commands = [row for row in evidence["commands"] if row["action"] == "volume"]
+        if len(volume_commands) != 1:
+            raise SmokeFailure(f"response loss did not issue exactly one target volume write: {evidence}")
+        operation_id = volume_commands[0]["operationId"]
+        if evidence["queries"] != [operation_id]:
+            raise SmokeFailure(f"response loss did not query the original operation identity: {evidence}")
+        query_results = evidence["queryResults"]
+        if len(query_results) != 1 or query_results[0].get("status") != "APPLIED":
+            raise SmokeFailure(f"response loss was not reconciled to APPLIED: {evidence}")
+        if not operation_id.endswith(":phase4:volume"):
+            raise SmokeFailure(f"response loss used an unstable migration operation identity: {operation_id}")
+        if evidence["targetPlayCount"] != 1 or evidence["state"]["status"] != "playing":
+            raise SmokeFailure(f"reconciled APPLIED volume did not preserve final play intent: {evidence}")
+        result = {"operation_id": operation_id, "query_count": 1, "query_status": "APPLIED",
+                  "volume_command_count": 1, "target_play_count": evidence["targetPlayCount"], "accepted_intent": evidence["state"]["acceptedIntent"],
+                  "fault_injection": "MockRemoteAudioAdapter responseLost during target volume confirmation"}
+        page.screenshot(path=str(browser_dir / "migration-response-loss.png"), full_page=True)
         page.close()
         return result
 

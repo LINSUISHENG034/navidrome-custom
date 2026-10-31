@@ -4359,6 +4359,63 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       await playPromise.catch(() => {})
     })
 
+    it('TC-MIG-64: Natural End preparation preserves the accepted play intent across output migration', async () => {
+      const audio = document.createElement('audio')
+      const localAdapter = createBrowserAudioAdapter({ audioElement: audio })
+      const controller = createPlaybackControlModule()
+      controller.setAdapter(localAdapter)
+      await controller.addQueueItems([
+        {
+          queueItemId: 'natural-1',
+          trackId: 'natural-track-1',
+          musicSrc: 'http://example.com/natural-1.mp3',
+        },
+        {
+          queueItemId: 'natural-2',
+          trackId: 'natural-track-2',
+          musicSrc: 'http://example.com/natural-2.mp3',
+        },
+      ])
+
+      const nextTrackPlay = deferredResult()
+      playSpy
+        .mockImplementationOnce(function () {
+          setMediaFlags(this, { paused: false, ended: false })
+          return Promise.resolve()
+        })
+        .mockImplementationOnce(() => nextTrackPlay.promise)
+      await controller.play()
+      const acceptedSequence = controller.getState().intentSequence
+
+      await act(async () => finishMedia(audio))
+      expect(controller.getState()).toMatchObject({
+        status: PlaybackStatus.PREPARING,
+        acceptedIntent: 'play',
+        currentQueueItemId: 'natural-2',
+        intentSequence: acceptedSequence,
+      })
+
+      const remoteAdapter = createMockRemoteAudioAdapter()
+      await controller.migrateOutput({
+        targetAdapter: remoteAdapter,
+        targetDevice: { name: 'Remote Speaker' },
+      })
+
+      const expectedMigratedState = {
+        status: PlaybackStatus.PLAYING,
+        acceptedIntent: 'play',
+        currentQueueItemId: 'natural-2',
+        intentSequence: acceptedSequence,
+        error: null,
+      }
+      expect(remoteAdapter.getPlayCount()).toBe(1)
+      expect(controller.getState()).toMatchObject(expectedMigratedState)
+      nextTrackPlay.resolve()
+      await act(async () => {})
+      expect(remoteAdapter.getPlayCount()).toBe(1)
+      expect(controller.getState()).toMatchObject(expectedMigratedState)
+    })
+
     it('TC-MIG-14: explicit pause during migration neutralizes automatic startup (zero target play calls); later play intent takes effect through newer intent sequence', async () => {
       const localAdapter = createBrowserAudioAdapter()
       const controller = createPlaybackControlModule()
@@ -4551,6 +4608,144 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
         code: 'COMMAND_SUPERSEDED',
       })
     })
+
+    it.each([
+      {
+        id: 'TC-MIG-65',
+        description:
+          'stale queue edits and old-track commands yield to a fresh authoritative snapshot',
+        sourceState: { queueVersion: 2 },
+        snapshot: {
+          queue: [
+            {
+              queueItemId: 'fresh-item',
+              trackId: 'fresh-track',
+              name: 'Fresh authoritative track',
+            },
+          ],
+          currentQueueItemId: 'fresh-item',
+          queueVersion: 100,
+        },
+        expectedQueue: ['fresh-item'],
+        expectedCurrent: 'fresh-item',
+        expectedPlaybackInstanceId: null,
+        expectStale: true,
+      },
+      {
+        id: 'TC-MIG-66',
+        description:
+          'stale commands cannot cross a replaced playback instance with the same queue and track',
+        sourceState: {
+          queueVersion: 2,
+          playbackInstanceId: 'old-instance',
+        },
+        snapshot: { playbackInstanceId: 'fresh-instance' },
+        expectedQueue: ['old-item'],
+        expectedCurrent: 'old-item',
+        expectedPlaybackInstanceId: 'fresh-instance',
+        expectStale: true,
+      },
+      {
+        id: 'TC-MIG-67',
+        description:
+          'an old-track command aligned to the current queue and playback instance settles after the safety gates',
+        sourceState: {
+          queueVersion: 2,
+          playbackInstanceId: 'old-instance',
+        },
+        snapshot: {},
+        expectedQueue: ['old-item'],
+        expectedCurrent: 'old-item',
+        expectedPlaybackInstanceId: 'old-instance',
+        expectStale: false,
+        submitQueueEdit: false,
+      },
+    ])(
+      '$id: $description',
+      async ({
+        sourceState,
+        snapshot,
+        expectedQueue,
+        expectedCurrent,
+        expectedPlaybackInstanceId,
+        expectStale,
+        submitQueueEdit = true,
+      }) => {
+        const audio = document.createElement('audio')
+        const localAdapter = createBrowserAudioAdapter({ audioElement: audio })
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(localAdapter)
+        await controller.addQueueItems([
+          {
+            queueItemId: 'old-item',
+            trackId: 'old-track',
+            musicSrc: 'http://example.com/old-track.mp3',
+          },
+        ])
+        await controller.play()
+        controller.backfillState(sourceState)
+
+        const target = createMockRemoteAudioAdapter()
+        const volumeStarted = deferredResult()
+        const confirmVolume = deferredResult()
+        const originalSetVolume = target.setVolume
+        vi.spyOn(target, 'setVolume').mockImplementation(async (...args) => {
+          const result = await originalSetVolume(...args)
+          volumeStarted.resolve()
+          await confirmVolume.promise
+          return result
+        })
+
+        const migration = controller.migrateOutput({
+          targetAdapter: target,
+          targetDevice: { name: 'Remote Speaker' },
+        })
+        const isolatedQueueEdit = submitQueueEdit
+          ? controller
+              .addQueueItems([
+                {
+                  queueItemId: 'stale-item',
+                  trackId: 'stale-track',
+                },
+              ])
+              .catch((error) => error)
+          : Promise.resolve(undefined)
+        const isolatedTrackCommand = controller
+          .skipToQueueItem('old-item')
+          .catch((error) => error)
+
+        await volumeStarted.promise
+        target.pushServerSnapshot(snapshot)
+        confirmVolume.resolve()
+        await migration
+
+        const [queueResult, trackResult] = await Promise.all([
+          isolatedQueueEdit,
+          isolatedTrackCommand,
+        ])
+        if (expectStale) {
+          expect(queueResult).toMatchObject({
+            code: 'COMMAND_SUPERSEDED',
+            stale: true,
+          })
+          expect(trackResult).toMatchObject({
+            code: 'COMMAND_SUPERSEDED',
+            stale: true,
+          })
+        } else {
+          expect(queueResult).toBeUndefined()
+          expect(trackResult).toBeUndefined()
+        }
+        expect(target.getQueue().map((item) => item.queueItemId)).toEqual(
+          expectedQueue,
+        )
+        expect(target.getCurrentQueueItemId()).toBe(expectedCurrent)
+        expect(controller.getState()).toMatchObject({
+          currentQueueItemId: expectedCurrent,
+          playbackInstanceId: expectedPlaybackInstanceId,
+        })
+      },
+    )
 
     it('TC-MIG-17: UNKNOWN reconciliation via queryOperation: timeout/lost response queries original operation identity rather than blind replay', async () => {
       const controller = createPlaybackControlModule()

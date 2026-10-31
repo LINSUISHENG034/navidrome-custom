@@ -27,7 +27,10 @@ const root = document.getElementById('root')
 
 function UnifiedControlValidation() {
   const [controller] = useState(() =>
-    createPlaybackControlModule({ initialVolume: 0.64, commandTimeoutMs: 1500 }),
+    createPlaybackControlModule({
+      initialVolume: 0.64,
+      commandTimeoutMs: 1500,
+    }),
   )
   const [browserAdapter] = useState(() =>
     createBrowserAudioAdapter({ unattached: true }),
@@ -48,6 +51,23 @@ function UnifiedControlValidation() {
       : createMockRemoteAudioAdapter({
           device: { volumeProfile: 'bluetooth-jukebox' },
         })
+    if (!local && params.get('responseLoss') === 'volume') {
+      const operationIds = []
+      const operationResults = []
+      target.setFailure({ action: 'volume', responseLost: true })
+      const queryOperation = target.queryOperation
+      target.queryOperation = async (operationId) => {
+        operationIds.push(operationId)
+        const result = await queryOperation(operationId)
+        operationResults.push(result)
+        return result
+      }
+      window.__unifiedControlValidation.responseLoss = {
+        operationIds,
+        operationResults,
+        target,
+      }
+    }
     if (local && !mountPlayer) {
       window.setTimeout(
         () => setMountPlayer(true),
@@ -251,7 +271,11 @@ function SessionHandoffValidation() {
       operationId: `g${scope.generation}:${crypto.randomUUID()}`,
       gain: 0.64,
     })
-    accept({ ...scope, lastWriteStatus: result.status, readOnly: result.status !== 200 })
+    accept({
+      ...scope,
+      lastWriteStatus: result.status,
+      readOnly: result.status !== 200,
+    })
   }
   return (
     <main style={{ padding: 24, fontFamily: 'sans-serif' }}>
