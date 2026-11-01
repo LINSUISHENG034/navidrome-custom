@@ -468,40 +468,41 @@ func (pd *playbackDevice) removeQueueEntryAtLocked(ctx context.Context, index in
 	isCurrent := pd.PlaybackQueue.Index == index
 	wasPlaying := pd.isPlaying()
 	if isCurrent {
-		pd.cancelPreparationLocked()
 		if pd.ActiveTrack != nil {
 			if err := pd.ActiveTrack.Pause(); err != nil {
 				log.Error(ctx, "error pausing active track during remove", err)
 				return pd.getStatus(), false, err
 			}
 		}
+		pd.cancelPreparationLocked()
 		pd.retireActiveTrackLocked()
 		pd.recoveryPosition = nil
 	}
 
 	pd.PlaybackQueue.Remove(index)
-
-	if isCurrent && pd.PlaybackQueue.Size() > 0 {
-		successor := min(index, pd.PlaybackQueue.Size()-1)
-		pd.PlaybackQueue.SetIndex(successor)
-		if wasPlaying {
-			track, token, current, err := pd.loadTrackLocked(ctx, successor)
-			if err != nil || !current {
-				pd.incrementQueueVersionLocked()
-				pd.incrementSceneRevisionLocked()
-				return pd.getStatus(), true, err
-			}
-			pd.assignTrack(track, token)
-			if pd.ActiveTrack != nil {
-				if err := pd.ActiveTrack.Unpause(); err != nil {
-					log.Error(ctx, "error unpausing successor after remove", err)
-					return pd.getStatus(), true, err
-				}
-			}
-		}
+	hasSuccessor := isCurrent && !pd.PlaybackQueue.IsEmpty()
+	if hasSuccessor {
+		pd.PlaybackQueue.SetIndex(min(index, pd.PlaybackQueue.Size()-1))
 	}
+	// Record the committed queue change before preparation can release the mutex.
 	pd.incrementQueueVersionLocked()
 	pd.incrementSceneRevisionLocked()
+
+	if hasSuccessor && wasPlaying {
+		track, token, current, err := pd.loadTrackLocked(ctx, pd.PlaybackQueue.Index)
+		if err != nil || !current {
+			return pd.getStatus(), true, err
+		}
+		pd.assignTrack(track, token)
+		if pd.ActiveTrack != nil {
+			if err := pd.ActiveTrack.Unpause(); err != nil {
+				log.Error(ctx, "error unpausing successor after remove", err)
+				return pd.getStatus(), true, err
+			}
+			pd.incrementStateSequenceLocked()
+			pd.incrementSceneRevisionLocked()
+		}
+	}
 	return pd.getStatus(), true, nil
 }
 
@@ -637,7 +638,7 @@ func (pd *playbackDevice) executeCommand(ctx context.Context, command PlaybackCo
 func (pd *playbackDevice) finishCommandLocked(ctx context.Context, command PlaybackCommand) (DeviceStatus, error) {
 	status, changed, err := pd.commandLocked(ctx, command)
 	var notify func()
-	if err == nil && changed {
+	if changed {
 		notify = pd.stateChangeNotifierLocked()
 	}
 	pd.mu.Unlock()

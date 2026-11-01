@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -1247,6 +1248,131 @@ func assertResolutionFailurePreservesScene(t *testing.T, playing bool, run func(
 	}
 	if track.pauseCalls != pauseCalls || track.closeCalls != closeCalls || notifications != 0 {
 		t.Errorf("resolution failure caused output or publication effects: pauses %d -> %d closes %d -> %d notifications=%d", pauseCalls, track.pauseCalls, closeCalls, track.closeCalls, notifications)
+	}
+}
+
+type removalFailureScene struct {
+	status      DeviceStatus
+	itemIDs     []string
+	track       Track
+	token       model.PlaybackToken
+	preparation uint64
+	revision    uint64
+}
+
+func captureRemovalFailureScene(fixture *anchorMoveFixture) removalFailureScene {
+	device := fixture.device
+	device.mu.Lock()
+	defer device.mu.Unlock()
+	return removalFailureScene{
+		status: device.getStatus(), itemIDs: device.PlaybackQueue.ItemIDs(),
+		track: device.ActiveTrack, token: device.activePlaybackToken,
+		preparation: device.preparationVersion, revision: device.sceneRevision,
+	}
+}
+
+func TestPlaybackDeviceRemovalOrdersCommittedAndStartedStates(t *testing.T) {
+	fixture := newAnchorMoveFixture(t)
+	fixture.start(t)
+	before := captureRemovalFailureScene(fixture)
+	var during removalFailureScene
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		during = captureRemovalFailureScene(fixture)
+		return fixture.newTrack(), nil
+	}
+	status, err := fixture.device.Remove(fixture.ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if during.status.QueueVersion != before.status.QueueVersion+1 || during.status.StateSequence != before.status.StateSequence+1 || during.status.Playing {
+		t.Errorf("unlocked successor preparation lacked committed ordering: before=%#v during=%#v", before.status, during.status)
+	}
+	if status.QueueVersion != before.status.QueueVersion+1 || status.StateSequence != before.status.StateSequence+2 || !status.Playing {
+		t.Errorf("started successor reused its pre-start sequence: before=%#v during=%#v after=%#v", before.status, during.status, status)
+	}
+}
+
+func TestPlaybackDeviceRemovalFailureStateSequence(t *testing.T) {
+	for _, stage := range []string{"pause", "load", "unpause"} {
+		t.Run(stage, func(t *testing.T) {
+			for _, command := range []struct {
+				name string
+				run  func(*anchorMoveFixture) (DeviceStatus, error)
+			}{
+				{"index", func(f *anchorMoveFixture) (DeviceStatus, error) { return f.device.Remove(f.ctx, 0) }},
+				{"identity", func(f *anchorMoveFixture) (DeviceStatus, error) {
+					return f.device.executeCommand(f.ctx, PlaybackCommand{Action: CommandRemove, QueueItemID: f.itemIDs[0]})
+				}},
+			} {
+				t.Run(command.name, func(t *testing.T) {
+					assertRemovalFailureStateSequence(t, stage, command.run)
+				})
+			}
+		})
+	}
+}
+
+func assertRemovalFailureStateSequence(t *testing.T, stage string, run func(*anchorMoveFixture) (DeviceStatus, error)) {
+	t.Helper()
+	fixture := newAnchorMoveFixture(t)
+	fixture.start(t)
+	device, track := fixture.device, fixture.playing
+	before := captureRemovalFailureScene(fixture)
+	failure := errors.New("output rejected " + stage)
+	if stage == "pause" {
+		track.onPause = func() error { return failure }
+	}
+	factoryCalls := 0
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		factoryCalls++
+		during := captureRemovalFailureScene(fixture)
+		if during.status.QueueVersion != before.status.QueueVersion+1 || during.status.StateSequence != before.status.StateSequence+1 {
+			t.Errorf("successor preparation exposed stale structural ordering: before=%#v during=%#v", before.status, during.status)
+		}
+		if stage == "load" {
+			return nil, failure
+		}
+		return &mockTrack{onUnpause: func() error { return failure }}, nil
+	}
+	var notifications []DeviceStatus
+	device.onStateChange = func(status DeviceStatus) {
+		observed, err := device.Status(fixture.ctx)
+		if err != nil || observed != status {
+			t.Errorf("failure notification is not a fresh unlocked observation: status=%#v observed=%#v error=%v", status, observed, err)
+		}
+		notifications = append(notifications, status)
+	}
+	t.Cleanup(func() { device.onStateChange = nil })
+	returned, err := run(fixture)
+	if !errors.Is(err, failure) {
+		t.Errorf("original output failure was not preserved: %v", err)
+	}
+	after := captureRemovalFailureScene(fixture)
+	if returned != after.status {
+		t.Errorf("failure returned stale state: returned=%#v observed=%#v", returned, after.status)
+	}
+	if stage == "pause" {
+		if !reflect.DeepEqual(before, after) || track.closeCalls != 0 || factoryCalls != 0 || len(notifications) != 0 {
+			t.Errorf("failed source pause mutated removal scene: before=%#v after=%#v closes=%d factory=%d notifications=%#v", before, after, track.closeCalls, factoryCalls, notifications)
+		}
+		return
+	}
+	if track.closeCalls != 1 || factoryCalls != 1 {
+		t.Errorf("committed removal retired or prepared output incorrectly: closes=%d factory=%d", track.closeCalls, factoryCalls)
+	}
+	assertCommittedRemovalFailure(t, before, after, notifications)
+}
+
+func assertCommittedRemovalFailure(t *testing.T, before, after removalFailureScene, notifications []DeviceStatus) {
+	t.Helper()
+	if after.status.QueueVersion != before.status.QueueVersion+1 || after.status.StateSequence != before.status.StateSequence+1 || after.revision != before.revision+1 {
+		t.Errorf("committed removal did not advance ordering once: before=%#v after=%#v", before, after)
+	}
+	if after.status.Playing || after.status.CurrentIndex != 0 || !slices.Equal(after.itemIDs, before.itemIDs[1:]) {
+		t.Errorf("failed successor did not retain committed queue context: before=%#v after=%#v", before, after)
+	}
+	if len(notifications) != 1 || notifications[0] != after.status {
+		t.Errorf("committed failure was not published exactly once: state=%#v notifications=%#v", after.status, notifications)
 	}
 }
 

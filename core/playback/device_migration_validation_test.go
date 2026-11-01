@@ -15,6 +15,7 @@ import (
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
+	serverevents "github.com/navidrome/navidrome/server/events"
 	"github.com/navidrome/navidrome/tests"
 )
 
@@ -1782,6 +1783,57 @@ func TestPlaybackIdentityRemovePausedSemantics(t *testing.T) {
 	}
 	if current := fixture.currentID(t); current != fixture.ids[2] {
 		t.Fatalf("identity select resolved wrong instance: %s", current)
+	}
+}
+
+func TestPlaybackProtectedRemovalFailurePublishesCommittedState(t *testing.T) {
+	ctx, server := newMigrationValidationServer(t)
+	device := migrationTestTarget(t, server, "old")
+	if _, err := device.Set(ctx, []string{"track", "track"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := device.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	attached := attachMigrationSource(t, server, "failed-remove-session", "owner", "old")
+	before, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentID := device.PlaybackQueue.CurrentItem().QueueItemID
+	failure := errors.New("successor unpause rejected")
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		return &mockTrack{onUnpause: func() error { return failure }}, nil
+	}
+	broker := server.eventBroker.(*fakeEventBroker)
+	broker.mu.Lock()
+	broker.sent = nil
+	broker.mu.Unlock()
+	scope := CommandScope{
+		User: "admin", SessionID: attached.SessionID, ClientID: "owner",
+		BindingGeneration: &attached.BindingGeneration, OperationID: "g1:remove-failure",
+	}
+	command := PlaybackCommand{Action: CommandRemove, QueueItemID: currentID}
+	after, err := server.ExecuteCommand(ctx, scope, command)
+	if !errors.Is(err, failure) || after.Playing || after.QueueVersion != before.QueueVersion+1 || after.StateSequence != before.StateSequence+1 {
+		t.Errorf("protected removal failure lost committed state: before=%#v after=%#v error=%v", before, after, err)
+	}
+	record, err := server.QueryOperation(ctx, scope.SessionID, scope.OperationID)
+	if err != nil || record.Status != OperationStatusFailed || record.DeviceStatus == nil || *record.DeviceStatus != after {
+		t.Errorf("committed failure did not retain a failed operation result: record=%#v error=%v", record, err)
+	}
+	replayed, err := server.ExecuteCommand(ctx, scope, command)
+	if !errors.Is(err, failure) || replayed != after {
+		t.Errorf("failed removal retry changed its result: original=%#v replayed=%#v error=%v", after, replayed, err)
+	}
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	if len(broker.sent) != 1 {
+		t.Fatalf("committed failure must publish once, including replay: %d events", len(broker.sent))
+	}
+	event, ok := broker.sent[0].event.(*serverevents.JukeboxStateUpdated)
+	if !ok || event.Playing || event.QueueVersion != after.QueueVersion || event.StateSequence != after.StateSequence {
+		t.Fatalf("committed failure event was not authoritative: %#v", broker.sent[0].event)
 	}
 }
 
