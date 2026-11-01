@@ -634,6 +634,21 @@ func (pd *playbackDevice) setMuteLocked(ctx context.Context, muted bool) (Device
 	return pd.getStatus(), changed, nil
 }
 
+func (pd *playbackDevice) setModeLocked(mode PlaybackMode) (DeviceStatus, bool, error) {
+	switch mode {
+	case PlaybackModeOrder, PlaybackModeRepeatList, PlaybackModeRepeatTrack, PlaybackModeShuffle:
+	default:
+		return pd.getStatus(), false, ErrInvalidPlayMode
+	}
+	if pd.mode == mode {
+		return pd.getStatus(), false, nil
+	}
+	pd.mode = mode
+	pd.incrementStateSequenceLocked()
+	pd.incrementSceneRevisionLocked()
+	return pd.getStatus(), true, nil
+}
+
 func (pd *playbackDevice) executeCommand(ctx context.Context, command PlaybackCommand) (DeviceStatus, error) {
 	pd.mu.Lock()
 	return pd.finishCommandLocked(ctx, command)
@@ -710,6 +725,8 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 		return pd.setGainLocked(ctx, command.Gain)
 	case CommandMute:
 		return pd.setMuteLocked(ctx, command.Muted)
+	case CommandSetMode:
+		return pd.setModeLocked(command.Mode)
 	default:
 		return pd.getStatus(), false, fmt.Errorf("unknown playback command: %s", command.Action)
 	}

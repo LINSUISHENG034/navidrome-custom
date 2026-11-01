@@ -80,6 +80,85 @@ func (m *mockTrack) Close() {
 }
 func (m *mockTrack) String() string { return "mockTrack" }
 
+func TestPlaybackDeviceSetMode(t *testing.T) {
+	cases := []struct {
+		name    string
+		initial PlaybackMode
+		mode    PlaybackMode
+		invalid bool
+	}{
+		{"order", PlaybackModeShuffle, PlaybackModeOrder, false},
+		{"order loop", PlaybackModeOrder, PlaybackModeRepeatList, false},
+		{"single loop", PlaybackModeOrder, PlaybackModeRepeatTrack, false},
+		{"shuffle", PlaybackModeOrder, PlaybackModeShuffle, false},
+		{"same mode", PlaybackModeShuffle, PlaybackModeShuffle, false},
+		{"empty value", PlaybackModeShuffle, "", true},
+		{"unknown value", PlaybackModeShuffle, "repeat", true},
+		{"wrong case", PlaybackModeShuffle, "ORDER", true},
+		{"whitespace", PlaybackModeShuffle, " order", true},
+	}
+	for _, tc := range cases {
+		for _, state := range []string{"empty", "paused", "playing"} {
+			t.Run(tc.name+"/"+state, func(t *testing.T) {
+				ctx := context.Background()
+				device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+				device.mode = tc.initial
+				device.stateSequence, device.queueVersion = 11, 7
+				if state != "empty" {
+					device.PlaybackQueue.Add(model.MediaFiles{{ID: "1"}, {ID: "1"}, {ID: "2"}})
+					device.PlaybackQueue.SetIndex(1)
+					device.ActiveTrack = &mockTrack{playing: state == "playing", position: 17}
+					device.activePlaybackToken = 37
+				}
+				before, _ := device.Status(ctx)
+				beforeScene := device.SceneFingerprint()
+				itemIDs := device.PlaybackQueue.ItemIDs()
+				track, token := device.ActiveTrack, device.activePlaybackToken
+				var published []DeviceStatus
+				device.onStateChange = func(status DeviceStatus) {
+					if !device.mu.TryLock() {
+						t.Error("mode callback ran under the device lock")
+						return
+					}
+					device.mu.Unlock()
+					published = append(published, status)
+				}
+				status, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandSetMode, Mode: tc.mode})
+				if tc.invalid {
+					if !errors.Is(err, ErrInvalidPlayMode) {
+						t.Fatalf("invalid mode error: %v", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				changed := !tc.invalid && tc.mode != tc.initial
+				wantMode, wantStatus, wantNotifications := tc.initial, before, 0
+				if changed {
+					wantMode = tc.mode
+					wantStatus.StateSequence++
+					wantNotifications = 1
+				}
+				observed, _ := device.Status(ctx)
+				if device.mode != wantMode || status != wantStatus || observed != wantStatus {
+					t.Errorf("mode/state mismatch: mode=%q returned=%#v observed=%#v wantMode=%q wantStatus=%#v", device.mode, status, observed, wantMode, wantStatus)
+				}
+				if len(published) != wantNotifications || (changed && published[0] != wantStatus) {
+					t.Errorf("mode publication mismatch: %v", published)
+				}
+				if (device.SceneFingerprint() != beforeScene) != changed {
+					t.Error("scene revision did not match mode mutation")
+				}
+				if !slices.Equal(itemIDs, device.PlaybackQueue.ItemIDs()) || device.ActiveTrack != track || device.activePlaybackToken != token {
+					t.Error("mode write changed queue identity or active output")
+				}
+				if active, ok := track.(*mockTrack); ok && (active.pauseCalls != 0 || active.closeCalls != 0 || active.positionSetCalls != 0 || active.muteCalls != 0 || len(active.volumeValues) != 0) {
+					t.Error("mode write issued an output command")
+				}
+			})
+		}
+	}
+}
+
 func TestPlaybackDeviceNaturalEndPlaybackModes(t *testing.T) {
 	cases := []struct {
 		name              string

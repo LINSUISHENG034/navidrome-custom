@@ -69,6 +69,7 @@ var (
 	ErrIdentityRequired          = errors.New("protected queue edits require queueItemId")
 	ErrQueueIdentityConflict     = errors.New("queueItemId cannot be combined with index/from/to")
 	ErrMigrationProtocolConflict = errors.New("migration queue shape mixes legacy and identity fields")
+	ErrInvalidPlayMode           = errors.New("invalid playback mode")
 )
 
 // QueueProtocolCapabilities is enforced in this build and advertised through
@@ -153,6 +154,7 @@ type PlaybackCommand struct {
 	To            int
 	Gain          float32
 	Muted         bool
+	Mode          PlaybackMode
 	// Relative-anchor move fields (T13). QueueItemID/AnchorQueueItemID select
 	// queue instances, Placement is "before"/"after", and ExpectedQueueVersion
 	// may be nil only for unprotected commands (distinct from explicit version 0).
@@ -182,6 +184,7 @@ const (
 	CommandShuffle = "shuffle"
 	CommandGain    = "gain"
 	CommandMute    = "mute"
+	CommandSetMode = "setMode"
 )
 
 // DeviceInfo represents an audio output device exposed via the API.

@@ -566,6 +566,74 @@ func TestPlaybackExplicitTakeoverCancelsInFlightOldOwnerPreparation(t *testing.T
 	}
 }
 
+func TestPlaybackModeCommandAuthorityAndReplay(t *testing.T) {
+	ctx, server := newMigrationValidationServer(t)
+	ctx = request.WithUser(ctx, model.User{UserName: "admin"})
+	attached, err := server.AttachSession(ctx, AttachRequest{SessionID: "mode", User: "admin", ClientID: "owner", DeviceName: "new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := migrationCommandScope(CommandScope{User: "admin", SessionID: "mode", ClientID: "owner", BindingGeneration: &attached.BindingGeneration})
+	device := server.playbackDevices[1]
+	before, _ := device.Status(ctx)
+	beforeScene := device.SceneFingerprint()
+	wrongOwner, wrongUser, missingGeneration, staleGeneration, missingOperation := scope, scope, scope, scope, scope
+	wrongOwner.ClientID = "observer"
+	wrongUser.User = "other"
+	missingGeneration.BindingGeneration = nil
+	otherGeneration := attached.BindingGeneration + 1
+	staleGeneration.BindingGeneration = &otherGeneration
+	missingOperation.OperationID = ""
+	command := PlaybackCommand{Action: CommandSetMode, Mode: PlaybackModeShuffle}
+	for _, tc := range []struct {
+		name  string
+		scope CommandScope
+		err   error
+	}{
+		{"bare", CommandScope{User: "admin"}, ErrSessionOwnership},
+		{"observer", wrongOwner, ErrSessionOwnership},
+		{"foreign user", wrongUser, ErrSessionOwnership},
+		{"missing generation", missingGeneration, ErrGenerationRequired},
+		{"different generation", staleGeneration, ErrCommandSuperseded},
+		{"missing operation", missingOperation, ErrOperationRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := server.ExecuteCommand(ctx, tc.scope, command); !errors.Is(err, tc.err) {
+				t.Fatalf("mode authority rejection: got=%v want=%v", err, tc.err)
+			}
+			status, _ := device.Status(ctx)
+			if status != before || device.mode != PlaybackModeOrder || device.SceneFingerprint() != beforeScene {
+				t.Fatal("rejected mode command changed device state")
+			}
+		})
+	}
+	applied, err := server.ExecuteCommand(ctx, scope, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.StateSequence != before.StateSequence+1 || applied.QueueVersion != before.QueueVersion || device.mode != PlaybackModeShuffle {
+		t.Fatalf("owner mode write did not apply once: %#v", applied)
+	}
+	newScope := migrationCommandScope(scope)
+	current, err := server.ExecuteCommand(ctx, newScope, PlaybackCommand{Action: CommandSetMode, Mode: PlaybackModeRepeatTrack})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := server.ExecuteCommand(ctx, scope, command)
+	observed, _ := device.Status(ctx)
+	if err != nil || replayed != applied || observed != current || current.StateSequence != applied.StateSequence+1 || device.mode != PlaybackModeRepeatTrack {
+		t.Fatalf("mode retry re-executed or lost stored result: replayed=%#v observed=%#v err=%v", replayed, observed, err)
+	}
+	record, err := server.QueryOperation(ctx, scope.SessionID, scope.OperationID)
+	if err != nil || record.Status != OperationStatusApplied || record.Action != CommandSetMode || record.DeviceStatus == nil || *record.DeviceStatus != applied {
+		t.Fatalf("mode operation result mismatch: %#v err=%v", record, err)
+	}
+	defaultStatus, _ := server.playbackDevices[0].Status(ctx)
+	if defaultStatus.StateSequence != 0 || server.playbackDevices[0].mode != PlaybackModeOrder {
+		t.Fatal("bound mode write changed default device")
+	}
+}
+
 func TestPlaybackCommandAuthorityValidation(t *testing.T) {
 	ctx, server := newMigrationValidationServer(t)
 	ctx = request.WithUser(ctx, model.User{UserName: "admin"})
