@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/model"
 )
 
@@ -1310,4 +1311,110 @@ func TestDurableSessionOperationRepair(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestDurableSessionReservationExpiryIsReadOnly(t *testing.T) {
+	previousTTL := conf.Server.Jukebox.ReservationTTL
+	conf.Server.Jukebox.ReservationTTL = time.Second
+	t.Cleanup(func() { conf.Server.Jukebox.ReservationTTL = previousTTL })
+
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	h.startPlayback(t)
+	h.attach(t, "target-owner")
+
+	ctx := h.ctx
+	sourceDevice := NewPlaybackDevice(ctx, h.server, "Source", "source-device")
+	h.server.playbackDevices = append(h.server.playbackDevices, sourceDevice)
+	source, err := h.server.AttachSession(ctx, AttachRequest{SessionID: "source-session", User: "admin", ClientID: "source-client", DeviceName: "source-device"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprint := h.device.SceneFingerprint()
+	reserve := ReserveMigrationRequest{
+		MigrationID:         "mig-expiry",
+		OperationID:         "g1:reserve-expiry",
+		SessionID:           "source-session",
+		ClientID:            "source-client",
+		User:                "admin",
+		DeviceName:          "pulse/test",
+		ForceTakeover:       true,
+		ExpectedFingerprint: fingerprint,
+		BindingGeneration:   &source.BindingGeneration,
+	}
+	if _, err := h.server.ReserveMigration(ctx, reserve); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	before, err := h.server.SessionSnapshot(ctx, "s1", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queueVersionBefore := h.device.queueVersion
+
+	// Advance the injected clock beyond ReservationTTL; nothing reaps eagerly.
+	h.advance(2 * time.Second)
+
+	// Expiry is observed lazily through the read-only query and flips ACTIVE -> EXPIRED.
+	queried, err := h.server.QueryReservation(ctx, "mig-expiry")
+	if err != nil || queried.Status != string(ReservationExpired) {
+		t.Fatalf("expected EXPIRED reservation after TTL, got %#v, %v", queried, err)
+	}
+	// A repeated query stays EXPIRED: expiry observation does not mutate the scene further.
+	queriedAgain, err := h.server.QueryReservation(ctx, "mig-expiry")
+	if err != nil || queriedAgain.Status != string(ReservationExpired) {
+		t.Fatalf("expiry observation was not read-only: %#v, %v", queriedAgain, err)
+	}
+
+	// Observing expiry never mutated the target scene, queue, or fingerprint.
+	after, err := h.server.SessionSnapshot(ctx, "s1", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("expiry observation mutated the target scene: before=%#v after=%#v", before, after)
+	}
+	if h.device.queueVersion != queueVersionBefore {
+		t.Fatalf("expiry observation changed queue version: %d -> %d", queueVersionBefore, h.device.queueVersion)
+	}
+	if current := h.device.SceneFingerprint(); current != fingerprint {
+		t.Fatalf("expiry observation changed scene fingerprint: %s -> %s", fingerprint, current)
+	}
+
+	// The expired reservation no longer blocks a competing confirmed reservation.
+	otherDevice := NewPlaybackDevice(ctx, h.server, "Other", "other-device")
+	h.server.playbackDevices = append(h.server.playbackDevices, otherDevice)
+	other, err := h.server.AttachSession(ctx, AttachRequest{SessionID: "other-session", User: "admin", ClientID: "other-client", DeviceName: "other-device"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicting := ReserveMigrationRequest{
+		MigrationID:         "mig-expiry-2",
+		OperationID:         "g1:reserve-expiry-2",
+		SessionID:           "other-session",
+		ClientID:            "other-client",
+		User:                "admin",
+		DeviceName:          "pulse/test",
+		ForceTakeover:       true,
+		ExpectedFingerprint: h.device.SceneFingerprint(),
+		BindingGeneration:   &other.BindingGeneration,
+	}
+	if _, err := h.server.ReserveMigration(ctx, conflicting); err != nil {
+		t.Fatalf("expired reservation still blocks a competing reservation: %v", err)
+	}
+
+	// Releasing the expired reservation is NOT_EXECUTED with the EXPIRED reason:
+	// expiry is never permission to replay, and release never revives it.
+	release := ReleaseMigrationRequest{MigrationID: "mig-expiry", OperationID: "g1:release-expiry", SessionID: "source-session", ClientID: "source-client", User: "admin", BindingGeneration: &source.BindingGeneration}
+	released, err := h.server.ReleaseMigrationReservation(ctx, release)
+	if err != nil || released.Status != OperationStatusNotExecuted || released.Reason != string(ReservationExpired) {
+		t.Fatalf("expected NOT_EXECUTED/EXPIRED release, got %#v, %v", released, err)
+	}
+
+	// Expiry never stopped playback nor evicted the current owner.
+	st, err := h.server.SessionStatus(ctx, "s1")
+	if err != nil || st.OwnerClientID != "target-owner" || !st.Playing {
+		t.Fatalf("expiry disturbed the current owner: %#v, %v", st, err)
+	}
 }

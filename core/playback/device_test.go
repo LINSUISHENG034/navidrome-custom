@@ -886,3 +886,36 @@ func TestPlaybackDeviceMuteRemainsIndependentAndPrecedesFirstUnpause(t *testing.
 		t.Fatalf("initial output commands were not confirmed before unpause: %v", sequence)
 	}
 }
+
+func TestPlaybackDevicePositionClockInterpolationDoesNotChangeSceneFingerprint(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+	t.Cleanup(func() { _, _ = device.Shutdown(ctx) })
+	device.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/1.mp3"}, {ID: "2", Path: "/2.mp3"}})
+	track := &mockTrack{playing: true, position: 10}
+	device.mu.Lock()
+	device.ActiveTrack = track
+	device.mu.Unlock()
+
+	fingerprint := device.SceneFingerprint()
+	queueVersion := device.queueVersion
+
+	// Position-clock interpolation: the track clock advances without any
+	// semantic queue, item, play/pause, mode, owner, or binding change.
+	track.position = 25
+	status, err := device.Status(ctx)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.Position != 25 {
+		t.Fatalf("position-clock interpolation not visible in status: %d", status.Position)
+	}
+	if current := device.SceneFingerprint(); current != fingerprint {
+		t.Fatalf("position-clock interpolation changed scene fingerprint: %s -> %s", fingerprint, current)
+	}
+	if device.queueVersion != queueVersion {
+		t.Fatalf("position-clock interpolation changed queue version: %d -> %d", queueVersion, device.queueVersion)
+	}
+}
