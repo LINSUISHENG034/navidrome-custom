@@ -186,15 +186,18 @@ func (pd *playbackDevice) Set(ctx context.Context, ids []string) (DeviceStatus, 
 
 func (pd *playbackDevice) setLocked(ctx context.Context, ids []string) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing Set action", "ids", ids, "device", pd)
-	queueChanged := !pd.PlaybackQueue.IsEmpty() || len(ids) > 0
+	items, err := pd.resolveMediaFilesLocked(ctx, ids)
+	if err != nil {
+		return pd.getStatus(), false, err
+	}
+	queueChanged := !pd.PlaybackQueue.IsEmpty() || len(items) > 0
 	pd.clearLocked(ctx)
-	status, err := pd.addLocked(ctx, ids)
-	if err == nil && queueChanged {
+	pd.PlaybackQueue.Add(items)
+	if queueChanged {
 		pd.incrementQueueVersionLocked()
 		pd.incrementSceneRevisionLocked()
-		status = pd.getStatus()
 	}
-	return status, queueChanged, err
+	return pd.getStatus(), queueChanged, nil
 }
 
 func (pd *playbackDevice) Start(ctx context.Context) (DeviceStatus, error) {
@@ -376,15 +379,9 @@ func (pd *playbackDevice) addLocked(ctx context.Context, ids []string) (DeviceSt
 		return pd.getStatus(), nil
 	}
 
-	items := model.MediaFiles{}
-
-	for _, id := range ids {
-		mf, err := pd.ParentPlaybackServer.GetMediaFile(id)
-		if err != nil {
-			return DeviceStatus{}, err
-		}
-		log.Debug(ctx, "Found mediafile: "+mf.Path)
-		items = append(items, *mf)
+	items, err := pd.resolveMediaFilesLocked(ctx, ids)
+	if err != nil {
+		return pd.getStatus(), err
 	}
 	pd.PlaybackQueue.Add(items)
 
@@ -397,17 +394,25 @@ func (pd *playbackDevice) insertLocked(ctx context.Context, index int, ids []str
 		return pd.getStatus(), nil
 	}
 
-	items := model.MediaFiles{}
+	items, err := pd.resolveMediaFilesLocked(ctx, ids)
+	if err != nil {
+		return pd.getStatus(), err
+	}
+	pd.PlaybackQueue.Insert(index, items)
+	return pd.getStatus(), nil
+}
+
+func (pd *playbackDevice) resolveMediaFilesLocked(ctx context.Context, ids []string) (model.MediaFiles, error) {
+	items := make(model.MediaFiles, 0, len(ids))
 	for _, id := range ids {
 		mf, err := pd.ParentPlaybackServer.GetMediaFile(id)
 		if err != nil {
-			return DeviceStatus{}, err
+			return nil, err
 		}
 		log.Debug(ctx, "Found mediafile: "+mf.Path)
 		items = append(items, *mf)
 	}
-	pd.PlaybackQueue.Insert(index, items)
-	return pd.getStatus(), nil
+	return items, nil
 }
 
 func (pd *playbackDevice) Clear(ctx context.Context) (DeviceStatus, error) {
@@ -674,8 +679,8 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 		} else {
 			status, err = pd.addLocked(ctx, command.IDs)
 		}
-		changed := len(command.IDs) > 0
-		if err == nil && changed {
+		changed := err == nil && len(command.IDs) > 0
+		if changed {
 			pd.incrementQueueVersionLocked()
 			pd.incrementSceneRevisionLocked()
 			status = pd.getStatus()

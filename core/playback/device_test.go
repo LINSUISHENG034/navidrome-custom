@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -1168,6 +1169,84 @@ func TestPlaybackDeviceStructuralStateSequence(t *testing.T) {
 			t.Fatalf("%s returned a stale status: returned=%#v observed=%#v error=%v", step.name, status, observed, err)
 		}
 		before = status
+	}
+}
+
+func TestPlaybackDeviceResolutionFailurePreservesScene(t *testing.T) {
+	for _, state := range []struct {
+		name    string
+		playing bool
+	}{
+		{"paused", false},
+		{"playing", true},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			for _, command := range []struct {
+				name string
+				run  func(*playbackDevice, context.Context, []string) (DeviceStatus, error)
+			}{
+				{"set", (*playbackDevice).Set},
+				{"add", (*playbackDevice).Add},
+				{"insert", func(device *playbackDevice, ctx context.Context, ids []string) (DeviceStatus, error) {
+					return device.Insert(ctx, 1, ids)
+				}},
+			} {
+				t.Run(command.name, func(t *testing.T) {
+					for _, input := range []struct {
+						name string
+						ids  []string
+					}{
+						{"first ID missing", []string{"missing"}},
+						{"later ID missing", []string{"1", "missing"}},
+					} {
+						t.Run(input.name, func(t *testing.T) {
+							assertResolutionFailurePreservesScene(t, state.playing, command.run, input.ids)
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func assertResolutionFailurePreservesScene(t *testing.T, playing bool, run func(*playbackDevice, context.Context, []string) (DeviceStatus, error), ids []string) {
+	t.Helper()
+	fixture := newAnchorMoveFixture(t)
+	fixture.start(t)
+	device, ctx, track := fixture.device, fixture.ctx, fixture.playing
+	if !playing {
+		if _, err := device.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	track.position = 17
+	before, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	itemIDs := device.PlaybackQueue.ItemIDs()
+	token, preparation, scene := device.activePlaybackToken, device.preparationVersion, device.sceneRevision
+	pauseCalls, closeCalls := track.pauseCalls, track.closeCalls
+	notifications := 0
+	device.onStateChange = func(DeviceStatus) { notifications++ }
+	t.Cleanup(func() { device.onStateChange = nil })
+
+	returned, err := run(device, ctx, ids)
+	if err == nil {
+		t.Fatal("expected media resolution failure")
+	}
+	after, err := device.Status(ctx)
+	if err != nil || after != before || returned != before {
+		t.Errorf("resolution failure did not preserve authoritative status: before=%#v returned=%#v after=%#v error=%v", before, returned, after, err)
+	}
+	if !slices.Equal(itemIDs, device.PlaybackQueue.ItemIDs()) || device.ActiveTrack != track || device.activePlaybackToken != token {
+		t.Errorf("resolution failure changed queue identity or active output: before IDs=%v after IDs=%v", itemIDs, device.PlaybackQueue.ItemIDs())
+	}
+	if device.preparationVersion != preparation || device.sceneRevision != scene {
+		t.Errorf("resolution failure changed preparation or scene authority: preparation %d -> %d, scene %d -> %d", preparation, device.preparationVersion, scene, device.sceneRevision)
+	}
+	if track.pauseCalls != pauseCalls || track.closeCalls != closeCalls || notifications != 0 {
+		t.Errorf("resolution failure caused output or publication effects: pauses %d -> %d closes %d -> %d notifications=%d", pauseCalls, track.pauseCalls, closeCalls, track.closeCalls, notifications)
 	}
 }
 
