@@ -403,6 +403,55 @@ export function resolveQueueProtocol(adapter, requiredFlags = []) {
   return normalized
 }
 
+export function serializeMigrationContext(snapshot) {
+  const invalid = (message) => {
+    throw { code: 'MIGRATION_CONTEXT_INVALID', message }
+  }
+  if (!Array.isArray(snapshot?.queue)) {
+    invalid('Migration requires an explicit queue array')
+  }
+  const seen = new Set()
+  const queueItems = Array.from(snapshot.queue, (item) => {
+    const queueItemId = item?.queueItemId
+    const mediaFileId = item?.mediaFileId || item?.id
+    if (typeof queueItemId !== 'string' || !queueItemId.trim()) {
+      invalid('Migration queue item IDs must be nonblank strings')
+    }
+    if (seen.has(queueItemId))
+      invalid('Migration queue item IDs must be unique')
+    if (typeof mediaFileId !== 'string' || !mediaFileId.trim()) {
+      invalid('Migration media IDs must be nonblank strings')
+    }
+    seen.add(queueItemId)
+    return { queueItemId, mediaFileId }
+  })
+  const result = { queueItems }
+  if (snapshot.currentQueueItemId != null) {
+    if (
+      typeof snapshot.currentQueueItemId !== 'string' ||
+      !snapshot.currentQueueItemId.trim() ||
+      !seen.has(snapshot.currentQueueItemId)
+    ) {
+      invalid('Migration current item must belong to the queue')
+    }
+    result.currentQueueItemId = snapshot.currentQueueItemId
+  }
+  if (snapshot.position !== undefined) {
+    if (
+      !Number.isFinite(snapshot.position) ||
+      snapshot.position < 0 ||
+      !Number.isSafeInteger(Math.round(snapshot.position))
+    ) {
+      invalid(
+        'Migration position must be finite, nonnegative and safely rounded',
+      )
+    }
+    // Nonnegative seconds use the same half-up rounding as Go math.Round.
+    result.position = Math.round(snapshot.position)
+  }
+  return result
+}
+
 export function applyQueueClear() {
   return {
     queue: [],

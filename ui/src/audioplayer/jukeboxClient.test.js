@@ -438,3 +438,491 @@ describe('jukeboxClient anchor queue transport', () => {
     })
   })
 })
+
+describe('jukeboxClient captured identity migration', () => {
+  const protocol = {
+    version: 1,
+    relativeMove: true,
+    identitySelect: true,
+    identityRemove: true,
+    identityMigration: true,
+    anchorVersionEnforcement: true,
+    operationResults: true,
+  }
+  const identity = { sessionId: 'session / a', clientId: 'tab-a' }
+  const snapshot = () => ({
+    queue: [
+      { queueItemId: 'q-first', id: 'same-media' },
+      { queueItemId: 'q-middle', id: 'fallback', mediaFileId: 'preferred' },
+      { queueItemId: 'q-last', id: 'same-media' },
+    ],
+    currentQueueItemId: 'q-last',
+    position: 12.5,
+    acceptedIntent: 'pause',
+    playMode: 'orderLoop',
+    volume: 0.2,
+  })
+  let client
+  let serialize
+  let createModule
+  let createAdapter
+
+  beforeEach(async () => {
+    vi.resetModules()
+    httpClient.mockReset()
+    client = (await import('./jukeboxClient')).default
+    const module = await import('./playbackControlModule')
+    serialize = module.serializeMigrationContext
+    createModule = module.createPlaybackControlModule
+    createAdapter = (await import('./mockRemoteAudioAdapter'))
+      .createMockRemoteAudioAdapter
+    httpClient.mockResolvedValue({ json: {} })
+  })
+
+  const attach = async (extra = {}) => {
+    const response = {
+      ...identity,
+      ownerClientId: identity.clientId,
+      ownershipState: 'attached',
+      bindingGeneration: 7,
+      queueProtocol: protocol,
+      ...extra,
+    }
+    httpClient.mockResolvedValueOnce({ json: response })
+    return client.attachSession(response.sessionId, identity.clientId)
+  }
+  const captured = async () => {
+    const lease = await attach()
+    const scope = client.captureMigrationScope(lease)
+    const operation = client.captureMigrationOperation(scope, 'mig:commit')
+    httpClient.mockClear()
+    return { lease, scope, operation }
+  }
+  const expectedScope = { ...identity, bindingGeneration: 7 }
+  const request = {
+    migrationId: 'migration / one',
+    deviceName: 'target-device',
+    targetDeviceName: 'target-device',
+    expectedFingerprint: 'reserved-target-fingerprint',
+    forceTakeover: true,
+    sessionId: 'injected-session',
+    clientId: 'injected-client',
+    bindingGeneration: 99,
+    expectedGeneration: 99,
+    operationId: 'g99:injected',
+    queue: ['legacy'],
+    currentIndex: 0,
+    queueItems: [],
+    gain: 1,
+    muted: false,
+    user: 'injected-user',
+  }
+
+  const transportArguments = (method, { operation, scope }) => {
+    if (method === 'commitMigration') return [snapshot(), request, operation]
+    if (method === 'queryOperation') return [operation]
+    if (method === 'queryReservation') return [request.migrationId, scope]
+    return [request, operation]
+  }
+
+  it('serializes ordered duplicate occurrences and actual media metadata only', () => {
+    expect(serialize(snapshot())).toEqual({
+      queueItems: [
+        { queueItemId: 'q-first', mediaFileId: 'same-media' },
+        { queueItemId: 'q-middle', mediaFileId: 'preferred' },
+        { queueItemId: 'q-last', mediaFileId: 'same-media' },
+      ],
+      currentQueueItemId: 'q-last',
+      position: 13,
+    })
+  })
+
+  it('serializes a real module addQueueItems snapshot without changing its IDs', async () => {
+    const controller = createModule()
+    controller.setAdapter(createAdapter())
+    try {
+      await controller.addQueueItems(snapshot().queue)
+      const state = controller.getState()
+      expect(serialize(state).queueItems).toEqual([
+        { queueItemId: 'q-first', mediaFileId: 'same-media' },
+        { queueItemId: 'q-middle', mediaFileId: 'preferred' },
+        { queueItemId: 'q-last', mediaFileId: 'same-media' },
+      ])
+      expect(state.queue.map((item) => item.queueItemId)).toEqual([
+        'q-first',
+        'q-middle',
+        'q-last',
+      ])
+    } finally {
+      controller.setAdapter(null)
+    }
+  })
+
+  it.each([undefined, null])(
+    'omits absent current %s and position for explicit empty queues',
+    (currentQueueItemId) => {
+      expect(serialize({ queue: [], currentQueueItemId })).toEqual({
+        queueItems: [],
+      })
+    },
+  )
+
+  it('preserves nonempty queues without inventing a current item', () => {
+    const state = snapshot()
+    delete state.currentQueueItemId
+    delete state.position
+    const wire = serialize(state)
+    expect(wire.queueItems).toHaveLength(3)
+    expect(wire).not.toHaveProperty('currentQueueItemId')
+    expect(wire).not.toHaveProperty('position')
+    expect(wire).not.toHaveProperty('queue')
+    expect(wire).not.toHaveProperty('currentIndex')
+  })
+
+  it.each([
+    [0, 0],
+    [12.49, 12],
+    [12.5, 13],
+  ])('rounds position %s to Go-compatible integer %s', (position, expected) => {
+    expect(serialize({ queue: [], position }).position).toBe(expected)
+  })
+
+  const invalidSnapshots = [
+    ['missing array', {}],
+    ['null array', { queue: null }],
+    ['non-array', { queue: {} }],
+    [
+      'duplicate IDs',
+      {
+        queue: [
+          { queueItemId: 'q', id: 'a' },
+          { queueItemId: 'q', id: 'b' },
+        ],
+      },
+    ],
+    ['blank item ID', { queue: [{ queueItemId: ' ', id: 'a' }] }],
+    ['missing item ID', { queue: [{ id: 'a' }] }],
+    ['numeric item ID', { queue: [{ queueItemId: 1, id: 'a' }] }],
+    [
+      'missing media ID',
+      { queue: [{ queueItemId: 'q', path: '/music/song.mp3' }] },
+    ],
+    ['blank media ID', { queue: [{ queueItemId: 'q', id: ' ' }] }],
+    ['numeric media ID', { queue: [{ queueItemId: 'q', id: 1 }] }],
+    ['missing current member', { queue: [], currentQueueItemId: 'q' }],
+    ['blank current', { queue: [], currentQueueItemId: ' ' }],
+    ['numeric current', { queue: [], currentQueueItemId: 1 }],
+    ...[NaN, Infinity, -1, null, '1', Number.MAX_SAFE_INTEGER + 1].map(
+      (position) => [`invalid position ${position}`, { queue: [], position }],
+    ),
+  ]
+  it.each(invalidSnapshots)(
+    'rejects %s before commit POST',
+    async (_name, state) => {
+      const { operation } = await captured()
+      expect(() => serialize(state)).toThrow(
+        expect.objectContaining({ code: 'MIGRATION_CONTEXT_INVALID' }),
+      )
+      await expect(
+        client.commitMigration(state, request, operation),
+      ).rejects.toMatchObject({ code: 'MIGRATION_CONTEXT_INVALID' })
+      expect(httpClient).not.toHaveBeenCalled()
+    },
+  )
+
+  it('freezes the capture, scope, capability and once-derived operation ID', async () => {
+    const { scope, operation } = await captured()
+    expect(Object.isFrozen(scope)).toBe(true)
+    expect(Object.isFrozen(scope.scope)).toBe(true)
+    expect(Object.isFrozen(scope.queueProtocol)).toBe(true)
+    expect(Object.isFrozen(operation)).toBe(true)
+    expect(scope.scope).toEqual(expectedScope)
+    expect(operation.operationId).toBe('g7:mig:commit')
+    expect(
+      client.captureMigrationOperation(scope, 'g7:already').operationId,
+    ).toBe('g7:already')
+    expect(() => client.captureMigrationOperation(scope, 'g8:wrong')).toThrow(
+      expect.objectContaining({ code: 'MIGRATION_OPERATION_INVALID' }),
+    )
+    expect(httpClient).not.toHaveBeenCalled()
+  })
+
+  it.each(['', ' ', 'g7:', null])(
+    'rejects invalid stable operation ID %s without HTTP',
+    async (id) => {
+      const { scope } = await captured()
+      expect(() => client.captureMigrationOperation(scope, id)).toThrow(
+        expect.objectContaining({ code: 'MIGRATION_OPERATION_INVALID' }),
+      )
+      expect(httpClient).not.toHaveBeenCalled()
+    },
+  )
+
+  it('requires exact current lease identity, not a copied status', async () => {
+    const lease = await attach()
+    httpClient.mockClear()
+    expect(() => client.captureMigrationScope({ ...lease })).toThrow(
+      expect.objectContaining({ code: 'MIGRATION_SCOPE_STALE' }),
+    )
+    expect(httpClient).not.toHaveBeenCalled()
+  })
+
+  it('rejects pre-attachment capture with zero HTTP', () => {
+    expect(() => client.captureMigrationScope(null)).toThrow(
+      expect.objectContaining({ code: 'MIGRATION_SCOPE_STALE' }),
+    )
+    expect(httpClient).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    null,
+    { version: 1 },
+    { ...protocol, version: 0 },
+    { ...protocol, version: 2 },
+    { ...protocol, identityMigration: false },
+    { ...protocol, operationResults: false },
+    { ...protocol, identityMigration: 'true' },
+  ])(
+    'rejects unsupported advertised capabilities %j with no migration HTTP',
+    async (queueProtocol) => {
+      const lease = await attach({ queueProtocol })
+      httpClient.mockClear()
+      expect(() => client.captureMigrationScope(lease)).toThrow(
+        expect.objectContaining({ code: 'QUEUE_PROTOCOL_UNSUPPORTED' }),
+      )
+      await expect(
+        client.commitMigration(snapshot(), request, undefined),
+      ).rejects.toMatchObject({ code: 'QUEUE_PROTOCOL_UNSUPPORTED' })
+      expect(httpClient).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([undefined, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid captured generation %s',
+    async (bindingGeneration) => {
+      const lease = await attach({ bindingGeneration })
+      httpClient.mockClear()
+      expect(() => client.captureMigrationScope(lease)).toThrow(
+        expect.objectContaining({ code: 'MIGRATION_SCOPE_INVALID' }),
+      )
+      expect(httpClient).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    [
+      'reserveMigration',
+      'migration/reserve',
+      {
+        migrationId: request.migrationId,
+        deviceName: request.deviceName,
+        forceTakeover: true,
+        expectedFingerprint: request.expectedFingerprint,
+      },
+    ],
+    [
+      'releaseMigrationReservation',
+      'migration/release',
+      { migrationId: request.migrationId },
+    ],
+    [
+      'commitMigration',
+      'migration/commit',
+      {
+        migrationId: request.migrationId,
+        targetDeviceName: request.targetDeviceName,
+        expectedFingerprint: request.expectedFingerprint,
+      },
+    ],
+  ])(
+    'allowlists exact %s payload and returns authoritative JSON unchanged',
+    async (method, path, fields) => {
+      const { operation, lease } = await captured()
+      const raw = {
+        status: 'APPLIED',
+        bindingGeneration: 8,
+        ownerClientId: identity.clientId,
+      }
+      httpClient.mockResolvedValueOnce({ json: raw })
+      const args =
+        method === 'commitMigration'
+          ? [snapshot(), request, operation]
+          : [request, operation]
+      expect(await client[method](...args)).toBe(raw)
+      expect(httpClient.mock.calls[0][0]).toBe(`/api/jukebox/${path}`)
+      expect(httpClient.mock.calls[0][1].method).toBe('POST')
+      expect(JSON.parse(httpClient.mock.calls[0][1].body)).toEqual({
+        ...fields,
+        ...(method === 'commitMigration' ? serialize(snapshot()) : {}),
+        ...expectedScope,
+        operationId: 'g7:mig:commit',
+      })
+      expect(client.captureMigrationScope(lease).scope.bindingGeneration).toBe(
+        7,
+      )
+    },
+  )
+
+  it('queries exact original wire operation ID after reattach and detach', async () => {
+    const { operation, scope } = await captured()
+    await attach({ bindingGeneration: 8 })
+    await client.detachSession(identity.sessionId, identity.clientId)
+    httpClient.mockClear()
+    const raw = { status: 'APPLIED', sessionStatus: { bindingGeneration: 8 } }
+    httpClient.mockResolvedValueOnce({ json: raw })
+    expect(await client.queryOperation(operation)).toBe(raw)
+    expect(httpClient.mock.calls[0]).toEqual([
+      '/api/jukebox/operation?sessionId=session%20%2F%20a&operationId=g7%3Amig%3Acommit',
+    ])
+    const reservation = { status: 'ACTIVE', expectedFingerprint: 'target' }
+    httpClient.mockResolvedValueOnce({ json: reservation })
+    expect(await client.queryReservation('migration / one', scope)).toBe(
+      reservation,
+    )
+    expect(httpClient.mock.calls[1]).toEqual([
+      '/api/jukebox/migration/reservation?migrationId=migration%20%2F%20one',
+    ])
+  })
+
+  it('rejects every stale captured write without dispatch', async () => {
+    const { operation } = await captured()
+    await attach({ bindingGeneration: 8 })
+    httpClient.mockClear()
+    for (const action of [
+      () => client.reserveMigration(request, operation),
+      () => client.releaseMigrationReservation(request, operation),
+      () => client.commitMigration(snapshot(), request, operation),
+    ]) {
+      await expect(action()).rejects.toMatchObject({
+        code: 'MIGRATION_SCOPE_STALE',
+      })
+    }
+    expect(httpClient).not.toHaveBeenCalled()
+  })
+
+  it('rejects in-place lease generation changes without altering original query identity', async () => {
+    const { lease, operation } = await captured()
+    lease.bindingGeneration = 8
+    await expect(
+      client.reserveMigration(request, operation),
+    ).rejects.toMatchObject({ code: 'MIGRATION_SCOPE_STALE' })
+    expect(httpClient).not.toHaveBeenCalled()
+    await client.queryOperation(operation)
+    expect(httpClient.mock.calls[0][0]).toContain(
+      'operationId=g7%3Amig%3Acommit',
+    )
+  })
+
+  it('does not let late older attachment capture overwrite a newer confirmed binding', async () => {
+    let completeOld
+    httpClient.mockReturnValueOnce(
+      new Promise((resolve) => {
+        completeOld = resolve
+      }),
+    )
+    const pending = client.attachSession('old-session', identity.clientId)
+    const current = await attach({ bindingGeneration: 8 })
+    completeOld({
+      json: {
+        ...identity,
+        sessionId: 'old-session',
+        ownerClientId: identity.clientId,
+        ownershipState: 'attached',
+        bindingGeneration: 7,
+        queueProtocol: protocol,
+      },
+    })
+    const old = await pending
+    httpClient.mockClear()
+    expect(() => client.captureMigrationScope(old)).toThrow(
+      expect.objectContaining({ code: 'MIGRATION_SCOPE_STALE' }),
+    )
+    expect(client.captureMigrationScope(current).scope.bindingGeneration).toBe(
+      8,
+    )
+    expect(httpClient).not.toHaveBeenCalled()
+  })
+
+  const migrationMethods = [
+    'reserveMigration',
+    'releaseMigrationReservation',
+    'commitMigration',
+    'queryOperation',
+    'queryReservation',
+  ]
+
+  it.each(migrationMethods)(
+    'forwards only the exact signal for %s outside JSON and captures',
+    async (method) => {
+      const values = await captured()
+      const signal = new AbortController().signal
+      const raw = { status: 'APPLIED' }
+      httpClient.mockResolvedValueOnce({ json: raw })
+      const args = transportArguments(method, values)
+      expect(
+        await client[method](...args, {
+          signal,
+          headers: { ignored: 'yes' },
+          operationId: 'g99:ignored',
+        }),
+      ).toBe(raw)
+      expect(httpClient).toHaveBeenCalledTimes(1)
+      const [, options] = httpClient.mock.calls[0]
+      expect(options.signal).toBe(signal)
+      expect(options).not.toHaveProperty('headers')
+      expect(options).not.toHaveProperty('operationId')
+      expect(values.operation).not.toHaveProperty('signal')
+      expect(values.scope).not.toHaveProperty('signal')
+      expect(values.scope.scope).not.toHaveProperty('signal')
+      if (options.body) {
+        const body = JSON.parse(options.body)
+        expect(body).not.toHaveProperty('signal')
+        expect(body.operationId).toBe('g7:mig:commit')
+      } else {
+        expect(options).toEqual({ signal })
+      }
+    },
+  )
+
+  it.each(migrationMethods)(
+    'propagates raw aborted %s rejection without retry or binding promotion',
+    async (method) => {
+      const values = await captured()
+      const abort = new AbortController()
+      abort.abort()
+      const error = new DOMException('Request aborted', 'AbortError')
+      httpClient.mockRejectedValueOnce(error)
+      const args = transportArguments(method, values)
+      await expect(
+        client[method](...args, { signal: abort.signal }),
+      ).rejects.toBe(error)
+      expect(httpClient).toHaveBeenCalledTimes(1)
+      expect(httpClient.mock.calls[0][1].signal).toBe(abort.signal)
+      expect(values.operation.operationId).toBe('g7:mig:commit')
+      expect(
+        client.captureMigrationScope(values.lease).scope.bindingGeneration,
+      ).toBe(7)
+      expect(error).not.toHaveProperty('status', 'NOT_EXECUTED')
+    },
+  )
+
+  it.each(migrationMethods)(
+    'normalizes coded %s errors without changing binding',
+    async (method) => {
+      const { lease, operation, scope } = await captured()
+      httpClient.mockRejectedValueOnce({
+        status: 409,
+        body: { code: 'MIGRATION_CONFLICT', error: 'target changed' },
+      })
+      const args = transportArguments(method, { operation, scope })
+      await expect(client[method](...args)).rejects.toMatchObject({
+        code: 'MIGRATION_CONFLICT',
+        message: 'target changed',
+        status: 409,
+      })
+      expect(client.captureMigrationScope(lease).scope.bindingGeneration).toBe(
+        7,
+      )
+    },
+  )
+})
