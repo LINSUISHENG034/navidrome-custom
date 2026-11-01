@@ -80,6 +80,92 @@ func (m *mockTrack) Close() {
 }
 func (m *mockTrack) String() string { return "mockTrack" }
 
+func TestPlaybackDeviceNaturalEndPlaybackModes(t *testing.T) {
+	cases := []struct {
+		name              string
+		mode              PlaybackMode
+		current           int
+		queueSize         int
+		wantIndex         int
+		wantPlaying       bool
+		wantTrack         string
+		wantSequenceDelta uint64
+	}{
+		{"order advances", PlaybackModeOrder, 0, 3, 1, true, "2", 2},
+		{"order retains final and stops", PlaybackModeOrder, 2, 3, 2, false, "3", 1},
+		{"order loop wraps", PlaybackModeRepeatList, 2, 3, 0, true, "1", 2},
+		{"single loop replays current", PlaybackModeRepeatTrack, 1, 3, 1, true, "2", 2},
+		{"shuffle excludes current", PlaybackModeShuffle, 1, 3, 0, true, "1", 2},
+		{"order single item stops", PlaybackModeOrder, 0, 1, 0, false, "1", 1},
+		{"order loop single item replays", PlaybackModeRepeatList, 0, 1, 0, true, "1", 2},
+		{"single loop single item replays", PlaybackModeRepeatTrack, 0, 1, 0, true, "1", 2},
+		{"shuffle single item replays", PlaybackModeShuffle, 0, 1, 0, true, "1", 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			repo := tests.CreateMockMediaFileRepo()
+			files := model.MediaFiles{{ID: "1", Path: "/1.mp3"}, {ID: "2", Path: "/2.mp3"}, {ID: "3", Path: "/3.mp3"}}
+			if tc.queueSize == 1 {
+				files = files[:1]
+			}
+			repo.SetData(files)
+			server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
+			device := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
+			if _, err := device.Set(ctx, []string{"1", "2", "3"}[:tc.queueSize]); err != nil {
+				t.Fatal(err)
+			}
+			device.mu.Lock()
+			device.mode = tc.mode
+			device.PlaybackQueue.SetIndex(tc.current)
+			if tc.mode == PlaybackModeShuffle && tc.queueSize > 1 {
+				device.randomFn = func(int) int { return 0 }
+			}
+			device.mu.Unlock()
+			previousNewTrack := newTrack
+			newTrack = func(_ context.Context, events chan<- model.PlaybackEvent, token model.PlaybackToken, deviceName string, media model.MediaFile) (Track, error) {
+				return &mockTrack{playing: true}, nil
+			}
+			t.Cleanup(func() {
+				_, _ = device.Shutdown(ctx)
+				device.preparing.Wait()
+				newTrack = previousNewTrack
+			})
+			if _, err := device.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			device.mu.Lock()
+			token := device.activePlaybackToken
+			device.mu.Unlock()
+			initial, err := device.Status(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			device.PlaybackEvents <- model.PlaybackEvent{Token: token, Kind: model.PlaybackEventNaturalEnd}
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				status, err := device.Status(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				device.mu.Lock()
+				current := device.PlaybackQueue.Current()
+				device.mu.Unlock()
+				if status.StateSequence >= initial.StateSequence+tc.wantSequenceDelta && status.CurrentIndex == tc.wantIndex && status.Playing == tc.wantPlaying && current != nil && current.ID == tc.wantTrack {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+			status, _ := device.Status(ctx)
+			device.mu.Lock()
+			current := device.PlaybackQueue.Current()
+			device.mu.Unlock()
+			t.Fatalf("natural end mismatch: status=%#v current=%#v", status, current)
+		})
+	}
+}
+
 func TestPlaybackDeviceStartPauseStateSequence(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")

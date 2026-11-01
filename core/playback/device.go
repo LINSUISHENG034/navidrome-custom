@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 
 	"github.com/navidrome/navidrome/core/playback/mpv"
@@ -51,6 +52,8 @@ type playbackDevice struct {
 	recoveryPosition      *int
 	sceneRevision         uint64
 	stateSequence         uint64
+	mode                  PlaybackMode
+	randomFn              func(int) int
 }
 
 type DeviceStatus struct {
@@ -155,6 +158,8 @@ func NewPlaybackDevice(ctx context.Context, playbackServer PlaybackServer, name 
 		Gain:                  DefaultGain,
 		DesiredGain:           DefaultGain,
 		PlaybackQueue:         NewQueue(),
+		mode:                  PlaybackModeOrder,
+		randomFn:              rand.Intn,
 		PlaybackEvents:        make(chan model.PlaybackEvent, 32),
 		pendingPlaybackTokens: make(map[model.PlaybackToken]chan struct{}),
 		sceneRevision:         1,
@@ -710,6 +715,41 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 	}
 }
 
+func (pd *playbackDevice) naturalEndIndexLocked() (int, bool) {
+	if pd.PlaybackQueue.IsEmpty() {
+		return -1, false
+	}
+	current := pd.PlaybackQueue.Index
+	switch pd.mode {
+	case PlaybackModeRepeatTrack:
+		return current, true
+	case PlaybackModeRepeatList:
+		return (current + 1) % pd.PlaybackQueue.Size(), true
+	case PlaybackModeShuffle:
+		if pd.PlaybackQueue.Size() == 1 {
+			return current, true
+		}
+		candidates := make([]int, 0, pd.PlaybackQueue.Size()-1)
+		for i := range pd.PlaybackQueue.Items {
+			if i != current {
+				candidates = append(candidates, i)
+			}
+		}
+		pick := 0
+		if pd.randomFn != nil {
+			pick = pd.randomFn(len(candidates))
+		}
+		return candidates[pick], true
+	case PlaybackModeOrder:
+		if current >= pd.PlaybackQueue.Size()-1 {
+			return current, false
+		}
+		return current + 1, true
+	default:
+		return current, false
+	}
+}
+
 func (pd *playbackDevice) isPlaying() bool {
 	return pd.ActiveTrack != nil && pd.ActiveTrack.IsPlaying()
 }
@@ -753,10 +793,10 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 		pd.recoveryPosition = nil
 		pd.retireActiveTrackLocked()
 		pd.incrementSceneRevisionLocked()
-		if !pd.PlaybackQueue.IsAtLastElement() {
-			pd.PlaybackQueue.IncreaseIndex()
-			idx := pd.PlaybackQueue.Index
-			log.Debug("Switching to next song", "index", idx)
+		idx, continuePlayback := pd.naturalEndIndexLocked()
+		if continuePlayback {
+			pd.PlaybackQueue.SetIndex(idx)
+			log.Debug("Switching to next song", "index", idx, "mode", pd.mode)
 			track, token, current, err := pd.loadTrackLocked(pd.serviceCtx, idx)
 			if err != nil || !current {
 				if err != nil {
@@ -767,12 +807,15 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 				if pd.ActiveTrack != nil {
 					if err := pd.ActiveTrack.Unpause(); err != nil {
 						log.Error("Error unpausing track on natural advance", err)
+					} else {
+						pd.incrementStateSequenceLocked()
 					}
 				}
 			}
 		} else {
 			log.Debug("There is no song left in the playlist. Finish.")
 		}
+		pd.incrementStateSequenceLocked()
 		notify = pd.stateChangeNotifierLocked()
 	case model.PlaybackEventRetired, model.PlaybackEventFailure:
 		if event.Position != nil {

@@ -429,11 +429,12 @@ var _ = Describe("PlaybackServer", func() {
 		pd.PlaybackEvents <- model.PlaybackEvent{Token: 1, Kind: model.PlaybackEventNaturalEnd}
 
 		Eventually(events, time.Second).Should(Receive(Equal(DeviceStatus{
-			CurrentIndex: 1,
-			Playing:      true,
-			Gain:         DefaultGain,
-			DesiredGain:  DefaultGain,
-			Position:     0,
+			CurrentIndex:  1,
+			Playing:       true,
+			Gain:          DefaultGain,
+			DesiredGain:   DefaultGain,
+			Position:      0,
+			StateSequence: 2,
 		})))
 	})
 })
