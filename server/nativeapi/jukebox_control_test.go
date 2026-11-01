@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -891,6 +892,173 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 	}
 }
 
+func TestJukeboxMigrationCommitWireShapeRejection(t *testing.T) {
+	_, ps := startJukeboxLogicalFixture(t, "Shape Default", []conf.AudioDeviceDefinition{
+		{"Shape Default", "shape-default"},
+		{"Shape Target", "shape-target"},
+	})
+	api := &Router{playback: ps}
+	router := chi.NewRouter()
+	api.addJukeboxControlRoute(router)
+	api.addJukeboxSessionRoute(router)
+
+	serve := func(t *testing.T, method, path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		var r *http.Request
+		if body != nil {
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r = httptest.NewRequest(method, path, bytes.NewReader(encoded))
+		} else {
+			r = httptest.NewRequest(method, path, nil)
+		}
+		r = r.WithContext(request.WithUser(r.Context(), model.User{
+			ID: "admin", UserName: "admin", IsAdmin: true,
+		}))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, r)
+		return rec
+	}
+	serveRaw := func(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+		r = r.WithContext(request.WithUser(r.Context(), model.User{
+			ID: "admin", UserName: "admin", IsAdmin: true,
+		}))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, r)
+		return rec
+	}
+
+	sessionID := uniqueSessionID("shape-src")
+	attachRes := serve(t, http.MethodPost, "/jukebox/session/attach", map[string]any{
+		"sessionId": sessionID, "clientId": "tab-1", "deviceName": "shape-default",
+	})
+	if attachRes.Code != http.StatusOK {
+		t.Fatalf("attach failed: %d %s", attachRes.Code, attachRes.Body.String())
+	}
+	var attachPayload struct {
+		BindingGeneration uint64 `json:"bindingGeneration"`
+	}
+	if err := json.Unmarshal(attachRes.Body.Bytes(), &attachPayload); err != nil {
+		t.Fatal(err)
+	}
+	targetOwnerID := uniqueSessionID("shape-target-owner")
+	targetAttach := serve(t, http.MethodPost, "/jukebox/session/attach", map[string]any{
+		"sessionId": targetOwnerID, "clientId": "shape-owner", "deviceName": "shape-target",
+	})
+	if targetAttach.Code != http.StatusOK {
+		t.Fatalf("target attach failed: %d %s", targetAttach.Code, targetAttach.Body.String())
+	}
+
+	// A device holds at most one active migration reservation, so every
+	// rejection case below shares this single reservation; rejected commits must
+	// leave it ACTIVE. Only the final legacy commit consumes it.
+	migrationID := "mig-shape"
+	generation := attachPayload.BindingGeneration
+	probe := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+		"migrationId": migrationID, "operationId": "g1:" + migrationID + "-probe", "sessionId": sessionID, "clientId": "tab-1",
+		"deviceName": "shape-target", "bindingGeneration": generation,
+	})
+	if probe.Code != http.StatusConflict {
+		t.Fatalf("expected occupied probe, got %d %s", probe.Code, probe.Body.String())
+	}
+	var probePayload map[string]any
+	_ = json.Unmarshal(probe.Body.Bytes(), &probePayload)
+	fp, ok := probePayload["sceneFingerprint"].(string)
+	if !ok || fp == "" {
+		t.Fatalf("probe did not return fingerprint: %#v", probePayload)
+	}
+	res := serve(t, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+		"migrationId": migrationID, "operationId": "g1:" + migrationID + "-take", "sessionId": sessionID, "clientId": "tab-1",
+		"deviceName": "shape-target", "bindingGeneration": generation, "expectedFingerprint": fp, "forceTakeover": true,
+	})
+	if res.Code != http.StatusOK {
+		t.Fatalf("reserve failed: %d %s", res.Code, res.Body.String())
+	}
+	fpJSON, _ := json.Marshal(fp)
+
+	commitBase := `"migrationId":"` + migrationID + `","sessionId":"%s","clientId":"tab-1","targetDeviceName":"shape-target","bindingGeneration":%d,"expectedFingerprint":` + string(fpJSON)
+	commitShape := func(t *testing.T, operationID, shape string) (int, map[string]any) {
+		t.Helper()
+		body := fmt.Sprintf(`{"operationId":%q,`+commitBase+`,%s}`, operationID, sessionID, generation, shape)
+		res := serveRaw(t, http.MethodPost, "/jukebox/migration/commit", body)
+		var payload map[string]any
+		_ = json.Unmarshal(res.Body.Bytes(), &payload)
+		return res.Code, payload
+	}
+	assertShapeRejected := func(t *testing.T, name, operationID, shape string) {
+		t.Helper()
+		code, payload := commitShape(t, operationID, shape)
+		if code != http.StatusBadRequest || payload["code"] != "MIGRATION_PROTOCOL_CONFLICT" {
+			t.Fatalf("%s not rejected: %d %s", name, code, payload)
+		}
+		info, qErr := ps.QueryReservation(context.Background(), migrationID)
+		if qErr != nil || info.Status != "ACTIVE" {
+			t.Fatalf("%s consumed reservation: %#v %v", name, info, qErr)
+		}
+	}
+
+	t.Run("explicit mixed legacy and identity keys rejected with state intact", func(t *testing.T) {
+		beforeTarget, err := ps.SessionSnapshot(context.Background(), targetOwnerID, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertShapeRejected(t, "mixed wire keys", "g1:commit-mixed",
+			`"queue":[],"currentIndex":0,"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}],"currentQueueItemId":"qi-1"`)
+		afterTarget, err := ps.SessionSnapshot(context.Background(), targetOwnerID, "admin")
+		if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
+			t.Fatalf("rejected commit changed target: before=%#v after=%#v err=%v", beforeTarget, afterTarget, err)
+		}
+	})
+
+	t.Run("explicit null shape key rejected", func(t *testing.T) {
+		assertShapeRejected(t, "null shape key", "g1:commit-null", `"queueItems":null`)
+	})
+
+	t.Run("mixed case keys still rejected", func(t *testing.T) {
+		assertShapeRejected(t, "mixed case keys", "g1:commit-case", `"Queue":[],"QueueItems":[]`)
+	})
+
+	t.Run("duplicate keys keep last and stay rejected", func(t *testing.T) {
+		assertShapeRejected(t, "duplicate keys", "g1:commit-dup",
+			`"queue":[],"queueItems":[],"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}]`)
+	})
+
+	t.Run("wrong type shape key stays invalid body", func(t *testing.T) {
+		code, _ := commitShape(t, "g1:commit-type", `"queueItems":"nope"`)
+		if code != http.StatusBadRequest {
+			t.Fatalf("wrong type not rejected as invalid body: %d", code)
+		}
+		info, qErr := ps.QueryReservation(context.Background(), migrationID)
+		if qErr != nil || info.Status != "ACTIVE" {
+			t.Fatalf("invalid body consumed reservation: %#v %v", info, qErr)
+		}
+	})
+
+	t.Run("legacy only explicit zero keys commit successfully then malformed replay rejected", func(t *testing.T) {
+		code, commitPayload := commitShape(t, "g1:commit-legacy", `"queue":[],"currentIndex":0`)
+		if code != http.StatusOK {
+			t.Fatalf("explicit zero legacy commit failed: %d %#v", code, commitPayload)
+		}
+		currentGeneration := uint64(commitPayload["bindingGeneration"].(float64))
+		if currentGeneration <= generation {
+			t.Fatalf("commit did not advance binding generation: %#v", commitPayload)
+		}
+
+		body := fmt.Sprintf(`{"operationId":"g1:commit-legacy","migrationId":%q,"sessionId":%q,"clientId":"tab-1","targetDeviceName":"shape-target","bindingGeneration":%d,"expectedFingerprint":%s,"queue":[],"currentIndex":0,"queueItems":[{"queueItemId":"qi-2","mediaFileId":"track"}]}`,
+			migrationID, sessionID, currentGeneration, fpJSON)
+		res := serveRaw(t, http.MethodPost, "/jukebox/migration/commit", body)
+		var replayPayload map[string]any
+		_ = json.Unmarshal(res.Body.Bytes(), &replayPayload)
+		if res.Code != http.StatusBadRequest || replayPayload["code"] != "MIGRATION_PROTOCOL_CONFLICT" {
+			t.Fatalf("malformed replay not rejected as protocol conflict: %d %s", res.Code, res.Body.String())
+		}
+	})
+}
+
 func TestJukeboxAnchorMoveProtocolValidation(t *testing.T) {
 	ctx, ps := startJukeboxLogicalFixture(t, "Anchor Default", []conf.AudioDeviceDefinition{
 		{"Anchor Default", "anchor-default"},
@@ -1094,5 +1262,81 @@ func TestJukeboxSessionStatusIncludesQueueVersion(t *testing.T) {
 	}
 	if payload.QueueVersion != 1 {
 		t.Fatalf("session status dropped queue version: got=%d want=1 (%s)", payload.QueueVersion, response.Body.String())
+	}
+}
+
+func TestJukeboxQueueProtocolCapabilityAdvertised(t *testing.T) {
+	ctx, ps := startJukeboxLogicalFixture(t, "Capability Default", []conf.AudioDeviceDefinition{
+		{"Capability Default", "capability-default"},
+	})
+	_ = ctx
+	api := &Router{playback: ps}
+	router := chi.NewRouter()
+	api.addJukeboxControlRoute(router)
+	api.addJukeboxSessionRoute(router)
+	serve := func(t *testing.T, path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
+		r = r.WithContext(request.WithUser(r.Context(), model.User{
+			ID: "validation-admin", UserName: "validation-admin", IsAdmin: true,
+		}))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, r)
+		return response
+	}
+
+	response := serve(t, "/jukebox/session/attach", map[string]any{
+		"sessionId": "cap-session", "clientId": "cap-tab", "deviceName": "capability-default",
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("attach: %d %s", response.Code, response.Body.String())
+	}
+	t.Cleanup(func() { _, _ = ps.DetachSession(context.Background(), "cap-session", "cap-tab") })
+	var attached struct {
+		QueueProtocol *struct {
+			Version                  int  `json:"version"`
+			RelativeMove             bool `json:"relativeMove"`
+			IdentityRemove           bool `json:"identityRemove"`
+			IdentityMigration        bool `json:"identityMigration"`
+			AnchorVersionEnforcement bool `json:"anchorVersionEnforcement"`
+		} `json:"queueProtocol"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &attached); err != nil {
+		t.Fatal(err)
+	}
+	if attached.QueueProtocol == nil || attached.QueueProtocol.Version != 1 ||
+		!attached.QueueProtocol.RelativeMove || !attached.QueueProtocol.IdentityRemove ||
+		!attached.QueueProtocol.IdentityMigration || !attached.QueueProtocol.AnchorVersionEnforcement {
+		t.Fatalf("attach did not advertise queue protocol: %s", response.Body.String())
+	}
+
+	get := func(t *testing.T, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r = r.WithContext(request.WithUser(r.Context(), model.User{
+			ID: "validation-admin", UserName: "validation-admin", IsAdmin: true,
+		}))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, r)
+		return response
+	}
+	response = get(t, "/jukebox/status?sessionId=cap-session")
+	if response.Code != http.StatusOK {
+		t.Fatalf("session status: %d %s", response.Code, response.Body.String())
+	}
+	var statusPayload struct {
+		QueueProtocol *struct {
+			Version int `json:"version"`
+		} `json:"queueProtocol"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &statusPayload); err != nil {
+		t.Fatal(err)
+	}
+	if statusPayload.QueueProtocol == nil || statusPayload.QueueProtocol.Version != 1 {
+		t.Fatalf("session status dropped queue protocol: %s", response.Body.String())
 	}
 }

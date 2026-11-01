@@ -435,25 +435,70 @@ func (pd *playbackDevice) Remove(ctx context.Context, index int) (DeviceStatus, 
 
 func (pd *playbackDevice) removeLocked(ctx context.Context, index int) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing Remove action", "index", index, "device", pd)
-	changed := index > -1 && index < pd.PlaybackQueue.Size()
-	// Cancel preparation and close the output when removing the current item.
-	if changed && pd.PlaybackQueue.Index == index {
+	if index < 0 || index >= pd.PlaybackQueue.Size() {
+		log.Error(ctx, "Index to remove out of range: "+fmt.Sprint(index))
+		return pd.getStatus(), false, nil
+	}
+	return pd.removeQueueEntryAtLocked(ctx, index)
+}
+
+// removeQueueEntryAtLocked is the single queue-removal execution path shared by
+// legacy index removes and identity removes. When the current item is removed
+// it prefers its successor (the item sliding into the freed slot); removing
+// the current last item selects the remaining last item. The prior play/pause
+// intent is preserved: a playing successor output is loaded and unpaused, a
+// paused edit never starts playback. Non-current removals never touch the
+// active output.
+func (pd *playbackDevice) removeQueueEntryAtLocked(ctx context.Context, index int) (DeviceStatus, bool, error) {
+	isCurrent := pd.PlaybackQueue.Index == index
+	wasPlaying := pd.isPlaying()
+	if isCurrent {
 		pd.cancelPreparationLocked()
 		if pd.ActiveTrack != nil {
-			pd.ActiveTrack.Pause()
+			if err := pd.ActiveTrack.Pause(); err != nil {
+				log.Error(ctx, "error pausing active track during remove", err)
+				return pd.getStatus(), false, err
+			}
 		}
 		pd.retireActiveTrackLocked()
 		pd.recoveryPosition = nil
 	}
 
-	if index > -1 && index < pd.PlaybackQueue.Size() {
-		pd.PlaybackQueue.Remove(index)
-		pd.incrementQueueVersionLocked()
-		pd.incrementSceneRevisionLocked()
-	} else {
-		log.Error(ctx, "Index to remove out of range: "+fmt.Sprint(index))
+	pd.PlaybackQueue.Remove(index)
+
+	if isCurrent && pd.PlaybackQueue.Size() > 0 {
+		successor := min(index, pd.PlaybackQueue.Size()-1)
+		pd.PlaybackQueue.SetIndex(successor)
+		if wasPlaying {
+			track, token, current, err := pd.loadTrackLocked(ctx, successor)
+			if err != nil || !current {
+				pd.incrementQueueVersionLocked()
+				pd.incrementSceneRevisionLocked()
+				return pd.getStatus(), true, err
+			}
+			pd.assignTrack(track, token)
+			if pd.ActiveTrack != nil {
+				if err := pd.ActiveTrack.Unpause(); err != nil {
+					log.Error(ctx, "error unpausing successor after remove", err)
+					return pd.getStatus(), true, err
+				}
+			}
+		}
 	}
-	return pd.getStatus(), changed, nil
+	pd.incrementQueueVersionLocked()
+	pd.incrementSceneRevisionLocked()
+	return pd.getStatus(), true, nil
+}
+
+func (pd *playbackDevice) removeByQueueItemIDLocked(ctx context.Context, queueItemID string) (DeviceStatus, bool, error) {
+	log.Debug(ctx, "Processing identity Remove action", "queueItemId", queueItemID, "device", pd)
+	index := pd.PlaybackQueue.IndexOfQueueItemID(queueItemID)
+	if index == -1 {
+		return pd.getStatus(), false, &QueueItemLookupError{
+			Source: true, QueueItemID: queueItemID, Status: pd.getStatus(),
+		}
+	}
+	return pd.removeQueueEntryAtLocked(ctx, index)
 }
 
 func (pd *playbackDevice) Move(ctx context.Context, fromIndex, toIndex int) (DeviceStatus, error) {
@@ -599,6 +644,15 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 	case CommandStop:
 		return pd.shutdownLocked(ctx)
 	case CommandSkip:
+		if command.QueueItemID != "" {
+			index := pd.PlaybackQueue.IndexOfQueueItemID(command.QueueItemID)
+			if index == -1 {
+				return pd.getStatus(), false, &QueueItemLookupError{
+					Source: true, QueueItemID: command.QueueItemID, Status: pd.getStatus(),
+				}
+			}
+			return pd.skipLocked(ctx, index, command.Offset)
+		}
 		return pd.skipLocked(ctx, command.Index, command.Offset)
 	case CommandSeek:
 		return pd.skipLocked(ctx, pd.PlaybackQueue.Index, command.Position)
@@ -620,6 +674,9 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 	case CommandClear:
 		return pd.clearCommandLocked(ctx)
 	case CommandRemove:
+		if command.QueueItemID != "" {
+			return pd.removeByQueueItemIDLocked(ctx, command.QueueItemID)
+		}
 		return pd.removeLocked(ctx, command.Index)
 	case CommandMove:
 		if command.QueueItemID != "" {

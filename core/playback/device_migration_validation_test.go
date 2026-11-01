@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -575,6 +576,14 @@ func TestPlaybackCommandAuthorityValidation(t *testing.T) {
 			// T13-AC10: protected incremental edits lacking stable instance
 			// identity are explicitly rejected after authority checks pass.
 			if !errors.Is(err, ErrMoveProtocolConflict) {
+				t.Fatalf("owner legacy %s not rejected: %v", command.Action, err)
+			}
+			continue
+		}
+		if command.Action == CommandSkip || command.Action == CommandRemove {
+			// T13: protected selection/removal lacking stable instance identity
+			// is explicitly rejected after authority checks pass.
+			if !errors.Is(err, ErrIdentityRequired) {
 				t.Fatalf("owner legacy %s not rejected: %v", command.Action, err)
 			}
 			continue
@@ -1157,5 +1166,543 @@ func TestPlaybackProtectedAnchorMoveReplayIsIdempotent(t *testing.T) {
 	}
 	if after.SessionStatus.QueueItemID != snapshot.SessionStatus.QueueItemID || after.SessionStatus.TrackID != snapshot.SessionStatus.TrackID {
 		t.Fatalf("current identity changed: before=%#v after=%#v", snapshot.SessionStatus, after.SessionStatus)
+	}
+}
+
+func migrationTestTarget(t *testing.T, server *playbackServer, deviceName string) *playbackDevice {
+	t.Helper()
+	for _, device := range server.playbackDevices {
+		if device.DeviceName == deviceName {
+			return device
+		}
+	}
+	t.Fatalf("device %s not found", deviceName)
+	return nil
+}
+
+func attachMigrationSource(t *testing.T, server *playbackServer, sessionID, clientID, deviceName string) SessionStatus {
+	t.Helper()
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	status, err := server.AttachSession(ctx, AttachRequest{
+		SessionID: sessionID, User: "admin", ClientID: clientID, DeviceName: deviceName,
+	})
+	if err != nil {
+		t.Fatalf("attach %s: %v", sessionID, err)
+	}
+	return status
+}
+
+func reserveForCommit(t *testing.T, server *playbackServer, sessionID, clientID string, generation uint64, migrationID, targetDevice string) {
+	t.Helper()
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	fp := migrationTestTarget(t, server, targetDevice).SceneFingerprint()
+	resReq := ReserveMigrationRequest{
+		MigrationID: migrationID, OperationID: "g1:reserve-" + migrationID,
+		SessionID: sessionID, ClientID: clientID, User: "admin",
+		DeviceName: targetDevice, ForceTakeover: true, ExpectedFingerprint: fp,
+		BindingGeneration: &generation,
+	}
+	if _, err := server.ReserveMigration(ctx, resReq); err != nil {
+		t.Fatalf("reserve %s: %v", migrationID, err)
+	}
+}
+
+func TestPlaybackCommitMigrationIdentityTransport(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	identityQueue := func() *[]QueueItemRef {
+		return &[]QueueItemRef{
+			{QueueItemID: "qi-1", MediaFileID: "track"},
+			{QueueItemID: "qi-2", MediaFileID: "track"},
+			{QueueItemID: "qi-3", MediaFileID: "track"},
+		}
+	}
+	currentTwo := func() *string { s := "qi-2"; return &s }
+
+	t.Run("preserves duplicate instance IDs and maps current by ID", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-id", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-id", OperationID: "g1:commit-id", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: identityQueue(), CurrentQueueItemID: currentTwo(),
+		})
+		if err != nil {
+			t.Fatalf("identity commit: %v", err)
+		}
+		if committed.CurrentIndex != 1 || committed.QueueItemID != "qi-2" || committed.TrackID != "track" {
+			t.Fatalf("identity commit lost current mapping: %#v", committed)
+		}
+		snapshot, err := server.SessionSnapshot(ctx, "src", "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries := snapshot.JukeboxPlaylist.Entry
+		if len(entries) != 3 || entries[0].QueueItemID != "qi-1" || entries[1].QueueItemID != "qi-2" || entries[2].QueueItemID != "qi-3" {
+			t.Fatalf("identity commit lost instance IDs: %#v", entries)
+		}
+	})
+
+	t.Run("empty identity queue preserves idle context without startup", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-empty", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-empty", OperationID: "g1:commit-empty", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{},
+		})
+		if err != nil {
+			t.Fatalf("empty identity commit: %v", err)
+		}
+		if committed.CurrentIndex != -1 || committed.Playing || committed.QueueItemID != "" {
+			t.Fatalf("empty identity commit changed idle state: %#v", committed)
+		}
+	})
+
+	t.Run("legacy queue rewrite still assigns fresh IDs", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-legacy", "new")
+		if _, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-legacy", OperationID: "g1:commit-legacy", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			Queue: []string{"track", "track"}, CurrentIndex: 1,
+		}); err != nil {
+			t.Fatalf("legacy commit: %v", err)
+		}
+		snapshot, err := server.SessionSnapshot(ctx, "src", "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries := snapshot.JukeboxPlaylist.Entry
+		if len(entries) != 2 || entries[0].QueueItemID == "" || entries[0].QueueItemID == entries[1].QueueItemID {
+			t.Fatalf("legacy commit did not assign fresh IDs: %#v", entries)
+		}
+		if snapshot.SessionStatus.CurrentIndex != 1 {
+			t.Fatalf("legacy current index not mapped: %d", snapshot.SessionStatus.CurrentIndex)
+		}
+	})
+
+	validationCases := []struct {
+		name    string
+		mutate  func(*CommitMigrationRequest)
+		wantErr error
+	}{
+		{"mixed legacy queue and identity items", func(req *CommitMigrationRequest) {
+			req.Queue = []string{"track"}
+			req.QueueItems = identityQueue()
+		}, ErrMigrationProtocolConflict},
+		{"mixed current index and current ID", func(req *CommitMigrationRequest) {
+			req.CurrentIndex = 2
+			req.QueueItems = identityQueue()
+			req.CurrentQueueItemID = currentTwo()
+		}, ErrMigrationProtocolConflict},
+		{"duplicate queue item IDs", func(req *CommitMigrationRequest) {
+			req.QueueItems = &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}, {QueueItemID: "qi-1", MediaFileID: "track"}}
+		}, ErrMigrationProtocolConflict},
+		{"empty queue item ID", func(req *CommitMigrationRequest) {
+			req.QueueItems = &[]QueueItemRef{{QueueItemID: "", MediaFileID: "track"}}
+		}, ErrMigrationProtocolConflict},
+		{"current ID not a member", func(req *CommitMigrationRequest) {
+			req.QueueItems = identityQueue()
+			s := "qi-missing"
+			req.CurrentQueueItemID = &s
+		}, ErrMigrationProtocolConflict},
+		{"unresolvable media file", func(req *CommitMigrationRequest) {
+			req.QueueItems = &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "nope"}}
+		}, nil},
+	}
+	for _, tc := range validationCases {
+		t.Run("rejects "+tc.name+" before target mutation", func(t *testing.T) {
+			_, server := newMigrationValidationServer(t)
+			migrationTestTarget(t, server, "new").PlaybackQueue.Add(model.MediaFiles{{ID: "seed", Path: "/seed.mp3"}})
+			attached := attachMigrationSource(t, server, "src", "tab", "old")
+			reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-bad", "new")
+			fpBefore := migrationTestTarget(t, server, "new").SceneFingerprint()
+			req := CommitMigrationRequest{
+				MigrationID: "mig-bad", OperationID: "g1:commit-bad", SessionID: "src", ClientID: "tab",
+				User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			}
+			tc.mutate(&req)
+			_, err := server.CommitMigration(ctx, req)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("want %v, got %v", tc.wantErr, err)
+				}
+			} else if err == nil {
+				t.Fatal("expected media resolution error")
+			}
+			after := migrationTestTarget(t, server, "new")
+			after.mu.Lock()
+			defer after.mu.Unlock()
+			if after.sceneFingerprintLocked() != fpBefore {
+				t.Fatal("rejected commit mutated target scene")
+			}
+			if after.PlaybackQueue.Size() != 1 || after.PlaybackQueue.Get()[0].ID != "seed" {
+				t.Fatalf("rejected commit mutated target queue: %s", after.PlaybackQueue)
+			}
+			// Reservation remains active for a legitimate retry.
+			info, qErr := server.QueryReservation(ctx, "mig-bad")
+			if qErr != nil || info.Status != string(ReservationActive) {
+				t.Fatalf("rejected commit consumed reservation: %#v %v", info, qErr)
+			}
+		})
+	}
+}
+
+func TestPlaybackCommitMigrationWireShapeValidation(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	identityBody := `"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}],"currentQueueItemId":"qi-1"`
+
+	t.Run("decode matrix", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			body    string
+			wantErr bool
+			invalid bool
+		}{
+			{"all shape keys omitted", `{}`, false, false},
+			{"legacy empty queue only", `{"queue":[]}`, false, false},
+			{"legacy zero current index only", `{"currentIndex":0}`, false, false},
+			{"identity transport", `{` + identityBody + `}`, false, false},
+			{"empty identity queue idle", `{"queueItems":[]}`, false, false},
+			{"mixed explicit empty legacy with identity", `{"queue":[],"currentIndex":0,` + identityBody + `}`, true, false},
+			{"mixed zero index with identity", `{"currentIndex":0,"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}]}`, true, false},
+			{"mixed empty legacy queue with identity", `{"queue":[],"queueItems":[]}`, true, false},
+			{"null queue items", `{"queueItems":null}`, true, false},
+			{"null queue", `{"queue":null}`, true, false},
+			{"null current index", `{"currentIndex":null}`, true, false},
+			{"null current queue item id", `{"currentQueueItemId":null}`, true, false},
+			{"mixed case legacy and identity keys", `{"Queue":[],"QueueItems":[]}`, true, false},
+			{"duplicate keys keep last and stay mixed", `{"queue":[],"queueItems":[],"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}]}`, true, false},
+			{"wrong type queue", `{"queue":5}`, false, true},
+			{"wrong type queue items", `{"queueItems":"nope"}`, false, true},
+			{"wrong type current index", `{"currentIndex":"x"}`, false, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var req CommitMigrationRequest
+				err := json.Unmarshal([]byte(tc.body), &req)
+				if tc.invalid {
+					if err == nil {
+						t.Fatalf("decode %s: expected type error", tc.body)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("decode %s: %v", tc.body, err)
+				}
+				_, shapeErr := validateMigrationQueueShape(req)
+				if tc.wantErr && !errors.Is(shapeErr, ErrMigrationProtocolConflict) {
+					t.Fatalf("want protocol conflict for %s, got %v", tc.body, shapeErr)
+				}
+				if !tc.wantErr && shapeErr != nil {
+					t.Fatalf("unexpected shape error for %s: %v", tc.body, shapeErr)
+				}
+			})
+		}
+	})
+
+	commitWithBody := func(t *testing.T, server *playbackServer, generation uint64, migrationID, operationID, body string) error {
+		t.Helper()
+		var req CommitMigrationRequest
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatalf("decode commit body: %v", err)
+		}
+		req.MigrationID = migrationID
+		req.OperationID = operationID
+		req.SessionID = "src"
+		req.ClientID = "tab"
+		req.User = "admin"
+		req.TargetDeviceName = "new"
+		req.ExpectedGeneration = generation
+		_, err := server.CommitMigration(ctx, req)
+		return err
+	}
+
+	t.Run("mixed explicit wire keys rejected before side effects", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		migrationTestTarget(t, server, "new").PlaybackQueue.Add(model.MediaFiles{{ID: "seed", Path: "/seed.mp3"}})
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-wire", "new")
+		fpBefore := migrationTestTarget(t, server, "new").SceneFingerprint()
+
+		err := commitWithBody(t, server, attached.BindingGeneration, "mig-wire", "g1:commit-wire",
+			`{"queue":[],"currentIndex":0,`+identityBody+`}`)
+		if !errors.Is(err, ErrMigrationProtocolConflict) {
+			t.Fatalf("want protocol conflict, got %v", err)
+		}
+
+		after := migrationTestTarget(t, server, "new")
+		after.mu.Lock()
+		defer after.mu.Unlock()
+		if after.sceneFingerprintLocked() != fpBefore {
+			t.Fatal("rejected wire commit mutated target scene")
+		}
+		if after.PlaybackQueue.Size() != 1 || after.PlaybackQueue.Get()[0].ID != "seed" {
+			t.Fatalf("rejected wire commit mutated target queue: %s", after.PlaybackQueue)
+		}
+		info, qErr := server.QueryReservation(ctx, "mig-wire")
+		if qErr != nil || info.Status != string(ReservationActive) {
+			t.Fatalf("rejected wire commit consumed reservation: %#v %v", info, qErr)
+		}
+	})
+
+	t.Run("explicit null shape key rejected before side effects", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		migrationTestTarget(t, server, "new").PlaybackQueue.Add(model.MediaFiles{{ID: "seed", Path: "/seed.mp3"}})
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-null", "new")
+		err := commitWithBody(t, server, attached.BindingGeneration, "mig-null", "g1:commit-null", `{"queueItems":null}`)
+		if !errors.Is(err, ErrMigrationProtocolConflict) {
+			t.Fatalf("want protocol conflict, got %v", err)
+		}
+		info, qErr := server.QueryReservation(ctx, "mig-null")
+		if qErr != nil || info.Status != string(ReservationActive) {
+			t.Fatalf("rejected null commit consumed reservation: %#v %v", info, qErr)
+		}
+	})
+
+	t.Run("legacy only explicit zero wire keys stay valid", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-legacy-zero", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-legacy-zero", OperationID: "g1:commit-legacy-zero", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			Queue: []string{}, CurrentIndex: 0,
+		})
+		if err != nil {
+			t.Fatalf("explicit zero legacy commit: %v", err)
+		}
+		if committed.CurrentIndex != -1 || committed.Playing {
+			t.Fatalf("explicit zero legacy commit changed idle state: %#v", committed)
+		}
+	})
+
+	t.Run("malformed replay cannot bypass validation after successful identity commit", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-replay", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-replay", OperationID: "g1:commit-replay", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}},
+		})
+		if err != nil {
+			t.Fatalf("identity commit: %v", err)
+		}
+		err = commitWithBody(t, server, committed.BindingGeneration, "mig-replay", "g1:commit-replay",
+			`{"queue":[],"currentIndex":0,"queueItems":[{"queueItemId":"qi-2","mediaFileId":"track"}]}`)
+		if !errors.Is(err, ErrMigrationProtocolConflict) {
+			t.Fatalf("malformed replay bypassed validation: %v", err)
+		}
+	})
+}
+
+type identityEditFixture struct {
+	ctx     context.Context
+	server  *playbackServer
+	scopeOf func(op string) CommandScope
+	device  *playbackDevice
+	ids     []string
+}
+
+func newIdentityEditFixture(t *testing.T) *identityEditFixture {
+	t.Helper()
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	_, server := newMigrationValidationServer(t)
+	attached, err := server.AttachSession(ctx, AttachRequest{SessionID: "edit", User: "admin", ClientID: "tab", DeviceName: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &identityEditFixture{
+		ctx:    ctx,
+		server: server,
+		scopeOf: func(op string) CommandScope {
+			return CommandScope{User: "admin", SessionID: "edit", ClientID: "tab", BindingGeneration: &attached.BindingGeneration, OperationID: op}
+		},
+		device: migrationTestTarget(t, server, "old"),
+	}
+	if _, err := server.ExecuteCommand(ctx, fixture.scopeOf("g1:set"), PlaybackCommand{Action: CommandSet, IDs: []string{"track", "track", "track", "track"}}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	snapshot, err := server.SessionSnapshot(ctx, "edit", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range snapshot.JukeboxPlaylist.Entry {
+		fixture.ids = append(fixture.ids, entry.QueueItemID)
+	}
+	return fixture
+}
+
+func (f *identityEditFixture) run(t *testing.T, op string, command PlaybackCommand) DeviceStatus {
+	t.Helper()
+	status, err := f.server.ExecuteCommand(f.ctx, f.scopeOf(op), command)
+	if err != nil {
+		t.Fatalf("%s: %v", op, err)
+	}
+	return status
+}
+
+func (f *identityEditFixture) currentID(t *testing.T) string {
+	t.Helper()
+	f.device.mu.Lock()
+	defer f.device.mu.Unlock()
+	item := f.device.PlaybackQueue.CurrentItem()
+	if item == nil {
+		return ""
+	}
+	return item.QueueItemID
+}
+
+func (f *identityEditFixture) activeTrack() Track {
+	f.device.mu.Lock()
+	defer f.device.mu.Unlock()
+	return f.device.ActiveTrack
+}
+
+func TestPlaybackIdentityRemoveRejectionEnvelopes(t *testing.T) {
+	fixture := newIdentityEditFixture(t)
+	fixture.device.mu.Lock()
+	versionBefore := fixture.device.queueVersion
+	fixture.device.mu.Unlock()
+
+	// Protected index-only remove is rejected after authorization.
+	if _, err := fixture.server.ExecuteCommand(fixture.ctx, fixture.scopeOf("g1:remove-index"), PlaybackCommand{Action: CommandRemove, Index: 0}); !errors.Is(err, ErrIdentityRequired) {
+		t.Fatalf("protected index remove accepted: %v", err)
+	}
+	// ID+index conflict is rejected after authorization, before side effects.
+	if _, err := fixture.server.ExecuteCommand(fixture.ctx, fixture.scopeOf("g1:remove-conflict"), PlaybackCommand{Action: CommandRemove, QueueItemID: fixture.ids[0], IndexProvided: true}); !errors.Is(err, ErrQueueIdentityConflict) {
+		t.Fatalf("ID+index remove accepted: %v", err)
+	}
+	fixture.device.mu.Lock()
+	got := fixture.device.queueVersion
+	fixture.device.mu.Unlock()
+	if got != versionBefore {
+		t.Fatalf("rejected remove mutated queue version: %d", got)
+	}
+	// Missing ID returns its distinct error with a fresh snapshot.
+	var lookupErr *QueueItemLookupError
+	if _, err := fixture.server.ExecuteCommand(fixture.ctx, fixture.scopeOf("g1:remove-missing"), PlaybackCommand{Action: CommandRemove, QueueItemID: "qi-missing"}); !errors.As(err, &lookupErr) {
+		t.Fatalf("missing identity remove: %T %v", err, err)
+	} else if !lookupErr.Source || lookupErr.Status.QueueVersion != versionBefore {
+		t.Fatalf("missing identity remove envelope: %#v", lookupErr)
+	}
+}
+
+func TestPlaybackIdentityRemovePausedSemantics(t *testing.T) {
+	fixture := newIdentityEditFixture(t)
+
+	// Paused remove of the current item selects its successor, never starts playback.
+	status := fixture.run(t, "g1:remove-current", PlaybackCommand{Action: CommandRemove, QueueItemID: fixture.ids[0]})
+	if status.Playing || status.CurrentIndex != 0 {
+		t.Fatalf("paused successor remove: %#v", status)
+	}
+	if current := fixture.currentID(t); current != fixture.ids[1] {
+		t.Fatalf("paused remove did not prefer successor: %s", current)
+	}
+
+	// Paused remove of a non-current item leaves current untouched.
+	status = fixture.run(t, "g1:remove-noncurrent", PlaybackCommand{Action: CommandRemove, QueueItemID: fixture.ids[3]})
+	if status.Playing || status.CurrentIndex != 0 {
+		t.Fatalf("paused non-current remove disturbed state: %#v", status)
+	}
+
+	// Paused select by identity moves current without startup.
+	status = fixture.run(t, "g1:select-last", PlaybackCommand{Action: CommandSkip, QueueItemID: fixture.ids[2]})
+	if status.Playing || status.CurrentIndex != 1 {
+		t.Fatalf("paused identity select: %#v", status)
+	}
+	if current := fixture.currentID(t); current != fixture.ids[2] {
+		t.Fatalf("identity select resolved wrong instance: %s", current)
+	}
+}
+
+func TestPlaybackIdentityRemovePlayingSemantics(t *testing.T) {
+	fixture := newIdentityEditFixture(t)
+
+	// Playing remove of a non-current item keeps the active output untouched.
+	fixture.run(t, "g1:select", PlaybackCommand{Action: CommandSkip, QueueItemID: fixture.ids[2]})
+	fixture.run(t, "g1:start", PlaybackCommand{Action: CommandStart})
+	playing := fixture.activeTrack()
+	if playing == nil {
+		t.Fatal("start did not load output")
+	}
+	// Removing the item before the current one shifts the current index down
+	// while the active output instance stays untouched.
+	status := fixture.run(t, "g1:remove-noncurrent", PlaybackCommand{Action: CommandRemove, QueueItemID: fixture.ids[1]})
+	if !status.Playing || status.CurrentIndex != 1 || fixture.activeTrack() != playing {
+		t.Fatalf("playing non-current remove disturbed playback: %#v", status)
+	}
+
+	// Appending while protected still mints fresh server-side IDs.
+	fixture.run(t, "g1:add", PlaybackCommand{Action: CommandAdd, IDs: []string{"track"}})
+	snapshot, err := fixture.server.SessionSnapshot(fixture.ctx, "edit", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendedID := snapshot.JukeboxPlaylist.Entry[len(snapshot.JukeboxPlaylist.Entry)-1].QueueItemID
+	for _, id := range fixture.ids {
+		if appendedID == id {
+			t.Fatalf("protected add reused an existing instance ID: %s", appendedID)
+		}
+	}
+
+	// Playing remove of the current item loads its immediate successor (the
+	// item after it, not the queue tail) and keeps playing.
+	status = fixture.run(t, "g1:remove-current", PlaybackCommand{Action: CommandRemove, QueueItemID: fixture.ids[2]})
+	if !status.Playing || status.CurrentIndex != 1 {
+		t.Fatalf("playing current remove lost intent: %#v", status)
+	}
+	if current := fixture.currentID(t); current != fixture.ids[3] {
+		t.Fatalf("playing current remove did not select successor: %s", current)
+	}
+	if track := fixture.activeTrack(); track == playing || track == nil {
+		t.Fatal("playing current remove did not switch to the successor output")
+	}
+
+	// Playing select of the appended last item, then removing that current
+	// last item selects the remaining last item and keeps playing.
+	fixture.run(t, "g1:add-again", PlaybackCommand{Action: CommandAdd, IDs: []string{"track"}})
+	snapshot, err = fixture.server.SessionSnapshot(fixture.ctx, "edit", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastID := snapshot.JukeboxPlaylist.Entry[len(snapshot.JukeboxPlaylist.Entry)-1].QueueItemID
+	fixture.run(t, "g1:select-appended", PlaybackCommand{Action: CommandSkip, QueueItemID: lastID})
+	status = fixture.run(t, "g1:remove-playing-last", PlaybackCommand{Action: CommandRemove, QueueItemID: lastID})
+	if !status.Playing || status.CurrentIndex != 2 {
+		t.Fatalf("playing last remove lost intent: %#v", status)
+	}
+	if current := fixture.currentID(t); current != appendedID {
+		t.Fatalf("last remove did not select remaining last: %s", current)
+	}
+}
+
+func TestPlaybackQueueProtocolCapabilityContract(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	_, server := newMigrationValidationServer(t)
+	attached, err := server.AttachSession(ctx, AttachRequest{SessionID: "cap", User: "admin", ClientID: "tab", DeviceName: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol := attached.QueueProtocol
+	if protocol == nil || protocol.Version != 1 ||
+		!protocol.RelativeMove || !protocol.IdentitySelect || !protocol.IdentityRemove ||
+		!protocol.IdentityMigration || !protocol.AnchorVersionEnforcement || !protocol.OperationResults {
+		t.Fatalf("attach did not advertise enforced queue protocol: %#v", protocol)
+	}
+	status, err := server.SessionStatus(ctx, "cap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.QueueProtocol == nil || status.QueueProtocol.Version != 1 {
+		t.Fatalf("session status dropped queue protocol: %#v", status.QueueProtocol)
+	}
+	event := NewJukeboxStateUpdatedEvent(status)
+	if event.QueueProtocol == nil || event.QueueProtocol.Version != 1 || !event.QueueProtocol.IdentityRemove {
+		t.Fatalf("SSE event dropped queue protocol: %#v", event.QueueProtocol)
 	}
 }

@@ -1142,3 +1142,60 @@ func assertAnchorMoveVersionPresence(t *testing.T, fixture *anchorMoveFixture, v
 		t.Fatalf("omitted expected version rejected: %v", err)
 	}
 }
+
+func TestPlaybackDeviceClearResetsQueueCurrentAndOutput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+	t.Cleanup(func() { _, _ = device.Shutdown(ctx) })
+	device.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/1.mp3"}, {ID: "2", Path: "/2.mp3"}})
+	device.PlaybackQueue.SetIndex(1)
+
+	previousNewTrack := newTrack
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, _ model.PlaybackToken, _ string, _ model.MediaFile) (Track, error) {
+		return &mockTrack{playing: true}, nil
+	}
+	t.Cleanup(func() { newTrack = previousNewTrack })
+
+	// Paused clear never starts playback and resets queue/current/position.
+	if _, err := device.Clear(ctx); err != nil {
+		t.Fatalf("paused clear: %v", err)
+	}
+	status, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Playing || status.CurrentIndex != -1 || status.Position != 0 || status.QueueVersion != 1 {
+		t.Fatalf("paused clear did not reset output semantics: %#v", status)
+	}
+	device.mu.Lock()
+	if device.ActiveTrack != nil || device.PlaybackQueue.Size() != 0 {
+		device.mu.Unlock()
+		t.Fatalf("paused clear left output or queue state: %s", device.PlaybackQueue)
+	}
+	device.mu.Unlock()
+
+	// Playing clear stops output and clears the current item.
+	device.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/1.mp3"}})
+	device.PlaybackQueue.SetIndex(0)
+	if _, err := device.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	versionBefore := device.queueVersion
+	if _, err := device.Clear(ctx); err != nil {
+		t.Fatalf("playing clear: %v", err)
+	}
+	status, err = device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Playing || status.CurrentIndex != -1 || status.Position != 0 || status.QueueVersion != versionBefore+1 {
+		t.Fatalf("playing clear did not stop and reset: %#v", status)
+	}
+	device.mu.Lock()
+	if device.ActiveTrack != nil || device.recoveryPosition != nil {
+		device.mu.Unlock()
+		t.Fatal("playing clear left an output or recovery position")
+	}
+	device.mu.Unlock()
+}

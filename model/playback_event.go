@@ -22,3 +22,16 @@ type PlaybackEvent struct {
 	Position *int
 	Err      error
 }
+
+// QueueProtocolCapabilities is the single additive queue-capability contract
+// shared by attach responses, status responses, and SSE events. Version is an
+// integer; clients must check boolean/version values, never field presence.
+type QueueProtocolCapabilities struct {
+	Version                  int  `json:"version"`
+	RelativeMove             bool `json:"relativeMove"`
+	IdentitySelect           bool `json:"identitySelect"`
+	IdentityRemove           bool `json:"identityRemove"`
+	IdentityMigration        bool `json:"identityMigration"`
+	AnchorVersionEnforcement bool `json:"anchorVersionEnforcement"`
+	OperationResults         bool `json:"operationResults"`
+}

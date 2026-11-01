@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/navidrome/navidrome/core/playback"
 	"github.com/navidrome/navidrome/log"
+	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 )
 
@@ -22,6 +23,9 @@ type jukeboxStatusResponse struct {
 	Muted        bool    `json:"muted"`
 	Position     int     `json:"position"`
 	QueueVersion int     `json:"queueVersion"`
+	// QueueProtocol is the shared additive capability contract; clients must
+	// check version/boolean values, never field presence.
+	QueueProtocol *model.QueueProtocolCapabilities `json:"queueProtocol,omitempty"`
 }
 
 type jukeboxCommandRequest struct {
@@ -63,20 +67,32 @@ func (api *Router) addJukeboxControlRoute(r chi.Router) {
 
 func toStatusResponse(s playback.DeviceStatus) *jukeboxStatusResponse {
 	return &jukeboxStatusResponse{
-		CurrentIndex: s.CurrentIndex,
-		Playing:      s.Playing,
-		Gain:         s.Gain,
-		DesiredGain:  s.DesiredGain,
-		Muted:        s.Muted,
-		Position:     s.Position,
-		QueueVersion: s.QueueVersion,
+		CurrentIndex:  s.CurrentIndex,
+		Playing:       s.Playing,
+		Gain:          s.Gain,
+		DesiredGain:   s.DesiredGain,
+		Muted:         s.Muted,
+		Position:      s.Position,
+		QueueVersion:  s.QueueVersion,
+		QueueProtocol: queueProtocolPtr(),
 	}
+}
+
+func queueProtocolPtr() *model.QueueProtocolCapabilities {
+	protocol := playback.CurrentQueueProtocol()
+	return &protocol
 }
 
 func writeJukeboxMoveProtocolConflict(w http.ResponseWriter, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
 	_ = json.NewEncoder(w).Encode(map[string]any{"code": "MOVE_PROTOCOL_CONFLICT", "error": err.Error()})
+}
+
+func writeJukeboxIdentityConflict(w http.ResponseWriter, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{"code": "QUEUE_IDENTITY_CONFLICT", "error": err.Error()})
 }
 
 // validateJukeboxMoveProtocol enforces the relative-anchor move contract
@@ -191,10 +207,14 @@ func (api *Router) jukeboxCommand(w http.ResponseWriter, r *http.Request, action
 			return
 		}
 	}
+	if (action == playback.CommandRemove || action == playback.CommandSkip) && req.QueueItemID != "" && req.Index != nil {
+		writeJukeboxIdentityConflict(w, playback.ErrQueueIdentityConflict)
+		return
+	}
 	command := playback.PlaybackCommand{
 		Action: action, IDs: req.IDs, Offset: req.Offset, Position: req.Position, Gain: req.Gain,
 		QueueItemID: req.QueueItemID, AnchorQueueItemID: req.AnchorQueueItemID, Placement: req.Placement,
-		ExpectedQueueVersion: req.ExpectedQueueVersion,
+		ExpectedQueueVersion: req.ExpectedQueueVersion, IndexProvided: req.Index != nil,
 	}
 	if req.From != nil {
 		command.From = *req.From

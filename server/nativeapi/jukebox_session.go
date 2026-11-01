@@ -202,6 +202,16 @@ func (api *Router) writeJukeboxSessionError(w http.ResponseWriter, err error) {
 		})
 	case errors.Is(err, playback.ErrMoveProtocolConflict):
 		writeJukeboxMoveProtocolConflict(w, err)
+	case errors.Is(err, playback.ErrIdentityRequired):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "IDENTITY_REQUIRED", "error": err.Error()})
+	case errors.Is(err, playback.ErrQueueIdentityConflict):
+		writeJukeboxIdentityConflict(w, err)
+	case errors.Is(err, playback.ErrMigrationProtocolConflict):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "MIGRATION_PROTOCOL_CONFLICT", "error": err.Error()})
 	case errors.As(err, &historyUnknown):
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)

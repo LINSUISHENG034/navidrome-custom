@@ -25,6 +25,7 @@ func NewJukeboxStateUpdatedEvent(status SessionStatus) *serverevents.JukeboxStat
 		OwnershipState:    status.OwnershipState,
 		TerminationReason: status.TerminationReason,
 		QueueVersion:      status.QueueVersion,
+		QueueProtocol:     status.QueueProtocol,
 		LastHeartbeat:     status.LastHeartbeat,
 		StaleSince:        status.StaleSince,
 		BindingGeneration: status.BindingGeneration,

@@ -65,7 +65,9 @@ func TestPlaybackServerGetReturnsIndependentQueueSnapshot(t *testing.T) {
 	if len(currentQueue) != 2 || currentQueue[0].ID != "track-b" || currentQueue[1].ID != "track-c" {
 		t.Fatalf("unexpected queue after Remove: %#v", currentQueue)
 	}
-	if currentStatus.CurrentIndex != -1 {
+	// T13-AC07: removing the current item selects its successor instead of
+	// leaving the queue without a current item.
+	if currentStatus.CurrentIndex != 0 {
 		t.Fatalf("unexpected status after Remove: %#v", currentStatus)
 	}
 
@@ -77,7 +79,7 @@ func TestPlaybackServerGetReturnsIndependentQueueSnapshot(t *testing.T) {
 	if len(latestQueue) != 2 || latestQueue[0].ID != "track-b" || latestQueue[1].ID != "track-c" {
 		t.Errorf("caller mutation changed current queue: %#v", latestQueue)
 	}
-	if latestStatus.CurrentIndex != -1 {
+	if latestStatus.CurrentIndex != 0 {
 		t.Errorf("unexpected status after caller mutation: %#v", latestStatus)
 	}
 }

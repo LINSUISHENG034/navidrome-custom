@@ -6,6 +6,7 @@
 package playback
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -49,22 +50,39 @@ type PlaybackServer interface {
 }
 
 var (
-	ErrCommandScope             = errors.New("sessionId and clientId must be supplied together")
-	ErrDeviceNotFound           = errors.New("device not found")
-	ErrGenerationRequired       = errors.New("bindingGeneration is required")
-	ErrCommandSuperseded        = errors.New("command superseded by newer generation")
-	ErrProtectedContextConflict = fmt.Errorf("%w: cannot issue legacy writes to protected playback context", ErrSessionOwnership)
-	ErrMigrationConflict        = errors.New("target device is reserved by another migration")
-	ErrReservationNotFound      = errors.New("migration reservation not found or not active")
-	ErrOperationRequired        = errors.New("operationId is required")
-	ErrOperationIdentity        = errors.New("operationId must be g<bindingGeneration>:<stable ID>")
-	ErrOperationUnknown         = errors.New("operation outcome is unknown")
-	ErrOperationCapacity        = errors.New("operation execution capacity exceeded")
-	ErrMoveProtocolConflict     = errors.New("relative move fields cannot be combined with legacy from/to/toIndex")
-	ErrQueueVersionConflict     = errors.New("queue version conflict")
-	ErrQueueItemNotFound        = errors.New("queue item not found")
-	ErrQueueAnchorNotFound      = errors.New("anchor queue item not found")
+	ErrCommandScope              = errors.New("sessionId and clientId must be supplied together")
+	ErrDeviceNotFound            = errors.New("device not found")
+	ErrGenerationRequired        = errors.New("bindingGeneration is required")
+	ErrCommandSuperseded         = errors.New("command superseded by newer generation")
+	ErrProtectedContextConflict  = fmt.Errorf("%w: cannot issue legacy writes to protected playback context", ErrSessionOwnership)
+	ErrMigrationConflict         = errors.New("target device is reserved by another migration")
+	ErrReservationNotFound       = errors.New("migration reservation not found or not active")
+	ErrOperationRequired         = errors.New("operationId is required")
+	ErrOperationIdentity         = errors.New("operationId must be g<bindingGeneration>:<stable ID>")
+	ErrOperationUnknown          = errors.New("operation outcome is unknown")
+	ErrOperationCapacity         = errors.New("operation execution capacity exceeded")
+	ErrMoveProtocolConflict      = errors.New("relative move fields cannot be combined with legacy from/to/toIndex")
+	ErrQueueVersionConflict      = errors.New("queue version conflict")
+	ErrQueueItemNotFound         = errors.New("queue item not found")
+	ErrQueueAnchorNotFound       = errors.New("anchor queue item not found")
+	ErrIdentityRequired          = errors.New("protected queue edits require queueItemId")
+	ErrQueueIdentityConflict     = errors.New("queueItemId cannot be combined with index/from/to")
+	ErrMigrationProtocolConflict = errors.New("migration queue shape mixes legacy and identity fields")
 )
+
+// QueueProtocolCapabilities is enforced in this build and advertised through
+// the shared model contract.
+func CurrentQueueProtocol() model.QueueProtocolCapabilities {
+	return model.QueueProtocolCapabilities{
+		Version:                  1,
+		RelativeMove:             true,
+		IdentitySelect:           true,
+		IdentityRemove:           true,
+		IdentityMigration:        true,
+		AnchorVersionEnforcement: true,
+		OperationResults:         true,
+	}
+}
 
 // QueueVersionConflictError reports a stale expectedQueueVersion. Status is a
 // fresh snapshot so clients can redraw without another round trip.
@@ -122,15 +140,18 @@ type CommandScope struct {
 }
 
 type PlaybackCommand struct {
-	Action   string
-	IDs      []string
-	Index    int
-	Offset   int
-	Position int
-	From     int
-	To       int
-	Gain     float32
-	Muted    bool
+	Action string
+	IDs    []string
+	Index  int
+	// IndexProvided records whether Index was explicitly supplied on the wire,
+	// distinguishing an omitted index from index 0 in conflict validation.
+	IndexProvided bool
+	Offset        int
+	Position      int
+	From          int
+	To            int
+	Gain          float32
+	Muted         bool
 	// Relative-anchor move fields (T13). QueueItemID/AnchorQueueItemID select
 	// queue instances, Placement is "before"/"after", and ExpectedQueueVersion
 	// is nil when the client did not capture one (distinct from index 0).
@@ -447,6 +468,21 @@ type ReleaseMigrationRequest struct {
 	BindingGeneration *uint64 `json:"bindingGeneration,omitempty"`
 }
 
+type QueueItemRef struct {
+	QueueItemID string `json:"queueItemId"`
+	MediaFileID string `json:"mediaFileId"`
+}
+
+// CommitMigrationRequest carries the migration commit over the native API.
+//
+// Wire protocol: the legacy transport (queue, currentIndex) and the identity
+// transport (queueItems, currentQueueItemId) are mutually exclusive. The
+// decoder records explicit presence of all four keys, including explicit
+// null, zero, and empty values, so a mixed request is rejected with
+// ErrMigrationProtocolConflict even when the legacy values decode to their
+// zero values. Direct Go callers bypass UnmarshalJSON; semantic presence
+// (non-nil queue slice or pointers, non-zero currentIndex) applies to them.
+// Explicit null on any of the four keys is always rejected.
 type CommitMigrationRequest struct {
 	MigrationID         string   `json:"migrationId"`
 	OperationID         string   `json:"operationId"`
@@ -459,9 +495,130 @@ type CommitMigrationRequest struct {
 	ExpectedFingerprint string   `json:"expectedFingerprint"`
 	Queue               []string `json:"queue,omitempty"`
 	CurrentIndex        int      `json:"currentIndex,omitempty"`
-	Position            *int     `json:"position,omitempty"`
-	Gain                *float32 `json:"gain,omitempty"`
-	Muted               *bool    `json:"muted,omitempty"`
+	// Identity transport (T13): QueueItems (pointer distinguishes absent from
+	// explicit empty) plus CurrentQueueItemID replace the legacy Queue/
+	// CurrentIndex rewrite while preserving imported instance IDs.
+	QueueItems         *[]QueueItemRef `json:"queueItems,omitempty"`
+	CurrentQueueItemID *string         `json:"currentQueueItemId,omitempty"`
+	Position           *int            `json:"position,omitempty"`
+	Gain               *float32        `json:"gain,omitempty"`
+	Muted              *bool           `json:"muted,omitempty"`
+
+	// migrationWire records which wire queue-shape keys were explicitly
+	// present during decoding. It is private so request hashing and JSON
+	// responses ignore it, and it is replaced on every decode.
+	migrationWire migrationWireShape
+}
+
+// migrationWireShape captures explicit wire presence of the four mutually
+// exclusive queue-shape keys, including explicit null values.
+type migrationWireShape struct {
+	queue              bool
+	currentIndex       bool
+	queueItems         bool
+	currentQueueItemID bool
+	nullKey            string
+}
+
+// UnmarshalJSON decodes CommitMigrationRequest while recording explicit
+// presence of the queue-shape keys. Shadowing the four shape fields with
+// json.RawMessage keeps encoding/json's case-insensitive field matching and
+// duplicate-key last-value semantics, then each value is decoded individually
+// so wrong types keep failing as decode errors.
+func (req *CommitMigrationRequest) UnmarshalJSON(data []byte) error {
+	type commitMigrationAlias CommitMigrationRequest
+	shadow := struct {
+		commitMigrationAlias
+		Queue              json.RawMessage `json:"queue"`
+		CurrentIndex       json.RawMessage `json:"currentIndex"`
+		QueueItems         json.RawMessage `json:"queueItems"`
+		CurrentQueueItemID json.RawMessage `json:"currentQueueItemId"`
+	}{}
+	if err := json.Unmarshal(data, &shadow); err != nil {
+		return err
+	}
+	*req = CommitMigrationRequest(shadow.commitMigrationAlias)
+	wire := migrationWireShape{}
+	assign := func(raw json.RawMessage, dst any, key string, used *bool) error {
+		if raw == nil {
+			return nil
+		}
+		*used = true
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			if wire.nullKey == "" {
+				wire.nullKey = key
+			}
+			return nil
+		}
+		return json.Unmarshal(raw, dst)
+	}
+	if err := assign(shadow.Queue, &req.Queue, "queue", &wire.queue); err != nil {
+		return err
+	}
+	if err := assign(shadow.CurrentIndex, &req.CurrentIndex, "currentIndex", &wire.currentIndex); err != nil {
+		return err
+	}
+	if err := assign(shadow.QueueItems, &req.QueueItems, "queueItems", &wire.queueItems); err != nil {
+		return err
+	}
+	if err := assign(shadow.CurrentQueueItemID, &req.CurrentQueueItemID, "currentQueueItemId", &wire.currentQueueItemID); err != nil {
+		return err
+	}
+	req.migrationWire = wire
+	return nil
+}
+
+// migrationQueueShape is the deterministic parse of the mutually exclusive
+// legacy and identity migration shapes.
+type migrationQueueShape struct {
+	identity bool
+	items    []QueueItemRef
+}
+
+// validateMigrationQueueShape rejects mixed, malformed, or ambiguous shapes
+// before any target mutation. Explicit wire presence (including explicit
+// null, zero, or empty values) counts as usage; direct Go callers rely on
+// semantic presence instead. Identity IDs must be non-empty and unique and,
+// when a current item is supplied, it must be a member of the queue.
+func validateMigrationQueueShape(req CommitMigrationRequest) (migrationQueueShape, error) {
+	if req.migrationWire.nullKey != "" {
+		return migrationQueueShape{}, fmt.Errorf("%w: %s must not be null", ErrMigrationProtocolConflict, req.migrationWire.nullKey)
+	}
+	legacyUsed := req.migrationWire.queue || req.migrationWire.currentIndex || req.Queue != nil || req.CurrentIndex != 0
+	identityUsed := req.migrationWire.queueItems || req.migrationWire.currentQueueItemID || req.QueueItems != nil || req.CurrentQueueItemID != nil
+	if legacyUsed && identityUsed {
+		return migrationQueueShape{}, ErrMigrationProtocolConflict
+	}
+	if !identityUsed {
+		return migrationQueueShape{}, nil
+	}
+	if req.QueueItems == nil {
+		return migrationQueueShape{}, fmt.Errorf("%w: currentQueueItemId requires queueItems", ErrMigrationProtocolConflict)
+	}
+	items := *req.QueueItems
+	seen := make(map[string]struct{}, len(items))
+	for _, ref := range items {
+		if ref.QueueItemID == "" {
+			return migrationQueueShape{}, fmt.Errorf("%w: queueItemId must be non-empty", ErrMigrationProtocolConflict)
+		}
+		if _, dup := seen[ref.QueueItemID]; dup {
+			return migrationQueueShape{}, fmt.Errorf("%w: duplicate queueItemId %q", ErrMigrationProtocolConflict, ref.QueueItemID)
+		}
+		seen[ref.QueueItemID] = struct{}{}
+	}
+	if req.CurrentQueueItemID != nil {
+		found := false
+		for _, ref := range items {
+			if ref.QueueItemID == *req.CurrentQueueItemID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return migrationQueueShape{}, fmt.Errorf("%w: currentQueueItemId %q is not a queue member", ErrMigrationProtocolConflict, *req.CurrentQueueItemID)
+		}
+	}
+	return migrationQueueShape{identity: true, items: items}, nil
 }
 
 type CommandResult struct {
@@ -668,6 +825,8 @@ func newSessionStatus(session Session) SessionStatus {
 	if status.OwnershipState == "" {
 		status.OwnershipState = SessionOwnershipAttached
 	}
+	protocol := CurrentQueueProtocol()
+	status.QueueProtocol = &protocol
 	if session.StaleSince != nil {
 		staleSince := *session.StaleSince
 		status.StaleSince = &staleSince
@@ -1257,7 +1416,8 @@ func isOperationAdmissionError(err error) bool {
 	return errors.Is(err, ErrSessionOwnership) || errors.Is(err, ErrGenerationRequired) ||
 		errors.Is(err, ErrCommandSuperseded) || errors.Is(err, ErrCommandScope) ||
 		errors.Is(err, ErrOperationIdentity) || errors.Is(err, ErrOperationRequired) ||
-		errors.Is(err, ErrMoveProtocolConflict)
+		errors.Is(err, ErrMoveProtocolConflict) || errors.Is(err, ErrIdentityRequired) ||
+		errors.Is(err, ErrQueueIdentityConflict) || errors.Is(err, ErrMigrationProtocolConflict)
 }
 
 // retireOperationsLocked applies history fences only after the store mutex has
@@ -1409,6 +1569,14 @@ func (ps *playbackServer) ExecuteCommand(ctx context.Context, scope CommandScope
 				// identity; legacy from/to moves stay on the unprotected path.
 				ps.mu.Unlock()
 				return OperationRecord{}, ErrMoveProtocolConflict
+			}
+			if (command.Action == CommandRemove || command.Action == CommandSkip) && command.QueueItemID == "" {
+				ps.mu.Unlock()
+				return OperationRecord{}, ErrIdentityRequired
+			}
+			if (command.Action == CommandRemove || command.Action == CommandSkip) && command.IndexProvided {
+				ps.mu.Unlock()
+				return OperationRecord{}, ErrQueueIdentityConflict
 			}
 			// Acquire the state lock before releasing the authority/binding lock.
 			device.mu.Lock()
@@ -1605,6 +1773,65 @@ func (ps *playbackServer) QueryReservation(ctx context.Context, migrationID stri
 	}, nil
 }
 
+// resolveMigrationMediaLocked loads migration media before any target
+// mutation. Identity transports reuse the client-supplied instance IDs bound
+// to the authenticated migration scope; legacy transports load plain media.
+func (ps *playbackServer) resolveMigrationMediaLocked(shape migrationQueueShape, req CommitMigrationRequest) (model.MediaFiles, []QueueCandidateItem, error) {
+	load := func(mediaFileID string) (model.MediaFile, error) {
+		mf, err := ps.GetMediaFile(mediaFileID)
+		if err != nil {
+			return model.MediaFile{}, fmt.Errorf("load migration media file %q: %w", mediaFileID, err)
+		}
+		if mf == nil {
+			return model.MediaFile{}, fmt.Errorf("migration media file %q not found", mediaFileID)
+		}
+		return *mf, nil
+	}
+	if shape.identity {
+		items := make([]QueueCandidateItem, 0, len(shape.items))
+		for _, ref := range shape.items {
+			mf, err := load(ref.MediaFileID)
+			if err != nil {
+				return nil, nil, err
+			}
+			items = append(items, QueueCandidateItem{QueueItemID: ref.QueueItemID, MediaFile: mf})
+		}
+		return nil, items, nil
+	}
+	legacy := make(model.MediaFiles, 0, len(req.Queue))
+	for _, id := range req.Queue {
+		mf, err := load(id)
+		if err != nil {
+			return nil, nil, err
+		}
+		legacy = append(legacy, mf)
+	}
+	return legacy, nil, nil
+}
+
+// applyMigrationQueueLocked installs the migrated queue. The identity
+// transport preserves the imported instance IDs, with an explicit empty queue
+// or absent current item staying idle; the legacy rewrite assigns fresh IDs.
+func applyMigrationQueueLocked(targetDevice *playbackDevice, shape migrationQueueShape, legacyItems model.MediaFiles, identityItems []QueueCandidateItem, currentQueueItemID *string, legacyIndex int) {
+	if shape.identity {
+		index := -1
+		if currentQueueItemID != nil {
+			for i := range identityItems {
+				if identityItems[i].QueueItemID == *currentQueueItemID {
+					index = i
+					break
+				}
+			}
+		}
+		targetDevice.PlaybackQueue.ReplaceItems(identityItems, index)
+		return
+	}
+	if len(legacyItems) > 0 {
+		targetDevice.PlaybackQueue.Set(legacyItems)
+		targetDevice.PlaybackQueue.SetIndex(legacyIndex)
+	}
+}
+
 func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrationRequest) (SessionStatus, error) {
 	generation := req.ExpectedGeneration
 	if req.BindingGeneration != nil {
@@ -1619,6 +1846,12 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		generationPtr = &generationCopy
 	}
 	scope := CommandScope{User: req.User, SessionID: req.SessionID, ClientID: req.ClientID, BindingGeneration: generationPtr, OperationID: req.OperationID}
+	// Reject malformed queue shapes before the operation store can hash or
+	// replay a result for them; ownership, reservation, and scene checks keep
+	// their order inside the apply closure.
+	if _, err := validateMigrationQueueShape(req); err != nil {
+		return SessionStatus{}, err
+	}
 	var revoked []Session
 	normalized := req
 	normalized.ExpectedGeneration = generation
@@ -1656,16 +1889,13 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 			return OperationRecord{}, &TargetOccupiedError{SceneFingerprint: currentFp, QueueCount: targetDevice.PlaybackQueue.Size()}
 		}
 
-		items := make(model.MediaFiles, 0, len(req.Queue))
-		for _, id := range req.Queue {
-			mf, err := ps.GetMediaFile(id)
-			if err != nil {
-				return OperationRecord{}, fmt.Errorf("load migration media file %q: %w", id, err)
-			}
-			if mf == nil {
-				return OperationRecord{}, fmt.Errorf("migration media file %q not found", id)
-			}
-			items = append(items, *mf)
+		shape, err := validateMigrationQueueShape(req)
+		if err != nil {
+			return OperationRecord{}, err
+		}
+		legacyItems, identityItems, err := ps.resolveMigrationMediaLocked(shape, req)
+		if err != nil {
+			return OperationRecord{}, err
 		}
 
 		sessionManager := ps.ensureSessionManagerLocked()
@@ -1677,10 +1907,7 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		sessionManager.Update(session)
 
 		targetDevice.clearLocked(ctx)
-		if len(items) > 0 {
-			targetDevice.PlaybackQueue.Set(items)
-			targetDevice.PlaybackQueue.SetIndex(req.CurrentIndex)
-		}
+		applyMigrationQueueLocked(targetDevice, shape, legacyItems, identityItems, req.CurrentQueueItemID, req.CurrentIndex)
 		if req.Position != nil {
 			pos := *req.Position
 			targetDevice.recoveryPosition = &pos

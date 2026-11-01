@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/navidrome/navidrome/conf"
+	"github.com/navidrome/navidrome/model"
 )
 
 var (
@@ -54,27 +55,28 @@ type Session struct {
 }
 
 type SessionStatus struct {
-	SessionID             string     `json:"sessionId"`
-	DeviceName            string     `json:"deviceName"`
-	OwnerClientID         string     `json:"ownerClientId"`
-	CurrentIndex          int        `json:"currentIndex"`
-	TrackID               string     `json:"trackId"`
-	QueueItemID           string     `json:"queueItemId,omitempty"`
-	Playing               bool       `json:"playing"`
-	Position              int        `json:"position"`
-	Gain                  float32    `json:"gain"`
-	Muted                 bool       `json:"muted"`
-	DesiredGain           float32    `json:"desiredGain"`
-	Attached              bool       `json:"attached"`
-	OwnershipState        string     `json:"ownershipState"`
-	TerminationReason     string     `json:"terminationReason,omitempty"`
-	QueueVersion          int        `json:"queueVersion"`
-	LastHeartbeat         time.Time  `json:"lastHeartbeat"`
-	StaleSince            *time.Time `json:"staleSince,omitempty"`
-	BindingGeneration     uint64     `json:"bindingGeneration"`
-	ControlHandoffToken   string     `json:"controlHandoffToken,omitempty"`
-	OperationIDFormat     string     `json:"operationIdFormat"`
-	RequiresNewGeneration bool       `json:"requiresNewGeneration"`
+	SessionID             string                           `json:"sessionId"`
+	DeviceName            string                           `json:"deviceName"`
+	OwnerClientID         string                           `json:"ownerClientId"`
+	CurrentIndex          int                              `json:"currentIndex"`
+	TrackID               string                           `json:"trackId"`
+	QueueItemID           string                           `json:"queueItemId,omitempty"`
+	Playing               bool                             `json:"playing"`
+	Position              int                              `json:"position"`
+	Gain                  float32                          `json:"gain"`
+	Muted                 bool                             `json:"muted"`
+	DesiredGain           float32                          `json:"desiredGain"`
+	Attached              bool                             `json:"attached"`
+	OwnershipState        string                           `json:"ownershipState"`
+	TerminationReason     string                           `json:"terminationReason,omitempty"`
+	QueueVersion          int                              `json:"queueVersion"`
+	LastHeartbeat         time.Time                        `json:"lastHeartbeat"`
+	StaleSince            *time.Time                       `json:"staleSince,omitempty"`
+	BindingGeneration     uint64                           `json:"bindingGeneration"`
+	ControlHandoffToken   string                           `json:"controlHandoffToken,omitempty"`
+	QueueProtocol         *model.QueueProtocolCapabilities `json:"queueProtocol,omitempty"`
+	OperationIDFormat     string                           `json:"operationIdFormat"`
+	RequiresNewGeneration bool                             `json:"requiresNewGeneration"`
 }
 
 type HandoffRequest struct {
