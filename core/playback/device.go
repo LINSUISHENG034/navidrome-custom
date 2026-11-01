@@ -50,16 +50,18 @@ type playbackDevice struct {
 	retiring              bool
 	recoveryPosition      *int
 	sceneRevision         uint64
+	stateSequence         uint64
 }
 
 type DeviceStatus struct {
-	CurrentIndex int
-	Playing      bool
-	Gain         float32
-	DesiredGain  float32
-	Muted        bool
-	Position     int
-	QueueVersion int
+	CurrentIndex  int
+	Playing       bool
+	Gain          float32
+	DesiredGain   float32
+	Muted         bool
+	Position      int
+	QueueVersion  int
+	StateSequence uint64 `json:"stateSequence"`
 }
 
 const DefaultGain float32 = 1.0
@@ -92,6 +94,10 @@ func (pd *playbackDevice) incrementSceneRevisionLocked() {
 	pd.sceneRevision++
 }
 
+func (pd *playbackDevice) incrementStateSequenceLocked() {
+	pd.stateSequence++
+}
+
 func (pd *playbackDevice) sceneFingerprintLocked() string {
 	return fmt.Sprintf("fp-%s-%d", pd.DeviceName, pd.sceneRevision)
 }
@@ -120,13 +126,14 @@ func (pd *playbackDevice) getStatus() DeviceStatus {
 		pos = *pd.recoveryPosition
 	}
 	return DeviceStatus{
-		CurrentIndex: pd.PlaybackQueue.Index,
-		Playing:      pd.isPlaying(),
-		Gain:         pd.Gain,
-		DesiredGain:  pd.DesiredGain,
-		Muted:        pd.Muted,
-		Position:     pos,
-		QueueVersion: pd.queueVersion,
+		CurrentIndex:  pd.PlaybackQueue.Index,
+		Playing:       pd.isPlaying(),
+		Gain:          pd.Gain,
+		DesiredGain:   pd.DesiredGain,
+		Muted:         pd.Muted,
+		Position:      pos,
+		QueueVersion:  pd.queueVersion,
+		StateSequence: pd.stateSequence,
 	}
 }
 
@@ -243,6 +250,7 @@ func (pd *playbackDevice) startLocked(ctx context.Context) (DeviceStatus, bool, 
 
 	if changed {
 		pd.incrementSceneRevisionLocked()
+		pd.incrementStateSequenceLocked()
 	}
 	return pd.getStatus(), changed, nil
 }
@@ -270,6 +278,7 @@ func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, bool, e
 	}
 	if changed {
 		pd.incrementSceneRevisionLocked()
+		pd.incrementStateSequenceLocked()
 	}
 	return pd.getStatus(), changed, nil
 }
