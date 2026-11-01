@@ -571,6 +571,14 @@ func TestPlaybackCommandAuthorityValidation(t *testing.T) {
 			t.Fatalf("forged user %s accepted: %v", command.Action, err)
 		}
 		status, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), command)
+		if command.Action == CommandMove {
+			// T13-AC10: protected incremental edits lacking stable instance
+			// identity are explicitly rejected after authority checks pass.
+			if !errors.Is(err, ErrMoveProtocolConflict) {
+				t.Fatalf("owner legacy %s not rejected: %v", command.Action, err)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatalf("owner %s failed: %v", command.Action, err)
 		}
@@ -1081,5 +1089,73 @@ func TestPlaybackServerMigrationTargetStartFailurePreservesFailedSceneWithoutOut
 	resumedStatus, err := newDev.Start(ctx)
 	if err != nil || !resumedStatus.Playing || resumedStatus.Position != 17 || resumedStatus.Gain != 0.5 {
 		t.Fatalf("retry after volume/prep failure did not resume from preserved scene: %#v, %v", resumedStatus, err)
+	}
+}
+
+func TestPlaybackProtectedAnchorMoveReplayIsIdempotent(t *testing.T) {
+	ctx, server := newMigrationValidationServer(t)
+	ctx = request.WithUser(ctx, model.User{UserName: "admin"})
+	attached, err := server.AttachSession(ctx, AttachRequest{SessionID: "replay", User: "admin", ClientID: "tab", DeviceName: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := CommandScope{
+		User: "admin", SessionID: "replay", ClientID: "tab",
+		BindingGeneration: &attached.BindingGeneration, OperationID: "g1:replay-set",
+	}
+	if _, err := server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandSet, IDs: []string{"track", "track", "track"}}); err != nil {
+		t.Fatalf("protected set: %v", err)
+	}
+	snapshot, err := server.SessionSnapshot(ctx, "replay", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := snapshot.JukeboxPlaylist.Entry
+	if len(entries) != 3 || entries[0].QueueItemID == "" || entries[0].QueueItemID == entries[1].QueueItemID {
+		t.Fatalf("snapshot lacks distinct queue item IDs: %#v", entries)
+	}
+
+	moveScope := CommandScope{
+		User: "admin", SessionID: "replay", ClientID: "tab",
+		BindingGeneration: &attached.BindingGeneration, OperationID: "g1:replay-move",
+	}
+	move := PlaybackCommand{
+		Action: CommandMove, QueueItemID: entries[2].QueueItemID,
+		AnchorQueueItemID: entries[0].QueueItemID, Placement: "before",
+	}
+	first, err := server.ExecuteCommand(ctx, moveScope, move)
+	if err != nil {
+		t.Fatalf("first anchor move: %v", err)
+	}
+	if first.QueueVersion != snapshot.SessionStatus.QueueVersion+1 {
+		t.Fatalf("first move did not bump queue version once: %d -> %d", snapshot.SessionStatus.QueueVersion, first.QueueVersion)
+	}
+
+	replay, err := server.ExecuteCommand(ctx, moveScope, move)
+	if err != nil {
+		t.Fatalf("replay anchor move: %v", err)
+	}
+	if replay.QueueVersion != first.QueueVersion {
+		t.Fatalf("replay re-executed the move: version %d -> %d", first.QueueVersion, replay.QueueVersion)
+	}
+	if replay.CurrentIndex != first.CurrentIndex || replay.Playing != first.Playing || replay.Position != first.Position ||
+		replay.Gain != first.Gain || replay.DesiredGain != first.DesiredGain || replay.Muted != first.Muted {
+		t.Fatalf("replay result differs from original: %#v vs %#v", replay, first)
+	}
+
+	after, err := server.SessionSnapshot(ctx, "replay", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.SessionStatus.QueueVersion != first.QueueVersion {
+		t.Fatalf("queue version changed after replay: %d", after.SessionStatus.QueueVersion)
+	}
+	order := after.JukeboxPlaylist.Entry
+	if len(order) != 3 || order[0].QueueItemID != entries[2].QueueItemID ||
+		order[1].QueueItemID != entries[0].QueueItemID || order[2].QueueItemID != entries[1].QueueItemID {
+		t.Fatalf("replay mutated queue order: %#v", order)
+	}
+	if after.SessionStatus.QueueItemID != snapshot.SessionStatus.QueueItemID || after.SessionStatus.TrackID != snapshot.SessionStatus.TrackID {
+		t.Fatalf("current identity changed: before=%#v after=%#v", snapshot.SessionStatus, after.SessionStatus)
 	}
 }

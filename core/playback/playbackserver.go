@@ -60,7 +60,49 @@ var (
 	ErrOperationIdentity        = errors.New("operationId must be g<bindingGeneration>:<stable ID>")
 	ErrOperationUnknown         = errors.New("operation outcome is unknown")
 	ErrOperationCapacity        = errors.New("operation execution capacity exceeded")
+	ErrMoveProtocolConflict     = errors.New("relative move fields cannot be combined with legacy from/to/toIndex")
+	ErrQueueVersionConflict     = errors.New("queue version conflict")
+	ErrQueueItemNotFound        = errors.New("queue item not found")
+	ErrQueueAnchorNotFound      = errors.New("anchor queue item not found")
 )
+
+// QueueVersionConflictError reports a stale expectedQueueVersion. Status is a
+// fresh snapshot so clients can redraw without another round trip.
+type QueueVersionConflictError struct {
+	Expected int
+	Actual   int
+	Status   DeviceStatus
+}
+
+func (e *QueueVersionConflictError) Error() string {
+	return fmt.Sprintf("%s: expected %d, actual %d", ErrQueueVersionConflict, e.Expected, e.Actual)
+}
+
+func (e *QueueVersionConflictError) Unwrap() error { return ErrQueueVersionConflict }
+
+// QueueItemLookupError reports a missing move source (Source=true) or anchor
+// target (Source=false). Status is a fresh snapshot and the queue version and
+// scene are left untouched.
+type QueueItemLookupError struct {
+	Source      bool
+	QueueItemID string
+	Status      DeviceStatus
+}
+
+func (e *QueueItemLookupError) Error() string {
+	kind := ErrQueueAnchorNotFound
+	if e.Source {
+		kind = ErrQueueItemNotFound
+	}
+	return fmt.Sprintf("%s: %s", kind, e.QueueItemID)
+}
+
+func (e *QueueItemLookupError) Unwrap() error {
+	if e.Source {
+		return ErrQueueItemNotFound
+	}
+	return ErrQueueAnchorNotFound
+}
 
 type TargetOccupiedError struct {
 	SceneFingerprint string `json:"sceneFingerprint"`
@@ -89,7 +131,19 @@ type PlaybackCommand struct {
 	To       int
 	Gain     float32
 	Muted    bool
+	// Relative-anchor move fields (T13). QueueItemID/AnchorQueueItemID select
+	// queue instances, Placement is "before"/"after", and ExpectedQueueVersion
+	// is nil when the client did not capture one (distinct from index 0).
+	QueueItemID          string
+	AnchorQueueItemID    string
+	Placement            string
+	ExpectedQueueVersion *int
 }
+
+const (
+	MovePlacementBefore = "before"
+	MovePlacementAfter  = "after"
+)
 
 const (
 	CommandSet     = "set"
@@ -132,11 +186,12 @@ type JukeboxPlaylistSnapshot struct {
 }
 
 type JukeboxEntrySnapshot struct {
-	ID       string  `json:"id"`
-	Title    string  `json:"title"`
-	Artist   string  `json:"artist"`
-	Album    string  `json:"album"`
-	Duration float32 `json:"duration"`
+	QueueItemID string  `json:"queueItemId"`
+	ID          string  `json:"id"`
+	Title       string  `json:"title"`
+	Artist      string  `json:"artist"`
+	Album       string  `json:"album"`
+	Duration    float32 `json:"duration"`
 }
 
 const (
@@ -634,6 +689,9 @@ func sessionStatusFromDevice(session Session, device *playbackDevice) SessionSta
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
 	}
+	if currentItem := device.PlaybackQueue.CurrentItem(); currentItem != nil {
+		status.QueueItemID = currentItem.QueueItemID
+	}
 	return status
 }
 
@@ -827,11 +885,12 @@ func (ps *playbackServer) SessionSnapshot(ctx context.Context, sessionID, user s
 	entries := make([]JukeboxEntrySnapshot, len(device.PlaybackQueue.Items))
 	for i, item := range device.PlaybackQueue.Items {
 		entries[i] = JukeboxEntrySnapshot{
-			ID:       item.ID,
-			Title:    item.Title,
-			Artist:   item.Artist,
-			Album:    item.Album,
-			Duration: item.Duration,
+			QueueItemID: item.QueueItemID,
+			ID:          item.MediaFile.ID,
+			Title:       item.MediaFile.Title,
+			Artist:      item.MediaFile.Artist,
+			Album:       item.MediaFile.Album,
+			Duration:    item.MediaFile.Duration,
 		}
 	}
 	return sessionSnapshotFromStatus(status, entries), nil
@@ -1197,7 +1256,8 @@ func operationRecordError(rec OperationRecord) error {
 func isOperationAdmissionError(err error) bool {
 	return errors.Is(err, ErrSessionOwnership) || errors.Is(err, ErrGenerationRequired) ||
 		errors.Is(err, ErrCommandSuperseded) || errors.Is(err, ErrCommandScope) ||
-		errors.Is(err, ErrOperationIdentity) || errors.Is(err, ErrOperationRequired)
+		errors.Is(err, ErrOperationIdentity) || errors.Is(err, ErrOperationRequired) ||
+		errors.Is(err, ErrMoveProtocolConflict)
 }
 
 // retireOperationsLocked applies history fences only after the store mutex has
@@ -1343,6 +1403,12 @@ func (ps *playbackServer) ExecuteCommand(ctx context.Context, scope CommandScope
 			if err != nil {
 				ps.mu.Unlock()
 				return OperationRecord{}, err
+			}
+			if command.Action == CommandMove && command.QueueItemID == "" {
+				// Protected incremental edits must address stable queue instance
+				// identity; legacy from/to moves stay on the unprotected path.
+				ps.mu.Unlock()
+				return OperationRecord{}, ErrMoveProtocolConflict
 			}
 			// Acquire the state lock before releasing the authority/binding lock.
 			device.mu.Lock()
@@ -1811,7 +1877,7 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 	var wasPlaying bool
 	var savedPosition *int
 	var savedGain float32
-	var savedQueue model.MediaFiles
+	var savedQueue []QueueCandidateItem
 	var savedIndex int
 	var preparationVersion uint64
 	oldDeviceName := ""
@@ -1821,7 +1887,7 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 		oldDev.mu.Lock()
 		wasPlaying = oldDev.isPlaying()
 		savedGain = oldDev.Gain
-		savedQueue = oldDev.PlaybackQueue.Get()
+		savedQueue = oldDev.PlaybackQueue.GetItems()
 		savedIndex = oldDev.PlaybackQueue.Index
 		if oldDev.ActiveTrack != nil {
 			position := oldDev.ActiveTrack.Position()
@@ -1838,8 +1904,9 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 		newDev.mu.Lock()
 		if len(savedQueue) > 0 {
 			newDev.clearLocked(ctx)
-			newDev.PlaybackQueue.Set(savedQueue)
-			newDev.PlaybackQueue.SetIndex(savedIndex)
+			// Migration keeps the imported instance IDs stable instead of
+			// silently losing identity through legacy whole-queue replacement.
+			newDev.PlaybackQueue.ReplaceItems(savedQueue, savedIndex)
 			newDev.Gain = savedGain
 			newDev.DesiredGain = savedGain
 			newDev.recoveryPosition = savedPosition

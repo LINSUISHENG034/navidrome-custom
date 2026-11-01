@@ -919,3 +919,226 @@ func TestPlaybackDevicePositionClockInterpolationDoesNotChangeSceneFingerprint(t
 		t.Fatalf("position-clock interpolation changed queue version: %d -> %d", queueVersion, device.queueVersion)
 	}
 }
+
+type anchorMoveFixture struct {
+	ctx     context.Context
+	device  *playbackDevice
+	itemIDs []string
+	playing *mockTrack
+}
+
+func newAnchorMoveFixture(t *testing.T) *anchorMoveFixture {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	repo := tests.CreateMockMediaFileRepo()
+	repo.SetData(model.MediaFiles{
+		{ID: "1", Path: "/one.mp3"},
+		{ID: "2", Path: "/two.mp3"},
+		{ID: "3", Path: "/three.mp3"},
+	})
+	server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
+	device := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
+	if _, err := device.Set(ctx, []string{"1", "1", "2", "3"}); err != nil {
+		t.Fatalf("set queue: %v", err)
+	}
+
+	fixture := &anchorMoveFixture{ctx: ctx, device: device, itemIDs: device.PlaybackQueue.ItemIDs()}
+	if len(fixture.itemIDs) != 4 {
+		t.Fatalf("queue size: %d", len(fixture.itemIDs))
+	}
+	previousNewTrack := newTrack
+	newTrack = func(_ context.Context, _ chan<- model.PlaybackEvent, _ model.PlaybackToken, _ string, _ model.MediaFile) (Track, error) {
+		return fixture.newTrack(), nil
+	}
+	t.Cleanup(func() {
+		_, _ = device.Shutdown(ctx)
+		cancel()
+		newTrack = previousNewTrack
+	})
+	return fixture
+}
+
+func (f *anchorMoveFixture) newTrack() *mockTrack {
+	f.playing = &mockTrack{}
+	return f.playing
+}
+
+func (f *anchorMoveFixture) start(t *testing.T) {
+	t.Helper()
+	if status, err := f.device.Start(f.ctx); err != nil || !status.Playing {
+		t.Fatalf("start: status=%#v err=%v", status, err)
+	}
+}
+
+func (f *anchorMoveFixture) anchorMove(command PlaybackCommand) (DeviceStatus, error) {
+	command.Action = CommandMove
+	return f.device.executeCommand(f.ctx, command)
+}
+
+func TestPlaybackDeviceAnchorMoveAssignsDistinctInstanceIDs(t *testing.T) {
+	fixture := newAnchorMoveFixture(t)
+	itemIDs := fixture.itemIDs
+
+	// T13-AC01/AC02: duplicate MediaFile occurrences get distinct, non-empty
+	// instance IDs that survive reordering and never collapse into one another.
+	if itemIDs[0] == itemIDs[1] || itemIDs[0] == "" || itemIDs[1] == "" {
+		t.Fatalf("duplicate occurrences share an instance ID: %v", itemIDs)
+	}
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: itemIDs[3], AnchorQueueItemID: itemIDs[0], Placement: "before",
+	}); err != nil {
+		t.Fatalf("anchor move: %v", err)
+	}
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: itemIDs[1], AnchorQueueItemID: itemIDs[3], Placement: "after",
+	}); err != nil {
+		t.Fatalf("second anchor move: %v", err)
+	}
+	got := fixture.device.PlaybackQueue.ItemIDs()
+	if len(got) != 4 || got[0] == got[1] {
+		t.Fatalf("duplicate occurrences collapsed after moves: %v", got)
+	}
+	for _, id := range itemIDs {
+		if fixture.device.PlaybackQueue.IndexOfQueueItemID(id) == -1 {
+			t.Fatalf("instance ID lost during moves: %v missing from %v", id, got)
+		}
+	}
+}
+
+func TestPlaybackDeviceAnchorMoveKeepsCurrentPlaybackContinuous(t *testing.T) {
+	fixture := newAnchorMoveFixture(t)
+	fixture.start(t)
+	fixture.playing.position = 42
+	currentID := fixture.itemIDs[0]
+
+	// T13-AC06: moving the current queue item changes only its location. The
+	// current instance, active playback instance, media resource, and playback
+	// position stay continuous: no reload, no audible restart.
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: currentID, AnchorQueueItemID: fixture.itemIDs[3], Placement: "after",
+	}); err != nil {
+		t.Fatalf("anchor move of current item: %v", err)
+	}
+	fixture.device.mu.Lock()
+	defer fixture.device.mu.Unlock()
+	if fixture.device.ActiveTrack != fixture.playing {
+		t.Fatal("anchor move of current item replaced the active track")
+	}
+	if got := fixture.device.PlaybackQueue.CurrentItem().QueueItemID; got != currentID {
+		t.Fatalf("current instance changed: got=%s want=%s", got, currentID)
+	}
+	if got := fixture.device.PlaybackQueue.ItemIDs(); got[3] != currentID {
+		t.Fatalf("moved current item not at anchor: %v", got)
+	}
+	if fixture.playing.position != 42 {
+		t.Fatalf("playback position disturbed by move: %d", fixture.playing.position)
+	}
+}
+
+func TestPlaybackDeviceAnchorMoveNoOpsAndFailures(t *testing.T) {
+	fixture := newAnchorMoveFixture(t)
+	currentID := fixture.itemIDs[0]
+
+	// T13-AC03: self-reference and already-adjacent moves are APPLIED no-ops
+	// with no queue-version or scene bump.
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: currentID, AnchorQueueItemID: fixture.itemIDs[3], Placement: "after",
+	}); err != nil {
+		t.Fatalf("initial placement move: %v", err)
+	}
+	versionBefore := fixture.device.queueVersion
+	sceneBefore := fixture.device.SceneFingerprint()
+	noOps := []PlaybackCommand{
+		{QueueItemID: currentID, AnchorQueueItemID: currentID, Placement: "before"},
+		{QueueItemID: currentID, AnchorQueueItemID: fixture.itemIDs[3], Placement: "after"},
+	}
+	for _, command := range noOps {
+		status, err := fixture.anchorMove(command)
+		if err != nil {
+			t.Fatalf("no-op move rejected: %v", err)
+		}
+		if status.QueueVersion != versionBefore {
+			t.Fatalf("no-op move bumped queue version: %d -> %d", versionBefore, status.QueueVersion)
+		}
+	}
+	if fixture.SceneFingerprintChanged(sceneBefore) {
+		t.Fatalf("no-op move bumped scene fingerprint: %s -> %s", sceneBefore, fixture.device.SceneFingerprint())
+	}
+	assertAnchorMoveFailureSnapshots(t, fixture, versionBefore, sceneBefore)
+	assertAnchorMoveVersionPresence(t, fixture, versionBefore)
+}
+
+func (f *anchorMoveFixture) SceneFingerprintChanged(before string) bool {
+	return f.device.SceneFingerprint() != before
+}
+
+// T13-AC04: missing source and missing target are distinct errors carrying a
+// fresh snapshot, without mutating the queue version or scene.
+func assertAnchorMoveFailureSnapshots(t *testing.T, fixture *anchorMoveFixture, versionBefore int, sceneBefore string) {
+	t.Helper()
+	currentID := fixture.itemIDs[0]
+	var sourceErr *QueueItemLookupError
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: "missing-source", AnchorQueueItemID: currentID, Placement: "before",
+	}); err == nil {
+		t.Fatal("missing source accepted")
+	} else if !errors.As(err, &sourceErr) {
+		t.Fatalf("missing source error type: %T %v", err, err)
+	} else if sourceErr.Source != true || sourceErr.QueueItemID != "missing-source" {
+		t.Fatalf("missing source error identity: %#v", sourceErr)
+	} else if sourceErr.Status.QueueVersion != versionBefore {
+		t.Fatalf("missing source snapshot is stale: %#v", sourceErr.Status)
+	}
+	var anchorErr *QueueItemLookupError
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: currentID, AnchorQueueItemID: "missing-target", Placement: "before",
+	}); err == nil {
+		t.Fatal("missing target accepted")
+	} else if !errors.As(err, &anchorErr) {
+		t.Fatalf("missing target error type: %T %v", err, err)
+	} else if anchorErr.Source != false || anchorErr.QueueItemID != "missing-target" {
+		t.Fatalf("missing target error identity: %#v", anchorErr)
+	}
+	if fixture.SceneFingerprintChanged(sceneBefore) || fixture.device.queueVersion != versionBefore {
+		t.Fatal("failed move mutated queue version or scene")
+	}
+}
+
+// T13-AC04: a stale expected version conflicts while an omitted expectation
+// passes; expected version 0 is a real expectation, not an omitted one.
+func assertAnchorMoveVersionPresence(t *testing.T, fixture *anchorMoveFixture, versionBefore int) {
+	t.Helper()
+	currentID := fixture.itemIDs[0]
+	stale := versionBefore + 99
+	var conflictErr *QueueVersionConflictError
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: currentID, AnchorQueueItemID: fixture.itemIDs[1], Placement: "before",
+		ExpectedQueueVersion: &stale,
+	}); err == nil {
+		t.Fatal("stale expected version accepted")
+	} else if !errors.As(err, &conflictErr) {
+		t.Fatalf("version conflict error type: %T %v", err, err)
+	} else if conflictErr.Expected != stale || conflictErr.Actual != versionBefore {
+		t.Fatalf("version conflict details: %#v", conflictErr)
+	} else if conflictErr.Status.QueueVersion != versionBefore {
+		t.Fatalf("version conflict snapshot is stale: %#v", conflictErr.Status)
+	}
+	if fixture.device.queueVersion != versionBefore {
+		t.Fatal("version conflict still mutated queue version")
+	}
+	zero := 0
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: currentID, AnchorQueueItemID: fixture.itemIDs[1], Placement: "before",
+		ExpectedQueueVersion: &zero,
+	}); err == nil {
+		t.Fatal("expected version 0 treated as omitted")
+	} else if !errors.As(err, &conflictErr) {
+		t.Fatalf("expected version 0 error type: %T %v", err, err)
+	}
+	if _, err := fixture.anchorMove(PlaybackCommand{
+		QueueItemID: currentID, AnchorQueueItemID: fixture.itemIDs[1], Placement: "before",
+	}); err != nil {
+		t.Fatalf("omitted expected version rejected: %v", err)
+	}
+}

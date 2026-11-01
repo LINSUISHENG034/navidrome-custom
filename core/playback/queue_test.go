@@ -134,25 +134,25 @@ var _ = Describe("Queues", func() {
 
 		It("moves a track forward without affecting current", func() {
 			queue.Move(0, 2) // move ID "1" from 0 to 2
-			Expect(queue.Items[0].ID).To(Equal("2"))
-			Expect(queue.Items[1].ID).To(Equal("3"))
-			Expect(queue.Items[2].ID).To(Equal("1"))
-			Expect(queue.Items[3].ID).To(Equal("4"))
+			Expect(queue.Items[0].MediaFile.ID).To(Equal("2"))
+			Expect(queue.Items[1].MediaFile.ID).To(Equal("3"))
+			Expect(queue.Items[2].MediaFile.ID).To(Equal("1"))
+			Expect(queue.Items[3].MediaFile.ID).To(Equal("4"))
 			Expect(queue.Index).To(Equal(0))
 		})
 
 		It("moves a track backward without affecting current", func() {
 			queue.Move(3, 0) // move ID "4" from 3 to 0
-			Expect(queue.Items[0].ID).To(Equal("4"))
-			Expect(queue.Items[1].ID).To(Equal("1"))
-			Expect(queue.Items[2].ID).To(Equal("2"))
-			Expect(queue.Items[3].ID).To(Equal("3"))
+			Expect(queue.Items[0].MediaFile.ID).To(Equal("4"))
+			Expect(queue.Items[1].MediaFile.ID).To(Equal("1"))
+			Expect(queue.Items[2].MediaFile.ID).To(Equal("2"))
+			Expect(queue.Items[3].MediaFile.ID).To(Equal("3"))
 			Expect(queue.Index).To(Equal(2))
 		})
 
 		It("moves the current track itself", func() {
 			queue.Move(1, 3) // move current ID "2" from 1 to 3
-			Expect(queue.Items[3].ID).To(Equal("2"))
+			Expect(queue.Items[3].MediaFile.ID).To(Equal("2"))
 			Expect(queue.Index).To(Equal(3))
 		})
 	})
@@ -197,9 +197,9 @@ var _ = Describe("Queue operations with duplicate IDs", func() {
 		queue.Insert(1, model.MediaFiles{{ID: "b", Path: "/b.mp3"}})
 
 		Expect(queue.Items).To(HaveLen(3))
-		Expect(queue.Items[0].ID).To(Equal("a"))
-		Expect(queue.Items[1].ID).To(Equal("b"))
-		Expect(queue.Items[2].ID).To(Equal("c"))
+		Expect(queue.Items[0].MediaFile.ID).To(Equal("a"))
+		Expect(queue.Items[1].MediaFile.ID).To(Equal("b"))
+		Expect(queue.Items[2].MediaFile.ID).To(Equal("c"))
 	})
 
 	It("keeps the current duplicate instance when removing before it", func() {
@@ -222,6 +222,101 @@ var _ = Describe("Queue operations with duplicate IDs", func() {
 		Expect(queue.Index).To(Equal(3))
 		Expect(queue.Current()).ToNot(BeNil())
 		Expect(queue.Current().Path).To(Equal("/a2.mp3"))
+	})
+})
+
+var _ = Describe("Production Queue stable instance identity (Ticket 13)", func() {
+	var queue *Queue
+
+	BeforeEach(func() {
+		queue = NewQueue()
+	})
+
+	It("assigns distinct globally unique instance IDs to duplicate media occurrences", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a.mp3"}, {ID: "a", Path: "/a.mp3"}})
+
+		ids := queue.ItemIDs()
+		Expect(ids).To(HaveLen(2))
+		Expect(ids[0]).ToNot(BeEmpty())
+		Expect(ids[1]).ToNot(BeEmpty())
+		Expect(ids[0]).ToNot(Equal(ids[1]))
+	})
+
+	It("assigns fresh instance IDs on add, insert, and legacy whole-queue set", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a.mp3"}})
+		firstID := queue.ItemIDs()[0]
+
+		queue.Insert(0, model.MediaFiles{{ID: "b", Path: "/b.mp3"}})
+		insertedID := queue.ItemIDs()[0]
+		Expect(insertedID).ToNot(Equal(firstID))
+		Expect(queue.ItemIDs()[1]).To(Equal(firstID))
+
+		queue.Set(model.MediaFiles{{ID: "a", Path: "/a.mp3"}})
+		replacedID := queue.ItemIDs()[0]
+		Expect(replacedID).ToNot(Equal(firstID))
+		Expect(replacedID).ToNot(Equal(insertedID))
+	})
+
+	It("preserves retained instance IDs across move and remove", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a.mp3"}, {ID: "b", Path: "/b.mp3"}, {ID: "c", Path: "/c.mp3"}})
+		ids := queue.ItemIDs()
+
+		queue.Move(0, 2)
+		Expect(queue.ItemIDs()).To(Equal([]string{ids[1], ids[2], ids[0]}))
+
+		queue.Remove(1)
+		Expect(queue.ItemIDs()).To(Equal([]string{ids[1], ids[0]}))
+	})
+
+	It("MoveRelative is a no-op for self reference and already-adjacent placement", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a.mp3"}, {ID: "b", Path: "/b.mp3"}, {ID: "c", Path: "/c.mp3"}})
+		ids := queue.ItemIDs()
+
+		applied, ok := queue.MoveRelative(ids[0], ids[0], "before")
+		Expect(ok).To(BeTrue())
+		Expect(applied).To(BeFalse())
+		Expect(queue.ItemIDs()).To(Equal(ids))
+
+		applied, ok = queue.MoveRelative(ids[0], ids[1], "before")
+		Expect(ok).To(BeTrue())
+		Expect(applied).To(BeFalse())
+		Expect(queue.ItemIDs()).To(Equal(ids))
+
+		applied, ok = queue.MoveRelative(ids[1], ids[0], "after")
+		Expect(ok).To(BeTrue())
+		Expect(applied).To(BeFalse())
+		Expect(queue.ItemIDs()).To(Equal(ids))
+	})
+
+	It("MoveRelative reports missing source and missing target distinctly", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a.mp3"}})
+		ids := queue.ItemIDs()
+
+		_, ok := queue.MoveRelative("missing-source", ids[0], "before")
+		Expect(ok).To(BeFalse())
+
+		_, ok = queue.MoveRelative(ids[0], "missing-target", "before")
+		Expect(ok).To(BeFalse())
+	})
+
+	It("MoveRelative places before and after the anchor while keeping the current instance", func() {
+		queue.Add(model.MediaFiles{{ID: "a", Path: "/a.mp3"}, {ID: "b", Path: "/b.mp3"}, {ID: "c", Path: "/c.mp3"}, {ID: "d", Path: "/d.mp3"}})
+		ids := queue.ItemIDs()
+		queue.SetIndex(0) // current is instance ids[0]
+
+		applied, ok := queue.MoveRelative(ids[3], ids[0], "before")
+		Expect(ok).To(BeTrue())
+		Expect(applied).To(BeTrue())
+		Expect(queue.ItemIDs()).To(Equal([]string{ids[3], ids[0], ids[1], ids[2]}))
+		Expect(queue.CurrentItem().QueueItemID).To(Equal(ids[0]))
+		Expect(queue.Index).To(Equal(1))
+
+		applied, ok = queue.MoveRelative(ids[0], ids[2], "after")
+		Expect(ok).To(BeTrue())
+		Expect(applied).To(BeTrue())
+		Expect(queue.ItemIDs()).To(Equal([]string{ids[3], ids[1], ids[2], ids[0]}))
+		Expect(queue.CurrentItem().QueueItemID).To(Equal(ids[0]))
+		Expect(queue.Index).To(Equal(3))
 	})
 })
 
@@ -473,4 +568,3 @@ var _ = Describe("QueueCandidateModel playback mode contract (Issue 04)", func()
 		Expect(id).To(Equal("single-1"))
 	})
 })
-

@@ -471,6 +471,44 @@ func (pd *playbackDevice) moveLocked(ctx context.Context, fromIndex, toIndex int
 	return pd.getStatus(), true, nil
 }
 
+// moveByAnchorLocked implements the relative-anchor move (T13). The version
+// check, instance lookup, and queue mutation are atomic under pd.mu. A stale
+// expected version, a missing source, or a missing target fail with a fresh
+// snapshot and leave queue version, scene, and playback untouched; self
+// reference and already-adjacent placement are APPLIED no-ops.
+func (pd *playbackDevice) moveByAnchorLocked(ctx context.Context, command PlaybackCommand) (DeviceStatus, bool, error) {
+	log.Debug(ctx, "Processing anchor Move action", "queueItemId", command.QueueItemID,
+		"anchorQueueItemId", command.AnchorQueueItemID, "placement", command.Placement, "device", pd)
+	if command.ExpectedQueueVersion != nil && *command.ExpectedQueueVersion != pd.queueVersion {
+		return pd.getStatus(), false, &QueueVersionConflictError{
+			Expected: *command.ExpectedQueueVersion, Actual: pd.queueVersion, Status: pd.getStatus(),
+		}
+	}
+	if pd.PlaybackQueue.IndexOfQueueItemID(command.QueueItemID) == -1 {
+		return pd.getStatus(), false, &QueueItemLookupError{
+			Source: true, QueueItemID: command.QueueItemID, Status: pd.getStatus(),
+		}
+	}
+	if pd.PlaybackQueue.IndexOfQueueItemID(command.AnchorQueueItemID) == -1 {
+		return pd.getStatus(), false, &QueueItemLookupError{
+			Source: false, QueueItemID: command.AnchorQueueItemID, Status: pd.getStatus(),
+		}
+	}
+	applied, ok := pd.PlaybackQueue.MoveRelative(command.QueueItemID, command.AnchorQueueItemID, command.Placement)
+	if !ok {
+		// Unreachable after the lookups above; kept as a defensive snapshot.
+		return pd.getStatus(), false, &QueueItemLookupError{
+			Source: true, QueueItemID: command.QueueItemID, Status: pd.getStatus(),
+		}
+	}
+	if !applied {
+		return pd.getStatus(), false, nil
+	}
+	pd.incrementQueueVersionLocked()
+	pd.incrementSceneRevisionLocked()
+	return pd.getStatus(), true, nil
+}
+
 func (pd *playbackDevice) Shuffle(ctx context.Context) (DeviceStatus, error) {
 	return pd.executeCommand(ctx, PlaybackCommand{Action: CommandShuffle})
 }
@@ -584,6 +622,9 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 	case CommandRemove:
 		return pd.removeLocked(ctx, command.Index)
 	case CommandMove:
+		if command.QueueItemID != "" {
+			return pd.moveByAnchorLocked(ctx, command)
+		}
 		return pd.moveLocked(ctx, command.From, command.To)
 	case CommandShuffle:
 		return pd.shuffleLocked(ctx)

@@ -174,7 +174,34 @@ func (api *Router) jukeboxSessionHandoff(w http.ResponseWriter, r *http.Request)
 func (api *Router) writeJukeboxSessionError(w http.ResponseWriter, err error) {
 	var targetOccupied *playback.TargetOccupiedError
 	var historyUnknown *playback.OperationHistoryError
+	var versionConflict *playback.QueueVersionConflictError
+	var itemLookup *playback.QueueItemLookupError
 	switch {
+	case errors.As(err, &versionConflict):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":                 "QUEUE_VERSION_CONFLICT",
+			"error":                err.Error(),
+			"expectedQueueVersion": versionConflict.Expected,
+			"queueVersion":         versionConflict.Actual,
+			"status":               toStatusResponse(versionConflict.Status),
+		})
+	case errors.As(err, &itemLookup):
+		code := "QUEUE_ANCHOR_NOT_FOUND"
+		if itemLookup.Source {
+			code = "QUEUE_ITEM_NOT_FOUND"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":        code,
+			"error":       err.Error(),
+			"queueItemId": itemLookup.QueueItemID,
+			"status":      toStatusResponse(itemLookup.Status),
+		})
+	case errors.Is(err, playback.ErrMoveProtocolConflict):
+		writeJukeboxMoveProtocolConflict(w, err)
 	case errors.As(err, &historyUnknown):
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)

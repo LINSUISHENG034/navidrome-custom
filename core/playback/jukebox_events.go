@@ -15,6 +15,7 @@ func NewJukeboxStateUpdatedEvent(status SessionStatus) *serverevents.JukeboxStat
 		OwnerClientID:     status.OwnerClientID,
 		CurrentIndex:      status.CurrentIndex,
 		TrackID:           status.TrackID,
+		QueueItemID:       status.QueueItemID,
 		Playing:           status.Playing,
 		Position:          status.Position,
 		Gain:              status.Gain,

@@ -9,6 +9,7 @@ type JukeboxStateUpdated struct {
 	OwnerClientID     string     `json:"ownerClientId"`
 	CurrentIndex      int        `json:"currentIndex"`
 	TrackID           string     `json:"trackId"`
+	QueueItemID       string     `json:"queueItemId,omitempty"`
 	Playing           bool       `json:"playing"`
 	Position          int        `json:"position"`
 	Gain              float32    `json:"gain"`

@@ -6,32 +6,54 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 )
 
+// Queue is the single authoritative production playback queue. Items carry a
+// stable, globally unique QueueItemID per enqueue instance, strictly
+// separating queue item identity from MediaFile identity and array position.
 type Queue struct {
 	Index int
-	Items model.MediaFiles
+	Items []QueueCandidateItem
 }
 
 func NewQueue() *Queue {
 	return &Queue{
 		Index: -1,
-		Items: model.MediaFiles{},
+		Items: []QueueCandidateItem{},
 	}
+}
+
+func newQueueItems(items model.MediaFiles) []QueueCandidateItem {
+	entries := make([]QueueCandidateItem, len(items))
+	for i := range items {
+		entries[i] = QueueCandidateItem{QueueItemID: uuid.NewString(), MediaFile: items[i]}
+	}
+	return entries
 }
 
 func (pd *Queue) String() string {
 	var filenames strings.Builder
 	for idx, item := range pd.Items {
-		filenames.WriteString(fmt.Sprint(idx) + ":" + item.Path + " ")
+		filenames.WriteString(fmt.Sprint(idx) + ":" + item.MediaFile.Path + " ")
 	}
 	return fmt.Sprintf("#Items: %d, idx: %d, files: %s", len(pd.Items), pd.Index, filenames.String())
 }
 
-// returns the current mediafile or nil
+// Current returns the current mediafile or nil. It is a legacy media view;
+// CurrentItem exposes the stable queue instance.
 func (pd *Queue) Current() *model.MediaFile {
+	item := pd.CurrentItem()
+	if item == nil {
+		return nil
+	}
+	return &item.MediaFile
+}
+
+// CurrentItem returns the current queue instance or nil.
+func (pd *Queue) CurrentItem() *QueueCandidateItem {
 	if pd.Index == -1 {
 		return nil
 	}
@@ -39,13 +61,41 @@ func (pd *Queue) Current() *model.MediaFile {
 		log.Error("internal error: current song index out of bounds", "idx", pd.Index, "length", len(pd.Items))
 		return nil
 	}
-
 	return &pd.Items[pd.Index]
 }
 
-// returns the whole queue
+// Get returns the whole queue as media files. It is a legacy media view;
+// GetItems exposes the stable queue instances.
 func (pd *Queue) Get() model.MediaFiles {
+	files := make(model.MediaFiles, len(pd.Items))
+	for i := range pd.Items {
+		files[i] = pd.Items[i].MediaFile
+	}
+	return files
+}
+
+// GetItems returns a copy of the queue with stable instance IDs.
+func (pd *Queue) GetItems() []QueueCandidateItem {
 	return slices.Clone(pd.Items)
+}
+
+// ItemIDs returns the stable instance IDs in queue order.
+func (pd *Queue) ItemIDs() []string {
+	ids := make([]string, len(pd.Items))
+	for i := range pd.Items {
+		ids[i] = pd.Items[i].QueueItemID
+	}
+	return ids
+}
+
+// IndexOfQueueItemID returns the position of a queue instance or -1.
+func (pd *Queue) IndexOfQueueItemID(queueItemID string) int {
+	for i := range pd.Items {
+		if pd.Items[i].QueueItemID == queueItemID {
+			return i
+		}
+	}
+	return -1
 }
 
 func (pd *Queue) Size() int {
@@ -56,15 +106,17 @@ func (pd *Queue) IsEmpty() bool {
 	return len(pd.Items) < 1
 }
 
-// set is similar to a clear followed by a add, but will not change the currently playing track.
+// Set is similar to a clear followed by a add, but will not change the currently playing track.
+// Every item receives a fresh instance ID: legacy whole-queue replacement
+// intentionally reassigns IDs (T13-AC10).
 func (pd *Queue) Set(items model.MediaFiles) {
 	pd.Clear()
-	pd.Items = append(pd.Items, items...)
+	pd.Items = append(pd.Items, newQueueItems(items)...)
 }
 
 // adding mediafiles to the queue
 func (pd *Queue) Add(items model.MediaFiles) {
-	pd.Items = append(pd.Items, items...)
+	pd.Items = append(pd.Items, newQueueItems(items)...)
 	if pd.Index == -1 && len(pd.Items) > 0 {
 		pd.Index = 0
 	}
@@ -77,9 +129,10 @@ func (pd *Queue) Insert(index int, items model.MediaFiles) {
 	}
 
 	index = max(0, min(index, len(pd.Items)))
-	newItems := make(model.MediaFiles, 0, len(pd.Items)+len(items))
+	entries := newQueueItems(items)
+	newItems := make([]QueueCandidateItem, 0, len(pd.Items)+len(entries))
 	newItems = append(newItems, pd.Items[:index]...)
-	newItems = append(newItems, items...)
+	newItems = append(newItems, entries...)
 	newItems = append(newItems, pd.Items[index:]...)
 	pd.Items = newItems
 
@@ -88,8 +141,16 @@ func (pd *Queue) Insert(index int, items model.MediaFiles) {
 		return
 	}
 	if pd.Index >= index {
-		pd.Index += len(items)
+		pd.Index += len(entries)
 	}
+}
+
+// ReplaceItems swaps the whole queue while preserving the provided instance
+// IDs and current index. It is used by migration paths that must not silently
+// lose instance identity (T13-AC10).
+func (pd *Queue) ReplaceItems(items []QueueCandidateItem, index int) {
+	pd.Items = slices.Clone(items)
+	pd.Index = index
 }
 
 // empties whole queue
@@ -99,7 +160,8 @@ func (pd *Queue) Clear() {
 }
 
 // Move moves a track from fromIndex to toIndex, adjusting the current index
-// to continue pointing at the same track instance even when IDs repeat.
+// to continue pointing at the same queue instance even when IDs repeat.
+// Retained items keep their instance IDs.
 func (pd *Queue) Move(fromIndex, toIndex int) {
 	if fromIndex == toIndex {
 		return
@@ -108,26 +170,75 @@ func (pd *Queue) Move(fromIndex, toIndex int) {
 		return
 	}
 
-	currentIndex := pd.Index
+	currentID := ""
+	if pd.Index >= 0 && pd.Index < len(pd.Items) {
+		currentID = pd.Items[pd.Index].QueueItemID
+	}
 	item := pd.Items[fromIndex]
-	remaining := make(model.MediaFiles, 0, len(pd.Items)-1)
+	remaining := make([]QueueCandidateItem, 0, len(pd.Items)-1)
 	remaining = append(remaining, pd.Items[:fromIndex]...)
 	remaining = append(remaining, pd.Items[fromIndex+1:]...)
 
-	newItems := make(model.MediaFiles, 0, len(pd.Items))
+	newItems := make([]QueueCandidateItem, 0, len(pd.Items))
 	newItems = append(newItems, remaining[:toIndex]...)
 	newItems = append(newItems, item)
 	newItems = append(newItems, remaining[toIndex:]...)
 	pd.Items = newItems
 
-	switch {
-	case currentIndex == fromIndex:
-		pd.Index = toIndex
-	case fromIndex < currentIndex && currentIndex <= toIndex:
-		pd.Index = currentIndex - 1
-	case toIndex <= currentIndex && currentIndex < fromIndex:
-		pd.Index = currentIndex + 1
+	pd.Index = pd.IndexOfQueueItemID(currentID)
+}
+
+// MoveRelative moves the queue instance itemID adjacent to anchorID: "before"
+// places it directly before the anchor, "after" directly after it. Retained
+// items keep their instance IDs and the current index follows the current
+// instance. ok is false when either ID is missing; applied is false when the
+// requested placement already holds (self-reference or already adjacent),
+// making those moves explicit no-ops (T13-AC03).
+func (pd *Queue) MoveRelative(itemID, anchorID, placement string) (applied bool, ok bool) {
+	fromIdx := pd.IndexOfQueueItemID(itemID)
+	if fromIdx == -1 {
+		return false, false
 	}
+	anchorIdx := pd.IndexOfQueueItemID(anchorID)
+	if anchorIdx == -1 {
+		return false, false
+	}
+	if itemID == anchorID {
+		return false, true
+	}
+	if (placement == "before" && fromIdx == anchorIdx-1) || (placement == "after" && fromIdx == anchorIdx+1) {
+		return false, true
+	}
+
+	currentID := ""
+	if pd.Index >= 0 && pd.Index < len(pd.Items) {
+		currentID = pd.Items[pd.Index].QueueItemID
+	}
+
+	item := pd.Items[fromIdx]
+	remaining := make([]QueueCandidateItem, 0, len(pd.Items)-1)
+	remaining = append(remaining, pd.Items[:fromIdx]...)
+	remaining = append(remaining, pd.Items[fromIdx+1:]...)
+
+	insertPos := 0
+	for i := range remaining {
+		if remaining[i].QueueItemID == anchorID {
+			insertPos = i
+			break
+		}
+	}
+	if placement == "after" {
+		insertPos++
+	}
+
+	newItems := make([]QueueCandidateItem, 0, len(pd.Items))
+	newItems = append(newItems, remaining[:insertPos]...)
+	newItems = append(newItems, item)
+	newItems = append(newItems, remaining[insertPos:]...)
+	pd.Items = newItems
+
+	pd.Index = pd.IndexOfQueueItemID(currentID)
+	return true, true
 }
 
 // idx Zero-based index of the song to skip to or remove.
@@ -147,32 +258,26 @@ func (pd *Queue) Remove(idx int) {
 }
 
 func (pd *Queue) Shuffle() {
-	currentIndex := pd.Index
-	current := pd.Current()
-	currentPath := ""
-	if current != nil {
-		currentPath = current.Path
+	currentID := ""
+	if pd.Index >= 0 && pd.Index < len(pd.Items) {
+		currentID = pd.Items[pd.Index].QueueItemID
 	}
 
 	//nolint:gosec // shuffle order is not a security decision
 	rand.Shuffle(len(pd.Items), func(i, j int) { pd.Items[i], pd.Items[j] = pd.Items[j], pd.Items[i] })
 
-	if currentIndex == -1 || currentPath == "" {
+	if currentID == "" {
 		return
 	}
-	for idx, item := range pd.Items {
-		if item.Path == currentPath {
-			pd.Index = idx
-			return
-		}
+	pd.Index = pd.IndexOfQueueItemID(currentID)
+	if pd.Index == -1 {
+		log.Error("Could not find current queue item while shuffling", "queueItemId", currentID)
 	}
-	log.Error("Could not find current track while shuffling", "path", currentPath)
-	pd.Index = -1
 }
 
 func (pd *Queue) getMediaFileIndexByID(id string) (int, error) {
 	for idx, item := range pd.Items {
-		if item.ID == id {
+		if item.MediaFile.ID == id {
 			return idx, nil
 		}
 	}
@@ -496,4 +601,3 @@ func (m *QueueCandidateModel) Prev(currentTime float64, r *rand.Rand) (string, b
 func (m *QueueCandidateModel) NaturalEnd(r *rand.Rand) (string, bool) {
 	return m.Next(false, r)
 }
-

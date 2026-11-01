@@ -3,6 +3,7 @@ package nativeapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -20,18 +21,23 @@ type jukeboxStatusResponse struct {
 	DesiredGain  float32 `json:"desiredGain"`
 	Muted        bool    `json:"muted"`
 	Position     int     `json:"position"`
+	QueueVersion int     `json:"queueVersion"`
 }
 
 type jukeboxCommandRequest struct {
 	playback.CommandScope
-	IDs      []string `json:"ids"`
-	Index    *int     `json:"index"`
-	Offset   int      `json:"offset"`
-	Position int      `json:"position"`
-	Gain     float32  `json:"gain"`
-	Muted    *bool    `json:"muted"`
-	From     int      `json:"from"`
-	To       int      `json:"to"`
+	IDs                  []string `json:"ids"`
+	Index                *int     `json:"index"`
+	Offset               int      `json:"offset"`
+	Position             int      `json:"position"`
+	Gain                 float32  `json:"gain"`
+	Muted                *bool    `json:"muted"`
+	From                 *int     `json:"from"`
+	To                   *int     `json:"to"`
+	QueueItemID          string   `json:"queueItemId"`
+	AnchorQueueItemID    string   `json:"anchorQueueItemId"`
+	Placement            string   `json:"placement"`
+	ExpectedQueueVersion *int     `json:"expectedQueueVersion"`
 }
 
 func (api *Router) addJukeboxControlRoute(r chi.Router) {
@@ -63,7 +69,32 @@ func toStatusResponse(s playback.DeviceStatus) *jukeboxStatusResponse {
 		DesiredGain:  s.DesiredGain,
 		Muted:        s.Muted,
 		Position:     s.Position,
+		QueueVersion: s.QueueVersion,
 	}
+}
+
+func writeJukeboxMoveProtocolConflict(w http.ResponseWriter, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{"code": "MOVE_PROTOCOL_CONFLICT", "error": err.Error()})
+}
+
+// validateJukeboxMoveProtocol enforces the relative-anchor move contract
+// before any authority check: anchor fields cannot be combined with any
+// legacy from/to/toIndex field, and a partial anchor request is rejected.
+func validateJukeboxMoveProtocol(req *jukeboxCommandRequest) error {
+	anchorFields := req.QueueItemID != "" || req.AnchorQueueItemID != "" || req.Placement != "" || req.ExpectedQueueVersion != nil
+	if !anchorFields {
+		return nil
+	}
+	if req.From != nil || req.To != nil || req.Index != nil {
+		return playback.ErrMoveProtocolConflict
+	}
+	if req.QueueItemID == "" || req.AnchorQueueItemID == "" ||
+		(req.Placement != playback.MovePlacementBefore && req.Placement != playback.MovePlacementAfter) {
+		return fmt.Errorf("queueItemId, anchorQueueItemId, and placement (before|after) are required for relative moves")
+	}
+	return nil
 }
 
 func (api *Router) writeJukeboxJSON(w http.ResponseWriter, r *http.Request, resp any) {
@@ -83,7 +114,8 @@ func (api *Router) jukeboxStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		status := snapshot.SessionStatus
 		api.writeJukeboxJSON(w, r, toStatusResponse(playback.DeviceStatus{
-			CurrentIndex: status.CurrentIndex, Playing: status.Playing, Position: status.Position, Gain: status.Gain, DesiredGain: status.DesiredGain, Muted: status.Muted,
+			CurrentIndex: status.CurrentIndex, Playing: status.Playing, Position: status.Position,
+			Gain: status.Gain, DesiredGain: status.DesiredGain, Muted: status.Muted, QueueVersion: status.QueueVersion,
 		}))
 		return
 	}
@@ -149,8 +181,26 @@ func (api *Router) jukeboxCommand(w http.ResponseWriter, r *http.Request, action
 		http.Error(w, "position must be >= 0", http.StatusBadRequest)
 		return
 	}
+	if action == playback.CommandMove {
+		if err := validateJukeboxMoveProtocol(&req); err != nil {
+			if errors.Is(err, playback.ErrMoveProtocolConflict) {
+				writeJukeboxMoveProtocolConflict(w, err)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	command := playback.PlaybackCommand{
-		Action: action, IDs: req.IDs, Offset: req.Offset, Position: req.Position, Gain: req.Gain, From: req.From, To: req.To,
+		Action: action, IDs: req.IDs, Offset: req.Offset, Position: req.Position, Gain: req.Gain,
+		QueueItemID: req.QueueItemID, AnchorQueueItemID: req.AnchorQueueItemID, Placement: req.Placement,
+		ExpectedQueueVersion: req.ExpectedQueueVersion,
+	}
+	if req.From != nil {
+		command.From = *req.From
+	}
+	if req.To != nil {
+		command.To = *req.To
 	}
 	if req.Muted != nil {
 		command.Muted = *req.Muted

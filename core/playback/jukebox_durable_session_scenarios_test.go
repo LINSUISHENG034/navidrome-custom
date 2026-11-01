@@ -1184,7 +1184,7 @@ func TestDurableSessionMigrationRepair(t *testing.T) {
 		if _, err := h.server.CommitMigration(h.ctx, commit); err == nil {
 			t.Fatal("omitting request fingerprint bypassed reserved scene validation")
 		}
-		if target.PlaybackQueue.Size() != 1 || target.PlaybackQueue.Items[0].ID != "third-party" {
+		if target.PlaybackQueue.Size() != 1 || target.PlaybackQueue.Items[0].MediaFile.ID != "third-party" {
 			t.Fatal("commit destroyed a newer third-party scene")
 		}
 	})

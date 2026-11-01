@@ -890,3 +890,209 @@ func TestJukeboxGenerationAndMigrationHTTPContract(t *testing.T) {
 		}
 	}
 }
+
+func TestJukeboxAnchorMoveProtocolValidation(t *testing.T) {
+	ctx, ps := startJukeboxLogicalFixture(t, "Anchor Default", []conf.AudioDeviceDefinition{
+		{"Anchor Default", "anchor-default"},
+	})
+	_ = ctx
+	api := &Router{playback: ps}
+	router := chi.NewRouter()
+	api.addJukeboxControlRoute(router)
+	api.addJukeboxSessionRoute(router)
+	serve := func(t *testing.T, path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
+		r = r.WithContext(request.WithUser(r.Context(), model.User{
+			ID: "validation-admin", UserName: "validation-admin", IsAdmin: true,
+		}))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, r)
+		return response
+	}
+	attach := func(t *testing.T, sessionID, clientID string) uint64 {
+		t.Helper()
+		response := serve(t, "/jukebox/session/attach", map[string]any{
+			"sessionId": sessionID, "clientId": clientID, "deviceName": "anchor-default",
+		})
+		if response.Code != http.StatusOK {
+			t.Fatalf("attach: %d %s", response.Code, response.Body.String())
+		}
+		var status playback.SessionStatus
+		if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, clientID) })
+		return status.BindingGeneration
+	}
+
+	scope := map[string]any{
+		"sessionId": "anchor-session", "clientId": "anchor-tab",
+		"bindingGeneration": 1, "operationId": "g1:anchor-move-validation",
+	}
+
+	// T13-AC05: relative-anchor fields combined with any legacy from/to/toIndex
+	// field are rejected with 400 MOVE_PROTOCOL_CONFLICT.
+	combos := []map[string]any{
+		{"queueItemId": "q-1", "anchorQueueItemId": "q-2", "placement": "before", "from": 0},
+		{"queueItemId": "q-1", "anchorQueueItemId": "q-2", "placement": "before", "to": 1},
+		{"queueItemId": "q-1", "anchorQueueItemId": "q-2", "placement": "before", "index": 1},
+	}
+	for _, combo := range combos {
+		body := make(map[string]any, len(scope)+len(combo))
+		for k, v := range scope {
+			body[k] = v
+		}
+		for k, v := range combo {
+			body[k] = v
+		}
+		response := serve(t, "/jukebox/move", body)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("anchor+legacy move accepted: %d %s", response.Code, response.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("conflict payload: %v", err)
+		}
+		if payload["code"] != "MOVE_PROTOCOL_CONFLICT" {
+			t.Fatalf("conflict code: %v (%s)", payload["code"], response.Body.String())
+		}
+	}
+
+	// T13-AC10: protected incremental edits lacking instance identity are
+	// explicitly rejected; unprotected legacy compat stays reachable.
+	generation := attach(t, "anchor-session", "anchor-tab")
+	_ = generation
+	protected := make(map[string]any, len(scope)+2)
+	for k, v := range scope {
+		protected[k] = v
+	}
+	protected["from"], protected["to"] = 0, 1
+	response := serve(t, "/jukebox/move", protected)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("protected legacy move accepted: %d %s", response.Code, response.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || payload["code"] != "MOVE_PROTOCOL_CONFLICT" {
+		t.Fatalf("protected legacy move code: %v err=%v (%s)", payload, err, response.Body.String())
+	}
+
+	// T13-AC04: a stale expected queue version fails with 409
+	// QUEUE_VERSION_CONFLICT and a fresh snapshot rather than queueing a drag.
+	stale := make(map[string]any, len(scope)+4)
+	for k, v := range scope {
+		stale[k] = v
+	}
+	stale["queueItemId"] = "q-1"
+	stale["anchorQueueItemId"] = "q-2"
+	stale["placement"] = "before"
+	stale["expectedQueueVersion"] = 7
+	response = serve(t, "/jukebox/move", stale)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("stale version not conflicted: %d %s", response.Code, response.Body.String())
+	}
+	payload = map[string]any{}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("conflict payload: %v", err)
+	}
+	if payload["code"] != "QUEUE_VERSION_CONFLICT" {
+		t.Fatalf("version conflict code: %v (%s)", payload["code"], response.Body.String())
+	}
+	if _, ok := payload["status"].(map[string]any); !ok {
+		t.Fatalf("version conflict lacks fresh snapshot: %s", response.Body.String())
+	}
+
+	// T13-AC04: missing source returns its distinct error with a fresh snapshot.
+	missingSource := make(map[string]any, len(scope)+4)
+	for k, v := range scope {
+		missingSource[k] = v
+	}
+	missingSource["queueItemId"] = "q-missing"
+	missingSource["anchorQueueItemId"] = "q-2"
+	missingSource["placement"] = "before"
+	missingSource["expectedQueueVersion"] = 0
+	missingSource["operationId"] = "g1:anchor-move-missing-source"
+	response = serve(t, "/jukebox/move", missingSource)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("missing source not found: %d %s", response.Code, response.Body.String())
+	}
+	payload = map[string]any{}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("missing source payload: %v", err)
+	}
+	if payload["code"] != "QUEUE_ITEM_NOT_FOUND" {
+		t.Fatalf("missing source code: %v (%s)", payload["code"], response.Body.String())
+	}
+	if payload["queueItemId"] != "q-missing" {
+		t.Fatalf("missing source identity: %v", payload)
+	}
+}
+
+func TestJukeboxSessionStatusIncludesQueueVersion(t *testing.T) {
+	ctx, ps := startJukeboxLogicalFixture(t, "Status Default", []conf.AudioDeviceDefinition{
+		{"Status Default", "status-default"},
+	})
+	_ = ctx
+	api := &Router{playback: ps}
+	router := chi.NewRouter()
+	api.addJukeboxControlRoute(router)
+	api.addJukeboxSessionRoute(router)
+	serve := func(t *testing.T, path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
+		r = r.WithContext(request.WithUser(r.Context(), model.User{
+			ID: "validation-admin", UserName: "validation-admin", IsAdmin: true,
+		}))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, r)
+		return response
+	}
+	get := func(t *testing.T, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r = r.WithContext(request.WithUser(r.Context(), model.User{
+			ID: "validation-admin", UserName: "validation-admin", IsAdmin: true,
+		}))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, r)
+		return response
+	}
+
+	device, err := ps.GetDeviceForUser("validation-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	device.PlaybackQueue.Add(model.MediaFiles{{ID: "seed", Path: "/seed.mp3"}})
+	// Bump the authoritative queue version via an unprotected incremental edit.
+	if response := serve(t, "/jukebox/remove", map[string]any{"index": 0}); response.Code != http.StatusOK {
+		t.Fatalf("seed remove: %d %s", response.Code, response.Body.String())
+	}
+	if response := serve(t, "/jukebox/session/attach", map[string]any{
+		"sessionId": "status-session", "clientId": "status-tab", "deviceName": "status-default",
+	}); response.Code != http.StatusOK {
+		t.Fatalf("attach: %d %s", response.Code, response.Body.String())
+	}
+	t.Cleanup(func() { _, _ = ps.DetachSession(context.Background(), "status-session", "status-tab") })
+
+	response := get(t, "/jukebox/status?sessionId=status-session")
+	if response.Code != http.StatusOK {
+		t.Fatalf("session status: %d %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		QueueVersion int `json:"queueVersion"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.QueueVersion != 1 {
+		t.Fatalf("session status dropped queue version: got=%d want=1 (%s)", payload.QueueVersion, response.Body.String())
+	}
+}

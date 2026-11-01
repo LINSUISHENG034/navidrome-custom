@@ -75,7 +75,7 @@ func TestPlaybackServerSessionSnapshotReturnsAuthorizedBoundQueue(t *testing.T) 
 	}
 
 	device.mu.Lock()
-	device.PlaybackQueue.Items[2].Title = "mutated after snapshot"
+	device.PlaybackQueue.Items[2].MediaFile.Title = "mutated after snapshot"
 	device.mu.Unlock()
 	if snapshot.JukeboxPlaylist.Entry[2].Title != "Current duplicate" {
 		t.Fatalf("snapshot retained mutable queue data: %#v", snapshot.JukeboxPlaylist.Entry[2])
@@ -125,5 +125,51 @@ func TestPlaybackServerSessionSnapshotFollowsMigratedDeviceBinding(t *testing.T)
 	}
 	if snapshot.JukeboxPlaylist.CurrentIndex != 1 || len(snapshot.JukeboxPlaylist.Entry) != 2 || snapshot.JukeboxPlaylist.Entry[1].Title != "Current after migration" || snapshot.JukeboxPlaylist.Gain != 0.65 {
 		t.Fatalf("snapshot did not follow migrated playback state: %#v", snapshot.JukeboxPlaylist)
+	}
+}
+
+func TestPlaybackServerSessionSnapshotCarriesStableQueueItemIDs(t *testing.T) {
+	ctx := context.Background()
+	device := NewPlaybackDevice(ctx, nil, "Bluetooth", "pulse/anchor_snapshot")
+	device.PlaybackQueue.Set(model.MediaFiles{
+		{ID: "repeat", Title: "Earlier duplicate"},
+		{ID: "other", Title: "Other"},
+		{ID: "repeat", Title: "Current duplicate"},
+	})
+	device.PlaybackQueue.SetIndex(2)
+	device.queueVersion = 5
+
+	ps := &playbackServer{
+		sessionManager:  NewSessionManager(time.Minute),
+		playbackDevices: []*playbackDevice{device},
+	}
+	ps.sessionManager.Attach(AttachRequest{
+		SessionID:  "anchor-session",
+		User:       "alice",
+		ClientID:   "tab-a",
+		DeviceName: "pulse/anchor_snapshot",
+	})
+
+	snapshot, err := ps.SessionSnapshot(ctx, "anchor-session", "alice")
+	if err != nil {
+		t.Fatalf("get session snapshot: %v", err)
+	}
+	entries := snapshot.JukeboxPlaylist.Entry
+	if len(entries) != 3 {
+		t.Fatalf("snapshot entries: %d", len(entries))
+	}
+	if entries[0].ID != "repeat" || entries[2].ID != "repeat" {
+		t.Fatalf("snapshot lost media identity: %#v", entries)
+	}
+	// T13-AC01/AC02: each queue occurrence carries its own stable instance ID,
+	// and the snapshot exposes the current item identity as well.
+	if entries[0].QueueItemID == "" || entries[2].QueueItemID == "" {
+		t.Fatalf("snapshot entries lack queue item IDs: %#v", entries)
+	}
+	if entries[0].QueueItemID == entries[2].QueueItemID {
+		t.Fatalf("duplicate occurrences share a queue item ID: %s", entries[0].QueueItemID)
+	}
+	if snapshot.SessionStatus.QueueVersion != 5 {
+		t.Fatalf("snapshot queue version: %d", snapshot.SessionStatus.QueueVersion)
 	}
 }
