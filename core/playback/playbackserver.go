@@ -62,6 +62,7 @@ var (
 	ErrOperationUnknown          = errors.New("operation outcome is unknown")
 	ErrOperationCapacity         = errors.New("operation execution capacity exceeded")
 	ErrMoveProtocolConflict      = errors.New("relative move fields cannot be combined with legacy from/to/toIndex")
+	ErrQueueVersionRequired      = errors.New("protected anchor moves require expectedQueueVersion")
 	ErrQueueVersionConflict      = errors.New("queue version conflict")
 	ErrQueueItemNotFound         = errors.New("queue item not found")
 	ErrQueueAnchorNotFound       = errors.New("anchor queue item not found")
@@ -154,7 +155,7 @@ type PlaybackCommand struct {
 	Muted         bool
 	// Relative-anchor move fields (T13). QueueItemID/AnchorQueueItemID select
 	// queue instances, Placement is "before"/"after", and ExpectedQueueVersion
-	// is nil when the client did not capture one (distinct from index 0).
+	// may be nil only for unprotected commands (distinct from explicit version 0).
 	QueueItemID          string
 	AnchorQueueItemID    string
 	Placement            string
@@ -1417,7 +1418,8 @@ func isOperationAdmissionError(err error) bool {
 		errors.Is(err, ErrCommandSuperseded) || errors.Is(err, ErrCommandScope) ||
 		errors.Is(err, ErrOperationIdentity) || errors.Is(err, ErrOperationRequired) ||
 		errors.Is(err, ErrMoveProtocolConflict) || errors.Is(err, ErrIdentityRequired) ||
-		errors.Is(err, ErrQueueIdentityConflict) || errors.Is(err, ErrMigrationProtocolConflict)
+		errors.Is(err, ErrQueueIdentityConflict) || errors.Is(err, ErrMigrationProtocolConflict) ||
+		errors.Is(err, ErrQueueVersionRequired)
 }
 
 // retireOperationsLocked applies history fences only after the store mutex has
@@ -1577,6 +1579,10 @@ func (ps *playbackServer) ExecuteCommand(ctx context.Context, scope CommandScope
 			if (command.Action == CommandRemove || command.Action == CommandSkip) && command.IndexProvided {
 				ps.mu.Unlock()
 				return OperationRecord{}, ErrQueueIdentityConflict
+			}
+			if command.Action == CommandMove && command.ExpectedQueueVersion == nil {
+				ps.mu.Unlock()
+				return OperationRecord{}, ErrQueueVersionRequired
 			}
 			// Acquire the state lock before releasing the authority/binding lock.
 			device.mu.Lock()

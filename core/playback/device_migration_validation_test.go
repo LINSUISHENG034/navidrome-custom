@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1101,6 +1102,130 @@ func TestPlaybackServerMigrationTargetStartFailurePreservesFailedSceneWithoutOut
 	}
 }
 
+func assertProtectedAnchorMoveUnchanged(t *testing.T, f *identityEditFixture, ctx context.Context, before SessionSnapshot, fingerprint string) {
+	t.Helper()
+	after, err := f.server.SessionSnapshot(ctx, "edit", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) || f.device.SceneFingerprint() != fingerprint || f.activeTrack() != nil {
+		t.Fatalf("rejected move changed queue/version/current/scene/output: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestPlaybackProtectedAnchorMoveVersionRejections(t *testing.T) {
+	t.Run("explicit zero is stale", func(t *testing.T) {
+		f := newIdentityEditFixture(t)
+		ctx, cancel := context.WithTimeout(f.ctx, 2*time.Second)
+		defer cancel()
+		before, err := f.server.SessionSnapshot(ctx, "edit", "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		version := before.SessionStatus.QueueVersion
+		if before.SessionStatus.QueueVersion <= 0 || f.activeTrack() != nil {
+			t.Fatalf("fixture must be idle with positive version: %#v", before)
+		}
+		fingerprint := f.device.SceneFingerprint()
+		zero := 0
+		move := PlaybackCommand{
+			Action: CommandMove, QueueItemID: f.ids[3], AnchorQueueItemID: f.ids[0],
+			Placement: MovePlacementBefore, ExpectedQueueVersion: &zero,
+		}
+		_, err = f.server.ExecuteCommand(ctx, f.scopeOf("g1:zero-version"), move)
+		var conflict *QueueVersionConflictError
+		if !errors.As(err, &conflict) || conflict.Expected != 0 || conflict.Actual != version {
+			t.Fatalf("explicit zero must reach stale-version validation: %v", err)
+		}
+		assertProtectedAnchorMoveUnchanged(t, f, ctx, before, fingerprint)
+	})
+
+	t.Run("ownership precedes omitted version", func(t *testing.T) {
+		f := newIdentityEditFixture(t)
+		ctx, cancel := context.WithTimeout(f.ctx, 2*time.Second)
+		defer cancel()
+		before, err := f.server.SessionSnapshot(ctx, "edit", "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if before.SessionStatus.QueueVersion <= 0 || f.activeTrack() != nil {
+			t.Fatalf("fixture must be idle with positive version: %#v", before)
+		}
+		fingerprint := f.device.SceneFingerprint()
+		scope := f.scopeOf("g1:wrong-owner")
+		scope.ClientID = "observer"
+		move := PlaybackCommand{Action: CommandMove, QueueItemID: f.ids[3], AnchorQueueItemID: f.ids[0], Placement: MovePlacementBefore}
+		if _, err := f.server.ExecuteCommand(ctx, scope, move); !errors.Is(err, ErrSessionOwnership) {
+			t.Fatalf("ownership must precede omitted version: %v", err)
+		}
+		assertProtectedAnchorMoveUnchanged(t, f, ctx, before, fingerprint)
+	})
+}
+
+func TestPlaybackProtectedAnchorMoveVersionAdmissionAndReplay(t *testing.T) {
+	for _, name := range []string{"omitted", "current", "same ID corrected retry"} {
+		t.Run(name, func(t *testing.T) {
+			f := newIdentityEditFixture(t)
+			ctx, cancel := context.WithTimeout(f.ctx, 2*time.Second)
+			defer cancel()
+			before, err := f.server.SessionSnapshot(ctx, "edit", "admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			version := before.SessionStatus.QueueVersion
+			if version <= 0 || f.activeTrack() != nil {
+				t.Fatalf("fixture must be idle with positive version: %#v", before)
+			}
+			fingerprint := f.device.SceneFingerprint()
+			scope := f.scopeOf("g1:version-move")
+			move := PlaybackCommand{Action: CommandMove, QueueItemID: f.ids[3], AnchorQueueItemID: f.ids[0], Placement: MovePlacementBefore}
+			if name == "omitted" || name == "same ID corrected retry" {
+				for attempt := 0; attempt < 2; attempt++ {
+					_, err := f.server.ExecuteCommand(ctx, scope, move)
+					// ExecuteCommand exposes the error, not its transient NOT_EXECUTED record.
+					// Admission failures must be rejected anew, not persisted as replay results.
+					if err == nil || err.Error() != "protected anchor moves require expectedQueueVersion" || !isOperationAdmissionError(err) {
+						t.Fatalf("attempt %d: expected version-required admission rejection, got %v", attempt, err)
+					}
+					record, err := f.server.QueryOperation(ctx, "edit", scope.OperationID)
+					if err != nil || record.Status != OperationStatusUnknown {
+						t.Fatalf("admission rejection retained: %#v, %v", record, err)
+					}
+					assertProtectedAnchorMoveUnchanged(t, f, ctx, before, fingerprint)
+				}
+				if name == "omitted" {
+					return
+				}
+			}
+			move.ExpectedQueueVersion = &version
+			status, err := f.server.ExecuteCommand(ctx, scope, move)
+			if err != nil || status.QueueVersion != version+1 {
+				t.Fatalf("current version must apply once: %#v, %v", status, err)
+			}
+			record, err := f.server.QueryOperation(ctx, "edit", scope.OperationID)
+			if err != nil || record.Status != OperationStatusApplied {
+				t.Fatalf("corrected/current result: %#v, %v", record, err)
+			}
+			replay, err := f.server.ExecuteCommand(ctx, scope, move)
+			if err != nil || !reflect.DeepEqual(replay, status) {
+				t.Fatalf("applied replay changed result: %#v, %v", replay, err)
+			}
+			after, err := f.server.SessionSnapshot(ctx, "edit", "admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, item := range after.JukeboxPlaylist.Entry {
+				got = append(got, item.QueueItemID)
+			}
+			want := []string{f.ids[3], f.ids[0], f.ids[1], f.ids[2]}
+			if !reflect.DeepEqual(got, want) || after.SessionStatus.QueueVersion != version+1 || after.SessionStatus.QueueItemID != before.SessionStatus.QueueItemID || after.SessionStatus.TrackID != before.SessionStatus.TrackID || after.SessionStatus.Position != before.SessionStatus.Position || after.SessionStatus.Playing || f.activeTrack() != nil {
+				t.Fatalf("applied move/replay violated idle queue continuity: %#v", after)
+			}
+		})
+	}
+}
+
 func TestPlaybackProtectedAnchorMoveReplayIsIdempotent(t *testing.T) {
 	ctx, server := newMigrationValidationServer(t)
 	ctx = request.WithUser(ctx, model.User{UserName: "admin"})
@@ -1131,6 +1256,7 @@ func TestPlaybackProtectedAnchorMoveReplayIsIdempotent(t *testing.T) {
 	move := PlaybackCommand{
 		Action: CommandMove, QueueItemID: entries[2].QueueItemID,
 		AnchorQueueItemID: entries[0].QueueItemID, Placement: "before",
+		ExpectedQueueVersion: &snapshot.SessionStatus.QueueVersion,
 	}
 	first, err := server.ExecuteCommand(ctx, moveScope, move)
 	if err != nil {

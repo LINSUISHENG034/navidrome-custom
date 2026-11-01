@@ -1059,6 +1059,65 @@ func TestJukeboxMigrationCommitWireShapeRejection(t *testing.T) {
 	})
 }
 
+func TestJukeboxProtectedAnchorMoveVersionPrecondition(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		clientID   string
+		protected  bool
+		version    *int
+		statusCode int
+		code       string
+	}{
+		{name: "omitted", clientID: "owner", protected: true, statusCode: http.StatusBadRequest, code: "QUEUE_VERSION_REQUIRED"},
+		{name: "wrong owner omitted", clientID: "observer", protected: true, statusCode: http.StatusForbidden, code: "SESSION_OWNERSHIP"},
+		{name: "explicit zero", clientID: "owner", protected: true, version: new(int), statusCode: http.StatusNotFound, code: "QUEUE_ITEM_NOT_FOUND"},
+		{name: "unprotected omitted", statusCode: http.StatusNotFound, code: "QUEUE_ITEM_NOT_FOUND"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			namespace := t.Name()
+			deviceName := namespace + "-device"
+			sessionID := namespace + "-session"
+			ownerID := namespace + "-owner"
+			clientID := namespace + "-" + tc.clientID
+			ctx, ps := startJukeboxLogicalFixture(t, deviceName, []conf.AudioDeviceDefinition{{deviceName, deviceName}})
+			ctx = request.WithUser(ctx, model.User{ID: "validation-admin", UserName: "validation-admin", IsAdmin: true})
+			body := map[string]any{"queueItemId": "missing-source", "anchorQueueItemId": "missing-anchor", "placement": "before"}
+			if tc.protected {
+				attached, err := ps.AttachSession(ctx, playback.AttachRequest{SessionID: sessionID, User: "validation-admin", ClientID: ownerID, DeviceName: deviceName})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, ownerID) })
+				body["sessionId"], body["clientId"] = sessionID, clientID
+				body["bindingGeneration"] = attached.BindingGeneration
+				body["operationId"] = fmt.Sprintf("g%d:%s", attached.BindingGeneration, namespace)
+			}
+			if tc.version != nil {
+				body["expectedQueueVersion"] = *tc.version
+			}
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			api := &Router{playback: ps}
+			router := chi.NewRouter()
+			api.addJukeboxControlRoute(router)
+			r := httptest.NewRequest(http.MethodPost, "/jukebox/move", bytes.NewReader(encoded)).WithContext(ctx)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, r)
+			var payload struct {
+				Code string `json:"code"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("non-JSON response: %d %s: %v", response.Code, response.Body.String(), err)
+			}
+			if response.Code != tc.statusCode || payload.Code != tc.code {
+				t.Fatalf("version admission: got %d %s, want %d %s", response.Code, response.Body.String(), tc.statusCode, tc.code)
+			}
+		})
+	}
+}
+
 func TestJukeboxAnchorMoveProtocolValidation(t *testing.T) {
 	ctx, ps := startJukeboxLogicalFixture(t, "Anchor Default", []conf.AudioDeviceDefinition{
 		{"Anchor Default", "anchor-default"},
