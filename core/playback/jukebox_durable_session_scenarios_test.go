@@ -11,6 +11,7 @@ import (
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/model"
+	"github.com/navidrome/navidrome/model/request"
 )
 
 type durableScenarioHarness struct {
@@ -393,6 +394,106 @@ func TestDurableSessionGenerationMatrix(t *testing.T) {
 	legacyScope := CommandScope{User: "admin"}
 	if _, err := h.server.ExecuteCommand(ctx, legacyScope, PlaybackCommand{Action: CommandGain, Gain: 0.9}); !errors.Is(err, ErrProtectedContextConflict) {
 		t.Fatalf("expected ErrProtectedContextConflict for legacy access to protected context, got %v", err)
+	}
+}
+
+func TestOperationStoreReportsAdmittedOperationsAsPending(t *testing.T) {
+	store := NewOperationStore(2, time.Hour)
+	initial := OperationRecord{
+		Status:            OperationStatusUnknown,
+		Action:            CommandGain,
+		SessionID:         "session",
+		OperationID:       "g1:pending",
+		BindingGeneration: 1,
+	}
+	admission := store.acquire(initial)
+	if !admission.first || admission.pending == nil {
+		t.Fatalf("expected first operation admission, got %#v", admission)
+	}
+
+	rec, found := store.Get(initial.SessionID, initial.OperationID)
+	if !found || rec.Status != OperationStatusPending {
+		t.Fatalf("expected in-flight operation to be PENDING, found=%v record=%#v", found, rec)
+	}
+	if rec.SessionID != initial.SessionID || rec.OperationID != initial.OperationID || rec.BindingGeneration != initial.BindingGeneration {
+		t.Fatalf("pending record lost operation identity: %#v", rec)
+	}
+
+	store.Complete(initial.SessionID, initial.OperationID, OperationRecord{
+		Status:            OperationStatusApplied,
+		BindingGeneration: initial.BindingGeneration,
+	})
+	rec, found = store.Get(initial.SessionID, initial.OperationID)
+	if !found || rec.Status != OperationStatusApplied {
+		t.Fatalf("expected completed operation after PENDING, found=%v record=%#v", found, rec)
+	}
+	if missing, found := store.Get(initial.SessionID, "g1:missing"); found || missing.Status != OperationStatusUnknown {
+		t.Fatalf("missing operation must remain UNKNOWN, found=%v record=%#v", found, missing)
+	}
+}
+
+func TestDurableSessionPendingOperationQueryCompatibility(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "1")
+	status := h.attach(t, "owner")
+	ctx := request.WithUser(h.ctx, model.User{UserName: "admin"})
+	before, err := h.server.SessionSnapshot(ctx, status.SessionID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := OperationRecord{
+		Status:            OperationStatusUnknown,
+		Action:            CommandGain,
+		SessionID:         status.SessionID,
+		OperationID:       "g1:pending-query",
+		BindingGeneration: status.BindingGeneration,
+	}
+	h.server.mu.Lock()
+	store := h.server.ensureOperationStoreLocked()
+	h.server.mu.Unlock()
+	if admission := store.acquire(initial); !admission.first {
+		t.Fatalf("expected first admission: %#v", admission)
+	}
+
+	rec, err := h.server.QueryOperation(ctx, initial.SessionID, initial.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != OperationStatusUnknown {
+		t.Fatalf("public pending query must remain UNKNOWN, got %s", rec.Status)
+	}
+	if rec.SessionID != initial.SessionID || rec.OperationID != initial.OperationID || rec.BindingGeneration != initial.BindingGeneration {
+		t.Fatalf("public pending query lost operation identity: %#v", rec)
+	}
+	if rec.DeviceStatus != nil || rec.SessionStatus != nil || rec.CommandResult != nil {
+		t.Fatalf("pending query returned an execution result: %#v", rec)
+	}
+	if pending, found := store.Get(initial.SessionID, initial.OperationID); !found || pending.Status != OperationStatusPending {
+		t.Fatalf("public query changed internal pending record: found=%v record=%#v", found, pending)
+	}
+	otherUser := request.WithUser(h.ctx, model.User{UserName: "other-user"})
+	if _, err := h.server.QueryOperation(otherUser, initial.SessionID, initial.OperationID); !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("cross-user query must be rejected: %v", err)
+	}
+	after, err := h.server.SessionSnapshot(ctx, status.SessionID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("pending queries changed playback context: before=%#v after=%#v", before, after)
+	}
+
+	store.Complete(initial.SessionID, initial.OperationID, OperationRecord{
+		Status:            OperationStatusApplied,
+		BindingGeneration: initial.BindingGeneration,
+	})
+	rec, err = h.server.QueryOperation(ctx, initial.SessionID, initial.OperationID)
+	if err != nil || rec.Status != OperationStatusApplied {
+		t.Fatalf("completed query must return APPLIED: record=%#v error=%v", rec, err)
+	}
+	rec, err = h.server.QueryOperation(ctx, initial.SessionID, "g1:missing")
+	if err != nil || rec.Status != OperationStatusUnknown {
+		t.Fatalf("missing query must remain UNKNOWN: record=%#v error=%v", rec, err)
 	}
 }
 

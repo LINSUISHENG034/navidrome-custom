@@ -220,6 +220,7 @@ const (
 	OperationStatusApplied     = "APPLIED"
 	OperationStatusNotExecuted = "NOT_EXECUTED"
 	OperationStatusFailed      = "FAILED"
+	OperationStatusPending     = "PENDING"
 	OperationStatusUnknown     = "UNKNOWN"
 	OperationIDFormat          = "g<bindingGeneration>:<stable ID>"
 )
@@ -342,11 +343,17 @@ func (s *OperationStore) prune() []OperationRecord {
 func (s *OperationStore) lookup(sessionID, operationID string) (OperationRecord, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.records[operationKey{sessionID: sessionID, operationID: operationID}]
+	key := operationKey{sessionID: sessionID, operationID: operationID}
+	rec, ok := s.records[key]
 	if ok && s.now().Sub(rec.CreatedAt) >= s.ttl {
 		return OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}, false
 	}
 	if !ok {
+		if pending, inFlight := s.inflight[key]; inFlight {
+			rec = pending.record
+			rec.Status = OperationStatusPending
+			return rec, true
+		}
 		rec = OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}
 	}
 	if rec.QueueCount != nil {
@@ -1963,6 +1970,9 @@ func (ps *playbackServer) QueryOperation(ctx context.Context, sessionID, operati
 	rec, found := store.Get(sessionID, operationID)
 	ps.mu.Unlock()
 	if found {
+		if rec.Status == OperationStatusPending {
+			rec.Status = OperationStatusUnknown
+		}
 		return rec, nil
 	}
 	return OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}, nil
