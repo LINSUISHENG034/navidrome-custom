@@ -1855,6 +1855,15 @@ func TestPlaybackIdentityRemovePausedSemantics(t *testing.T) {
 }
 
 func TestPlaybackProtectedRemovalFailurePublishesCommittedState(t *testing.T) {
+	assertProtectedCommittedFailure(t, CommandRemove, 0, 1)
+}
+
+func TestPlaybackProtectedSkipFailurePublishesCommittedState(t *testing.T) {
+	assertProtectedCommittedFailure(t, CommandSkip, 1, 0)
+}
+
+func assertProtectedCommittedFailure(t *testing.T, action string, targetIndex, queueDelta int) {
+	t.Helper()
 	ctx, server := newMigrationValidationServer(t)
 	device := migrationTestTarget(t, server, "old")
 	if _, err := device.Set(ctx, []string{"track", "track"}); err != nil {
@@ -1863,12 +1872,12 @@ func TestPlaybackProtectedRemovalFailurePublishesCommittedState(t *testing.T) {
 	if _, err := device.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	attached := attachMigrationSource(t, server, "failed-remove-session", "owner", "old")
+	attached := attachMigrationSource(t, server, "failed-"+action+"-session", "owner", "old")
 	before, err := device.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	currentID := device.PlaybackQueue.CurrentItem().QueueItemID
+	currentID := device.PlaybackQueue.Items[targetIndex].QueueItemID
 	failure := errors.New("successor unpause rejected")
 	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
 		return &mockTrack{onUnpause: func() error { return failure }}, nil
@@ -1879,12 +1888,12 @@ func TestPlaybackProtectedRemovalFailurePublishesCommittedState(t *testing.T) {
 	broker.mu.Unlock()
 	scope := CommandScope{
 		User: "admin", SessionID: attached.SessionID, ClientID: "owner",
-		BindingGeneration: &attached.BindingGeneration, OperationID: "g1:remove-failure",
+		BindingGeneration: &attached.BindingGeneration, OperationID: "g1:" + action + "-failure",
 	}
-	command := PlaybackCommand{Action: CommandRemove, QueueItemID: currentID}
+	command := PlaybackCommand{Action: action, QueueItemID: currentID}
 	after, err := server.ExecuteCommand(ctx, scope, command)
-	if !errors.Is(err, failure) || after.Playing || after.QueueVersion != before.QueueVersion+1 || after.StateSequence != before.StateSequence+1 {
-		t.Errorf("protected removal failure lost committed state: before=%#v after=%#v error=%v", before, after, err)
+	if !errors.Is(err, failure) || after.Playing || after.CurrentIndex != targetIndex || after.QueueVersion != before.QueueVersion+queueDelta || after.StateSequence != before.StateSequence+1 {
+		t.Errorf("protected %s failure lost committed state: before=%#v after=%#v error=%v", action, before, after, err)
 	}
 	record, err := server.QueryOperation(ctx, scope.SessionID, scope.OperationID)
 	if err != nil || record.Status != OperationStatusFailed || record.DeviceStatus == nil || *record.DeviceStatus != after {
@@ -1892,7 +1901,7 @@ func TestPlaybackProtectedRemovalFailurePublishesCommittedState(t *testing.T) {
 	}
 	replayed, err := server.ExecuteCommand(ctx, scope, command)
 	if !errors.Is(err, failure) || replayed != after {
-		t.Errorf("failed removal retry changed its result: original=%#v replayed=%#v error=%v", after, replayed, err)
+		t.Errorf("failed %s retry changed its result: original=%#v replayed=%#v error=%v", action, after, replayed, err)
 	}
 	broker.mu.Lock()
 	defer broker.mu.Unlock()

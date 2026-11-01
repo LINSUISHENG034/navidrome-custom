@@ -318,6 +318,9 @@ func (pd *playbackDevice) Skip(ctx context.Context, index int, offset int) (Devi
 
 func (pd *playbackDevice) skipLocked(ctx context.Context, index int, offset int) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing Skip action", "index", index, "offset", offset, "device", pd)
+	if pd.PlaybackQueue.IsEmpty() {
+		return pd.getStatus(), false, errors.New("could not get current track")
+	}
 
 	// Skip is a no-op if already playing the requested track at offset 0.
 	// This prevents the browser's auto-advance onAudioPlayTrackChange from
@@ -326,47 +329,59 @@ func (pd *playbackDevice) skipLocked(ctx context.Context, index int, offset int)
 		return pd.getStatus(), false, nil
 	}
 
+	changed := false
+	commit := func() {
+		if !changed {
+			pd.incrementSceneRevisionLocked()
+			pd.incrementStateSequenceLocked()
+			changed = true
+		}
+	}
 	wasPlaying := pd.isPlaying()
-
-	if pd.ActiveTrack != nil && wasPlaying {
+	if wasPlaying {
 		if err := pd.ActiveTrack.Pause(); err != nil {
 			log.Error(ctx, "error pausing active track during skip", err)
 			return pd.getStatus(), false, err
 		}
+		commit()
 	}
 
 	if index != pd.PlaybackQueue.Index {
+		hadOutput := pd.ActiveTrack != nil || pd.recoveryPosition != nil
+		previousIndex := pd.PlaybackQueue.Index
 		pd.recoveryPosition = nil
 		pd.retireActiveTrackLocked()
+		pd.PlaybackQueue.SetIndex(index)
+		if hadOutput || previousIndex != pd.PlaybackQueue.Index {
+			commit()
+		}
 	}
 
 	if pd.ActiveTrack == nil {
 		track, token, current, err := pd.loadTrackLocked(ctx, index)
 		if err != nil || !current {
-			return pd.getStatus(), false, err
+			return pd.getStatus(), changed, err
 		}
 		pd.assignTrack(track, token)
+		commit()
 	}
 
-	if pd.ActiveTrack != nil {
-		err := pd.ActiveTrack.SetPosition(offset)
-		if err != nil {
-			log.Error(ctx, "error setting position", err)
-			return pd.getStatus(), false, err
-		}
-		pd.recoveryPosition = nil
+	if err := pd.ActiveTrack.SetPosition(offset); err != nil {
+		log.Error(ctx, "error setting position", err)
+		return pd.getStatus(), changed, err
 	}
+	pd.recoveryPosition = nil
+	commit()
 
 	if wasPlaying {
-		_, _, err := pd.startLocked(ctx)
-		if err != nil {
-			log.Error(ctx, "error starting new track after skipping")
-			return pd.getStatus(), false, err
+		if err := pd.ActiveTrack.Unpause(); err != nil {
+			log.Error(ctx, "error starting new track after skipping", err)
+			return pd.getStatus(), changed, err
 		}
+		pd.incrementSceneRevisionLocked()
+		pd.incrementStateSequenceLocked()
 	}
-
-	pd.incrementSceneRevisionLocked()
-	return pd.getStatus(), true, nil
+	return pd.getStatus(), changed, nil
 }
 
 func (pd *playbackDevice) Add(ctx context.Context, ids []string) (DeviceStatus, error) {

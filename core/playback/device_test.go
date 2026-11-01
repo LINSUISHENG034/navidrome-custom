@@ -26,6 +26,7 @@ type mockTrack struct {
 	muteCalls        int
 	onSetMute        func(bool) error
 	onSetVolume      func(float32) error
+	onSetPosition    func(int) error
 	onPause          func() error
 	onUnpause        func() error
 	onClose          func()
@@ -69,6 +70,11 @@ func (m *mockTrack) Unpause() error {
 func (m *mockTrack) Position() int { return m.position }
 func (m *mockTrack) SetPosition(offset int) error {
 	m.positionSetCalls++
+	if m.onSetPosition != nil {
+		if err := m.onSetPosition(offset); err != nil {
+			return err
+		}
+	}
 	m.position = offset
 	return nil
 }
@@ -807,7 +813,12 @@ func testPlaybackDeviceCancelsPendingSkip(t *testing.T, stop func(*playbackDevic
 	if status, err := h.device.Start(h.ctx); err != nil || !status.Playing {
 		t.Fatalf("initial start: status=%#v, err=%v", status, err)
 	}
+	before, _ := h.device.Status(h.ctx)
 	done := h.begin(t, func(ctx context.Context) (DeviceStatus, error) { return h.device.Skip(ctx, 1, 0) })
+	during, _ := h.device.Status(h.ctx)
+	if during.StateSequence != before.StateSequence+1 || during.QueueVersion != before.QueueVersion {
+		t.Errorf("pending skip did not expose its committed ordering: before=%#v during=%#v", before, during)
+	}
 	if status, err := stop(h.device, h.ctx); err != nil || status.Playing {
 		t.Fatalf("stop while skipping: status=%#v, err=%v", status, err)
 	}
@@ -816,8 +827,9 @@ func testPlaybackDeviceCancelsPendingSkip(t *testing.T, stop func(*playbackDevic
 			t.Fatalf("successor start: status=%#v, err=%v", status, err)
 		}
 	}
-	if status := h.finish(t, done); status.Playing != resume {
-		t.Fatalf("cancelled skip returned the wrong playback state: %#v", status)
+	winner, _ := h.device.Status(h.ctx)
+	if status := h.finish(t, done); status != winner || status.Playing != resume {
+		t.Fatalf("cancelled skip changed the winner's state or ordering: returned=%#v winner=%#v", status, winner)
 	}
 	h.assertRetired(t, resume, []string{"1", "2"})
 }
@@ -1433,6 +1445,153 @@ func captureRemovalFailureScene(fixture *anchorMoveFixture) removalFailureScene 
 		status: device.getStatus(), itemIDs: device.PlaybackQueue.ItemIDs(),
 		track: device.ActiveTrack, token: device.activePlaybackToken,
 		preparation: device.preparationVersion, revision: device.sceneRevision,
+	}
+}
+
+type skipSequenceCase struct {
+	name    string
+	index   int
+	offset  int
+	loaded  bool
+	playing bool
+	stage   string
+	delta   uint64
+}
+
+func TestPlaybackDeviceSkipStateSequence(t *testing.T) {
+	for _, tc := range []skipSequenceCase{
+		{"seek playing", 0, 17, true, true, "", 2},
+		{"seek paused", 0, 17, true, false, "", 1},
+		{"switch playing", 2, 17, true, true, "", 2},
+		{"switch paused", 2, 17, true, false, "", 1},
+		{"unloaded seek", 0, 17, false, false, "", 1},
+		{"unloaded switch", 2, 17, false, false, "", 1},
+		{"seek pause failure", 0, 17, true, true, "pause", 0},
+		{"switch pause failure", 2, 17, true, true, "pause", 0},
+		{"seek playing position failure", 0, 17, true, true, "position", 1},
+		{"seek paused position failure", 0, 17, true, false, "position", 0},
+		{"switch playing load failure", 2, 17, true, true, "load", 1},
+		{"switch paused load failure", 2, 17, true, false, "load", 1},
+		{"unloaded seek load failure", 0, 17, false, false, "load", 0},
+		{"unloaded switch load failure", 2, 17, false, false, "load", 1},
+		{"switch playing position failure", 2, 17, true, true, "position", 1},
+		{"switch paused position failure", 2, 17, true, false, "position", 1},
+		{"unloaded seek position failure", 0, 17, false, false, "position", 1},
+		{"seek unpause failure", 0, 17, true, true, "unpause", 1},
+		{"switch unpause failure", 2, 17, true, true, "unpause", 1},
+		{"playing current zero offset no-op", 0, 0, true, true, "", 0},
+		{"empty queue rejection", 0, 17, false, false, "empty", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) { assertSkipStateSequence(t, tc) })
+	}
+}
+
+func configureSkipFailure(track *mockTrack, stage string, failure error) {
+	switch stage {
+	case "pause":
+		track.onPause = func() error { return failure }
+	case "position":
+		track.onSetPosition = func(int) error { return failure }
+	case "unpause":
+		track.onUnpause = func() error { return failure }
+	}
+}
+
+func assertSkipStateSequence(t *testing.T, tc skipSequenceCase) {
+	t.Helper()
+	fixture := newAnchorMoveFixture(t)
+	device := fixture.device
+	if tc.loaded {
+		fixture.start(t)
+		if !tc.playing {
+			if _, err := device.Stop(fixture.ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		fixture.playing.position = 5
+	}
+	if tc.stage == "empty" {
+		if _, err := device.Clear(fixture.ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := captureRemovalFailureScene(fixture)
+	failure := errors.New("skip output rejected " + tc.stage)
+	if tc.loaded {
+		configureSkipFailure(fixture.playing, tc.stage, failure)
+	}
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		during := captureRemovalFailureScene(fixture)
+		wantSequence := before.status.StateSequence
+		if tc.index != before.status.CurrentIndex {
+			wantSequence++
+		}
+		if during.status.StateSequence != wantSequence || during.status.QueueVersion != before.status.QueueVersion {
+			t.Errorf("unlocked skip preparation ordering: before=%#v during=%#v wantSequence=%d", before.status, during.status, wantSequence)
+		}
+		if tc.stage == "load" {
+			return nil, failure
+		}
+		track := fixture.newTrack()
+		configureSkipFailure(track, tc.stage, failure)
+		return track, nil
+	}
+	var notifications []DeviceStatus
+	device.onStateChange = func(status DeviceStatus) {
+		if !device.mu.TryLock() {
+			t.Error("skip callback ran under device lock")
+			return
+		}
+		observed := device.getStatus()
+		device.mu.Unlock()
+		if observed != status {
+			t.Errorf("skip callback is stale: callback=%#v observed=%#v", status, observed)
+		}
+		notifications = append(notifications, status)
+	}
+	t.Cleanup(func() { device.onStateChange = nil })
+	command := PlaybackCommand{Action: CommandSeek, Position: tc.offset}
+	if tc.index != before.status.CurrentIndex || tc.stage == "empty" {
+		command = PlaybackCommand{Action: CommandSkip, Index: tc.index, Offset: tc.offset}
+	}
+	returned, err := device.executeCommand(fixture.ctx, command)
+	if tc.stage == "empty" {
+		if err == nil || err.Error() != "could not get current track" {
+			t.Errorf("empty skip error changed: %v", err)
+		}
+	} else if (tc.stage == "" && err != nil) || (tc.stage != "" && !errors.Is(err, failure)) {
+		t.Errorf("skip output error mismatch: %v", err)
+	}
+	after := captureRemovalFailureScene(fixture)
+	assertSkipSequenceResult(t, tc, before, after, returned, notifications)
+}
+
+func assertSkipSequenceResult(t *testing.T, tc skipSequenceCase, before, after removalFailureScene, returned DeviceStatus, notifications []DeviceStatus) {
+	t.Helper()
+	if returned != after.status || after.status.StateSequence != before.status.StateSequence+tc.delta || after.revision != before.revision+tc.delta {
+		t.Errorf("skip semantic accounting: before=%#v after=%#v returned=%#v wantDelta=%d", before, after, returned, tc.delta)
+	}
+	if after.status.QueueVersion != before.status.QueueVersion || !slices.Equal(after.itemIDs, before.itemIDs) {
+		t.Error("skip changed structural queue state")
+	}
+	if tc.delta == 0 {
+		expected := before
+		if !tc.loaded && tc.stage == "load" && tc.index == before.status.CurrentIndex {
+			expected.preparation++
+		}
+		if !reflect.DeepEqual(expected, after) || len(notifications) != 0 {
+			t.Errorf("uncommitted skip mutated or published state: expected=%#v after=%#v notifications=%#v", expected, after, notifications)
+		}
+		return
+	}
+	if len(notifications) != 1 || notifications[0] != after.status {
+		t.Errorf("committed skip not published once: state=%#v notifications=%#v", after.status, notifications)
+	}
+	if tc.stage == "" && (after.status.CurrentIndex != tc.index || after.status.Position != tc.offset || after.status.Playing != tc.playing) {
+		t.Errorf("successful skip lost playback intent: %#v", after.status)
+	}
+	if tc.stage != "" && (after.status.CurrentIndex != tc.index || after.status.Playing) {
+		t.Errorf("committed skip failure lost selected paused context: %#v", after.status)
 	}
 }
 
