@@ -16,13 +16,14 @@ import (
 )
 
 type jukeboxStatusResponse struct {
-	CurrentIndex int     `json:"currentIndex"`
-	Playing      bool    `json:"playing"`
-	Gain         float32 `json:"gain"`
-	DesiredGain  float32 `json:"desiredGain"`
-	Muted        bool    `json:"muted"`
-	Position     int     `json:"position"`
-	QueueVersion int     `json:"queueVersion"`
+	CurrentIndex  int     `json:"currentIndex"`
+	Playing       bool    `json:"playing"`
+	Gain          float32 `json:"gain"`
+	DesiredGain   float32 `json:"desiredGain"`
+	Muted         bool    `json:"muted"`
+	Position      int     `json:"position"`
+	QueueVersion  int     `json:"queueVersion"`
+	StateSequence uint64  `json:"stateSequence"`
 	// QueueProtocol is the shared additive capability contract; clients must
 	// check version/boolean values, never field presence.
 	QueueProtocol *model.QueueProtocolCapabilities `json:"queueProtocol,omitempty"`
@@ -74,6 +75,7 @@ func toStatusResponse(s playback.DeviceStatus) *jukeboxStatusResponse {
 		Muted:         s.Muted,
 		Position:      s.Position,
 		QueueVersion:  s.QueueVersion,
+		StateSequence: s.StateSequence,
 		QueueProtocol: queueProtocolPtr(),
 	}
 }
@@ -132,6 +134,7 @@ func (api *Router) jukeboxStatus(w http.ResponseWriter, r *http.Request) {
 		api.writeJukeboxJSON(w, r, toStatusResponse(playback.DeviceStatus{
 			CurrentIndex: status.CurrentIndex, Playing: status.Playing, Position: status.Position,
 			Gain: status.Gain, DesiredGain: status.DesiredGain, Muted: status.Muted, QueueVersion: status.QueueVersion,
+			StateSequence: status.StateSequence,
 		}))
 		return
 	}

@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"sync"
 	"testing"
@@ -157,6 +158,72 @@ func (f *fakeEventBroker) SendBroadcastMessage(ctx context.Context, event server
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.broadcasts = append(f.broadcasts, capturedBrokerMessage{ctx: ctx, event: event})
+}
+
+func TestPlaybackServerStateSequenceMappings(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sequence uint64
+	}{
+		{"explicit zero", 0},
+		{"semantic sequence distinct from queue version", 17},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+			device.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/track.mp3"}})
+			device.queueVersion = 3
+			device.stateSequence = tc.sequence
+			broker := &fakeEventBroker{}
+			ps := &playbackServer{
+				ctx: &ctx, sessionManager: NewSessionManager(time.Minute),
+				playbackDevices: []*playbackDevice{device}, eventBroker: broker,
+			}
+			attached, err := ps.AttachSession(ctx, AttachRequest{
+				SessionID: "sequence-session", ClientID: "owner", User: "admin", DeviceName: device.DeviceName,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, err := ps.SessionStatus(ctx, attached.SessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := ps.SessionSnapshot(ctx, attached.SessionID, "admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ps.publishJukeboxStateUpdates(device)
+			if len(broker.sent) == 0 {
+				t.Fatal("no targeted session event published")
+			}
+			for _, mapping := range []struct {
+				name  string
+				value any
+			}{
+				{"attach", attached},
+				{"status", status},
+				{"atomic snapshot", snapshot.SessionStatus},
+				{"event conversion", NewJukeboxStateUpdatedEvent(status)},
+				{"targeted event", broker.sent[len(broker.sent)-1].event},
+			} {
+				encoded, err := json.Marshal(mapping.value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var payload struct {
+					StateSequence *uint64 `json:"stateSequence"`
+					QueueVersion  int     `json:"queueVersion"`
+				}
+				if err := json.Unmarshal(encoded, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 {
+					t.Errorf("%s lost sequence or structural version: %s", mapping.name, encoded)
+				}
+			}
+		})
+	}
 }
 
 func TestNewJukeboxStateUpdatedEvent(t *testing.T) {

@@ -853,6 +853,7 @@ func sessionStatusFromDevice(session Session, device *playbackDevice) SessionSta
 	status.Muted = deviceStatus.Muted
 	status.DesiredGain = device.desiredGainLocked()
 	status.QueueVersion = device.queueVersion
+	status.StateSequence = deviceStatus.StateSequence
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
 	}

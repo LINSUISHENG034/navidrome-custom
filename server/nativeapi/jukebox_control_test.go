@@ -1259,6 +1259,66 @@ func TestJukeboxAnchorMoveProtocolValidation(t *testing.T) {
 	}
 }
 
+type jukeboxStatusSnapshotServer struct {
+	playback.PlaybackServer
+	snapshot  playback.SessionSnapshot
+	sessionID string
+	user      string
+}
+
+func (s *jukeboxStatusSnapshotServer) SessionSnapshot(_ context.Context, sessionID, user string) (playback.SessionSnapshot, error) {
+	s.sessionID, s.user = sessionID, user
+	return s.snapshot, nil
+}
+
+func TestJukeboxStateSequenceStatusMappings(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sequence uint64
+	}{
+		{"explicit zero", 0},
+		{"semantic sequence distinct from queue version", 17},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &jukeboxStatusSnapshotServer{snapshot: playback.SessionSnapshot{
+				SessionStatus: playback.SessionStatus{StateSequence: tc.sequence, QueueVersion: 3},
+			}}
+			api := &Router{playback: server}
+			router := chi.NewRouter()
+			api.addJukeboxControlRoute(router)
+			r := httptest.NewRequest(http.MethodGet, "/jukebox/status?sessionId=sequence-session", nil)
+			r = r.WithContext(request.WithUser(r.Context(), model.User{UserName: "admin"}))
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, r)
+			if response.Code != http.StatusOK || server.sessionID != "sequence-session" || server.user != "admin" {
+				t.Fatalf("status did not read bound snapshot: status=%d session=%q user=%q", response.Code, server.sessionID, server.user)
+			}
+			encoded, err := json.Marshal(toStatusResponse(playback.DeviceStatus{StateSequence: tc.sequence, QueueVersion: 3}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, mapping := range []struct {
+				name string
+				body []byte
+			}{
+				{"device response", encoded},
+				{"session status response", response.Body.Bytes()},
+			} {
+				var payload struct {
+					StateSequence *uint64 `json:"stateSequence"`
+					QueueVersion  int     `json:"queueVersion"`
+				}
+				if err := json.Unmarshal(mapping.body, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 {
+					t.Errorf("%s lost sequence or structural version: %s", mapping.name, mapping.body)
+				}
+			}
+		})
+	}
+}
+
 func TestJukeboxSessionStatusIncludesQueueVersion(t *testing.T) {
 	ctx, ps := startJukeboxLogicalFixture(t, "Status Default", []conf.AudioDeviceDefinition{
 		{"Status Default", "status-default"},
