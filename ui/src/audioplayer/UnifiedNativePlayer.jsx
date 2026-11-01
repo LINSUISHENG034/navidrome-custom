@@ -227,11 +227,24 @@ export class UnifiedNativePlayer extends ReactJkMusicPlayer {
 
       try {
         if (validMove) {
-          await controller.moveQueueItem(
-            drag.ids[oldIndex],
-            newIndex,
-            drag.queueVersion,
-          )
+          // The drop resolves stable identities from the drag-start snapshot
+          // (never from the mutated DOM) and maps Sortable's remove/insert
+          // index onto the relative-anchor protocol.
+          const sourceQueueItemId = drag.ids[oldIndex]
+          const remainingIds = drag.ids.filter((_, idx) => idx !== oldIndex)
+          const anchorQueueItemId =
+            newIndex >= remainingIds.length
+              ? remainingIds[remainingIds.length - 1]
+              : remainingIds[newIndex]
+          const placement = newIndex >= remainingIds.length ? 'after' : 'before'
+          if (anchorQueueItemId && anchorQueueItemId !== sourceQueueItemId) {
+            await controller.moveQueueItemAnchor(
+              sourceQueueItemId,
+              anchorQueueItemId,
+              placement,
+              drag.queueVersion,
+            )
+          }
         }
       } catch {
         // The Module owns the error; the view always returns to current authority.

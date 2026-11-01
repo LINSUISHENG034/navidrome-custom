@@ -1,10 +1,51 @@
 import httpClient from '../dataProvider/httpClient'
+import { normalizeQueueProtocol } from './playbackControlModule'
+
+// Public re-export kept for compatibility; the single pure normalizer lives
+// in playbackControlModule alongside the module capability gate.
+export {
+  normalizeQueueProtocol,
+  SUPPORTED_QUEUE_PROTOCOL_VERSION,
+} from './playbackControlModule'
 
 let attachedScope = null
 let attachedLease = null
 let attachmentVersion = 0
 let confirmedAttachmentVersion = 0
 const sessionTransitions = new Map()
+
+// The queue protocol capability is bound to the currently confirmed
+// attachment (session/client identity). It is replaced only by a newer
+// confirmed attach and cleared on detach, so a stale channel can never
+// reinstate capabilities over a newer binding.
+let boundQueueProtocol = null
+
+// Canonical shared queue protocol contract. Version is an integer; clients
+// must check exact version and boolean values, never field presence.
+// normalizeQueueProtocol (re-exported above) returns a validated capability
+// copy or null. Anything that is not the exact supported shape with enforced
+// boolean values is unsupported, including future versions and mere field
+// presence.
+
+// normalizeJukeboxHttpError maps coded jukebox error bodies onto rejected
+// command errors, carrying the fresh authoritative snapshot when the server
+// included one (409 version conflicts, 404 item/anchor misses).
+function normalizeJukeboxHttpError(err) {
+  const body = err?.body
+  if (body && typeof body === 'object' && typeof body.code === 'string') {
+    return {
+      code: body.code,
+      message: body.error || err.message,
+      status: err.status,
+      snapshot: body.status,
+      queueItemId: body.queueItemId,
+      expectedQueueVersion: body.expectedQueueVersion,
+      queueVersion: body.queueVersion,
+      requiresNewGeneration: body.requiresNewGeneration,
+    }
+  }
+  return err
+}
 
 const transitionSession = (sessionId, clientId, operation) => {
   const key = JSON.stringify([sessionId, clientId])
@@ -61,6 +102,7 @@ const jukeboxClient = {
           confirmedAttachmentVersion = version
           attachedScope = { sessionId, clientId }
           attachedLease = status
+          boundQueueProtocol = normalizeQueueProtocol(status.queueProtocol)
         }
         return status
       }),
@@ -87,6 +129,7 @@ const jukeboxClient = {
         ) {
           attachedScope = null
           attachedLease = null
+          boundQueueProtocol = null
         }
         return status
       })
@@ -108,6 +151,34 @@ const jukeboxClient = {
     ),
   remove: (index, scope) => command('remove', { index }, scope),
   move: (from, to, scope) => command('move', { from, to }, scope),
+  // Identity/anchor queue transports (T13). expectedQueueVersion is omitted
+  // when the caller captured none; legacy index fields are never sent.
+  moveAnchor: (
+    { queueItemId, anchorQueueItemId, placement, expectedQueueVersion } = {},
+    scope,
+  ) =>
+    command(
+      'move',
+      {
+        queueItemId,
+        anchorQueueItemId,
+        placement,
+        ...(expectedQueueVersion !== undefined ? { expectedQueueVersion } : {}),
+      },
+      scope,
+    ).catch((err) => {
+      throw normalizeJukeboxHttpError(err)
+    }),
+  removeItem: (queueItemId, scope) =>
+    command('remove', { queueItemId }, scope).catch((err) => {
+      throw normalizeJukeboxHttpError(err)
+    }),
+  skipToItem: (queueItemId, scope) =>
+    command('skip', { queueItemId }, scope).catch((err) => {
+      throw normalizeJukeboxHttpError(err)
+    }),
+  getQueueProtocol: () =>
+    boundQueueProtocol ? { ...boundQueueProtocol } : null,
   switchDevice: (deviceName, scope) =>
     command('devices/switch', { deviceName }, scope),
 }

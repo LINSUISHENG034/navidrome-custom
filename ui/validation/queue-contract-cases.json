@@ -1,0 +1,197 @@
+{
+  "$schema": "queue-contract-cases.json",
+  "description": "Shared queue behavioral input/expected-state single source for the relative-anchor queue editing contract. Consumed by the Vitest suite and by the real browser/server validation harness. Pure data: no engine or transport logic.",
+  "fixtures": {
+    "duplicateQueueTracks": [
+      {
+        "queueItemId": "q-dup-1",
+        "trackId": "track-dup",
+        "name": "Duplicate Song (Instance 1)",
+        "singer": "Artist Alpha",
+        "musicSrc": "http://localhost/dup.mp3",
+        "id": "track-dup"
+      },
+      {
+        "queueItemId": "q-mid-2",
+        "trackId": "track-unique",
+        "name": "Middle Unique Song",
+        "singer": "Artist Beta",
+        "musicSrc": "http://localhost/unique.mp3",
+        "id": "track-unique"
+      },
+      {
+        "queueItemId": "q-dup-3",
+        "trackId": "track-dup",
+        "name": "Duplicate Song (Instance 2)",
+        "singer": "Artist Alpha",
+        "musicSrc": "http://localhost/dup.mp3",
+        "id": "track-dup"
+      }
+    ]
+  },
+  "anchorMoveCases": [
+    {
+      "id": "TC-QC-AM-01",
+      "title": "relative before move reorders by stable identities",
+      "queue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "current": "q-dup-1",
+      "move": {
+        "queueItemId": "q-dup-3",
+        "anchorQueueItemId": "q-dup-1",
+        "placement": "before",
+        "expectedQueueVersion": 0
+      },
+      "expectedQueue": ["q-dup-3", "q-dup-1", "q-mid-2"],
+      "expectedCurrent": "q-dup-1",
+      "expectedVersionDelta": 1,
+      "expectedWire": {
+        "action": "move",
+        "queueItemId": "q-dup-3",
+        "anchorQueueItemId": "q-dup-1",
+        "placement": "before",
+        "expectedQueueVersion": 0
+      }
+    },
+    {
+      "id": "TC-QC-AM-02",
+      "title": "relative after move reorders by stable identities",
+      "queue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "current": "q-mid-2",
+      "move": {
+        "queueItemId": "q-dup-1",
+        "anchorQueueItemId": "q-dup-3",
+        "placement": "after",
+        "expectedQueueVersion": 0
+      },
+      "expectedQueue": ["q-mid-2", "q-dup-3", "q-dup-1"],
+      "expectedCurrent": "q-mid-2",
+      "expectedVersionDelta": 1,
+      "expectedWire": {
+        "action": "move",
+        "queueItemId": "q-dup-1",
+        "anchorQueueItemId": "q-dup-3",
+        "placement": "after",
+        "expectedQueueVersion": 0
+      }
+    },
+    {
+      "id": "TC-QC-AM-03",
+      "title": "moving an item onto its own position is an applied no-op with a stable version",
+      "queue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "current": "q-dup-1",
+      "move": {
+        "queueItemId": "q-dup-1",
+        "anchorQueueItemId": "q-mid-2",
+        "placement": "before",
+        "expectedQueueVersion": 0
+      },
+      "expectedQueue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "expectedCurrent": "q-dup-1",
+      "expectedVersionDelta": 0,
+      "expectedWire": {
+        "action": "move",
+        "queueItemId": "q-dup-1",
+        "anchorQueueItemId": "q-mid-2",
+        "placement": "before",
+        "expectedQueueVersion": 0
+      }
+    },
+    {
+      "id": "TC-QC-AM-04",
+      "title": "moving an item adjacent to its current position is an applied no-op with a stable version",
+      "queue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "current": "q-mid-2",
+      "move": {
+        "queueItemId": "q-mid-2",
+        "anchorQueueItemId": "q-dup-1",
+        "placement": "after",
+        "expectedQueueVersion": 0
+      },
+      "expectedQueue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "expectedCurrent": "q-mid-2",
+      "expectedVersionDelta": 0,
+      "expectedWire": {
+        "action": "move",
+        "queueItemId": "q-mid-2",
+        "anchorQueueItemId": "q-dup-1",
+        "placement": "after",
+        "expectedQueueVersion": 0
+      }
+    },
+    {
+      "id": "TC-QC-AM-05",
+      "title": "a stale expected version rejects the move and leaves the queue unchanged",
+      "queue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "current": "q-dup-1",
+      "move": {
+        "queueItemId": "q-dup-3",
+        "anchorQueueItemId": "q-dup-1",
+        "placement": "before",
+        "expectedQueueVersion": 7
+      },
+      "expectedError": "QUEUE_VERSION_CONFLICT",
+      "expectedQueue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "expectedCurrent": "q-dup-1",
+      "expectedVersionDelta": 0
+    },
+    {
+      "id": "TC-QC-AM-07",
+      "title": "a missing move source rejects with QUEUE_ITEM_NOT_FOUND, a fresh snapshot, and no scene or version mutation",
+      "queue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "current": "q-dup-1",
+      "move": {
+        "queueItemId": "q-ghost-source",
+        "anchorQueueItemId": "q-dup-1",
+        "placement": "before",
+        "expectedQueueVersion": 0
+      },
+      "expectedError": "QUEUE_ITEM_NOT_FOUND",
+      "expectedErrorQueueItemId": "q-ghost-source",
+      "expectedErrorSnapshot": true,
+      "expectedQueue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "expectedCurrent": "q-dup-1",
+      "expectedVersionDelta": 0
+    },
+    {
+      "id": "TC-QC-AM-08",
+      "title": "a missing anchor rejects with QUEUE_ANCHOR_NOT_FOUND, a fresh snapshot, and no scene or version mutation",
+      "queue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "current": "q-dup-1",
+      "move": {
+        "queueItemId": "q-dup-3",
+        "anchorQueueItemId": "q-ghost-anchor",
+        "placement": "before",
+        "expectedQueueVersion": 0
+      },
+      "expectedError": "QUEUE_ANCHOR_NOT_FOUND",
+      "expectedErrorQueueItemId": "q-ghost-anchor",
+      "expectedErrorSnapshot": true,
+      "expectedQueue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "expectedCurrent": "q-dup-1",
+      "expectedVersionDelta": 0
+    },
+    {
+      "id": "TC-QC-AM-06",
+      "title": "moving the current item keeps current identity continuous",
+      "queue": ["q-dup-1", "q-mid-2", "q-dup-3"],
+      "current": "q-dup-1",
+      "status": "playing",
+      "move": {
+        "queueItemId": "q-dup-1",
+        "anchorQueueItemId": "q-dup-3",
+        "placement": "after",
+        "expectedQueueVersion": 0
+      },
+      "expectedQueue": ["q-mid-2", "q-dup-3", "q-dup-1"],
+      "expectedCurrent": "q-dup-1",
+      "expectedVersionDelta": 1,
+      "expectedWire": {
+        "action": "move",
+        "queueItemId": "q-dup-1",
+        "anchorQueueItemId": "q-dup-3",
+        "placement": "after",
+        "expectedQueueVersion": 0
+      }
+    }
+  ]
+}

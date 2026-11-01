@@ -216,3 +216,225 @@ describe('jukeboxClient command authority', () => {
     expect(JSON.parse(httpClient.mock.calls.at(-1)[1].body)).toEqual(next)
   })
 })
+
+describe('jukeboxClient queue protocol capability lifecycle', () => {
+  const scope = { sessionId: 'session-a', clientId: 'tab-a' }
+  const fullProtocol = {
+    version: 1,
+    relativeMove: true,
+    identitySelect: true,
+    identityRemove: true,
+    identityMigration: true,
+    anchorVersionEnforcement: true,
+    operationResults: true,
+  }
+  const attached = (extra = {}) => ({
+    ...scope,
+    ownerClientId: scope.clientId,
+    ownershipState: 'attached',
+    ...extra,
+  })
+  const deferred = () => {
+    let resolve
+    const promise = new Promise((complete) => {
+      resolve = complete
+    })
+    return { promise, resolve }
+  }
+  let client
+
+  beforeEach(async () => {
+    vi.resetModules()
+    vi.clearAllMocks()
+    client = (await import('./jukeboxClient')).default
+    httpClient.mockResolvedValue({ json: {} })
+  })
+
+  it('exposes no capability before any confirmed attachment', () => {
+    expect(client.getQueueProtocol()).toBeNull()
+  })
+
+  it('binds the normalized capability of the confirmed attach lease', async () => {
+    httpClient.mockResolvedValueOnce({
+      json: attached({ queueProtocol: fullProtocol }),
+    })
+    await client.attachSession(scope.sessionId, scope.clientId)
+    expect(client.getQueueProtocol()).toEqual(fullProtocol)
+  })
+
+  it('resets the capability when the binding detaches', async () => {
+    httpClient.mockResolvedValueOnce({
+      json: attached({ queueProtocol: fullProtocol }),
+    })
+    await client.attachSession(scope.sessionId, scope.clientId)
+    await client.detachSession(scope.sessionId, scope.clientId)
+    expect(client.getQueueProtocol()).toBeNull()
+  })
+
+  it('rebinds the capability to a newer attachment instead of keeping the stale one', async () => {
+    httpClient.mockResolvedValueOnce({
+      json: attached({ queueProtocol: fullProtocol }),
+    })
+    await client.attachSession(scope.sessionId, scope.clientId)
+    httpClient.mockResolvedValueOnce({
+      json: attached({ queueProtocol: null }),
+    })
+    await client.attachSession(scope.sessionId, scope.clientId)
+    expect(client.getQueueProtocol()).toBeNull()
+  })
+
+  it('never lets a late old attach reinstall a capability over a newer binding', async () => {
+    const old = deferred()
+    httpClient.mockReturnValueOnce(old.promise)
+    const pending = client.attachSession(scope.sessionId, scope.clientId)
+    httpClient.mockResolvedValueOnce({
+      json: attached({
+        queueProtocol: { ...fullProtocol, relativeMove: false },
+      }),
+    })
+    const replacement = client.attachSession(scope.sessionId, scope.clientId)
+    old.resolve({ json: attached({ queueProtocol: fullProtocol }) })
+    await Promise.all([pending, replacement])
+    expect(client.getQueueProtocol()?.relativeMove).toBe(false)
+  })
+
+  it.each([
+    ['field presence without enforced boolean values', { version: 1 }],
+    ['an unsupported future version', { ...fullProtocol, version: 2 }],
+    ['a non-object advertisement', 'v1'],
+  ])(
+    'treats %s as unsupported instead of inferring capability',
+    async (_title, raw) => {
+      httpClient.mockResolvedValueOnce({
+        json: attached({ queueProtocol: raw }),
+      })
+      await client.attachSession(scope.sessionId, scope.clientId)
+      expect(client.getQueueProtocol()).toBeNull()
+    },
+  )
+})
+
+describe('jukeboxClient anchor queue transport', () => {
+  const scope = { sessionId: 'session-a', clientId: 'tab-a' }
+  let client
+
+  beforeEach(async () => {
+    vi.resetModules()
+    vi.clearAllMocks()
+    client = (await import('./jukeboxClient')).default
+    httpClient.mockResolvedValue({ json: {} })
+  })
+
+  it('sends an exact anchor move payload with no legacy index fields', async () => {
+    await client.moveAnchor(
+      {
+        queueItemId: 'q-dup-3',
+        anchorQueueItemId: 'q-dup-1',
+        placement: 'before',
+        expectedQueueVersion: 0,
+      },
+      scope,
+    )
+    const [path, options] = httpClient.mock.calls.at(-1)
+    expect(path).toBe('/api/jukebox/move')
+    expect(options.method).toBe('POST')
+    expect(JSON.parse(options.body)).toEqual({
+      queueItemId: 'q-dup-3',
+      anchorQueueItemId: 'q-dup-1',
+      placement: 'before',
+      expectedQueueVersion: 0,
+      ...scope,
+    })
+  })
+
+  it('omits expectedQueueVersion when the caller captured none', async () => {
+    await client.moveAnchor(
+      {
+        queueItemId: 'q-dup-3',
+        anchorQueueItemId: 'q-dup-1',
+        placement: 'before',
+      },
+      scope,
+    )
+    const body = JSON.parse(httpClient.mock.calls.at(-1)[1].body)
+    expect(body).not.toHaveProperty('expectedQueueVersion')
+    expect(body).not.toHaveProperty('index')
+    expect(body).not.toHaveProperty('from')
+    expect(body).not.toHaveProperty('to')
+  })
+
+  it('addresses identity remove and select transports by queueItemId only', async () => {
+    await client.removeItem('q-dup-3', scope)
+    expect(JSON.parse(httpClient.mock.calls.at(-1)[1].body)).toEqual({
+      queueItemId: 'q-dup-3',
+      ...scope,
+    })
+    expect(httpClient.mock.calls.at(-1)[0]).toBe('/api/jukebox/remove')
+
+    await client.skipToItem('q-dup-3', scope)
+    expect(JSON.parse(httpClient.mock.calls.at(-1)[1].body)).toEqual({
+      queueItemId: 'q-dup-3',
+      ...scope,
+    })
+    expect(httpClient.mock.calls.at(-1)[0]).toBe('/api/jukebox/skip')
+  })
+
+  it('normalizes a 409 version conflict into a coded error with the fresh snapshot', async () => {
+    const conflict = Object.assign(new Error('queue version conflict'), {
+      status: 409,
+      body: {
+        code: 'QUEUE_VERSION_CONFLICT',
+        error: 'queue version conflict',
+        expectedQueueVersion: 7,
+        queueVersion: 2,
+        status: { queueVersion: 2, playing: true },
+      },
+    })
+    httpClient.mockRejectedValueOnce(conflict)
+    await expect(
+      client.moveAnchor(
+        {
+          queueItemId: 'q-dup-3',
+          anchorQueueItemId: 'q-dup-1',
+          placement: 'before',
+          expectedQueueVersion: 7,
+        },
+        scope,
+      ),
+    ).rejects.toMatchObject({
+      code: 'QUEUE_VERSION_CONFLICT',
+      status: 409,
+      expectedQueueVersion: 7,
+      queueVersion: 2,
+      snapshot: { queueVersion: 2, playing: true },
+    })
+  })
+
+  it('normalizes a 404 anchor miss into a coded error with the fresh snapshot', async () => {
+    const missing = Object.assign(new Error('anchor not found'), {
+      status: 404,
+      body: {
+        code: 'QUEUE_ANCHOR_NOT_FOUND',
+        error: 'anchor not found',
+        queueItemId: 'q-dup-1',
+        status: { queueVersion: 2 },
+      },
+    })
+    httpClient.mockRejectedValueOnce(missing)
+    await expect(
+      client.moveAnchor(
+        {
+          queueItemId: 'q-dup-3',
+          anchorQueueItemId: 'q-dup-1',
+          placement: 'before',
+        },
+        scope,
+      ),
+    ).rejects.toMatchObject({
+      code: 'QUEUE_ANCHOR_NOT_FOUND',
+      status: 404,
+      queueItemId: 'q-dup-1',
+      snapshot: { queueVersion: 2 },
+    })
+  })
+})

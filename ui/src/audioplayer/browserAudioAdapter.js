@@ -15,6 +15,7 @@ import {
   applyQueueAdd,
   applyQueueRemove,
   applyQueueMove,
+  applyQueueMoveAnchor,
   applyQueueClear,
 } from './playbackControlModule'
 
@@ -947,6 +948,69 @@ export function createBrowserAudioAdapter(options = {}) {
     publishState()
   }
 
+  async function moveQueueItemAnchor(
+    epoch,
+    queueItemId,
+    anchorQueueItemId,
+    placement,
+    expectedQueueVersion = queueVersion,
+    options = {},
+  ) {
+    if (!isActive || epoch !== activeEpoch) return
+    const opId = options.operationId
+    let result
+    try {
+      result = applyQueueMoveAnchor(
+        queue,
+        queueItemId,
+        anchorQueueItemId,
+        placement,
+        {
+          expectedQueueVersion,
+          queueVersion,
+          currentQueueItemId,
+        },
+      )
+    } catch (error) {
+      // Mirror the remote contract: a rejected move may have dispatched, but
+      // the queue, current item, and version stay untouched; the caller
+      // receives the distinct coded failure with a fresh authoritative
+      // snapshot.
+      const failure = {
+        code: error?.code || 'QUEUE_MOVE_FAILED',
+        message: error?.message || 'The queue move was rejected',
+        status: CommandResultStatus.FAILED,
+        operationId: opId,
+        queueItemId: error?.queueItemId,
+        snapshot: error?.snapshot || {
+          queue: [...queue],
+          currentQueueItemId,
+          queueVersion,
+        },
+      }
+      if (opId) {
+        operations.set(opId, {
+          status: CommandResultStatus.FAILED,
+          error: failure,
+          operationId: opId,
+        })
+      }
+      publishState({ ...failure.snapshot, error: failure })
+      throw failure
+    }
+    if (opId) {
+      operations.set(opId, {
+        status: CommandResultStatus.APPLIED,
+        operationId: opId,
+      })
+    }
+    // Applied no-ops (self reference, already-adjacent) keep the version stable
+    if (!result.moved || result.noop) return
+    queue = result.queue
+    queueVersion += 1
+    publishState()
+  }
+
   async function clearQueue(epoch, options = {}) {
     if (!isActive || epoch !== activeEpoch) return
     return recordCommand(options, () => {
@@ -991,12 +1055,23 @@ export function createBrowserAudioAdapter(options = {}) {
     addQueueItems,
     removeQueueItem,
     moveQueueItem,
+    moveQueueItemAnchor,
     clearQueue,
     skipToQueueItem,
     reserveMigration,
     releaseMigrationReservation,
     queryOperation,
     getReservations: () => new Map(reservations),
+    // Advertises only capabilities this adapter actually implements.
+    getQueueProtocol: () => ({
+      version: 1,
+      relativeMove: true,
+      identitySelect: true,
+      identityRemove: true,
+      identityMigration: true,
+      anchorVersionEnforcement: true,
+      operationResults: true,
+    }),
     getQueue: () => [...queue],
     getCurrentQueueItemId: () => currentQueueItemId,
     getPlayMode: () => playMode,

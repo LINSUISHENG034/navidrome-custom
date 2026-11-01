@@ -16,6 +16,7 @@ import {
   applyQueueAdd,
   applyQueueRemove,
   applyQueueMove,
+  applyQueueMoveAnchor,
   applyQueueClear,
 } from './playbackControlModule'
 import {
@@ -69,6 +70,22 @@ export function createMockRemoteAudioAdapter(options = {}) {
   let hasActiveSession = Boolean(options.hasActiveSession)
   let activeSessionOwner =
     options.activeSessionOwner || (hasActiveSession ? 'other-client' : null)
+
+  // Configurable advertised queue protocol for capability tests. Defaults to
+  // the full implemented surface; tests inject reduced claims to prove the
+  // module fails closed instead of inferring support from field presence.
+  const queueProtocol =
+    options.queueProtocol === undefined
+      ? {
+          version: 1,
+          relativeMove: true,
+          identitySelect: true,
+          identityRemove: true,
+          identityMigration: true,
+          anchorVersionEnforcement: true,
+          operationResults: true,
+        }
+      : options.queueProtocol
 
   const operations = new Map()
   const reservations = new Map()
@@ -425,6 +442,65 @@ export function createMockRemoteAudioAdapter(options = {}) {
         { queueItemId, toIndex, expectedQueueVersion },
         'move',
       ),
+    moveQueueItemAnchor: (
+      epoch,
+      queueItemId,
+      anchorQueueItemId,
+      placement,
+      expectedQueueVersion = queueVersion,
+      options = {},
+    ) =>
+      simulateAction(
+        epoch,
+        'moveQueueItemAnchor',
+        () => {
+          // Validate at apply time so an intervening authoritative snapshot
+          // during simulated latency rejects with the fresh view, like the
+          // server-side atomic version check.
+          let res
+          try {
+            res = applyQueueMoveAnchor(
+              remoteQueue,
+              queueItemId,
+              anchorQueueItemId,
+              placement,
+              { expectedQueueVersion, queueVersion, currentQueueItemId },
+            )
+          } catch (error) {
+            const err = {
+              code: error.code || 'QUEUE_VERSION_CONFLICT',
+              message: error.message,
+              status: 'FAILED',
+              operationId: options.operationId,
+              queueItemId: error.queueItemId,
+              snapshot: error.snapshot || {
+                queue: [...remoteQueue],
+                currentQueueItemId,
+                queueVersion,
+              },
+            }
+            if (options.operationId) {
+              operations.set(options.operationId, {
+                status: 'FAILED',
+                error: err,
+                action: 'moveQueueItemAnchor',
+              })
+            }
+            publishState({ ...err.snapshot, error: err })
+            throw err
+          }
+          if (!res.moved) return {}
+          remoteQueue = res.queue
+          if (!res.noop) queueVersion += 1
+          return {
+            queue: [...remoteQueue],
+            currentQueueItemId,
+            queueVersion,
+          }
+        },
+        { queueItemId, anchorQueueItemId, placement, expectedQueueVersion },
+        'move',
+      ),
     clearQueue: (epoch, options = {}) =>
       simulateAction(
         epoch,
@@ -542,6 +618,9 @@ export function createMockRemoteAudioAdapter(options = {}) {
     clearWireCommands: () => {
       wireCommands.length = 0
     },
+    // Advertises the configured claims verbatim; tests inject reduced or
+    // malformed capabilities to exercise the module's fail-closed gate.
+    getQueueProtocol: () => (queueProtocol ? { ...queueProtocol } : null),
     getQueue: () => [...remoteQueue],
     getCurrentQueueItemId: () => currentQueueItemId,
     getPlayMode: () => playMode,

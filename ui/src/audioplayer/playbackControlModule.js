@@ -276,6 +276,133 @@ export function applyQueueMove(
   return { queue: nextQueue, moved: true }
 }
 
+/**
+ * Shared relative-anchor queue transition used by every engine. Mirrors the
+ * server contract (core/playback moveByAnchorLocked): a stale expected version
+ * rejects with QUEUE_VERSION_CONFLICT; a missing source rejects with
+ * QUEUE_ITEM_NOT_FOUND and a missing anchor with QUEUE_ANCHOR_NOT_FOUND, each
+ * carrying a fresh authoritative snapshot with no scene or version mutation;
+ * self reference and already-adjacent placement are applied no-ops that keep
+ * the queue version stable.
+ */
+export function applyQueueMoveAnchor(
+  queue = [],
+  queueItemId,
+  anchorQueueItemId,
+  placement,
+  { expectedQueueVersion, queueVersion, currentQueueItemId = null } = {},
+) {
+  if (
+    expectedQueueVersion !== undefined &&
+    expectedQueueVersion !== queueVersion
+  ) {
+    throw {
+      code: 'QUEUE_VERSION_CONFLICT',
+      message: 'The queue changed before the move could be applied',
+    }
+  }
+  const freshSnapshot = () => ({
+    queue: [...queue],
+    currentQueueItemId,
+    queueVersion,
+  })
+  const fromIndex = queue.findIndex((item) => item.queueItemId === queueItemId)
+  if (fromIndex === -1) {
+    throw {
+      code: 'QUEUE_ITEM_NOT_FOUND',
+      message: `queue item not found: ${queueItemId}`,
+      status: CommandResultStatus.FAILED,
+      queueItemId,
+      snapshot: freshSnapshot(),
+    }
+  }
+  const anchorIndex = queue.findIndex(
+    (item) => item.queueItemId === anchorQueueItemId,
+  )
+  if (anchorIndex === -1) {
+    throw {
+      code: 'QUEUE_ANCHOR_NOT_FOUND',
+      message: `anchor queue item not found: ${anchorQueueItemId}`,
+      status: CommandResultStatus.FAILED,
+      queueItemId: anchorQueueItemId,
+      snapshot: freshSnapshot(),
+    }
+  }
+  // Self reference is an applied no-op with a stable version.
+  if (queueItemId === anchorQueueItemId) {
+    return { queue, moved: true, noop: true }
+  }
+
+  const item = queue[fromIndex]
+  const remaining = queue.filter((_, idx) => idx !== fromIndex)
+  let insertPos = remaining.findIndex(
+    (entry) => entry.queueItemId === anchorQueueItemId,
+  )
+  if (insertPos === -1) {
+    // Unreachable after the anchor lookup above; kept as a defensive no-op.
+    return { queue, moved: true, noop: true }
+  }
+  if (placement === 'after') {
+    insertPos += 1
+  }
+
+  const nextQueue = [
+    ...remaining.slice(0, insertPos),
+    item,
+    ...remaining.slice(insertPos),
+  ]
+  const noop = nextQueue.every(
+    (entry, idx) => entry.queueItemId === queue[idx].queueItemId,
+  )
+
+  return { queue: nextQueue, moved: true, noop }
+}
+
+/**
+ * Shared queue protocol capability gate. Adapters advertise only
+ * implemented claims; presence of a getQueueProtocol field or of the
+ * capability object is never treated as support. Requires the exact
+ * supported version and every requested flag to be explicitly true.
+ */
+export const SUPPORTED_QUEUE_PROTOCOL_VERSION = 1
+
+const QUEUE_PROTOCOL_FLAGS = [
+  'relativeMove',
+  'identitySelect',
+  'identityRemove',
+  'identityMigration',
+  'anchorVersionEnforcement',
+  'operationResults',
+]
+
+// The single pure normalizer for the queue protocol capability shape. Version
+// must be exactly supported and every flag an enforced boolean; anything else
+// (future versions, field presence without booleans, non-objects) is
+// unsupported. Shared by the playback control module and jukeboxClient.
+export function normalizeQueueProtocol(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (raw.version !== SUPPORTED_QUEUE_PROTOCOL_VERSION) return null
+  const normalized = { version: raw.version }
+  for (const flag of QUEUE_PROTOCOL_FLAGS) {
+    if (typeof raw[flag] !== 'boolean') return null
+    normalized[flag] = raw[flag]
+  }
+  return normalized
+}
+
+export function resolveQueueProtocol(adapter, requiredFlags = []) {
+  const raw =
+    adapter && typeof adapter.getQueueProtocol === 'function'
+      ? adapter.getQueueProtocol()
+      : null
+  const normalized = normalizeQueueProtocol(raw)
+  if (!normalized) return null
+  for (const flag of requiredFlags) {
+    if (normalized[flag] !== true) return null
+  }
+  return normalized
+}
+
 export function applyQueueClear() {
   return {
     queue: [],
@@ -674,6 +801,8 @@ export function createPlaybackControlModule(config = {}) {
         message: err?.message || `Failed to execute ${commandName}`,
         status: err?.status,
         operationId: err?.operationId,
+        queueItemId: err?.queueItemId,
+        snapshot: err?.snapshot,
       }
       if (
         isCurrentOperation(operation) &&
@@ -1809,31 +1938,101 @@ export function createPlaybackControlModule(config = {}) {
       dispatchCommand('addQueueItems', (epoch, adapter) =>
         adapter.addQueueItems(epoch, items, index),
       ),
-    removeQueueItem: (queueItemId) =>
-      dispatchCommand('removeQueueItem', (epoch, adapter) =>
+    // Protected identity remove intent (T13). Gated on the adapter's
+    // advertised queue protocol before dispatch: an unsupported adapter
+    // rejects with zero operation ID, metric increment, or adapter call.
+    removeQueueItem: (queueItemId) => {
+      if (!resolveQueueProtocol(activeAdapter, ['identityRemove'])) {
+        return Promise.reject({
+          code: 'QUEUE_PROTOCOL_UNSUPPORTED',
+          message:
+            'Identity remove requires queue protocol v1 with identityRemove',
+        })
+      }
+      return dispatchCommand('removeQueueItem', (epoch, adapter) =>
         adapter.removeQueueItem(epoch, queueItemId),
-      ),
-    moveQueueItem: (
+      )
+    },
+    // Canonical relative-anchor move intent (T13). Gated on the adapter's
+    // advertised queue protocol; unsupported protected operations fail
+    // visibly with zero adapter side effects.
+    moveQueueItemAnchor: (
+      queueItemId,
+      anchorQueueItemId,
+      placement,
+      expectedQueueVersion = state.queueVersion,
+    ) => {
+      if (
+        !resolveQueueProtocol(activeAdapter, [
+          'relativeMove',
+          'anchorVersionEnforcement',
+        ])
+      ) {
+        return Promise.reject({
+          code: 'QUEUE_PROTOCOL_UNSUPPORTED',
+          message:
+            'Relative-anchor moves require queue protocol v1 with relativeMove and anchorVersionEnforcement',
+        })
+      }
+      return dispatchCommand('moveQueueItem', (epoch, adapter, options) =>
+        adapter.moveQueueItemAnchor(
+          epoch,
+          queueItemId,
+          anchorQueueItemId,
+          placement,
+          expectedQueueVersion,
+          options,
+        ),
+      )
+    },
+    // Legacy compatibility wrapper: normalizes the index-based signature into
+    // the one canonical anchor intent against the current authoritative view.
+    moveQueueItem(
       queueItemId,
       toIndex,
       expectedQueueVersion = state.queueVersion,
-    ) =>
-      dispatchCommand('moveQueueItem', (epoch, adapter) =>
-        adapter.moveQueueItem(
-          epoch,
-          queueItemId,
-          toIndex,
-          expectedQueueVersion,
-        ),
-      ),
+    ) {
+      const fromIndex = state.queue.findIndex(
+        (item) => item.queueItemId === queueItemId,
+      )
+      if (fromIndex === -1) {
+        return Promise.resolve()
+      }
+      const remaining = state.queue.filter(
+        (item) => item.queueItemId !== queueItemId,
+      )
+      if (remaining.length === 0) {
+        return Promise.resolve()
+      }
+      const boundedTo = Math.max(0, Math.min(toIndex, remaining.length))
+      const anchor =
+        boundedTo >= remaining.length
+          ? remaining[remaining.length - 1]
+          : remaining[boundedTo]
+      const placement = boundedTo >= remaining.length ? 'after' : 'before'
+      return this.moveQueueItemAnchor(
+        queueItemId,
+        anchor.queueItemId,
+        placement,
+        expectedQueueVersion,
+      )
+    },
     clearQueue: () =>
       dispatchCommand('clearQueue', (epoch, adapter) =>
         adapter.clearQueue(epoch),
       ),
-    skipToQueueItem: (queueItemId) =>
-      dispatchCommand('skipToQueueItem', (epoch, adapter) =>
+    skipToQueueItem: (queueItemId) => {
+      if (!resolveQueueProtocol(activeAdapter, ['identitySelect'])) {
+        return Promise.reject({
+          code: 'QUEUE_PROTOCOL_UNSUPPORTED',
+          message:
+            'Identity select requires queue protocol v1 with identitySelect',
+        })
+      }
+      return dispatchCommand('skipToQueueItem', (epoch, adapter) =>
         adapter.skipToQueueItem(epoch, queueItemId),
-      ),
+      )
+    },
     playNext: (items) => {
       const curIdx = state.queue.findIndex(
         (it) => it.queueItemId === state.currentQueueItemId,

@@ -66,6 +66,7 @@ import {
 } from './volumeProfiles'
 import { audioVolumeToUiVolume } from './volumeMapping'
 import Sortable from 'sortablejs'
+import queueContractCases from '../../validation/queue-contract-cases.json'
 
 function deferredResult() {
   let resolve
@@ -715,6 +716,28 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(onEnd.mock.contexts[0]).toBe(drag.sortable)
     })
 
+    it('TC-QC-09: the drop resolves drag-start identities and captured version into the anchor protocol', async () => {
+      const { controller, adapter } = await renderControlledPlayer('remote', {
+        audioLists: [
+          ...sampleTracks,
+          { ...sampleTracks[0], id: 's-2', name: 'Song 2' },
+        ],
+      })
+      adapter.clearWireCommands()
+      const capturedVersion = controller.getState().queueVersion
+      const drag = startNativeDrag(0, 2)
+      await drag.end()
+
+      const wire = adapter.getWireCommands().find((c) => c.action === 'move')
+      expect(wire).toMatchObject({
+        queueItemId: 'controlled-0',
+        anchorQueueItemId: 'controlled-2',
+        placement: 'after',
+        expectedQueueVersion: capturedVersion,
+      })
+      expect(wire).not.toHaveProperty('toIndex')
+    })
+
     it('TC-QC-09: unmounting during drag cleans the binding and ignores its late drop', async () => {
       const { controller, unmount } = await renderControlledPlayer('remote')
       const drag = startNativeDrag(0, 1)
@@ -756,7 +779,7 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       const initialQueue = controller.getState().queue
       const initialIntents = controller.getMetrics().intentsIssued
       adapter.setFailure({
-        action: 'moveQueueItem',
+        action: 'moveQueueItemAnchor',
         code: 'MOVE_REJECTED',
         message: 'Move rejected',
       })
@@ -2507,32 +2530,8 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
     let pauseSpy
     let loadSpy
 
-    const duplicateQueueTracks = [
-      {
-        queueItemId: 'q-dup-1',
-        trackId: 'track-dup',
-        name: 'Duplicate Song (Instance 1)',
-        singer: 'Artist Alpha',
-        musicSrc: 'http://localhost/dup.mp3',
-        id: 'track-dup',
-      },
-      {
-        queueItemId: 'q-mid-2',
-        trackId: 'track-unique',
-        name: 'Middle Unique Song',
-        singer: 'Artist Beta',
-        musicSrc: 'http://localhost/unique.mp3',
-        id: 'track-unique',
-      },
-      {
-        queueItemId: 'q-dup-3',
-        trackId: 'track-dup',
-        name: 'Duplicate Song (Instance 2)',
-        singer: 'Artist Alpha',
-        musicSrc: 'http://localhost/dup.mp3',
-        id: 'track-dup',
-      },
-    ]
+    const duplicateQueueTracks =
+      queueContractCases.fixtures.duplicateQueueTracks
 
     beforeEach(() => {
       playSpy = vi
@@ -2746,11 +2745,14 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
 
       const wireCommands = remoteAdapter.getWireCommands()
       expect(wireCommands).toHaveLength(1)
+      // The legacy index signature normalizes into the canonical anchor intent
       expect(wireCommands[0]).toMatchObject({
         action: 'move',
         queueItemId: 'q-dup-1',
-        toIndex: 2,
+        anchorQueueItemId: 'q-dup-3',
+        placement: 'after',
       })
+      expect(wireCommands[0]).not.toHaveProperty('toIndex')
       expect(wireCommands.some((c) => c.action === 'set')).toBe(false)
     })
 
@@ -2825,7 +2827,8 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
           .find((c) => c.action === 'move')
         expect(cmd).toBeDefined()
         expect(cmd.queueItemId).toBe('q-dup-1')
-        expect(cmd.toIndex).toBe(1)
+        expect(cmd.anchorQueueItemId).toBe('q-mid-2')
+        expect(cmd.placement).toBe('after')
       })
 
       await act(async () => {
@@ -2989,6 +2992,273 @@ describe('Dual-Engine Unified Native Player Control Loop (Issue 02)', () => {
       expect(localResult.currentId).toBe('q-dup-1') // Successor at index 0
       expect(remoteResult.queueIds).toEqual(localResult.queueIds)
       expect(remoteResult.currentId).toEqual(localResult.currentId)
+    })
+
+    describe('Relative-anchor queue editing contract (Ticket 13)', () => {
+      const fixtureById = Object.fromEntries(
+        queueContractCases.fixtures.duplicateQueueTracks.map((track) => [
+          track.queueItemId,
+          track,
+        ]),
+      )
+      const buildQueue = (ids) => ids.map((id) => fixtureById[id])
+      const adapterFactories = {
+        browser: () => createBrowserAudioAdapter(),
+        mock: () => createMockRemoteAudioAdapter(),
+      }
+
+      it.each(
+        queueContractCases.anchorMoveCases.flatMap((testCase) =>
+          Object.entries(adapterFactories).map(([kind, factory]) => [
+            `${testCase.id} [${kind}] ${testCase.title}`,
+            testCase,
+            kind,
+            factory,
+          ]),
+        ),
+      )(
+        '%s',
+        async (_title, testCase, kind, factory) => {
+          const adapter = factory()
+          const controller = createPlaybackControlModule()
+          controller.setAdapter(adapter)
+
+          await controller.addQueueItems(buildQueue(testCase.queue))
+          if (controller.getState().currentQueueItemId !== testCase.current) {
+            await controller.skipToQueueItem(testCase.current)
+          }
+          const versionBefore = controller.getState().queueVersion
+          // Case versions are relative to the scene baseline captured at setup
+          const capturedVersion =
+            versionBefore + testCase.move.expectedQueueVersion
+          const isCurrentMoveNoReload =
+            kind === 'browser' && testCase.id === 'TC-QC-AM-06'
+
+          if (testCase.expectedError) {
+            const expectedRejection = { code: testCase.expectedError }
+            if (testCase.expectedErrorQueueItemId) {
+              expectedRejection.queueItemId = testCase.expectedErrorQueueItemId
+            }
+            if (testCase.expectedErrorSnapshot) {
+              // The rejection must carry a fresh authoritative snapshot of the
+              // untouched scene, mirroring the backend 404 contract.
+              expectedRejection.snapshot = {
+                queue: buildQueue(testCase.expectedQueue),
+                currentQueueItemId: testCase.expectedCurrent,
+                queueVersion: versionBefore,
+              }
+            }
+            await expect(
+              controller.moveQueueItemAnchor(
+                testCase.move.queueItemId,
+                testCase.move.anchorQueueItemId,
+                testCase.move.placement,
+                capturedVersion,
+              ),
+            ).rejects.toMatchObject(expectedRejection)
+          } else {
+            if (isCurrentMoveNoReload) loadSpy.mockClear()
+            await controller.moveQueueItemAnchor(
+              testCase.move.queueItemId,
+              testCase.move.anchorQueueItemId,
+              testCase.move.placement,
+              capturedVersion,
+            )
+            if (isCurrentMoveNoReload) {
+              // Moving the current queue item never reloads media
+              expect(loadSpy).not.toHaveBeenCalled()
+            }
+          }
+
+          expect(controller.getState().queue.map((i) => i.queueItemId)).toEqual(
+            testCase.expectedQueue,
+          )
+          expect(controller.getState().currentQueueItemId).toBe(
+            testCase.expectedCurrent,
+          )
+          expect(controller.getState().queueVersion - versionBefore).toBe(
+            testCase.expectedVersionDelta,
+          )
+
+          if (kind === 'mock' && testCase.expectedWire) {
+            const wireMoves = adapter
+              .getWireCommands()
+              .filter((c) => c.action === 'move')
+            expect(wireMoves.at(-1)).toMatchObject({
+              ...testCase.expectedWire,
+              expectedQueueVersion: capturedVersion,
+            })
+          }
+          controller.setAdapter(null)
+        },
+        10000,
+      )
+
+      it('rejects a protected anchor move without the advertised capability and sends nothing', async () => {
+        const remoteAdapter = createMockRemoteAudioAdapter({
+          queueProtocol: {
+            version: 1,
+            relativeMove: false,
+            identitySelect: true,
+            identityRemove: true,
+            identityMigration: true,
+            anchorVersionEnforcement: true,
+            operationResults: true,
+          },
+        })
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(remoteAdapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        remoteAdapter.clearWireCommands()
+
+        await expect(
+          controller.moveQueueItemAnchor('q-dup-3', 'q-dup-1', 'before', 0),
+        ).rejects.toMatchObject({ code: 'QUEUE_PROTOCOL_UNSUPPORTED' })
+        expect(remoteAdapter.getWireCommands()).toHaveLength(0)
+        expect(controller.getMetrics().commandsSent.moveQueueItem).toBe(0)
+        expect(controller.getState().queue).toHaveLength(3)
+      })
+
+      const withoutFlag = (flag) => ({
+        version: 1,
+        relativeMove: true,
+        identitySelect: true,
+        identityRemove: true,
+        identityMigration: true,
+        anchorVersionEnforcement: true,
+        operationResults: true,
+        [flag]: false,
+      })
+
+      it('rejects identity remove without the advertised capability before any dispatch side effect', async () => {
+        const remoteAdapter = createMockRemoteAudioAdapter({
+          queueProtocol: withoutFlag('identityRemove'),
+        })
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(remoteAdapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        remoteAdapter.clearWireCommands()
+        const intents = controller.getMetrics().intentsIssued
+
+        await expect(
+          controller.removeQueueItem('q-dup-3'),
+        ).rejects.toMatchObject({ code: 'QUEUE_PROTOCOL_UNSUPPORTED' })
+        expect(remoteAdapter.getWireCommands()).toHaveLength(0)
+        expect(controller.getMetrics().commandsSent.removeQueueItem).toBe(0)
+        expect(controller.getMetrics().intentsIssued).toBe(intents)
+        expect(controller.getState().queue).toHaveLength(3)
+        controller.setAdapter(null)
+      })
+
+      it('rejects identity select without the advertised capability before any dispatch side effect', async () => {
+        const remoteAdapter = createMockRemoteAudioAdapter({
+          queueProtocol: withoutFlag('identitySelect'),
+        })
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(remoteAdapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        remoteAdapter.clearWireCommands()
+        const intents = controller.getMetrics().intentsIssued
+
+        await expect(
+          controller.skipToQueueItem('q-dup-3'),
+        ).rejects.toMatchObject({ code: 'QUEUE_PROTOCOL_UNSUPPORTED' })
+        expect(remoteAdapter.getWireCommands()).toHaveLength(0)
+        expect(controller.getMetrics().commandsSent.skipToQueueItem).toBe(0)
+        expect(controller.getMetrics().intentsIssued).toBe(intents)
+        expect(controller.getState().currentQueueItemId).toBe('q-dup-1')
+        controller.setAdapter(null)
+      })
+
+      it('identity remove and select dispatch normally when their capabilities are advertised', async () => {
+        const remoteAdapter = createMockRemoteAudioAdapter()
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(remoteAdapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        remoteAdapter.clearWireCommands()
+
+        await controller.skipToQueueItem('q-mid-2')
+        await controller.removeQueueItem('q-dup-3')
+
+        const actions = remoteAdapter
+          .getWireCommands()
+          .map((command) => command.action)
+        expect(actions).toEqual(['skip', 'remove'])
+        expect(
+          controller.getState().queue.map((item) => item.queueItemId),
+        ).toEqual(['q-dup-1', 'q-mid-2'])
+        expect(controller.getState().currentQueueItemId).toBe('q-mid-2')
+        controller.setAdapter(null)
+      })
+
+      it('apply-time latency validates identities against the fresh queue and rejects distinctly', async () => {
+        const remoteAdapter = createMockRemoteAudioAdapter({ delayMs: 20 })
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(remoteAdapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        const versionBefore = controller.getState().queueVersion
+
+        await expect(
+          controller.moveQueueItemAnchor(
+            'q-dup-3',
+            'q-ghost-anchor',
+            'before',
+            versionBefore,
+          ),
+        ).rejects.toMatchObject({
+          code: 'QUEUE_ANCHOR_NOT_FOUND',
+          queueItemId: 'q-ghost-anchor',
+          snapshot: {
+            queue: buildQueue(['q-dup-1', 'q-mid-2', 'q-dup-3']),
+            currentQueueItemId: 'q-dup-1',
+            queueVersion: versionBefore,
+          },
+        })
+        // The dispatched wire command may exist, but the queue, current item,
+        // and version must remain exactly as before the rejected apply.
+        const wireMoves = remoteAdapter
+          .getWireCommands()
+          .filter((command) => command.action === 'move')
+        expect(wireMoves).toHaveLength(1)
+        expect(controller.getState().queueVersion).toBe(versionBefore)
+        expect(
+          controller.getState().queue.map((item) => item.queueItemId),
+        ).toEqual(['q-dup-1', 'q-mid-2', 'q-dup-3'])
+        expect(controller.getState().currentQueueItemId).toBe('q-dup-1')
+        controller.setAdapter(null)
+      })
+
+      it('normalizes the legacy move signature into the one canonical anchor intent', async () => {
+        const remoteAdapter = createMockRemoteAudioAdapter()
+        const controller = createPlaybackControlModule()
+        controller.setAdapter(remoteAdapter)
+
+        await controller.addQueueItems(duplicateQueueTracks)
+        remoteAdapter.clearWireCommands()
+
+        await controller.moveQueueItem('q-dup-3', 0)
+
+        const wire = remoteAdapter
+          .getWireCommands()
+          .find((c) => c.action === 'move')
+        expect(wire).toMatchObject({
+          queueItemId: 'q-dup-3',
+          anchorQueueItemId: 'q-dup-1',
+          placement: 'before',
+        })
+        expect(wire).not.toHaveProperty('toIndex')
+        expect(controller.getState().queue.map((i) => i.queueItemId)).toEqual([
+          'q-dup-3',
+          'q-dup-1',
+          'q-mid-2',
+        ])
+        controller.setAdapter(null)
+      })
     })
   })
 
