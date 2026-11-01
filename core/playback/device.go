@@ -88,6 +88,7 @@ func (pd *playbackDevice) stateChangeNotifierLocked() func() {
 
 func (pd *playbackDevice) incrementQueueVersionLocked() {
 	pd.queueVersion++
+	pd.incrementStateSequenceLocked()
 }
 
 func (pd *playbackDevice) incrementSceneRevisionLocked() {

@@ -66,6 +66,15 @@ func TestPlaybackServerPausedMigrationPreservesResumePosition(t *testing.T) {
 	if _, err := device.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
+	sourceBefore, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := migrationTestTarget(t, server, "new")
+	targetBefore, err := target.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := server.SwitchDevice(ctx, "new"); err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +85,13 @@ func TestPlaybackServerPausedMigrationPreservesResumePosition(t *testing.T) {
 	status, err := migrated.Status(ctx)
 	if err != nil || status.Playing || status.Position != 17 {
 		t.Fatalf("paused migration lost position: %#v, %v", status, err)
+	}
+	if status.QueueVersion != targetBefore.QueueVersion+1 || status.StateSequence != targetBefore.StateSequence+1 {
+		t.Fatalf("paused migration lost target-local ordering: before=%#v after=%#v", targetBefore, status)
+	}
+	sourceAfter, err := device.Status(ctx)
+	if err != nil || sourceAfter.QueueVersion != sourceBefore.QueueVersion+1 || sourceAfter.StateSequence != sourceBefore.StateSequence+1 {
+		t.Fatalf("paused migration lost source ordering: before=%#v after=%#v error=%v", sourceBefore, sourceAfter, err)
 	}
 	status, err = migrated.Start(ctx)
 	if err != nil || !status.Playing || status.Position != 17 {
@@ -1347,6 +1363,14 @@ func TestPlaybackCommitMigrationIdentityTransport(t *testing.T) {
 	t.Run("preserves duplicate instance IDs and maps current by ID", func(t *testing.T) {
 		_, server := newMigrationValidationServer(t)
 		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		target := migrationTestTarget(t, server, "new")
+		target.mu.Lock()
+		target.stateSequence = 17
+		target.mu.Unlock()
+		before, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-id", "new")
 		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
 			MigrationID: "mig-id", OperationID: "g1:commit-id", SessionID: "src", ClientID: "tab",
@@ -1355,6 +1379,9 @@ func TestPlaybackCommitMigrationIdentityTransport(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("identity commit: %v", err)
+		}
+		if committed.QueueVersion != before.QueueVersion+1 || committed.StateSequence != before.StateSequence+1 {
+			t.Fatalf("identity commit lost target-local ordering: before=%#v after=%#v", before, committed)
 		}
 		if committed.CurrentIndex != 1 || committed.QueueItemID != "qi-2" || committed.TrackID != "track" {
 			t.Fatalf("identity commit lost current mapping: %#v", committed)
@@ -1373,6 +1400,10 @@ func TestPlaybackCommitMigrationIdentityTransport(t *testing.T) {
 		_, server := newMigrationValidationServer(t)
 		attached := attachMigrationSource(t, server, "src", "tab", "old")
 		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-empty", "new")
+		before, err := migrationTestTarget(t, server, "new").Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
 			MigrationID: "mig-empty", OperationID: "g1:commit-empty", SessionID: "src", ClientID: "tab",
 			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
@@ -1380,6 +1411,9 @@ func TestPlaybackCommitMigrationIdentityTransport(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("empty identity commit: %v", err)
+		}
+		if committed.QueueVersion != before.QueueVersion+1 || committed.StateSequence != before.StateSequence+1 {
+			t.Fatalf("empty identity import lost ordering: before=%#v after=%#v", before, committed)
 		}
 		if committed.CurrentIndex != -1 || committed.Playing || committed.QueueItemID != "" {
 			t.Fatalf("empty identity commit changed idle state: %#v", committed)
@@ -1410,6 +1444,11 @@ func TestPlaybackCommitMigrationIdentityTransport(t *testing.T) {
 		}
 	})
 
+	assertMigrationIdentityRejections(t, ctx, identityQueue, currentTwo)
+}
+
+func assertMigrationIdentityRejections(t *testing.T, ctx context.Context, identityQueue func() *[]QueueItemRef, currentTwo func() *string) {
+	t.Helper()
 	validationCases := []struct {
 		name    string
 		mutate  func(*CommitMigrationRequest)

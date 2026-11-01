@@ -252,7 +252,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		DesiredGain:   DefaultGain,
 		Position:      position,
 		QueueVersion:  1,
-		StateSequence: 1,
+		StateSequence: 2,
 	})
 	if first.track.closeCalls != 1 {
 		t.Fatalf("failed output was not released: closes=%d", first.track.closeCalls)
@@ -278,7 +278,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		DesiredGain:   DefaultGain,
 		Position:      position,
 		QueueVersion:  1,
-		StateSequence: 2,
+		StateSequence: 3,
 	}, 100*time.Millisecond)
 	if second.track.closeCalls != 0 {
 		t.Fatalf("stale event closed successor output: closes=%d", second.track.closeCalls)
@@ -297,7 +297,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		DesiredGain:   DefaultGain,
 		Position:      retiredPosition,
 		QueueVersion:  1,
-		StateSequence: 2,
+		StateSequence: 3,
 	})
 	if second.track.closeCalls != 1 {
 		t.Fatalf("retired output was not released: closes=%d", second.track.closeCalls)
@@ -344,7 +344,7 @@ func TestPlaybackDeviceUnknownFailurePositionDoesNotInventSeekOffset(t *testing.
 		DesiredGain:   DefaultGain,
 		Position:      0,
 		QueueVersion:  1,
-		StateSequence: 1,
+		StateSequence: 2,
 	})
 	if first.track.closeCalls != 1 {
 		t.Fatalf("failed output was not released: closes=%d", first.track.closeCalls)
@@ -1108,6 +1108,102 @@ func (f *anchorMoveFixture) anchorMove(command PlaybackCommand) (DeviceStatus, e
 	return f.device.executeCommand(f.ctx, command)
 }
 
+func TestPlaybackDeviceStructuralStateSequence(t *testing.T) {
+	fixture := newAnchorMoveFixture(t)
+	device, ctx := fixture.device, fixture.ctx
+	before, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notifications []DeviceStatus
+	device.onStateChange = func(status DeviceStatus) { notifications = append(notifications, status) }
+	steps := []struct {
+		name         string
+		run          func() (DeviceStatus, error)
+		versionStep  int
+		sequenceStep uint64
+		playing      bool
+	}{
+		{"add", func() (DeviceStatus, error) { return device.Add(ctx, []string{"1"}) }, 1, 1, false},
+		{"empty add", func() (DeviceStatus, error) { return device.Add(ctx, nil) }, 0, 0, false},
+		{"insert", func() (DeviceStatus, error) { return device.Insert(ctx, 1, []string{"2"}) }, 1, 1, false},
+		{"anchor move", func() (DeviceStatus, error) {
+			return fixture.anchorMove(PlaybackCommand{QueueItemID: fixture.itemIDs[3], AnchorQueueItemID: fixture.itemIDs[0], Placement: MovePlacementBefore})
+		}, 1, 1, false},
+		{"legacy move", func() (DeviceStatus, error) { return device.Move(ctx, 0, 1) }, 1, 1, false},
+		{"legacy shuffle", func() (DeviceStatus, error) { return device.Shuffle(ctx) }, 1, 1, false},
+		{"remove non-current", func() (DeviceStatus, error) {
+			index := 0
+			if device.PlaybackQueue.Index == index {
+				index = 1
+			}
+			return device.Remove(ctx, index)
+		}, 1, 1, false},
+		{"clear", func() (DeviceStatus, error) { return device.Clear(ctx) }, 1, 1, false},
+		{"empty clear", func() (DeviceStatus, error) { return device.Clear(ctx) }, 0, 0, false},
+		{"set", func() (DeviceStatus, error) { return device.Set(ctx, []string{"1", "2"}) }, 1, 1, false},
+		{"start", func() (DeviceStatus, error) { return device.Start(ctx) }, 0, 1, true},
+		{"pause", func() (DeviceStatus, error) { return device.Stop(ctx) }, 0, 1, false},
+		{"add after playback transitions", func() (DeviceStatus, error) { return device.Add(ctx, []string{"3"}) }, 1, 1, false},
+	}
+	for _, step := range steps {
+		count := len(notifications)
+		status, err := step.run()
+		if err != nil {
+			t.Fatalf("%s: %v", step.name, err)
+		}
+		if status.QueueVersion != before.QueueVersion+step.versionStep || status.StateSequence != before.StateSequence+step.sequenceStep || status.Playing != step.playing {
+			t.Fatalf("%s: before=%#v after=%#v; want version delta=%d sequence delta=%d playing=%v", step.name, before, status, step.versionStep, step.sequenceStep, step.playing)
+		}
+		if step.sequenceStep != 0 {
+			count++
+			if len(notifications) != count || notifications[count-1] != status {
+				t.Fatalf("%s notification mismatch: status=%#v notifications=%#v", step.name, status, notifications)
+			}
+		} else if len(notifications) != count {
+			t.Fatalf("%s no-op emitted a notification: %#v", step.name, notifications)
+		}
+		observed, err := device.Status(ctx)
+		if err != nil || observed != status {
+			t.Fatalf("%s returned a stale status: returned=%#v observed=%#v error=%v", step.name, status, observed, err)
+		}
+		before = status
+	}
+}
+
+func TestPlaybackDeviceStructuralFailureStateSequence(t *testing.T) {
+	t.Run("media lookup fails before add mutation", func(t *testing.T) {
+		fixture := newAnchorMoveFixture(t)
+		before, err := fixture.device.Status(fixture.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.device.Add(fixture.ctx, []string{"missing"}); err == nil {
+			t.Fatal("expected media lookup failure")
+		}
+		after, err := fixture.device.Status(fixture.ctx)
+		if err != nil || after != before {
+			t.Fatalf("failed lookup changed status: before=%#v after=%#v error=%v", before, after, err)
+		}
+	})
+	t.Run("successor load fails after committed remove", func(t *testing.T) {
+		fixture := newAnchorMoveFixture(t)
+		fixture.start(t)
+		before, err := fixture.device.Status(fixture.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		failure := errors.New("successor load rejected")
+		newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+			return nil, failure
+		}
+		after, err := fixture.device.Remove(fixture.ctx, before.CurrentIndex)
+		if !errors.Is(err, failure) || after.Playing || after.QueueVersion != before.QueueVersion+1 || after.StateSequence != before.StateSequence+1 {
+			t.Fatalf("committed removal lost ordering after output failure: before=%#v after=%#v error=%v", before, after, err)
+		}
+	})
+}
+
 func TestPlaybackDeviceAnchorMoveAssignsDistinctInstanceIDs(t *testing.T) {
 	fixture := newAnchorMoveFixture(t)
 	itemIDs := fixture.itemIDs
@@ -1180,6 +1276,7 @@ func TestPlaybackDeviceAnchorMoveNoOpsAndFailures(t *testing.T) {
 		t.Fatalf("initial placement move: %v", err)
 	}
 	versionBefore := fixture.device.queueVersion
+	sequenceBefore := fixture.device.stateSequence
 	sceneBefore := fixture.device.SceneFingerprint()
 	noOps := []PlaybackCommand{
 		{QueueItemID: currentID, AnchorQueueItemID: currentID, Placement: "before"},
@@ -1190,14 +1287,17 @@ func TestPlaybackDeviceAnchorMoveNoOpsAndFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("no-op move rejected: %v", err)
 		}
-		if status.QueueVersion != versionBefore {
-			t.Fatalf("no-op move bumped queue version: %d -> %d", versionBefore, status.QueueVersion)
+		if status.QueueVersion != versionBefore || status.StateSequence != sequenceBefore {
+			t.Fatalf("no-op move advanced ordering: status=%#v want version=%d sequence=%d", status, versionBefore, sequenceBefore)
 		}
 	}
 	if fixture.SceneFingerprintChanged(sceneBefore) {
 		t.Fatalf("no-op move bumped scene fingerprint: %s -> %s", sceneBefore, fixture.device.SceneFingerprint())
 	}
 	assertAnchorMoveFailureSnapshots(t, fixture, versionBefore, sceneBefore)
+	if fixture.device.stateSequence != sequenceBefore {
+		t.Fatal("rejected move advanced semantic sequence")
+	}
 	assertAnchorMoveVersionPresence(t, fixture, versionBefore)
 }
 
