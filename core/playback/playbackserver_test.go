@@ -435,6 +435,7 @@ var _ = Describe("PlaybackServer", func() {
 			DesiredGain:   DefaultGain,
 			Position:      0,
 			StateSequence: 2,
+			Mode:          PlaybackModeOrder,
 		})))
 	})
 })

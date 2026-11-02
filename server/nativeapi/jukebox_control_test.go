@@ -1271,17 +1271,110 @@ func (s *jukeboxStatusSnapshotServer) SessionSnapshot(_ context.Context, session
 	return s.snapshot, nil
 }
 
+func TestJukeboxModeHTTPContract(t *testing.T) {
+	ctx, server := startJukeboxLogicalFixture(t, "Mode Default", []conf.AudioDeviceDefinition{{"Mode Default", "mode-default"}})
+	attached, err := server.AttachSession(ctx, playback.AttachRequest{
+		SessionID: "mode-api", User: "validation-admin", ClientID: "owner", DeviceName: "mode-default",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = server.DetachSession(context.Background(), "mode-api", "owner") })
+	device, err := server.GetDeviceForUser("validation-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &Router{playback: server}
+	router := chi.NewRouter()
+	api.addJukeboxControlRoute(router)
+	serve := func(t *testing.T, method, path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+		r = r.WithContext(request.WithUser(r.Context(), model.User{ID: "validation-admin", UserName: "validation-admin", IsAdmin: true}))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, r)
+		return response
+	}
+	for index, tc := range []struct {
+		name  string
+		mode  any
+		omit  bool
+		valid bool
+	}{
+		{"order", "order", false, true},
+		{"order loop", "orderLoop", false, true},
+		{"single loop", "singleLoop", false, true},
+		{"shuffle", "shufflePlay", false, true},
+		{"same shuffle", "shufflePlay", false, true},
+		{"empty", "", false, false},
+		{"unknown", "repeat", false, false},
+		{"case", "ORDER", false, false},
+		{"whitespace", " order", false, false},
+		{"null", nil, false, false},
+		{"omitted", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, _ := device.Status(ctx)
+			body := map[string]any{
+				"sessionId": attached.SessionID, "clientId": "owner", "bindingGeneration": attached.BindingGeneration,
+				"operationId": fmt.Sprintf("g%d:mode-%d", attached.BindingGeneration, index),
+			}
+			if !tc.omit {
+				body["mode"] = tc.mode
+			}
+			response := serve(t, http.MethodPost, "/jukebox/mode", body)
+			wantCode := http.StatusBadRequest
+			if tc.valid {
+				wantCode = http.StatusOK
+			}
+			if response.Code != wantCode {
+				t.Fatalf("mode status=%d want=%d body=%s", response.Code, wantCode, response.Body.String())
+			}
+			after, _ := device.Status(ctx)
+			if !tc.valid {
+				var payload struct{ Code string }
+				if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || payload.Code != "INVALID_PLAY_MODE" || after != before {
+					t.Fatalf("invalid mode mutated state or lost error code: before=%#v after=%#v response=%s err=%v", before, after, response.Body.String(), err)
+				}
+				return
+			}
+			want := before
+			want.Mode = playback.PlaybackMode(tc.mode.(string))
+			if want.Mode != before.Mode {
+				want.StateSequence++
+			}
+			if after != want {
+				t.Errorf("mode write lost state or ordering: got=%#v want=%#v", after, want)
+			}
+			for _, path := range []string{"/jukebox/status", "/jukebox/status?sessionId=" + attached.SessionID} {
+				statusResponse := serve(t, http.MethodGet, path, nil)
+				var payload jukeboxStatusResponse
+				if err := json.Unmarshal(statusResponse.Body.Bytes(), &payload); err != nil || statusResponse.Code != http.StatusOK || payload.PlayMode != after.Mode || payload.StateSequence != after.StateSequence {
+					t.Errorf("mode status mapping %s: %s err=%v", path, statusResponse.Body.String(), err)
+				}
+			}
+		})
+	}
+}
+
 func TestJukeboxStateSequenceStatusMappings(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		sequence uint64
+		mode     playback.PlaybackMode
 	}{
-		{"explicit zero", 0},
-		{"semantic sequence distinct from queue version", 17},
+		{"explicit zero", 0, playback.PlaybackModeOrder},
+		{"semantic sequence distinct from queue version", 17, playback.PlaybackModeShuffle},
+		{"single loop", 13, playback.PlaybackModeRepeatTrack},
+		{"order loop", 5, playback.PlaybackModeRepeatList},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := &jukeboxStatusSnapshotServer{snapshot: playback.SessionSnapshot{
-				SessionStatus: playback.SessionStatus{StateSequence: tc.sequence, QueueVersion: 3},
+				SessionStatus: playback.SessionStatus{StateSequence: tc.sequence, QueueVersion: 3, PlayMode: string(tc.mode)},
 			}}
 			api := &Router{playback: server}
 			router := chi.NewRouter()
@@ -1293,7 +1386,7 @@ func TestJukeboxStateSequenceStatusMappings(t *testing.T) {
 			if response.Code != http.StatusOK || server.sessionID != "sequence-session" || server.user != "admin" {
 				t.Fatalf("status did not read bound snapshot: status=%d session=%q user=%q", response.Code, server.sessionID, server.user)
 			}
-			encoded, err := json.Marshal(toStatusResponse(playback.DeviceStatus{StateSequence: tc.sequence, QueueVersion: 3}))
+			encoded, err := json.Marshal(toStatusResponse(playback.DeviceStatus{StateSequence: tc.sequence, QueueVersion: 3, Mode: tc.mode}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1307,12 +1400,13 @@ func TestJukeboxStateSequenceStatusMappings(t *testing.T) {
 				var payload struct {
 					StateSequence *uint64 `json:"stateSequence"`
 					QueueVersion  int     `json:"queueVersion"`
+					PlayMode      string  `json:"playMode"`
 				}
 				if err := json.Unmarshal(mapping.body, &payload); err != nil {
 					t.Fatal(err)
 				}
-				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 {
-					t.Errorf("%s lost sequence or structural version: %s", mapping.name, mapping.body)
+				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 || payload.PlayMode != string(tc.mode) {
+					t.Errorf("%s lost sequence, structural version, or mode: %s", mapping.name, mapping.body)
 				}
 			}
 		})

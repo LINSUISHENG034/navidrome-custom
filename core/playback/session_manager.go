@@ -71,6 +71,7 @@ type SessionStatus struct {
 	TerminationReason     string                           `json:"terminationReason,omitempty"`
 	QueueVersion          int                              `json:"queueVersion"`
 	StateSequence         uint64                           `json:"stateSequence"`
+	PlayMode              string                           `json:"playMode"`
 	LastHeartbeat         time.Time                        `json:"lastHeartbeat"`
 	StaleSince            *time.Time                       `json:"staleSince,omitempty"`
 	BindingGeneration     uint64                           `json:"bindingGeneration"`

@@ -64,7 +64,8 @@ type DeviceStatus struct {
 	Muted         bool
 	Position      int
 	QueueVersion  int
-	StateSequence uint64 `json:"stateSequence"`
+	StateSequence uint64       `json:"stateSequence"`
+	Mode          PlaybackMode `json:"playMode"`
 }
 
 const DefaultGain float32 = 1.0
@@ -138,6 +139,7 @@ func (pd *playbackDevice) getStatus() DeviceStatus {
 		Position:      pos,
 		QueueVersion:  pd.queueVersion,
 		StateSequence: pd.stateSequence,
+		Mode:          pd.mode,
 	}
 }
 
@@ -703,9 +705,7 @@ func (pd *playbackDevice) setMuteLocked(ctx context.Context, muted bool) (Device
 }
 
 func (pd *playbackDevice) setModeLocked(mode PlaybackMode) (DeviceStatus, bool, error) {
-	switch mode {
-	case PlaybackModeOrder, PlaybackModeRepeatList, PlaybackModeRepeatTrack, PlaybackModeShuffle:
-	default:
+	if !mode.valid() {
 		return pd.getStatus(), false, ErrInvalidPlayMode
 	}
 	if pd.mode == mode {

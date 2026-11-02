@@ -24,6 +24,7 @@ type JukeboxStateUpdated struct {
 	TerminationReason string                           `json:"terminationReason,omitempty"`
 	QueueVersion      int                              `json:"queueVersion"`
 	StateSequence     uint64                           `json:"stateSequence"`
+	PlayMode          string                           `json:"playMode"`
 	QueueProtocol     *model.QueueProtocolCapabilities `json:"queueProtocol,omitempty"`
 	LastHeartbeat     time.Time                        `json:"lastHeartbeat"`
 	StaleSince        *time.Time                       `json:"staleSince,omitempty"`

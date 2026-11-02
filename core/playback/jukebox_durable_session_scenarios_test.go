@@ -805,6 +805,13 @@ func TestDurableSessionRefreshHandoffContract(t *testing.T) {
 	h := newDurableScenarioHarness(t)
 	h.configureQueue("1", "2")
 	status := h.attach(t, "tab-1")
+	modeScope := CommandScope{
+		User: "admin", SessionID: "s1", ClientID: "tab-1",
+		BindingGeneration: &status.BindingGeneration, OperationID: "g1:refresh-mode",
+	}
+	if _, err := h.server.ExecuteCommand(h.ctx, modeScope, PlaybackCommand{Action: CommandSetMode, Mode: PlaybackModeRepeatTrack}); err != nil {
+		t.Fatal(err)
+	}
 
 	if status.ControlHandoffToken == "" {
 		t.Fatal("expected attach response to issue handoff token to owner")
@@ -816,11 +823,17 @@ func TestDurableSessionRefreshHandoffContract(t *testing.T) {
 	if err != nil || statusQuery.ControlHandoffToken != "" {
 		t.Fatalf("status query disclosed handoff token: %#v", statusQuery)
 	}
+	if statusQuery.PlayMode != string(PlaybackModeRepeatTrack) {
+		t.Errorf("status lost non-default mode before refresh: %#v", statusQuery)
+	}
 
 	// Snapshot query does NOT disclose handoff token
 	snapQuery, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
 	if err != nil || snapQuery.SessionStatus.ControlHandoffToken != "" {
 		t.Fatalf("snapshot query disclosed handoff token: %#v", snapQuery)
+	}
+	if snapQuery.SessionStatus.PlayMode != string(PlaybackModeRepeatTrack) {
+		t.Errorf("snapshot lost non-default mode before refresh: %#v", snapQuery.SessionStatus)
 	}
 
 	// Handoff to new document tab-2
@@ -835,6 +848,9 @@ func TestDurableSessionRefreshHandoffContract(t *testing.T) {
 	}
 	if handoffStatus.OwnerClientID != "tab-2" {
 		t.Fatalf("expected owner tab-2, got %s", handoffStatus.OwnerClientID)
+	}
+	if handoffStatus.PlayMode != string(PlaybackModeRepeatTrack) {
+		t.Errorf("refresh handoff lost non-default mode: %#v", handoffStatus)
 	}
 	if handoffStatus.BindingGeneration != 2 {
 		t.Fatalf("expected generation 2 after handoff, got %d", handoffStatus.BindingGeneration)
@@ -862,8 +878,10 @@ func TestDurableSessionRefreshHandoffContract(t *testing.T) {
 		ClientID:          "tab-1",
 		BindingGeneration: &gen1,
 	}
-	if _, err := h.server.ExecuteCommand(h.ctx, oldDocScope, PlaybackCommand{Action: CommandGain, Gain: 0.1}); !errors.Is(err, ErrSessionOwnership) {
-		t.Fatalf("expected ErrSessionOwnership for old document, got: %v", err)
+	for _, command := range []PlaybackCommand{{Action: CommandGain, Gain: 0.1}, {Action: CommandSetMode, Mode: PlaybackModeOrder}} {
+		if _, err := h.server.ExecuteCommand(h.ctx, oldDocScope, command); !errors.Is(err, ErrSessionOwnership) {
+			t.Fatalf("expected ErrSessionOwnership for old document %s, got: %v", command.Action, err)
+		}
 	}
 
 	// Tab-2 is active owner and writes with generation 2 succeed
@@ -875,8 +893,8 @@ func TestDurableSessionRefreshHandoffContract(t *testing.T) {
 		BindingGeneration: &gen2,
 		OperationID:       "g2:handoff-write",
 	}
-	if st, err := h.server.ExecuteCommand(h.ctx, newDocScope, PlaybackCommand{Action: CommandGain, Gain: 0.1}); err != nil || st.Gain != 0.1 {
-		t.Fatalf("new document command failed: %v", err)
+	if st, err := h.server.ExecuteCommand(h.ctx, newDocScope, PlaybackCommand{Action: CommandGain, Gain: 0.1}); err != nil || st.Gain != 0.1 || st.Mode != PlaybackModeRepeatTrack {
+		t.Fatalf("new document command failed or lost mode: status=%#v err=%v", st, err)
 	}
 }
 

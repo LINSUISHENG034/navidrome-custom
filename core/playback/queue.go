@@ -313,6 +313,15 @@ const (
 	PlaybackModeShuffle     PlaybackMode = "shufflePlay"
 )
 
+func (mode PlaybackMode) valid() bool {
+	switch mode {
+	case PlaybackModeOrder, PlaybackModeRepeatList, PlaybackModeRepeatTrack, PlaybackModeShuffle:
+		return true
+	default:
+		return false
+	}
+}
+
 // PrevRewindThresholdSeconds is the threshold above which skipPrev rewinds to 0s
 // instead of switching to the previous track.
 const PrevRewindThresholdSeconds = 1.0
@@ -468,12 +477,10 @@ func (m *QueueCandidateModel) Clear() {
 }
 
 func (m *QueueCandidateModel) SetMode(mode PlaybackMode) {
-	switch mode {
-	case PlaybackModeOrder, PlaybackModeRepeatList, PlaybackModeRepeatTrack, PlaybackModeShuffle:
-		m.Mode = mode
-	default:
-		m.Mode = PlaybackModeOrder
+	if !mode.valid() {
+		mode = PlaybackModeOrder
 	}
+	m.Mode = mode
 }
 
 func randInt(r *rand.Rand, n int) int {

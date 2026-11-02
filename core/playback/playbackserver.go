@@ -516,6 +516,7 @@ type CommitMigrationRequest struct {
 	Position           *int            `json:"position,omitempty"`
 	Gain               *float32        `json:"gain,omitempty"`
 	Muted              *bool           `json:"muted,omitempty"`
+	Mode               *PlaybackMode   `json:"mode,omitempty"`
 
 	// migrationWire records which wire queue-shape keys were explicitly
 	// present during decoding. It is private so request hashing and JSON
@@ -531,6 +532,8 @@ type migrationWireShape struct {
 	queueItems         bool
 	currentQueueItemID bool
 	nullKey            string
+	modePresent        bool
+	modeNull           bool
 }
 
 // UnmarshalJSON decodes CommitMigrationRequest while recording explicit
@@ -546,6 +549,7 @@ func (req *CommitMigrationRequest) UnmarshalJSON(data []byte) error {
 		CurrentIndex       json.RawMessage `json:"currentIndex"`
 		QueueItems         json.RawMessage `json:"queueItems"`
 		CurrentQueueItemID json.RawMessage `json:"currentQueueItemId"`
+		Mode               json.RawMessage `json:"mode"`
 	}{}
 	if err := json.Unmarshal(data, &shadow); err != nil {
 		return err
@@ -577,6 +581,14 @@ func (req *CommitMigrationRequest) UnmarshalJSON(data []byte) error {
 	if err := assign(shadow.CurrentQueueItemID, &req.CurrentQueueItemID, "currentQueueItemId", &wire.currentQueueItemID); err != nil {
 		return err
 	}
+	if shadow.Mode != nil {
+		wire.modePresent = true
+		if bytes.Equal(bytes.TrimSpace(shadow.Mode), []byte("null")) {
+			wire.modeNull = true
+		} else if err := json.Unmarshal(shadow.Mode, &req.Mode); err != nil {
+			return err
+		}
+	}
 	req.migrationWire = wire
 	return nil
 }
@@ -594,6 +606,12 @@ type migrationQueueShape struct {
 // semantic presence instead. Identity IDs must be non-empty and unique and,
 // when a current item is supplied, it must be a member of the queue.
 func validateMigrationQueueShape(req CommitMigrationRequest) (migrationQueueShape, error) {
+	if req.migrationWire.modeNull {
+		return migrationQueueShape{}, ErrInvalidPlayMode
+	}
+	if req.Mode != nil && !(*req.Mode).valid() {
+		return migrationQueueShape{}, ErrInvalidPlayMode
+	}
 	if req.migrationWire.nullKey != "" {
 		return migrationQueueShape{}, fmt.Errorf("%w: %s must not be null", ErrMigrationProtocolConflict, req.migrationWire.nullKey)
 	}
@@ -859,6 +877,7 @@ func sessionStatusFromDevice(session Session, device *playbackDevice) SessionSta
 	status.DesiredGain = device.desiredGainLocked()
 	status.QueueVersion = device.queueVersion
 	status.StateSequence = deviceStatus.StateSequence
+	status.PlayMode = string(deviceStatus.Mode)
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
 	}
@@ -1404,6 +1423,8 @@ func operationErrorCode(err error) string {
 		return "OPERATION_CAPACITY"
 	case errors.Is(err, ErrOperationUnknown):
 		return "OPERATION_UNKNOWN"
+	case errors.Is(err, ErrInvalidPlayMode):
+		return "INVALID_PLAY_MODE"
 	case errors.Is(err, ErrCommandSuperseded):
 		return "COMMAND_SUPERSEDED"
 	case errors.Is(err, ErrSessionOwnership):
@@ -1427,7 +1448,7 @@ func operationRecordError(rec OperationRecord) error {
 }
 
 func isOperationAdmissionError(err error) bool {
-	return errors.Is(err, ErrSessionOwnership) || errors.Is(err, ErrGenerationRequired) ||
+	return errors.Is(err, ErrInvalidPlayMode) || errors.Is(err, ErrSessionOwnership) || errors.Is(err, ErrGenerationRequired) ||
 		errors.Is(err, ErrCommandSuperseded) || errors.Is(err, ErrCommandScope) ||
 		errors.Is(err, ErrOperationIdentity) || errors.Is(err, ErrOperationRequired) ||
 		errors.Is(err, ErrMoveProtocolConflict) || errors.Is(err, ErrIdentityRequired) ||
@@ -1901,7 +1922,21 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		if targetDevice == nil {
 			return OperationRecord{}, fmt.Errorf("%w: %s", ErrDeviceNotFound, req.TargetDeviceName)
 		}
+		var carriedMode PlaybackMode
+		carriedModeReady := false
+		if req.Mode == nil && session.DeviceName != req.TargetDeviceName {
+			sourceDevice := ps.deviceByNameLocked(session.DeviceName)
+			if sourceDevice != nil {
+				sourceDevice.mu.Lock()
+				carriedMode = sourceDevice.mode
+				sourceDevice.mu.Unlock()
+				carriedModeReady = true
+			}
+		}
 		targetDevice.mu.Lock()
+		if !carriedModeReady {
+			carriedMode = targetDevice.mode
+		}
 		defer targetDevice.mu.Unlock()
 		currentFp := targetDevice.sceneFingerprintLocked()
 		if currentFp != reservation.ExpectedFingerprint || (req.ExpectedFingerprint != "" && req.ExpectedFingerprint != reservation.ExpectedFingerprint) {
@@ -1927,6 +1962,12 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 
 		targetDevice.clearLocked(ctx)
 		applyMigrationQueueLocked(targetDevice, shape, legacyItems, identityItems, req.CurrentQueueItemID, req.CurrentIndex)
+		if req.Mode != nil {
+			carriedMode = *req.Mode
+		}
+		if targetDevice.mode != carriedMode {
+			targetDevice.mode = carriedMode
+		}
 		if req.Position != nil {
 			pos := *req.Position
 			targetDevice.recoveryPosition = &pos
@@ -2126,6 +2167,7 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 	var wasPlaying bool
 	var savedPosition *int
 	var savedGain float32
+	var savedMode PlaybackMode
 	var savedQueue []QueueCandidateItem
 	var savedIndex int
 	var preparationVersion uint64
@@ -2136,6 +2178,7 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 		oldDev.mu.Lock()
 		wasPlaying = oldDev.isPlaying()
 		savedGain = oldDev.Gain
+		savedMode = oldDev.mode
 		savedQueue = oldDev.PlaybackQueue.GetItems()
 		savedIndex = oldDev.PlaybackQueue.Index
 		if oldDev.ActiveTrack != nil {
@@ -2159,8 +2202,14 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 			newDev.Gain = savedGain
 			newDev.DesiredGain = savedGain
 			newDev.recoveryPosition = savedPosition
+			if newDev.mode != savedMode {
+				newDev.mode = savedMode
+			}
 			newDev.incrementQueueVersionLocked()
 			preparationVersion = newDev.preparationVersion
+		} else if newDev.PlaybackQueue.IsEmpty() && newDev.ActiveTrack == nil && newDev.mode != savedMode {
+			newDev.mode = savedMode
+			newDev.incrementStateSequenceLocked()
 		}
 		newDev.incrementSceneRevisionLocked()
 		newDev.mu.Unlock()

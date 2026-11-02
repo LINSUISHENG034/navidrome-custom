@@ -200,6 +200,10 @@ func (api *Router) writeJukeboxSessionError(w http.ResponseWriter, err error) {
 			"queueItemId": itemLookup.QueueItemID,
 			"status":      toStatusResponse(itemLookup.Status),
 		})
+	case errors.Is(err, playback.ErrInvalidPlayMode):
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "INVALID_PLAY_MODE", "error": err.Error()})
 	case errors.Is(err, playback.ErrQueueVersionRequired):
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)

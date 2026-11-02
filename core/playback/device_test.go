@@ -144,6 +144,7 @@ func TestPlaybackDeviceSetMode(t *testing.T) {
 					wantStatus.StateSequence++
 					wantNotifications = 1
 				}
+				wantStatus.Mode = wantMode
 				observed, _ := device.Status(ctx)
 				if device.mode != wantMode || status != wantStatus || observed != wantStatus {
 					t.Errorf("mode/state mismatch: mode=%q returned=%#v observed=%#v wantMode=%q wantStatus=%#v", device.mode, status, observed, wantMode, wantStatus)
@@ -426,6 +427,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		Position:      position,
 		QueueVersion:  1,
 		StateSequence: 2,
+		Mode:          PlaybackModeOrder,
 	})
 	if first.track.closeCalls != 1 {
 		t.Fatalf("failed output was not released: closes=%d", first.track.closeCalls)
@@ -452,6 +454,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		Position:      position,
 		QueueVersion:  1,
 		StateSequence: 3,
+		Mode:          PlaybackModeOrder,
 	}, 100*time.Millisecond)
 	if second.track.closeCalls != 0 {
 		t.Fatalf("stale event closed successor output: closes=%d", second.track.closeCalls)
@@ -471,6 +474,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		Position:      retiredPosition,
 		QueueVersion:  1,
 		StateSequence: 3,
+		Mode:          PlaybackModeOrder,
 	})
 	if second.track.closeCalls != 1 {
 		t.Fatalf("retired output was not released: closes=%d", second.track.closeCalls)
@@ -518,6 +522,7 @@ func TestPlaybackDeviceUnknownFailurePositionDoesNotInventSeekOffset(t *testing.
 		Position:      0,
 		QueueVersion:  1,
 		StateSequence: 2,
+		Mode:          PlaybackModeOrder,
 	})
 	if first.track.closeCalls != 1 {
 		t.Fatalf("failed output was not released: closes=%d", first.track.closeCalls)

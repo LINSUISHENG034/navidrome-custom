@@ -16,14 +16,15 @@ import (
 )
 
 type jukeboxStatusResponse struct {
-	CurrentIndex  int     `json:"currentIndex"`
-	Playing       bool    `json:"playing"`
-	Gain          float32 `json:"gain"`
-	DesiredGain   float32 `json:"desiredGain"`
-	Muted         bool    `json:"muted"`
-	Position      int     `json:"position"`
-	QueueVersion  int     `json:"queueVersion"`
-	StateSequence uint64  `json:"stateSequence"`
+	CurrentIndex  int                   `json:"currentIndex"`
+	Playing       bool                  `json:"playing"`
+	Gain          float32               `json:"gain"`
+	DesiredGain   float32               `json:"desiredGain"`
+	Muted         bool                  `json:"muted"`
+	Position      int                   `json:"position"`
+	QueueVersion  int                   `json:"queueVersion"`
+	StateSequence uint64                `json:"stateSequence"`
+	PlayMode      playback.PlaybackMode `json:"playMode"`
 	// QueueProtocol is the shared additive capability contract; clients must
 	// check version/boolean values, never field presence.
 	QueueProtocol *model.QueueProtocolCapabilities `json:"queueProtocol,omitempty"`
@@ -31,18 +32,19 @@ type jukeboxStatusResponse struct {
 
 type jukeboxCommandRequest struct {
 	playback.CommandScope
-	IDs                  []string `json:"ids"`
-	Index                *int     `json:"index"`
-	Offset               int      `json:"offset"`
-	Position             int      `json:"position"`
-	Gain                 float32  `json:"gain"`
-	Muted                *bool    `json:"muted"`
-	From                 *int     `json:"from"`
-	To                   *int     `json:"to"`
-	QueueItemID          string   `json:"queueItemId"`
-	AnchorQueueItemID    string   `json:"anchorQueueItemId"`
-	Placement            string   `json:"placement"`
-	ExpectedQueueVersion *int     `json:"expectedQueueVersion"`
+	IDs                  []string              `json:"ids"`
+	Index                *int                  `json:"index"`
+	Offset               int                   `json:"offset"`
+	Position             int                   `json:"position"`
+	Gain                 float32               `json:"gain"`
+	Muted                *bool                 `json:"muted"`
+	Mode                 playback.PlaybackMode `json:"mode"`
+	From                 *int                  `json:"from"`
+	To                   *int                  `json:"to"`
+	QueueItemID          string                `json:"queueItemId"`
+	AnchorQueueItemID    string                `json:"anchorQueueItemId"`
+	Placement            string                `json:"placement"`
+	ExpectedQueueVersion *int                  `json:"expectedQueueVersion"`
 }
 
 func (api *Router) addJukeboxControlRoute(r chi.Router) {
@@ -61,6 +63,7 @@ func (api *Router) addJukeboxControlRoute(r chi.Router) {
 	r.Post("/jukebox/seek", api.jukeboxSeek)
 	r.Post("/jukebox/volume", api.jukeboxVolume)
 	r.Post("/jukebox/mute", api.jukeboxMute)
+	r.Post("/jukebox/mode", api.jukeboxMode)
 	r.Post("/jukebox/add", api.jukeboxAdd)
 	r.Post("/jukebox/remove", api.jukeboxRemove)
 	r.Post("/jukebox/move", api.jukeboxMove)
@@ -76,6 +79,7 @@ func toStatusResponse(s playback.DeviceStatus) *jukeboxStatusResponse {
 		Position:      s.Position,
 		QueueVersion:  s.QueueVersion,
 		StateSequence: s.StateSequence,
+		PlayMode:      s.Mode,
 		QueueProtocol: queueProtocolPtr(),
 	}
 }
@@ -134,7 +138,7 @@ func (api *Router) jukeboxStatus(w http.ResponseWriter, r *http.Request) {
 		api.writeJukeboxJSON(w, r, toStatusResponse(playback.DeviceStatus{
 			CurrentIndex: status.CurrentIndex, Playing: status.Playing, Position: status.Position,
 			Gain: status.Gain, DesiredGain: status.DesiredGain, Muted: status.Muted, QueueVersion: status.QueueVersion,
-			StateSequence: status.StateSequence,
+			StateSequence: status.StateSequence, Mode: playback.PlaybackMode(status.PlayMode),
 		}))
 		return
 	}
@@ -217,7 +221,7 @@ func (api *Router) jukeboxCommand(w http.ResponseWriter, r *http.Request, action
 	command := playback.PlaybackCommand{
 		Action: action, IDs: req.IDs, Offset: req.Offset, Position: req.Position, Gain: req.Gain,
 		QueueItemID: req.QueueItemID, AnchorQueueItemID: req.AnchorQueueItemID, Placement: req.Placement,
-		ExpectedQueueVersion: req.ExpectedQueueVersion, IndexProvided: req.Index != nil,
+		ExpectedQueueVersion: req.ExpectedQueueVersion, IndexProvided: req.Index != nil, Mode: req.Mode,
 	}
 	if req.From != nil {
 		command.From = *req.From
@@ -240,6 +244,10 @@ func (api *Router) jukeboxCommand(w http.ResponseWriter, r *http.Request, action
 		return
 	}
 	api.writeJukeboxJSON(w, r, toStatusResponse(status))
+}
+
+func (api *Router) jukeboxMode(w http.ResponseWriter, r *http.Request) {
+	api.jukeboxCommand(w, r, playback.CommandSetMode, true)
 }
 
 func (api *Router) jukeboxSet(w http.ResponseWriter, r *http.Request) {

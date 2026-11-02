@@ -1420,6 +1420,179 @@ func reserveForCommit(t *testing.T, server *playbackServer, sessionID, clientID 
 	}
 }
 
+type modeMigrationFixture struct {
+	ctx     context.Context
+	server  *playbackServer
+	source  *playbackDevice
+	target  *playbackDevice
+	request CommitMigrationRequest
+}
+
+func newModeMigrationFixture(t *testing.T, shape string, sourceName string) *modeMigrationFixture {
+	t.Helper()
+	ctx, server := newMigrationValidationServer(t)
+	source := migrationTestTarget(t, server, sourceName)
+	target := migrationTestTarget(t, server, "new")
+	source.mode, source.stateSequence = PlaybackModeShuffle, 5
+	target.mode, target.stateSequence, target.queueVersion = PlaybackModeRepeatTrack, 17, 3
+	attached := attachMigrationSource(t, server, "mode-migration", "owner", sourceName)
+	reserveForCommit(t, server, attached.SessionID, "owner", attached.BindingGeneration, "mode-import", "new")
+	req := CommitMigrationRequest{
+		MigrationID: "mode-import", OperationID: "g1:mode-import", SessionID: attached.SessionID, ClientID: "owner",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+	}
+	switch shape {
+	case "legacy":
+		req.Queue, req.CurrentIndex = []string{"track", "track"}, 1
+	case "identity":
+		current := "mode-item-2"
+		req.QueueItems = &[]QueueItemRef{{QueueItemID: "mode-item-1", MediaFileID: "track"}, {QueueItemID: current, MediaFileID: "track"}}
+		req.CurrentQueueItemID = &current
+	case "empty":
+		req.QueueItems = &[]QueueItemRef{}
+	default:
+		t.Fatalf("unknown mode migration shape %q", shape)
+	}
+	return &modeMigrationFixture{ctx: ctx, server: server, source: source, target: target, request: req}
+}
+
+func TestPlaybackLegacySwitchModeContext(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		sourceQueue  bool
+		targetQueue  bool
+		targetOutput bool
+		equalMode    bool
+	}{
+		{"queue import", true, false, false, false},
+		{"queue replacement", true, true, false, false},
+		{"both idle mode change", false, false, false, false},
+		{"both idle same mode", false, false, false, true},
+		{"retain target queue", false, true, false, false},
+		{"retain target output", false, false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, server := newMigrationValidationServer(t)
+			source, target := server.playbackDevices[0], server.playbackDevices[1]
+			if tc.sourceQueue {
+				if _, err := source.Set(ctx, []string{"track", "track"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.targetQueue {
+				if _, err := target.Set(ctx, []string{"track"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source.mode, target.mode = PlaybackModeShuffle, PlaybackModeRepeatTrack
+			if tc.equalMode {
+				target.mode = source.mode
+			}
+			if tc.targetOutput {
+				target.ActiveTrack, target.activePlaybackToken = &mockTrack{playing: true, position: 9}, 37
+			}
+			attached := attachMigrationSource(t, server, "mode-switch", "owner", "old")
+			before, _ := target.Status(ctx)
+			revision := target.sceneRevision
+			want, wantIDs := before, target.PlaybackQueue.ItemIDs()
+			want.Mode = target.mode
+			if tc.sourceQueue {
+				want.CurrentIndex, want.Position, want.Playing = source.PlaybackQueue.Index, 0, false
+				want.QueueVersion++
+				want.StateSequence++
+				want.Mode, wantIDs = source.mode, source.PlaybackQueue.ItemIDs()
+			} else if !tc.targetQueue && !tc.targetOutput {
+				want.Mode = source.mode
+				if want.Mode != target.mode {
+					want.StateSequence++
+				}
+			}
+			output, token := target.ActiveTrack, target.activePlaybackToken
+			scope := CommandScope{User: "admin", SessionID: attached.SessionID, ClientID: "owner", BindingGeneration: &attached.BindingGeneration, OperationID: "g1:mode-switch"}
+			if err := server.SwitchDeviceForCommand(ctx, scope, "new"); err != nil {
+				t.Fatal(err)
+			}
+			after, _ := target.Status(ctx)
+			if after != want || target.mode != want.Mode || target.sceneRevision != revision+1 || !reflect.DeepEqual(target.PlaybackQueue.ItemIDs(), wantIDs) {
+				t.Errorf("legacy switch lost context/mode ordering: before=%#v after=%#v want=%#v actualMode=%q", before, after, want, target.mode)
+			}
+			if !tc.sourceQueue && (target.ActiveTrack != output || target.activePlaybackToken != token) {
+				t.Error("empty-source legacy switch replaced retained output")
+			}
+		})
+	}
+}
+
+func TestPlaybackMigrationModeImportAndCarry(t *testing.T) {
+	for _, shape := range []string{"legacy", "identity", "empty"} {
+		for _, source := range []string{"old", "new"} {
+			for _, mode := range []PlaybackMode{"", PlaybackModeOrder, PlaybackModeRepeatList, PlaybackModeRepeatTrack, PlaybackModeShuffle} {
+				name := string(mode)
+				if mode == "" {
+					name = "omitted"
+				}
+				t.Run(shape+"/"+source+"/"+name, func(t *testing.T) {
+					fixture := newModeMigrationFixture(t, shape, source)
+					before, _ := fixture.target.Status(fixture.ctx)
+					wantMode := fixture.source.mode
+					if mode != "" {
+						fixture.request.Mode, wantMode = &mode, mode
+					}
+					committed, err := fixture.server.CommitMigration(fixture.ctx, fixture.request)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if fixture.target.mode != wantMode || committed.PlayMode != string(wantMode) || committed.StateSequence != before.StateSequence+1 || committed.QueueVersion != before.QueueVersion+1 {
+						t.Errorf("mode import/carry or target-local ordering failed: before=%#v committed=%#v actualMode=%q wantMode=%q", before, committed, fixture.target.mode, wantMode)
+					}
+					record, err := fixture.server.QueryOperation(fixture.ctx, fixture.request.SessionID, fixture.request.OperationID)
+					if err != nil || record.SessionStatus == nil || record.SessionStatus.PlayMode != string(wantMode) {
+						t.Errorf("original migration query lost committed mode: record=%#v err=%v", record, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestPlaybackMigrationRejectsInvalidModeBeforeMutation(t *testing.T) {
+	for _, value := range []any{"", "repeat", "ORDER", " order", nil} {
+		t.Run(fmt.Sprintf("mode=%v", value), func(t *testing.T) {
+			fixture := newModeMigrationFixture(t, "identity", "old")
+			encoded, err := json.Marshal(fixture.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				t.Fatal(err)
+			}
+			payload["mode"] = value
+			encoded, err = json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(encoded, &fixture.request); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := fixture.target.Status(fixture.ctx)
+			fingerprint := fixture.target.SceneFingerprint()
+			if _, err := fixture.server.CommitMigration(fixture.ctx, fixture.request); !errors.Is(err, ErrInvalidPlayMode) {
+				t.Errorf("invalid migration mode accepted: %v", err)
+			}
+			after, _ := fixture.target.Status(fixture.ctx)
+			reservation, err := fixture.server.QueryReservation(fixture.ctx, fixture.request.MigrationID)
+			if err != nil || reservation.Status != string(ReservationActive) || after != before || fixture.target.SceneFingerprint() != fingerprint {
+				t.Errorf("invalid mode consumed reservation or mutated target: before=%#v after=%#v reservation=%#v err=%v", before, after, reservation, err)
+			}
+			record, err := fixture.server.QueryOperation(fixture.ctx, fixture.request.SessionID, fixture.request.OperationID)
+			if err != nil || record.Status != OperationStatusUnknown {
+				t.Errorf("invalid mode entered operation history: %#v err=%v", record, err)
+			}
+		})
+	}
+}
+
 func TestPlaybackCommitMigrationIdentityTransport(t *testing.T) {
 	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
 	identityQueue := func() *[]QueueItemRef {

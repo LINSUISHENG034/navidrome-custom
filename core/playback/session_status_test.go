@@ -164,9 +164,12 @@ func TestPlaybackServerStateSequenceMappings(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		sequence uint64
+		mode     PlaybackMode
 	}{
-		{"explicit zero", 0},
-		{"semantic sequence distinct from queue version", 17},
+		{"explicit zero", 0, PlaybackModeOrder},
+		{"semantic sequence distinct from queue version", 17, PlaybackModeShuffle},
+		{"single loop", 13, PlaybackModeRepeatTrack},
+		{"order loop", 5, PlaybackModeRepeatList},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -174,6 +177,7 @@ func TestPlaybackServerStateSequenceMappings(t *testing.T) {
 			device.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/track.mp3"}})
 			device.queueVersion = 3
 			device.stateSequence = tc.sequence
+			device.mode = tc.mode
 			broker := &fakeEventBroker{}
 			ps := &playbackServer{
 				ctx: &ctx, sessionManager: NewSessionManager(time.Minute),
@@ -214,12 +218,13 @@ func TestPlaybackServerStateSequenceMappings(t *testing.T) {
 				var payload struct {
 					StateSequence *uint64 `json:"stateSequence"`
 					QueueVersion  int     `json:"queueVersion"`
+					PlayMode      string  `json:"playMode"`
 				}
 				if err := json.Unmarshal(encoded, &payload); err != nil {
 					t.Fatal(err)
 				}
-				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 {
-					t.Errorf("%s lost sequence or structural version: %s", mapping.name, encoded)
+				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 || payload.PlayMode != string(tc.mode) {
+					t.Errorf("%s lost sequence, structural version, or mode: %s", mapping.name, encoded)
 				}
 			}
 		})
