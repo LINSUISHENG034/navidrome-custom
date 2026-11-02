@@ -25,6 +25,8 @@ import (
 	"github.com/navidrome/navidrome/model/request"
 	serverevents "github.com/navidrome/navidrome/server/events"
 	"github.com/navidrome/navidrome/utils/singleton"
+
+	"github.com/google/uuid"
 )
 
 type PlaybackServer interface {
@@ -496,6 +498,14 @@ type QueueItemRef struct {
 // zero values. Direct Go callers bypass UnmarshalJSON; semantic presence
 // (non-nil queue slice or pointers, non-zero currentIndex) applies to them.
 // Explicit null on any of the four keys is always rejected.
+//
+// PlaybackInstanceID optionally imports an explicit playback instance
+// identity: raw canonical UUID text (parse.String() == raw, case-sensitive,
+// no trim, no UUID-version restriction) bound to the imported selected
+// current queue item. It takes precedence over the inferred server-source
+// carry and requires a non-empty queue with a selected current item. An
+// omitted field leaves the inferred carry path unchanged and is never filled
+// from the carry before operation hashing.
 type CommitMigrationRequest struct {
 	MigrationID         string   `json:"migrationId"`
 	OperationID         string   `json:"operationId"`
@@ -513,10 +523,14 @@ type CommitMigrationRequest struct {
 	// CurrentIndex rewrite while preserving imported instance IDs.
 	QueueItems         *[]QueueItemRef `json:"queueItems,omitempty"`
 	CurrentQueueItemID *string         `json:"currentQueueItemId,omitempty"`
-	Position           *int            `json:"position,omitempty"`
-	Gain               *float32        `json:"gain,omitempty"`
-	Muted              *bool           `json:"muted,omitempty"`
-	Mode               *PlaybackMode   `json:"mode,omitempty"`
+	// PlaybackInstanceID is the optional explicit playback instance import.
+	// Exported so the normalized operation request hash covers an explicit
+	// value; omitted stays nil.
+	PlaybackInstanceID *string       `json:"playbackInstanceId,omitempty"`
+	Position           *int          `json:"position,omitempty"`
+	Gain               *float32      `json:"gain,omitempty"`
+	Muted              *bool         `json:"muted,omitempty"`
+	Mode               *PlaybackMode `json:"mode,omitempty"`
 
 	// migrationWire records which wire queue-shape keys were explicitly
 	// present during decoding. It is private so request hashing and JSON
@@ -531,6 +545,7 @@ type migrationWireShape struct {
 	currentIndex       bool
 	queueItems         bool
 	currentQueueItemID bool
+	playbackInstanceID bool
 	nullKey            string
 	modePresent        bool
 	modeNull           bool
@@ -549,6 +564,7 @@ func (req *CommitMigrationRequest) UnmarshalJSON(data []byte) error {
 		CurrentIndex       json.RawMessage `json:"currentIndex"`
 		QueueItems         json.RawMessage `json:"queueItems"`
 		CurrentQueueItemID json.RawMessage `json:"currentQueueItemId"`
+		PlaybackInstanceID json.RawMessage `json:"playbackInstanceId"`
 		Mode               json.RawMessage `json:"mode"`
 	}{}
 	if err := json.Unmarshal(data, &shadow); err != nil {
@@ -579,6 +595,9 @@ func (req *CommitMigrationRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if err := assign(shadow.CurrentQueueItemID, &req.CurrentQueueItemID, "currentQueueItemId", &wire.currentQueueItemID); err != nil {
+		return err
+	}
+	if err := assign(shadow.PlaybackInstanceID, &req.PlaybackInstanceID, "playbackInstanceId", &wire.playbackInstanceID); err != nil {
 		return err
 	}
 	if shadow.Mode != nil {
@@ -650,6 +669,44 @@ func validateMigrationQueueShape(req CommitMigrationRequest) (migrationQueueShap
 		}
 	}
 	return migrationQueueShape{identity: true, items: items}, nil
+}
+
+// validateMigrationPlaybackInstance enforces the optional explicit
+// playbackInstanceId import contract before any operation hashing, admission,
+// reservation release, or target mutation. An explicit value must be raw
+// canonical UUID text — uuid.Parse must succeed and parse.String() must equal
+// the raw text exactly (case-sensitive, no trim or normalization, no
+// UUID-version restriction) — and the import must select a current queue item
+// for the identity to bind to: an empty queue or an identity import without a
+// current item is rejected. An omitted field is a no-op, leaving the inferred
+// server-source carry path unchanged.
+func validateMigrationPlaybackInstance(req CommitMigrationRequest) error {
+	explicit := req.PlaybackInstanceID != nil || req.migrationWire.playbackInstanceID
+	if !explicit {
+		return nil
+	}
+	if req.PlaybackInstanceID == nil {
+		return fmt.Errorf("%w: playbackInstanceId must not be null", ErrMigrationProtocolConflict)
+	}
+	parsed, err := uuid.Parse(*req.PlaybackInstanceID)
+	if err != nil || parsed.String() != *req.PlaybackInstanceID {
+		return fmt.Errorf("%w: playbackInstanceId must be raw canonical UUID text", ErrMigrationProtocolConflict)
+	}
+	legacyUsed := req.migrationWire.queue || req.migrationWire.currentIndex || req.Queue != nil || req.CurrentIndex != 0
+	identityUsed := req.migrationWire.queueItems || req.migrationWire.currentQueueItemID || req.QueueItems != nil || req.CurrentQueueItemID != nil
+	switch {
+	case identityUsed:
+		if req.CurrentQueueItemID == nil || req.QueueItems == nil || len(*req.QueueItems) == 0 {
+			return fmt.Errorf("%w: playbackInstanceId requires a selected current queue item", ErrMigrationProtocolConflict)
+		}
+	case legacyUsed:
+		if len(req.Queue) == 0 {
+			return fmt.Errorf("%w: playbackInstanceId requires a non-empty queue", ErrMigrationProtocolConflict)
+		}
+	default:
+		return fmt.Errorf("%w: playbackInstanceId requires a selected current queue item", ErrMigrationProtocolConflict)
+	}
+	return nil
 }
 
 type CommandResult struct {
@@ -1887,10 +1944,14 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		generationPtr = &generationCopy
 	}
 	scope := CommandScope{User: req.User, SessionID: req.SessionID, ClientID: req.ClientID, BindingGeneration: generationPtr, OperationID: req.OperationID}
-	// Reject malformed queue shapes before the operation store can hash or
-	// replay a result for them; ownership, reservation, and scene checks keep
-	// their order inside the apply closure.
+	// Reject malformed queue shapes and invalid explicit playback instance
+	// imports before the operation store can hash or replay a result for
+	// them; ownership, reservation, and scene checks keep their order inside
+	// the apply closure.
 	if _, err := validateMigrationQueueShape(req); err != nil {
+		return SessionStatus{}, err
+	}
+	if err := validateMigrationPlaybackInstance(req); err != nil {
 		return SessionStatus{}, err
 	}
 	var revoked []Session
@@ -1971,7 +2032,14 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 
 		targetDevice.clearLocked(ctx)
 		applyMigrationQueueLocked(targetDevice, shape, legacyItems, identityItems, req.CurrentQueueItemID, req.CurrentIndex)
-		if carriedInstance != "" && carriedSourceMediaID != "" {
+		// An explicit playback instance import always wins and binds to the
+		// actual imported current queue occurrence; the inferred server-source
+		// carry only applies when no explicit identity was imported. The
+		// validation above guarantees a selected current item whenever an
+		// explicit value is present, so this never mints or implies one.
+		if req.PlaybackInstanceID != nil {
+			targetDevice.stageCarriedInstanceLocked(*req.PlaybackInstanceID)
+		} else if carriedInstance != "" && carriedSourceMediaID != "" {
 			if importedItem := targetDevice.PlaybackQueue.CurrentItem(); importedItem != nil && importedItem.MediaFile.ID == carriedSourceMediaID {
 				targetDevice.stageCarriedInstanceLocked(carriedInstance)
 			}

@@ -2095,6 +2095,763 @@ func TestPlaybackMigrationPlaybackInstanceCarry(t *testing.T) {
 	})
 }
 
+// Fixed canonical UUID literals for explicit playbackInstanceId wire values.
+// Explicit imports must bind exactly what a client supplies, so tests never
+// mint or fake these values.
+const (
+	explicitInstanceID    = "7f3a2b1c-9d4e-4a5f-b6c7-d8e9f0a1b2c3"
+	explicitInstanceIDAlt = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+	// explicitInstanceIDV1 is a canonical version-1 UUID: the import boundary
+	// policy accepts any canonical UUID text without a version restriction.
+	explicitInstanceIDV1 = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+)
+
+// decodeCommitMigrationWire re-encodes req as raw JSON, applies mutate to the
+// wire payload, and decodes it back. Explicit playbackInstanceId tests use it
+// to exercise the wire contract without referencing Go fields that do not
+// exist yet; the baseline decoder ignores the unknown key, so only behavior
+// assertions turn RED, never compilation.
+func decodeCommitMigrationWire(t *testing.T, req CommitMigrationRequest, mutate func(map[string]any)) (CommitMigrationRequest, error) {
+	t.Helper()
+	encoded, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		mutate(payload)
+	}
+	encoded, err = json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded CommitMigrationRequest
+	err = json.Unmarshal(encoded, &decoded)
+	return decoded, err
+}
+
+// explicitImportCurrentRef returns a fresh pointer to the given queue item ID
+// so wire-decoded requests never alias fixture state.
+func explicitImportCurrentRef(id string) *string { s := id; return &s }
+
+// injectExplicitInstanceID adds the fixed explicit playbackInstanceId wire
+// value to a raw commit payload.
+func injectExplicitInstanceID(payload map[string]any) {
+	payload["playbackInstanceId"] = explicitInstanceID
+}
+
+// startExplicitImportSource drives the default ("old") device to a playing
+// scene and returns the server, target device, the attached session, and the
+// exact server-minted source instance.
+func startExplicitImportSource(t *testing.T, ctx context.Context) (*playbackServer, *playbackDevice, SessionStatus, string) {
+	t.Helper()
+	_, server := newMigrationValidationServer(t)
+	source, err := server.GetDeviceForUser("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Set(ctx, []string{"track"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status, err := source.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.PlaybackInstanceID == "" {
+		t.Fatalf("expected non-empty source instance: %#v", status)
+	}
+	attached := attachMigrationSource(t, server, "src", "tab", "old")
+	return server, migrationTestTarget(t, server, "new"), attached, status.PlaybackInstanceID
+}
+
+// assertImportedInstanceEverywhere pins the imported instance to the commit
+// response path: session snapshot, immediate target status, and the first
+// target Start, in that order.
+func assertImportedInstanceEverywhere(t *testing.T, ctx context.Context, server *playbackServer, target *playbackDevice, sessionID, want string) {
+	t.Helper()
+	snapshot, err := server.SessionSnapshot(ctx, sessionID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.SessionStatus.PlaybackInstanceID != want {
+		t.Fatalf("snapshot lost bound instance: want %q got %q", want, snapshot.SessionStatus.PlaybackInstanceID)
+	}
+	status, err := target.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.PlaybackInstanceID != want {
+		t.Fatalf("target status lost bound instance: want %q got %q", want, status.PlaybackInstanceID)
+	}
+	started, err := target.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.PlaybackInstanceID != want {
+		t.Fatalf("first start did not keep bound instance: want %q got %q", want, started.PlaybackInstanceID)
+	}
+}
+
+func TestPlaybackMigrationExplicitInstanceImport(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	t.Run("explicit id takes precedence over server-source carry on identity shape", func(t *testing.T) {
+		explicitImportIdentityPrecedence(t, ctx)
+	})
+	t.Run("explicit id binds on legacy normalized index shape", func(t *testing.T) {
+		explicitImportLegacyShape(t, ctx)
+	})
+	t.Run("explicit id works same-device without source carry", func(t *testing.T) {
+		explicitImportSameDevice(t, ctx)
+	})
+	t.Run("omitted field keeps inferred server-source carry unchanged", func(t *testing.T) {
+		explicitImportOmittedCarry(t, ctx)
+	})
+	t.Run("explicit id binds to the imported occurrence and survives index shifts", func(t *testing.T) {
+		explicitImportSurvivesIndexShift(t, ctx)
+	})
+	t.Run("selecting another occurrence before start supersedes explicit id", func(t *testing.T) {
+		explicitImportSupersededByReselect(t, ctx)
+	})
+	t.Run("failed import load with explicit id leaves target stopped", func(t *testing.T) {
+		explicitImportFailedLoadStaysStopped(t, ctx)
+	})
+	t.Run("inferred carry with duplicate media keeps provenance compatibility", func(t *testing.T) {
+		explicitImportDuplicateMediaCarryCompat(t, ctx)
+	})
+}
+
+func explicitImportIdentityPrecedence(t *testing.T, ctx context.Context) {
+	t.Helper()
+	server, target, attached, sourceInstance := startExplicitImportSource(t, ctx)
+	if sourceInstance == explicitInstanceID {
+		t.Fatalf("fixture collision: source minted the explicit literal %q", sourceInstance)
+	}
+	reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-id", "new")
+	req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+		MigrationID: "mig-exp-id", OperationID: "g1:commit-exp-id", SessionID: "src", ClientID: "tab",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+		QueueItems:         &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}, {QueueItemID: "qi-2", MediaFileID: "track"}},
+		CurrentQueueItemID: explicitImportCurrentRef("qi-1"),
+	}, injectExplicitInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := server.CommitMigration(ctx, req)
+	if err != nil {
+		t.Fatalf("explicit identity commit: %v", err)
+	}
+	if committed.PlaybackInstanceID != explicitInstanceID {
+		t.Fatalf("explicit instance not bound at commit: want %q got %q (carried source was %q)", explicitInstanceID, committed.PlaybackInstanceID, sourceInstance)
+	}
+	assertImportedInstanceEverywhere(t, ctx, server, target, "src", explicitInstanceID)
+}
+
+func explicitImportLegacyShape(t *testing.T, ctx context.Context) {
+	t.Helper()
+	server, target, attached, sourceInstance := startExplicitImportSource(t, ctx)
+	reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-legacy", "new")
+	req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+		MigrationID: "mig-exp-legacy", OperationID: "g1:commit-exp-legacy", SessionID: "src", ClientID: "tab",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+		Queue: []string{"track", "track"}, CurrentIndex: 0,
+	}, injectExplicitInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := server.CommitMigration(ctx, req)
+	if err != nil {
+		t.Fatalf("explicit legacy commit: %v", err)
+	}
+	if committed.PlaybackInstanceID != explicitInstanceID {
+		t.Fatalf("explicit instance not bound on legacy shape: want %q got %q (carried source was %q)", explicitInstanceID, committed.PlaybackInstanceID, sourceInstance)
+	}
+	assertImportedInstanceEverywhere(t, ctx, server, target, "src", explicitInstanceID)
+}
+
+func explicitImportSameDevice(t *testing.T, ctx context.Context) {
+	t.Helper()
+	_, server := newMigrationValidationServer(t)
+	attached := attachMigrationSource(t, server, "src", "tab", "old")
+	reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-same", "old")
+	req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+		MigrationID: "mig-exp-same", OperationID: "g1:commit-exp-same", SessionID: "src", ClientID: "tab",
+		User: "admin", TargetDeviceName: "old", ExpectedGeneration: attached.BindingGeneration,
+		QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}}, CurrentQueueItemID: explicitImportCurrentRef("qi-1"),
+	}, func(payload map[string]any) {
+		// A canonical version-1 UUID proves the import has no version
+		// restriction; the same-device path has no server carry to
+		// compete with the explicit value.
+		payload["playbackInstanceId"] = explicitInstanceIDV1
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := server.CommitMigration(ctx, req)
+	if err != nil {
+		t.Fatalf("same-device explicit commit: %v", err)
+	}
+	if committed.PlaybackInstanceID != explicitInstanceIDV1 {
+		t.Fatalf("same-device explicit instance not bound: want %q got %q", explicitInstanceIDV1, committed.PlaybackInstanceID)
+	}
+	assertImportedInstanceEverywhere(t, ctx, server, migrationTestTarget(t, server, "old"), "src", explicitInstanceIDV1)
+}
+
+func explicitImportOmittedCarry(t *testing.T, ctx context.Context) {
+	t.Helper()
+	server, target, attached, sourceInstance := startExplicitImportSource(t, ctx)
+	reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-omitted", "new")
+	committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+		MigrationID: "mig-exp-omitted", OperationID: "g1:commit-exp-omitted", SessionID: "src", ClientID: "tab",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+		QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}}, CurrentQueueItemID: explicitImportCurrentRef("qi-1"),
+	})
+	if err != nil {
+		t.Fatalf("omitted-field commit: %v", err)
+	}
+	if committed.PlaybackInstanceID != sourceInstance {
+		t.Fatalf("omitted field changed inferred carry: want %q got %q", sourceInstance, committed.PlaybackInstanceID)
+	}
+	assertImportedInstanceEverywhere(t, ctx, server, target, "src", sourceInstance)
+}
+
+func explicitImportSurvivesIndexShift(t *testing.T, ctx context.Context) {
+	t.Helper()
+	server, target, attached, _ := startExplicitImportSource(t, ctx)
+	reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-shift", "new")
+	req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+		MigrationID: "mig-exp-shift", OperationID: "g1:commit-exp-shift", SessionID: "src", ClientID: "tab",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+		QueueItems:         &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}, {QueueItemID: "qi-2", MediaFileID: "track"}, {QueueItemID: "qi-3", MediaFileID: "track"}},
+		CurrentQueueItemID: explicitImportCurrentRef("qi-2"),
+	}, injectExplicitInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := server.CommitMigration(ctx, req)
+	if err != nil {
+		t.Fatalf("shift fixture commit: %v", err)
+	}
+	if committed.PlaybackInstanceID != explicitInstanceID || committed.QueueItemID != "qi-2" {
+		t.Fatalf("explicit instance not bound to imported occurrence: %#v", committed)
+	}
+	if _, err := target.Insert(ctx, 0, []string{"track"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := server.SessionSnapshot(ctx, "src", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.SessionStatus.QueueItemID != "qi-2" {
+		t.Fatalf("index shift moved the bound selection: %#v", snapshot.SessionStatus)
+	}
+	started, err := target.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.PlaybackInstanceID != explicitInstanceID {
+		t.Fatalf("index shift before start dropped explicit instance: want %q got %q", explicitInstanceID, started.PlaybackInstanceID)
+	}
+}
+
+func explicitImportSupersededByReselect(t *testing.T, ctx context.Context) {
+	t.Helper()
+	server, target, attached, _ := startExplicitImportSource(t, ctx)
+	reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-supersede", "new")
+	req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+		MigrationID: "mig-exp-supersede", OperationID: "g1:commit-exp-supersede", SessionID: "src", ClientID: "tab",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+		QueueItems:         &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}, {QueueItemID: "qi-2", MediaFileID: "track"}},
+		CurrentQueueItemID: explicitImportCurrentRef("qi-1"),
+	}, injectExplicitInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := server.CommitMigration(ctx, req)
+	if err != nil {
+		t.Fatalf("supersede fixture commit: %v", err)
+	}
+	if committed.PlaybackInstanceID != explicitInstanceID {
+		t.Fatalf("explicit instance not bound at commit: want %q got %q", explicitInstanceID, committed.PlaybackInstanceID)
+	}
+	if _, err := target.Skip(ctx, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	started, err := target.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.PlaybackInstanceID == "" || started.PlaybackInstanceID == explicitInstanceID {
+		t.Fatalf("start after superseding selection must mint a fresh instance: explicit=%q got=%q", explicitInstanceID, started.PlaybackInstanceID)
+	}
+}
+
+func explicitImportFailedLoadStaysStopped(t *testing.T, ctx context.Context) {
+	t.Helper()
+	server, target, attached, _ := startExplicitImportSource(t, ctx)
+	reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-badload", "new")
+	fingerprint := target.SceneFingerprint()
+	before, err := target.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+		MigrationID: "mig-exp-badload", OperationID: "g1:commit-exp-badload", SessionID: "src", ClientID: "tab",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+		QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "nope"}}, CurrentQueueItemID: explicitImportCurrentRef("qi-1"),
+	}, injectExplicitInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.CommitMigration(ctx, req); err == nil {
+		t.Fatal("unresolvable media import succeeded")
+	}
+	after, err := target.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Playing || after.PlaybackInstanceID != "" || after != before {
+		t.Fatalf("failed import load mutated target or reported playback: before=%#v after=%#v", before, after)
+	}
+	if target.SceneFingerprint() != fingerprint {
+		t.Fatal("failed import load mutated target scene")
+	}
+}
+
+func explicitImportDuplicateMediaCarryCompat(t *testing.T, ctx context.Context) {
+	t.Helper()
+	// Compatibility control: the pre-existing inferred carry is keyed by
+	// the imported current media and stays occurrence-bound afterwards; a
+	// duplicate-media import of another occurrence must keep carrying
+	// exactly as before the explicit import existed. There is no blanket
+	// source-ID equality gate for inferred carry.
+	_, server := newMigrationValidationServer(t)
+	source, err := server.GetDeviceForUser("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Set(ctx, []string{"track", "track"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sourceStatus, err := source.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceInstance := sourceStatus.PlaybackInstanceID
+	if sourceInstance == "" {
+		t.Fatalf("expected non-empty source instance: %#v", sourceStatus)
+	}
+	attached := attachMigrationSource(t, server, "src", "tab", "old")
+	target := migrationTestTarget(t, server, "new")
+	reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-dupmedia", "new")
+	committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+		MigrationID: "mig-exp-dupmedia", OperationID: "g1:commit-exp-dupmedia", SessionID: "src", ClientID: "tab",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+		QueueItems:         &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}, {QueueItemID: "qi-2", MediaFileID: "track"}},
+		CurrentQueueItemID: explicitImportCurrentRef("qi-2"),
+	})
+	if err != nil {
+		t.Fatalf("duplicate-media inferred carry commit: %v", err)
+	}
+	if committed.PlaybackInstanceID != sourceInstance || committed.QueueItemID != "qi-2" {
+		t.Fatalf("duplicate-media inferred carry changed: want %q on qi-2 got %#v", sourceInstance, committed)
+	}
+	started, err := target.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.PlaybackInstanceID != sourceInstance {
+		t.Fatalf("duplicate-media start lost inferred carry: want %q got %q", sourceInstance, started.PlaybackInstanceID)
+	}
+}
+
+func TestPlaybackMigrationExplicitInstanceImportDecodeReset(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	identityBody := func(migrationID, operationID string, generation uint64, extra string) string {
+		return fmt.Sprintf(`{"migrationId":%q,"operationId":%q,"sessionId":"src","clientId":"tab","user":"admin","targetDeviceName":"new","expectedGeneration":%d,"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}],"currentQueueItemId":"qi-1"%s}`,
+			migrationID, operationID, generation, extra)
+	}
+
+	t.Run("stale null bit from earlier decode does not poison later decode", func(t *testing.T) {
+		server, _, attached, sourceInstance := func() (*playbackServer, *playbackDevice, SessionStatus, string) {
+			t.Helper()
+			_, server := newMigrationValidationServer(t)
+			source, err := server.GetDeviceForUser("admin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := source.Set(ctx, []string{"track"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := source.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			status, err := source.Status(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attached := attachMigrationSource(t, server, "src", "tab", "old")
+			return server, migrationTestTarget(t, server, "new"), attached, status.PlaybackInstanceID
+		}()
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-reset-null", "new")
+		var req CommitMigrationRequest
+		if err := json.Unmarshal([]byte(identityBody("mig-exp-reset-null", "g1:commit-exp-reset-null", attached.BindingGeneration, `,"playbackInstanceId":null`)), &req); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := server.CommitMigration(ctx, req); !errors.Is(err, ErrMigrationProtocolConflict) {
+			t.Fatalf("explicit null from first decode accepted: %v", err)
+		}
+		// A later decode of the same value without the key must observe omitted
+		// semantics; the stale null bit from the first decode must be reset.
+		if err := json.Unmarshal([]byte(identityBody("mig-exp-reset-null", "g1:commit-exp-reset-omitted", attached.BindingGeneration, "")), &req); err != nil {
+			t.Fatal(err)
+		}
+		committed, err := server.CommitMigration(ctx, req)
+		if err != nil {
+			t.Fatalf("decode reset did not restore omitted semantics: %v", err)
+		}
+		if committed.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("stale null bit poisoned later decode: want inferred carry %q got %q", sourceInstance, committed.PlaybackInstanceID)
+		}
+	})
+
+	t.Run("stale presence bit from earlier decode does not poison later decode", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		source, err := server.GetDeviceForUser("admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Set(ctx, []string{"track"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		sourceStatus, err := source.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sourceInstance := sourceStatus.PlaybackInstanceID
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-exp-reset-present", "new")
+		var req CommitMigrationRequest
+		if err := json.Unmarshal([]byte(identityBody("mig-exp-reset-present", "g1:commit-exp-reset-present", attached.BindingGeneration, `,"playbackInstanceId":"`+explicitInstanceID+`"`)), &req); err != nil {
+			t.Fatal(err)
+		}
+		// Decode the same variable again without the key before committing: a
+		// stale presence bit must not make the server treat the field as
+		// explicit (which would bind the literal below instead of carrying).
+		if err := json.Unmarshal([]byte(identityBody("mig-exp-reset-present", "g1:commit-exp-reset-present2", attached.BindingGeneration, "")), &req); err != nil {
+			t.Fatal(err)
+		}
+		committed, err := server.CommitMigration(ctx, req)
+		if err != nil {
+			t.Fatalf("decode reset did not restore omitted semantics: %v", err)
+		}
+		if committed.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("stale presence bit poisoned later decode: want inferred carry %q got %q", sourceInstance, committed.PlaybackInstanceID)
+		}
+	})
+}
+
+func TestPlaybackMigrationExplicitInstanceImportRejection(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	currentOne := func() *string { s := "qi-1"; return &s }
+	identityReq := func(migrationID, operationID string, generation uint64) CommitMigrationRequest {
+		return CommitMigrationRequest{
+			MigrationID: migrationID, OperationID: operationID, SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: generation,
+			QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}}, CurrentQueueItemID: currentOne(),
+		}
+	}
+	newReservedFixture := func(t *testing.T, migrationID string) (*playbackServer, uint64) {
+		t.Helper()
+		_, server := newMigrationValidationServer(t)
+		migrationTestTarget(t, server, "new").PlaybackQueue.Add(model.MediaFiles{{ID: "seed", Path: "/seed.mp3"}})
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, migrationID, "new")
+		return server, attached.BindingGeneration
+	}
+	// assertUnchanged pins the rejection boundary: no target mutation, no
+	// reservation release, no user revocation visible in the scene, and no
+	// operation-history entry, i.e. the request died before hashing/admission.
+	assertUnchanged := func(t *testing.T, server *playbackServer, migrationID, operationID, fingerprint string) {
+		t.Helper()
+		after := migrationTestTarget(t, server, "new")
+		after.mu.Lock()
+		defer after.mu.Unlock()
+		if after.sceneFingerprintLocked() != fingerprint {
+			t.Fatal("rejected explicit-instance commit mutated target scene")
+		}
+		if after.PlaybackQueue.Size() != 1 || after.PlaybackQueue.Get()[0].ID != "seed" {
+			t.Fatalf("rejected explicit-instance commit mutated target queue: %s", after.PlaybackQueue)
+		}
+		info, err := server.QueryReservation(ctx, migrationID)
+		if err != nil || info.Status != string(ReservationActive) {
+			t.Fatalf("rejected explicit-instance commit consumed reservation: %#v %v", info, err)
+		}
+		record, err := server.QueryOperation(ctx, "src", operationID)
+		if err != nil || record.Status != OperationStatusUnknown {
+			t.Fatalf("rejected explicit-instance commit entered operation history: %#v %v", record, err)
+		}
+	}
+
+	t.Run("non-canonical values rejected before operation admission", func(t *testing.T) {
+		values := []struct {
+			name  string
+			value any
+		}{
+			{"null", nil},
+			{"empty", ""},
+			{"whitespace", " \t\n"},
+			{"leading-space", " " + explicitInstanceID},
+			{"trailing-space", explicitInstanceID + " "},
+			{"uppercase", "7F3A2B1C-9D4E-4A5F-B6C7-D8E9F0A1B2C3"},
+			{"braced", "{" + explicitInstanceID + "}"},
+			{"urn", "urn:uuid:" + explicitInstanceID},
+			{"undashed-hex", "7f3a2b1c9d4e4a5fb6c7d8e9f0a1b2c3"},
+			{"truncated", "7f3a2b1c-9d4e-4a5f"},
+			{"non-hex", "zf3a2b1c-9d4e-4a5f-b6c7-d8e9f0a1b2c3"},
+		}
+		for _, tc := range values {
+			t.Run(tc.name, func(t *testing.T) {
+				migrationID := "mig-reject-" + tc.name
+				server, generation := newReservedFixture(t, migrationID)
+				fingerprint := migrationTestTarget(t, server, "new").SceneFingerprint()
+				operationID := "g1:commit-reject-" + tc.name
+				req, err := decodeCommitMigrationWire(t, identityReq(migrationID, operationID, generation),
+					func(payload map[string]any) { payload["playbackInstanceId"] = tc.value })
+				if err != nil {
+					t.Fatalf("decode %s: %v", tc.name, err)
+				}
+				if _, err := server.CommitMigration(ctx, req); !errors.Is(err, ErrMigrationProtocolConflict) {
+					t.Fatalf("explicit instance %q accepted: %v", tc.name, err)
+				}
+				assertUnchanged(t, server, migrationID, operationID, fingerprint)
+			})
+		}
+	})
+
+	t.Run("non-string values fail wire decode like other wrong-typed keys", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			value any
+		}{
+			{"number", float64(42)},
+			{"bool", true},
+			{"array", []any{}},
+			{"object", map[string]any{}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, server := newMigrationValidationServer(t)
+				attached := attachMigrationSource(t, server, "src", "tab", "old")
+				_, err := decodeCommitMigrationWire(t, identityReq("mig-reject-type", "g1:commit-reject-type", attached.BindingGeneration),
+					func(payload map[string]any) { payload["playbackInstanceId"] = tc.value })
+				if err == nil {
+					t.Fatalf("non-string playbackInstanceId %s decoded without error", tc.name)
+				}
+			})
+		}
+	})
+
+	t.Run("explicit id with empty queue rejected", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			shape func(req *CommitMigrationRequest)
+		}{
+			{"empty-identity-queue", func(req *CommitMigrationRequest) { req.QueueItems = &[]QueueItemRef{} }},
+			{"empty-legacy-queue", func(req *CommitMigrationRequest) {
+				req.QueueItems = nil
+				req.Queue = []string{}
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				migrationID := "mig-reject-" + tc.name
+				server, generation := newReservedFixture(t, migrationID)
+				fingerprint := migrationTestTarget(t, server, "new").SceneFingerprint()
+				operationID := "g1:commit-reject-" + tc.name
+				base := CommitMigrationRequest{
+					MigrationID: migrationID, OperationID: operationID, SessionID: "src", ClientID: "tab",
+					User: "admin", TargetDeviceName: "new", ExpectedGeneration: generation,
+				}
+				tc.shape(&base)
+				req, err := decodeCommitMigrationWire(t, base, func(payload map[string]any) {
+					payload["playbackInstanceId"] = explicitInstanceID
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := server.CommitMigration(ctx, req); !errors.Is(err, ErrMigrationProtocolConflict) {
+					t.Fatalf("explicit instance with %s accepted: %v", tc.name, err)
+				}
+				assertUnchanged(t, server, migrationID, operationID, fingerprint)
+			})
+		}
+	})
+
+	t.Run("explicit id without a selected current item rejected", func(t *testing.T) {
+		migrationID := "mig-reject-nocurrent"
+		server, generation := newReservedFixture(t, migrationID)
+		fingerprint := migrationTestTarget(t, server, "new").SceneFingerprint()
+		operationID := "g1:commit-reject-nocurrent"
+		req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+			MigrationID: migrationID, OperationID: operationID, SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: generation,
+			QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}},
+		}, func(payload map[string]any) { payload["playbackInstanceId"] = explicitInstanceID })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := server.CommitMigration(ctx, req); !errors.Is(err, ErrMigrationProtocolConflict) {
+			t.Fatalf("explicit instance without current item accepted: %v", err)
+		}
+		assertUnchanged(t, server, migrationID, operationID, fingerprint)
+	})
+
+	t.Run("omitted explicit id keeps idle imports allowed", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			shape func(req *CommitMigrationRequest)
+		}{
+			{"empty-identity-queue", func(req *CommitMigrationRequest) { req.QueueItems = &[]QueueItemRef{} }},
+			{"identity-without-current", func(req *CommitMigrationRequest) {
+				req.QueueItems = &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}}
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				migrationID := "mig-allow-" + tc.name
+				server, generation := newReservedFixture(t, migrationID)
+				base := CommitMigrationRequest{
+					MigrationID: migrationID, OperationID: "g1:commit-allow-" + tc.name, SessionID: "src", ClientID: "tab",
+					User: "admin", TargetDeviceName: "new", ExpectedGeneration: generation,
+				}
+				tc.shape(&base)
+				committed, err := server.CommitMigration(ctx, base)
+				if err != nil {
+					t.Fatalf("omitted explicit id with %s rejected: %v", tc.name, err)
+				}
+				if committed.PlaybackInstanceID != "" || committed.Playing {
+					t.Fatalf("idle import minted an instance: %#v", committed)
+				}
+			})
+		}
+	})
+
+	t.Run("explicit id is not a credential", func(t *testing.T) {
+		migrationID := "mig-reject-authority"
+		server, generation := newReservedFixture(t, migrationID)
+		fingerprint := migrationTestTarget(t, server, "new").SceneFingerprint()
+
+		t.Run("wrong owner rejected without mutation", func(t *testing.T) {
+			operationID := "g1:commit-reject-wrongowner"
+			wrongOwner := identityReq(migrationID, operationID, generation)
+			wrongOwner.ClientID = "other-tab"
+			req, err := decodeCommitMigrationWire(t, wrongOwner, func(payload map[string]any) {
+				payload["playbackInstanceId"] = explicitInstanceID
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := server.CommitMigration(ctx, req); !errors.Is(err, ErrSessionOwnership) {
+				t.Fatalf("explicit instance bypassed ownership: %v", err)
+			}
+			assertUnchanged(t, server, migrationID, operationID, fingerprint)
+		})
+
+		t.Run("stale generation rejected without mutation", func(t *testing.T) {
+			operationID := "g1:commit-reject-stalegen"
+			stale := identityReq(migrationID, operationID, generation+1)
+			req, err := decodeCommitMigrationWire(t, stale, func(payload map[string]any) {
+				payload["playbackInstanceId"] = explicitInstanceID
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := server.CommitMigration(ctx, req); !errors.Is(err, ErrCommandSuperseded) {
+				t.Fatalf("explicit instance bypassed generation: %v", err)
+			}
+			assertUnchanged(t, server, migrationID, operationID, fingerprint)
+		})
+	})
+}
+
+func TestPlaybackMigrationExplicitInstanceImportOperationIdentity(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	currentOne := func() *string { s := "qi-1"; return &s }
+	_, server := newMigrationValidationServer(t)
+	attached := attachMigrationSource(t, server, "src", "tab", "old")
+	withInstance := func(instanceID string) CommitMigrationRequest {
+		req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+			MigrationID: "mig-no-reservation", OperationID: "op-explicit-instance", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}}, CurrentQueueItemID: currentOne(),
+		}, func(payload map[string]any) { payload["playbackInstanceId"] = instanceID })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+
+	// The first attempt fails after admission (no reservation) and records a
+	// FAILED operation at the current generation.
+	if _, err := server.CommitMigration(ctx, withInstance(explicitInstanceID)); !errors.Is(err, ErrReservationNotFound) {
+		t.Fatalf("first attempt: %v", err)
+	}
+	// The same operationId with a different explicit instance is a different
+	// normalized request identity and must not replay the stored result.
+	if _, err := server.CommitMigration(ctx, withInstance(explicitInstanceIDAlt)); !errors.Is(err, ErrOperationIdentity) {
+		t.Fatalf("changed explicit instance did not change request identity: %v", err)
+	}
+	// An identical replay reconciles with the stored record.
+	if _, err := server.CommitMigration(ctx, withInstance(explicitInstanceID)); !errors.Is(err, ErrReservationNotFound) {
+		t.Fatalf("identical replay lost reconciliation: %v", err)
+	}
+	// QueryOperation keeps reconciling against the original record.
+	record, err := server.QueryOperation(ctx, "src", "op-explicit-instance")
+	if err != nil || record.Status != OperationStatusFailed || record.ErrorCode != "RESERVATION_NOT_FOUND" {
+		t.Fatalf("query operation lost the original record: %#v err=%v", record, err)
+	}
+
+	// An invalid explicit import against a completed operation is rejected by
+	// the pre-admission validation, not answered from the cached result.
+	if _, err := server.CommitMigration(ctx, withInstance("")); !errors.Is(err, ErrMigrationProtocolConflict) {
+		t.Fatalf("invalid explicit import replayed the cached result instead of rejecting: %v", err)
+	}
+	record, err = server.QueryOperation(ctx, "src", "op-explicit-instance")
+	if err != nil || record.Status != OperationStatusFailed || record.ErrorCode != "RESERVATION_NOT_FOUND" {
+		t.Fatalf("invalid explicit import mutated the completed record: %#v err=%v", record, err)
+	}
+
+	// Omitted field must not be filled before hashing: the identical
+	// omitted-field request reconciles with its own record instead of
+	// colliding as a different identity.
+	omitted := func() CommitMigrationRequest {
+		req, err := decodeCommitMigrationWire(t, CommitMigrationRequest{
+			MigrationID: "mig-no-reservation", OperationID: "op-omitted-instance", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}}, CurrentQueueItemID: currentOne(),
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+	if _, err := server.CommitMigration(ctx, omitted()); !errors.Is(err, ErrReservationNotFound) {
+		t.Fatalf("first omitted attempt: %v", err)
+	}
+	if _, err := server.CommitMigration(ctx, omitted()); !errors.Is(err, ErrReservationNotFound) {
+		t.Fatalf("omitted field was filled before hashing and broke idempotent replay: %v", err)
+	}
+}
+
 func TestPlaybackSwitchDevicePlaybackInstanceCarry(t *testing.T) {
 	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
 

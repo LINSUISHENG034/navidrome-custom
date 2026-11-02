@@ -1059,6 +1059,316 @@ func TestJukeboxMigrationCommitWireShapeRejection(t *testing.T) {
 	})
 }
 
+// jukeboxExplicitWireInstanceID is the fixed canonical UUID used as the
+// explicit playbackInstanceId wire value; it never collides with
+// server-minted instances.
+const jukeboxExplicitWireInstanceID = "7f3a2b1c-9d4e-4a5f-b6c7-d8e9f0a1b2c3"
+
+// jukeboxExplicitInstanceFixture wires the logical-device playback server and
+// an attached source/target-owner session pair for the explicit
+// playbackInstanceId HTTP contract tests.
+type jukeboxExplicitInstanceFixture struct {
+	ps            playback.PlaybackServer
+	router        *chi.Mux
+	sessionID     string
+	generation    uint64
+	targetOwnerID string
+}
+
+func newJukeboxExplicitInstanceFixture(t *testing.T) *jukeboxExplicitInstanceFixture {
+	t.Helper()
+	_, ps := startJukeboxLogicalFixture(t, "Explicit Default", []conf.AudioDeviceDefinition{
+		{"Explicit Default", "explicit-default"},
+		{"Explicit Target", "explicit-target"},
+	})
+	api := &Router{playback: ps}
+	router := chi.NewRouter()
+	api.addJukeboxControlRoute(router)
+	api.addJukeboxSessionRoute(router)
+
+	sessionID := uniqueSessionID("explicit-src")
+	attachRes := serveJukeboxJSON(t, router, http.MethodPost, "/jukebox/session/attach", map[string]any{
+		"sessionId": sessionID, "clientId": "tab-1", "deviceName": "explicit-default",
+	})
+	if attachRes.Code != http.StatusOK {
+		t.Fatalf("attach failed: %d %s", attachRes.Code, attachRes.Body.String())
+	}
+	var attachPayload struct {
+		BindingGeneration uint64 `json:"bindingGeneration"`
+	}
+	if err := json.Unmarshal(attachRes.Body.Bytes(), &attachPayload); err != nil {
+		t.Fatal(err)
+	}
+	targetOwnerID := uniqueSessionID("explicit-target-owner")
+	targetAttach := serveJukeboxJSON(t, router, http.MethodPost, "/jukebox/session/attach", map[string]any{
+		"sessionId": targetOwnerID, "clientId": "explicit-owner", "deviceName": "explicit-target",
+	})
+	if targetAttach.Code != http.StatusOK {
+		t.Fatalf("target attach failed: %d %s", targetAttach.Code, targetAttach.Body.String())
+	}
+	return &jukeboxExplicitInstanceFixture{
+		ps: ps, router: router, sessionID: sessionID,
+		generation: attachPayload.BindingGeneration, targetOwnerID: targetOwnerID,
+	}
+}
+
+func serveJukeboxJSON(t *testing.T, router *chi.Mux, method, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var r *http.Request
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r = httptest.NewRequest(method, path, bytes.NewReader(encoded))
+	} else {
+		r = httptest.NewRequest(method, path, nil)
+	}
+	r = r.WithContext(request.WithUser(r.Context(), model.User{
+		ID: "admin", UserName: "admin", IsAdmin: true,
+	}))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, r)
+	return rec
+}
+
+func (f *jukeboxExplicitInstanceFixture) serveRaw(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+	r = r.WithContext(request.WithUser(r.Context(), model.User{
+		ID: "admin", UserName: "admin", IsAdmin: true,
+	}))
+	rec := httptest.NewRecorder()
+	f.router.ServeHTTP(rec, r)
+	return rec
+}
+
+// commitInstance posts a migration commit for the no-reservation migration
+// mig-explicit-none. The value matrix sends no reservation: the
+// explicit-instance validation runs before the reservation lookup, so a
+// conforming server answers 400 MIGRATION_PROTOCOL_CONFLICT while the
+// baseline ignores the unknown key and dies later at the missing reservation
+// (404). That keeps every case independent — a baseline-accepted body can
+// never consume a shared reservation and cascade COMMAND_SUPERSEDED into
+// later cases. The nil-datastore logical fixture cannot resolve media files,
+// so the matrix uses the empty-queue vehicle; core tests cover the same
+// values on non-empty queues with resolvable media.
+func (f *jukeboxExplicitInstanceFixture) commitInstance(t *testing.T, operationID, shape string) (int, map[string]any) {
+	t.Helper()
+	body := fmt.Sprintf(`{"operationId":%q,"migrationId":"mig-explicit-none","sessionId":%q,"clientId":"tab-1","targetDeviceName":"explicit-target","bindingGeneration":%d,%s}`,
+		operationID, f.sessionID, f.generation, shape)
+	res := f.serveRaw(t, http.MethodPost, "/jukebox/migration/commit", body)
+	var payload map[string]any
+	_ = json.Unmarshal(res.Body.Bytes(), &payload)
+	return res.Code, payload
+}
+
+func (f *jukeboxExplicitInstanceFixture) assertInstanceRejected(t *testing.T, name, operationID, shape string) {
+	t.Helper()
+	beforeTarget, err := f.ps.SessionSnapshot(context.Background(), f.targetOwnerID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, payload := f.commitInstance(t, operationID, shape)
+	if code != http.StatusBadRequest || payload["code"] != "MIGRATION_PROTOCOL_CONFLICT" {
+		t.Fatalf("%s not rejected: %d %s", name, code, payload)
+	}
+	afterTarget, err := f.ps.SessionSnapshot(context.Background(), f.targetOwnerID, "admin")
+	if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
+		t.Fatalf("%s changed target owner scene: before=%#v after=%#v err=%v", name, beforeTarget, afterTarget, err)
+	}
+}
+
+// explicitInstanceIDJSONFragment renders `"playbackInstanceId":<encoded>`.
+func explicitInstanceIDJSONFragment(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `"playbackInstanceId":` + string(encoded)
+}
+
+func TestJukeboxMigrationCommitExplicitInstanceWireContract(t *testing.T) {
+	f := newJukeboxExplicitInstanceFixture(t)
+	t.Run("non-canonical explicit values rejected as protocol conflict", func(t *testing.T) {
+		jukeboxExplicitValueMatrix(t, f)
+	})
+	t.Run("non-string explicit values stay invalid body", func(t *testing.T) {
+		jukeboxExplicitNonStringMatrix(t, f)
+	})
+	t.Run("canonical explicit value with empty queue rejected", func(t *testing.T) {
+		f.assertInstanceRejected(t, "explicit with empty queue", "g1:commit-exp-emptyqueue",
+			`"queueItems":[],"playbackInstanceId":"`+jukeboxExplicitWireInstanceID+`"`)
+	})
+	t.Run("canonical explicit value without current item rejected", func(t *testing.T) {
+		f.assertInstanceRejected(t, "explicit without current item", "g1:commit-exp-nocurrent",
+			`"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}],"playbackInstanceId":"`+jukeboxExplicitWireInstanceID+`"`)
+	})
+	t.Run("invalid explicit import against completed operation rejects before cached result", func(t *testing.T) {
+		jukeboxExplicitCompletedOperationGuard(t, f)
+	})
+	t.Run("explicit id is not a credential", func(t *testing.T) {
+		jukeboxExplicitAuthorityBoundaries(t, f)
+	})
+	t.Run("omitted explicit id keeps idle import allowed", func(t *testing.T) {
+		jukeboxExplicitOmittedIdleImport(t, f)
+	})
+}
+
+// jukeboxExplicitValueMatrix runs the non-canonical string value matrix.
+// Every fixture value is marshaled so the wire text is always valid JSON;
+// whitespace stays inside the UUID string literal.
+func jukeboxExplicitValueMatrix(t *testing.T, f *jukeboxExplicitInstanceFixture) {
+	t.Helper()
+	for _, tc := range []struct {
+		name  string
+		value any // nil encodes JSON null
+	}{
+		{"null", nil},
+		{"empty", ""},
+		{"whitespace", " \t"},
+		{"leading-space", " " + jukeboxExplicitWireInstanceID},
+		{"trailing-space", jukeboxExplicitWireInstanceID + " "},
+		{"uppercase", "7F3A2B1C-9D4E-4A5F-B6C7-D8E9F0A1B2C3"},
+		{"braced", "{" + jukeboxExplicitWireInstanceID + "}"},
+		{"urn", "urn:uuid:" + jukeboxExplicitWireInstanceID},
+		{"undashed-hex", "7f3a2b1c9d4e4a5fb6c7d8e9f0a1b2c3"},
+		{"truncated", "7f3a2b1c-9d4e-4a5f"},
+		{"non-hex", "zf3a2b1c-9d4e-4a5f-b6c7-d8e9f0a1b2c3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			operationID := "g1:commit-exp-" + tc.name
+			f.assertInstanceRejected(t, tc.name, operationID,
+				`"queueItems":[],`+explicitInstanceIDJSONFragment(t, tc.value))
+		})
+	}
+}
+
+func jukeboxExplicitNonStringMatrix(t *testing.T, f *jukeboxExplicitInstanceFixture) {
+	t.Helper()
+	for _, tc := range []struct {
+		name  string
+		value any
+	}{
+		{"number", float64(42)},
+		{"bool", true},
+		{"array", []any{}},
+		{"object", map[string]any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _ := f.commitInstance(t, "g1:commit-exp-type-"+tc.name,
+				`"queueItems":[],`+explicitInstanceIDJSONFragment(t, tc.value))
+			if code != http.StatusBadRequest {
+				t.Fatalf("non-string explicit value not rejected as invalid body: %d", code)
+			}
+		})
+	}
+}
+
+func jukeboxExplicitCompletedOperationGuard(t *testing.T, f *jukeboxExplicitInstanceFixture) {
+	t.Helper()
+	// The first attempt records a FAILED operation (no reservation for
+	// mig-explicit-none). Its body must be shape-valid under the explicit
+	// import contract — non-empty queueItems with a selected current item —
+	// so it passes validation and fails at the missing reservation,
+	// recording the FAILED result the replay below collides with.
+	firstCode, _ := f.commitInstance(t, "g1:commit-exp-cached",
+		`"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}],"currentQueueItemId":"qi-1","playbackInstanceId":"`+jukeboxExplicitWireInstanceID+`"`)
+	if firstCode != http.StatusNotFound {
+		t.Fatalf("setup commit: %d", firstCode)
+	}
+	code, payload := f.commitInstance(t, "g1:commit-exp-cached", `"queueItems":[],"playbackInstanceId":""`)
+	if code != http.StatusBadRequest || payload["code"] != "MIGRATION_PROTOCOL_CONFLICT" {
+		t.Fatalf("invalid explicit import replayed cached result: %d %s", code, payload)
+	}
+	query := serveJukeboxJSON(t, f.router, http.MethodGet, "/jukebox/operation?sessionId="+f.sessionID+"&operationId=g1:commit-exp-cached", nil)
+	var result map[string]any
+	_ = json.Unmarshal(query.Body.Bytes(), &result)
+	if query.Code != http.StatusOK || result["status"] != "FAILED" || result["errorCode"] != "RESERVATION_NOT_FOUND" {
+		t.Fatalf("invalid explicit import disturbed the completed record: %#v status=%d", result, query.Code)
+	}
+}
+
+func jukeboxExplicitAuthorityBoundaries(t *testing.T, f *jukeboxExplicitInstanceFixture) {
+	t.Helper()
+	// Shape-valid commit with a current item: authorization runs before
+	// media resolution, so the wrong owner must be refused without the
+	// explicit instance acting as a credential. This control passes on the
+	// baseline too; it pins the authority boundary for the new field.
+	beforeTarget, err := f.ps.SessionSnapshot(context.Background(), f.targetOwnerID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitBase := `"migrationId":"mig-explicit-none","sessionId":%q,"clientId":"tab-1","targetDeviceName":"explicit-target","bindingGeneration":%d`
+	body := fmt.Sprintf(`{"operationId":"g1:commit-exp-wrongowner",`+commitBase+`,"clientId":"non-owner","queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}],"currentQueueItemId":"qi-1","playbackInstanceId":"%s"}`,
+		f.sessionID, f.generation, jukeboxExplicitWireInstanceID)
+	res := f.serveRaw(t, http.MethodPost, "/jukebox/migration/commit", body)
+	var payload map[string]any
+	_ = json.Unmarshal(res.Body.Bytes(), &payload)
+	if res.Code != http.StatusForbidden || payload["code"] != "SESSION_OWNERSHIP" {
+		t.Fatalf("explicit instance bypassed ownership: %d %s", res.Code, res.Body.String())
+	}
+	afterTarget, err := f.ps.SessionSnapshot(context.Background(), f.targetOwnerID, "admin")
+	if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
+		t.Fatalf("denied explicit commit changed target: before=%#v after=%#v err=%v", beforeTarget, afterTarget, err)
+	}
+
+	staleBody := fmt.Sprintf(`{"operationId":"g1:commit-exp-stalegen",`+commitBase+`,"bindingGeneration":%d,"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}],"currentQueueItemId":"qi-1","playbackInstanceId":"%s"}`,
+		f.sessionID, f.generation, f.generation+1, jukeboxExplicitWireInstanceID)
+	res = f.serveRaw(t, http.MethodPost, "/jukebox/migration/commit", staleBody)
+	_ = json.Unmarshal(res.Body.Bytes(), &payload)
+	if res.Code != http.StatusConflict || payload["code"] != "COMMAND_SUPERSEDED" {
+		t.Fatalf("explicit instance bypassed stale generation: %d %s", res.Code, res.Body.String())
+	}
+	afterTarget, err = f.ps.SessionSnapshot(context.Background(), f.targetOwnerID, "admin")
+	if err != nil || !reflect.DeepEqual(beforeTarget, afterTarget) {
+		t.Fatalf("stale explicit commit changed target: before=%#v after=%#v err=%v", beforeTarget, afterTarget, err)
+	}
+}
+
+func jukeboxExplicitOmittedIdleImport(t *testing.T, f *jukeboxExplicitInstanceFixture) {
+	t.Helper()
+	// The idle import without playbackInstanceId must stay legal on the
+	// conforming server; this control also passes on the baseline. It
+	// needs a real reservation, so it uses its own migrationId and takes
+	// the occupied-probe fingerprint flow like the existing wire-shape
+	// test.
+	idleMigrationID := "mig-explicit-idle"
+	probe := serveJukeboxJSON(t, f.router, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+		"migrationId": idleMigrationID, "operationId": "g1:" + idleMigrationID + "-probe", "sessionId": f.sessionID, "clientId": "tab-1",
+		"deviceName": "explicit-target", "bindingGeneration": f.generation,
+	})
+	if probe.Code != http.StatusConflict {
+		t.Fatalf("expected occupied probe, got %d %s", probe.Code, probe.Body.String())
+	}
+	var probePayload map[string]any
+	_ = json.Unmarshal(probe.Body.Bytes(), &probePayload)
+	fp, ok := probePayload["sceneFingerprint"].(string)
+	if !ok || fp == "" {
+		t.Fatalf("probe did not return fingerprint: %#v", probePayload)
+	}
+	res := serveJukeboxJSON(t, f.router, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+		"migrationId": idleMigrationID, "operationId": "g1:" + idleMigrationID + "-take", "sessionId": f.sessionID, "clientId": "tab-1",
+		"deviceName": "explicit-target", "bindingGeneration": f.generation, "expectedFingerprint": fp, "forceTakeover": true,
+	})
+	if res.Code != http.StatusOK {
+		t.Fatalf("reserve failed: %d %s", res.Code, res.Body.String())
+	}
+	fpJSON, _ := json.Marshal(fp)
+	body := fmt.Sprintf(`{"operationId":"g1:commit-exp-omitted","migrationId":%q,"sessionId":%q,"clientId":"tab-1","targetDeviceName":"explicit-target","bindingGeneration":%d,"expectedFingerprint":%s,"queueItems":[]}`,
+		idleMigrationID, f.sessionID, f.generation, fpJSON)
+	res = f.serveRaw(t, http.MethodPost, "/jukebox/migration/commit", body)
+	var commitPayload map[string]any
+	_ = json.Unmarshal(res.Body.Bytes(), &commitPayload)
+	if res.Code != http.StatusOK {
+		t.Fatalf("omitted explicit idle import rejected: %d %s", res.Code, res.Body.String())
+	}
+	if commitPayload["playbackInstanceId"] != nil && commitPayload["playbackInstanceId"] != "" {
+		t.Fatalf("idle import minted an instance: %#v", commitPayload)
+	}
+}
+
 func TestJukeboxProtectedAnchorMoveVersionPrecondition(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
