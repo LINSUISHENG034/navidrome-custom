@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"sync"
 
+	"github.com/google/uuid"
+
 	"github.com/navidrome/navidrome/core/playback/mpv"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
@@ -52,20 +54,22 @@ type playbackDevice struct {
 	recoveryPosition      *int
 	sceneRevision         uint64
 	stateSequence         uint64
+	playbackInstanceID    string
 	mode                  PlaybackMode
 	randomFn              func(int) int
 }
 
 type DeviceStatus struct {
-	CurrentIndex  int
-	Playing       bool
-	Gain          float32
-	DesiredGain   float32
-	Muted         bool
-	Position      int
-	QueueVersion  int
-	StateSequence uint64       `json:"stateSequence"`
-	Mode          PlaybackMode `json:"playMode"`
+	CurrentIndex       int
+	Playing            bool
+	Gain               float32
+	DesiredGain        float32
+	Muted              bool
+	Position           int
+	QueueVersion       int
+	StateSequence      uint64       `json:"stateSequence"`
+	PlaybackInstanceID string       `json:"playbackInstanceId,omitempty"`
+	Mode               PlaybackMode `json:"playMode"`
 }
 
 const DefaultGain float32 = 1.0
@@ -131,15 +135,16 @@ func (pd *playbackDevice) getStatus() DeviceStatus {
 		pos = *pd.recoveryPosition
 	}
 	return DeviceStatus{
-		CurrentIndex:  pd.PlaybackQueue.Index,
-		Playing:       pd.isPlaying(),
-		Gain:          pd.Gain,
-		DesiredGain:   pd.DesiredGain,
-		Muted:         pd.Muted,
-		Position:      pos,
-		QueueVersion:  pd.queueVersion,
-		StateSequence: pd.stateSequence,
-		Mode:          pd.mode,
+		CurrentIndex:       pd.PlaybackQueue.Index,
+		Playing:            pd.isPlaying(),
+		Gain:               pd.Gain,
+		DesiredGain:        pd.DesiredGain,
+		Muted:              pd.Muted,
+		Position:           pos,
+		QueueVersion:       pd.queueVersion,
+		StateSequence:      pd.stateSequence,
+		PlaybackInstanceID: pd.playbackInstanceID,
+		Mode:               pd.mode,
 	}
 }
 
@@ -517,6 +522,7 @@ func (pd *playbackDevice) clearLocked(ctx context.Context) {
 	pd.retireActiveTrackLocked()
 	pd.recoveryPosition = nil
 	pd.PlaybackQueue.Clear()
+	pd.playbackInstanceID = ""
 }
 
 func (pd *playbackDevice) Remove(ctx context.Context, index int) (DeviceStatus, error) {
@@ -978,6 +984,7 @@ func (pd *playbackDevice) loadTrackLocked(ctx context.Context, index int) (Track
 // If another goroutine set ActiveTrack during the unlock window, the
 // orphaned process is closed before the new track is assigned.
 func (pd *playbackDevice) assignTrack(newTrack Track, token model.PlaybackToken) {
+	pd.playbackInstanceID = uuid.NewString()
 	pd.retireActiveTrackLocked()
 	pd.ActiveTrack = newTrack
 	pd.activePlaybackToken = token

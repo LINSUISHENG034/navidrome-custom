@@ -1374,7 +1374,7 @@ func TestJukeboxStateSequenceStatusMappings(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := &jukeboxStatusSnapshotServer{snapshot: playback.SessionSnapshot{
-				SessionStatus: playback.SessionStatus{StateSequence: tc.sequence, QueueVersion: 3, PlayMode: string(tc.mode)},
+				SessionStatus: playback.SessionStatus{StateSequence: tc.sequence, QueueVersion: 3, PlayMode: string(tc.mode), PlaybackInstanceID: "instance-" + string(tc.mode)},
 			}}
 			api := &Router{playback: server}
 			router := chi.NewRouter()
@@ -1386,7 +1386,7 @@ func TestJukeboxStateSequenceStatusMappings(t *testing.T) {
 			if response.Code != http.StatusOK || server.sessionID != "sequence-session" || server.user != "admin" {
 				t.Fatalf("status did not read bound snapshot: status=%d session=%q user=%q", response.Code, server.sessionID, server.user)
 			}
-			encoded, err := json.Marshal(toStatusResponse(playback.DeviceStatus{StateSequence: tc.sequence, QueueVersion: 3, Mode: tc.mode}))
+			encoded, err := json.Marshal(toStatusResponse(playback.DeviceStatus{StateSequence: tc.sequence, QueueVersion: 3, Mode: tc.mode, PlaybackInstanceID: "instance-" + string(tc.mode)}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1398,14 +1398,15 @@ func TestJukeboxStateSequenceStatusMappings(t *testing.T) {
 				{"session status response", response.Body.Bytes()},
 			} {
 				var payload struct {
-					StateSequence *uint64 `json:"stateSequence"`
-					QueueVersion  int     `json:"queueVersion"`
-					PlayMode      string  `json:"playMode"`
+					StateSequence      *uint64 `json:"stateSequence"`
+					QueueVersion       int     `json:"queueVersion"`
+					PlayMode           string  `json:"playMode"`
+					PlaybackInstanceID string  `json:"playbackInstanceId"`
 				}
 				if err := json.Unmarshal(mapping.body, &payload); err != nil {
 					t.Fatal(err)
 				}
-				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 || payload.PlayMode != string(tc.mode) {
+				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 || payload.PlayMode != string(tc.mode) || payload.PlaybackInstanceID != "instance-"+string(tc.mode) {
 					t.Errorf("%s lost sequence, structural version, or mode: %s", mapping.name, mapping.body)
 				}
 			}

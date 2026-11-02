@@ -178,6 +178,7 @@ func TestPlaybackServerStateSequenceMappings(t *testing.T) {
 			device.queueVersion = 3
 			device.stateSequence = tc.sequence
 			device.mode = tc.mode
+			device.playbackInstanceID = "instance-" + string(tc.mode)
 			broker := &fakeEventBroker{}
 			ps := &playbackServer{
 				ctx: &ctx, sessionManager: NewSessionManager(time.Minute),
@@ -216,14 +217,15 @@ func TestPlaybackServerStateSequenceMappings(t *testing.T) {
 					t.Fatal(err)
 				}
 				var payload struct {
-					StateSequence *uint64 `json:"stateSequence"`
-					QueueVersion  int     `json:"queueVersion"`
-					PlayMode      string  `json:"playMode"`
+					StateSequence      *uint64 `json:"stateSequence"`
+					QueueVersion       int     `json:"queueVersion"`
+					PlayMode           string  `json:"playMode"`
+					PlaybackInstanceID string  `json:"playbackInstanceId"`
 				}
 				if err := json.Unmarshal(encoded, &payload); err != nil {
 					t.Fatal(err)
 				}
-				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 || payload.PlayMode != string(tc.mode) {
+				if payload.StateSequence == nil || *payload.StateSequence != tc.sequence || payload.QueueVersion != 3 || payload.PlayMode != string(tc.mode) || payload.PlaybackInstanceID != "instance-"+string(tc.mode) {
 					t.Errorf("%s lost sequence, structural version, or mode: %s", mapping.name, encoded)
 				}
 			}

@@ -11,6 +11,7 @@ import (
 	"github.com/navidrome/navidrome/tests"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega/gstruct"
 )
 
 func TestPlaybackServerGetReturnsIndependentQueueSnapshot(t *testing.T) {
@@ -428,14 +429,14 @@ var _ = Describe("PlaybackServer", func() {
 		go pd.trackSwitcherGoroutine()
 		pd.PlaybackEvents <- model.PlaybackEvent{Token: 1, Kind: model.PlaybackEventNaturalEnd}
 
-		Eventually(events, time.Second).Should(Receive(Equal(DeviceStatus{
-			CurrentIndex:  1,
-			Playing:       true,
-			Gain:          DefaultGain,
-			DesiredGain:   DefaultGain,
-			Position:      0,
-			StateSequence: 2,
-			Mode:          PlaybackModeOrder,
+		Eventually(events, time.Second).Should(Receive(MatchFields(IgnoreExtras, Fields{
+			"CurrentIndex":  Equal(1),
+			"Playing":       Equal(true),
+			"Gain":          Equal(DefaultGain),
+			"DesiredGain":   Equal(DefaultGain),
+			"Position":      Equal(0),
+			"StateSequence": Equal(uint64(2)),
+			"Mode":          Equal(PlaybackModeOrder),
 		})))
 	})
 })

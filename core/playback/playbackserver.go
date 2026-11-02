@@ -878,6 +878,7 @@ func sessionStatusFromDevice(session Session, device *playbackDevice) SessionSta
 	status.QueueVersion = device.queueVersion
 	status.StateSequence = deviceStatus.StateSequence
 	status.PlayMode = string(deviceStatus.Mode)
+	status.PlaybackInstanceID = deviceStatus.PlaybackInstanceID
 	if current := device.PlaybackQueue.Current(); current != nil {
 		status.TrackID = current.ID
 	}
