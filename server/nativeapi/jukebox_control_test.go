@@ -1361,6 +1361,256 @@ func TestJukeboxModeHTTPContract(t *testing.T) {
 	}
 }
 
+func TestJukeboxManualNavigationHTTPContract(t *testing.T) {
+	ctx, ps := startJukeboxLogicalFixture(t, "Navigation Default", []conf.AudioDeviceDefinition{
+		{"Navigation Default", "navigation-default"},
+	})
+	api := &Router{playback: ps}
+	router := chi.NewRouter()
+	api.addJukeboxControlRoute(router)
+	api.addJukeboxSessionRoute(router)
+
+	serve := func(t *testing.T, method, path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		var r *http.Request
+		if body != nil {
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r = httptest.NewRequest(method, path, bytes.NewReader(encoded))
+		} else {
+			r = httptest.NewRequest(method, path, nil)
+		}
+		r = r.WithContext(request.WithUser(r.Context(), model.User{
+			ID: "validation-admin", UserName: "validation-admin", IsAdmin: true,
+		}))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, r)
+		return rec
+	}
+	attach := func(t *testing.T, sessionID, clientID string, takeover bool) uint64 {
+		t.Helper()
+		body := map[string]any{
+			"sessionId": sessionID, "clientId": clientID, "deviceName": "navigation-default",
+		}
+		if takeover {
+			body["takeover"] = true
+		}
+		response := serve(t, http.MethodPost, "/jukebox/session/attach", body)
+		if response.Code != http.StatusOK {
+			t.Fatalf("attach: %d %s", response.Code, response.Body.String())
+		}
+		var status playback.SessionStatus
+		if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, clientID) })
+		return status.BindingGeneration
+	}
+	snapshot := func(t *testing.T, sessionID string) playback.SessionSnapshot {
+		t.Helper()
+		state, err := ps.SessionSnapshot(ctx, sessionID, "validation-admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	assertNoMutation := func(t *testing.T, sessionID string, before playback.SessionSnapshot) {
+		t.Helper()
+		if after := snapshot(t, sessionID); !reflect.DeepEqual(before, after) {
+			t.Errorf("rejected navigation mutated state: before=%#v after=%#v", before, after)
+		}
+	}
+
+	// Both manual navigation actions reuse the protected ExecuteCommand path:
+	// the owner is admitted on an empty queue as a no-op, and the response
+	// carries the authoritative ordering, mode, and instance mappings.
+	for _, action := range []struct {
+		path string
+		op   string
+	}{
+		{"/jukebox/next", "next"},
+		{"/jukebox/prev", "prev"},
+	} {
+		t.Run(action.op+"/owner admitted as empty queue no-op", func(t *testing.T) {
+			sessionID := uniqueSessionID("nav-" + action.op)
+			generation := attach(t, sessionID, "owner", false)
+			before := snapshot(t, sessionID)
+			response := serve(t, http.MethodPost, action.path, map[string]any{
+				"sessionId": sessionID, "clientId": "owner", "bindingGeneration": generation,
+				"operationId": fmt.Sprintf("g%d:nav-%s-owner", generation, action.op),
+			})
+			if response.Code != http.StatusOK {
+				t.Fatalf("%s status=%d want=200 body=%s", action.path, response.Code, response.Body.String())
+			}
+			var payload jukeboxStatusResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("%s response is not a status mapping: %s err=%v", action.path, response.Body.String(), err)
+			}
+			if payload.StateSequence != before.SessionStatus.StateSequence ||
+				payload.QueueVersion != before.SessionStatus.QueueVersion ||
+				string(payload.PlayMode) != before.SessionStatus.PlayMode ||
+				payload.PlaybackInstanceID != "" {
+				t.Errorf("%s response lost ordering/mode/instance mappings: %s", action.path, response.Body.String())
+			}
+			assertNoMutation(t, sessionID, before)
+		})
+	}
+
+	t.Run("next/query scope with empty body admitted", func(t *testing.T) {
+		sessionID := uniqueSessionID("nav-query")
+		generation := attach(t, sessionID, "owner", false)
+		before := snapshot(t, sessionID)
+		path := fmt.Sprintf("/jukebox/next?sessionId=%s&clientId=owner&bindingGeneration=%d&operationId=g%d:nav-next-query",
+			sessionID, generation, generation)
+		response := serve(t, http.MethodPost, path, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("query scope navigation: %d %s", response.Code, response.Body.String())
+		}
+		assertNoMutation(t, sessionID, before)
+	})
+
+	t.Run("prev/body and query scope conflict rejected without mutation", func(t *testing.T) {
+		sessionID := uniqueSessionID("nav-conflict")
+		generation := attach(t, sessionID, "owner", false)
+		before := snapshot(t, sessionID)
+		response := serve(t, http.MethodPost, "/jukebox/prev?sessionId=other-session&clientId=owner", map[string]any{
+			"sessionId": sessionID, "clientId": "owner", "bindingGeneration": generation,
+			"operationId": fmt.Sprintf("g%d:nav-prev-conflict", generation),
+		})
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("scope conflict: %d %s", response.Code, response.Body.String())
+		}
+		assertNoMutation(t, sessionID, before)
+	})
+
+	t.Run("next/wrong generation rejected without mutation", func(t *testing.T) {
+		sessionID := uniqueSessionID("nav-generation")
+		generation := attach(t, sessionID, "owner", false)
+		before := snapshot(t, sessionID)
+		stale := generation + 1
+		response := serve(t, http.MethodPost, "/jukebox/next", map[string]any{
+			"sessionId": sessionID, "clientId": "owner", "bindingGeneration": stale,
+			"operationId": fmt.Sprintf("g%d:nav-next-stale", stale),
+		})
+		var payload map[string]any
+		_ = json.Unmarshal(response.Body.Bytes(), &payload)
+		if response.Code != http.StatusConflict || payload["code"] != "COMMAND_SUPERSEDED" {
+			t.Fatalf("wrong generation: %d %s", response.Code, response.Body.String())
+		}
+		assertNoMutation(t, sessionID, before)
+	})
+
+	t.Run("prev/non-owner rejected without mutation", func(t *testing.T) {
+		sessionID := uniqueSessionID("nav-nonowner")
+		generation := attach(t, sessionID, "owner", false)
+		before := snapshot(t, sessionID)
+		response := serve(t, http.MethodPost, "/jukebox/prev", map[string]any{
+			"sessionId": sessionID, "clientId": "intruder", "bindingGeneration": generation,
+			"operationId": fmt.Sprintf("g%d:nav-prev-intruder", generation),
+		})
+		var payload map[string]any
+		_ = json.Unmarshal(response.Body.Bytes(), &payload)
+		if response.Code != http.StatusForbidden || payload["code"] != "SESSION_OWNERSHIP" {
+			t.Fatalf("non-owner navigation: %d %s", response.Code, response.Body.String())
+		}
+		assertNoMutation(t, sessionID, before)
+	})
+
+	t.Run("prev/old generation after takeover rejected without mutation", func(t *testing.T) {
+		sessionID := uniqueSessionID("nav-takeover")
+		oldGeneration := attach(t, sessionID, "old-owner", false)
+		currentGeneration := attach(t, sessionID, "new-owner", true)
+		if currentGeneration <= oldGeneration {
+			t.Fatalf("takeover did not advance binding generation: old=%d current=%d", oldGeneration, currentGeneration)
+		}
+		before := snapshot(t, sessionID)
+		response := serve(t, http.MethodPost, "/jukebox/prev", map[string]any{
+			"sessionId": sessionID, "clientId": "new-owner", "bindingGeneration": oldGeneration,
+			"operationId": fmt.Sprintf("g%d:nav-prev-old-generation", oldGeneration),
+		})
+		var payload map[string]any
+		_ = json.Unmarshal(response.Body.Bytes(), &payload)
+		if response.Code != http.StatusConflict || payload["code"] != "COMMAND_SUPERSEDED" {
+			t.Fatalf("stale generation after takeover: %d %s", response.Code, response.Body.String())
+		}
+		assertNoMutation(t, sessionID, before)
+	})
+
+	t.Run("next/operation replay idempotent", func(t *testing.T) {
+		sessionID := uniqueSessionID("nav-replay")
+		generation := attach(t, sessionID, "owner", false)
+		body := map[string]any{
+			"sessionId": sessionID, "clientId": "owner", "bindingGeneration": generation,
+			"operationId": fmt.Sprintf("g%d:nav-next-replay", generation),
+		}
+		first := serve(t, http.MethodPost, "/jukebox/next", body)
+		if first.Code != http.StatusOK {
+			t.Fatalf("first navigation: %d %s", first.Code, first.Body.String())
+		}
+		var firstPayload jukeboxStatusResponse
+		if err := json.Unmarshal(first.Body.Bytes(), &firstPayload); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, sessionID)
+		replay := serve(t, http.MethodPost, "/jukebox/next", body)
+		if replay.Code != http.StatusOK {
+			t.Fatalf("replayed navigation: %d %s", replay.Code, replay.Body.String())
+		}
+		var replayPayload jukeboxStatusResponse
+		if err := json.Unmarshal(replay.Body.Bytes(), &replayPayload); err != nil {
+			t.Fatal(err)
+		}
+		if replayPayload.StateSequence != firstPayload.StateSequence || replayPayload.QueueVersion != firstPayload.QueueVersion {
+			t.Errorf("replay re-executed navigation: first=%#v replay=%#v", firstPayload, replayPayload)
+		}
+		query := serve(t, http.MethodGet, fmt.Sprintf("/jukebox/operation?sessionId=%s&operationId=%s",
+			sessionID, body["operationId"]), nil)
+		var record map[string]any
+		_ = json.Unmarshal(query.Body.Bytes(), &record)
+		if query.Code != http.StatusOK || record["status"] != "APPLIED" {
+			t.Errorf("replay operation record: %d %s", query.Code, query.Body.String())
+		}
+		assertNoMutation(t, sessionID, before)
+	})
+
+	t.Run("prev/non-default mode retained in navigation response", func(t *testing.T) {
+		sessionID := uniqueSessionID("nav-mode")
+		generation := attach(t, sessionID, "owner", false)
+		modeResponse := serve(t, http.MethodPost, "/jukebox/mode", map[string]any{
+			"sessionId": sessionID, "clientId": "owner", "bindingGeneration": generation,
+			"operationId": fmt.Sprintf("g%d:nav-mode-seed", generation), "mode": "shufflePlay",
+		})
+		if modeResponse.Code != http.StatusOK {
+			t.Fatalf("seed mode: %d %s", modeResponse.Code, modeResponse.Body.String())
+		}
+		seeded := snapshot(t, sessionID)
+		if seeded.SessionStatus.PlayMode != string(playback.PlaybackModeShuffle) {
+			t.Fatalf("mode seed did not apply: %#v", seeded.SessionStatus)
+		}
+		response := serve(t, http.MethodPost, "/jukebox/prev", map[string]any{
+			"sessionId": sessionID, "clientId": "owner", "bindingGeneration": generation,
+			"operationId": fmt.Sprintf("g%d:nav-prev-mode", generation),
+		})
+		if response.Code != http.StatusOK {
+			t.Fatalf("mode navigation: %d %s", response.Code, response.Body.String())
+		}
+		var payload jukeboxStatusResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if string(payload.PlayMode) != seeded.SessionStatus.PlayMode ||
+			payload.StateSequence != seeded.SessionStatus.StateSequence ||
+			payload.QueueVersion != seeded.SessionStatus.QueueVersion {
+			t.Errorf("navigation response lost mode or ordering: %s", response.Body.String())
+		}
+		if after := snapshot(t, sessionID); !reflect.DeepEqual(seeded, after) {
+			t.Errorf("empty queue navigation mutated mode state: before=%#v after=%#v", seeded, after)
+		}
+	})
+}
+
 func TestJukeboxStateSequenceStatusMappings(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

@@ -61,6 +61,8 @@ func (api *Router) addJukeboxControlRoute(r chi.Router) {
 	r.Post("/jukebox/stop", api.jukeboxShutdown)
 	r.Post("/jukebox/pause", api.jukeboxStop)
 	r.Post("/jukebox/skip", api.jukeboxSkip)
+	r.Post("/jukebox/next", api.jukeboxNext)
+	r.Post("/jukebox/prev", api.jukeboxPrev)
 	r.Post("/jukebox/seek", api.jukeboxSeek)
 	r.Post("/jukebox/volume", api.jukeboxVolume)
 	r.Post("/jukebox/mute", api.jukeboxMute)
@@ -278,6 +280,14 @@ func (api *Router) jukeboxVolume(w http.ResponseWriter, r *http.Request) {
 
 func (api *Router) jukeboxMute(w http.ResponseWriter, r *http.Request) {
 	api.jukeboxCommand(w, r, playback.CommandMute, true)
+}
+
+func (api *Router) jukeboxNext(w http.ResponseWriter, r *http.Request) {
+	api.jukeboxCommand(w, r, playback.CommandNext, false)
+}
+
+func (api *Router) jukeboxPrev(w http.ResponseWriter, r *http.Request) {
+	api.jukeboxCommand(w, r, playback.CommandPrev, false)
 }
 
 func (api *Router) jukeboxSeek(w http.ResponseWriter, r *http.Request) {
