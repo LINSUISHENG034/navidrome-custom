@@ -1448,6 +1448,126 @@ func captureRemovalFailureScene(fixture *anchorMoveFixture) removalFailureScene 
 	}
 }
 
+type manualNavigationCase struct {
+	name     string
+	action   string
+	size     int
+	current  int
+	position int
+	ordered  int
+	shuffled int
+	fail     bool
+}
+
+func TestPlaybackDeviceManualModeNavigation(t *testing.T) {
+	cases := []manualNavigationCase{
+		{"next middle", CommandNext, 4, 1, 0, 2, 0, false},
+		{"next wraps", CommandNext, 4, 3, 17, 0, 0, false},
+		{"previous middle", CommandPrev, 4, 1, 0, 0, 0, false},
+		{"previous wraps at threshold", CommandPrev, 4, 0, 1, 3, 1, false},
+		{"previous rewinds above threshold", CommandPrev, 4, 1, 2, 1, 1, false},
+		{"next single", CommandNext, 1, 0, 4, 0, 0, false},
+		{"previous single", CommandPrev, 1, 0, 1, 0, 0, false},
+		{"previous single rewind", CommandPrev, 1, 0, 4, 0, 0, false},
+		{"next empty", CommandNext, 0, -1, 0, -1, -1, false},
+		{"previous empty", CommandPrev, 0, -1, 0, -1, -1, false},
+		{"rewind failure", CommandPrev, 4, 1, 2, 1, 1, true},
+	}
+	for _, mode := range []PlaybackMode{PlaybackModeOrder, PlaybackModeRepeatList, PlaybackModeRepeatTrack, PlaybackModeShuffle} {
+		t.Run(string(mode), func(t *testing.T) {
+			for _, playing := range []bool{false, true} {
+				state := "paused"
+				if playing {
+					state = "playing"
+				}
+				t.Run(state, func(t *testing.T) {
+					for _, tc := range cases {
+						t.Run(tc.name, func(t *testing.T) { assertManualNavigation(t, mode, playing, tc) })
+					}
+				})
+			}
+		})
+	}
+}
+
+func assertManualNavigation(t *testing.T, mode PlaybackMode, playing bool, tc manualNavigationCase) {
+	t.Helper()
+	fixture := newAnchorMoveFixture(t)
+	device := fixture.device
+	if tc.size == 1 {
+		if _, err := device.Set(fixture.ctx, []string{"1"}); err != nil {
+			t.Fatal(err)
+		}
+	} else if tc.size == 0 {
+		if _, err := device.Clear(fixture.ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := device.executeCommand(fixture.ctx, PlaybackCommand{Action: CommandSetMode, Mode: mode}); err != nil {
+		t.Fatal(err)
+	}
+	if tc.size > 0 {
+		device.PlaybackQueue.SetIndex(tc.current)
+		fixture.start(t)
+		if !playing {
+			if _, err := device.Stop(fixture.ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		fixture.playing.position = tc.position
+	}
+	device.randomFn = func(int) int { return 0 }
+	before := captureRemovalFailureScene(fixture)
+	failure := errors.New("rewind position rejected")
+	if tc.fail {
+		configureSkipFailure(fixture.playing, "position", failure)
+	}
+	factoryCalls := 0
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		factoryCalls++
+		return fixture.newTrack(), nil
+	}
+	var notifications []DeviceStatus
+	device.onStateChange = func(status DeviceStatus) { notifications = append(notifications, status) }
+	t.Cleanup(func() { device.onStateChange = nil })
+	returned, err := device.executeCommand(fixture.ctx, PlaybackCommand{Action: tc.action})
+	after := captureRemovalFailureScene(fixture)
+	if tc.fail {
+		if !errors.Is(err, failure) || !reflect.DeepEqual(before, after) || len(notifications) != 0 || factoryCalls != 0 {
+			t.Errorf("failed rewind changed state: before=%#v after=%#v notifications=%v factory=%d err=%v", before, after, notifications, factoryCalls, err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := tc.ordered
+	if mode == PlaybackModeShuffle {
+		target = tc.shuffled
+	}
+	delta, wantFactory, wantNotifications := uint64(1), 0, 1
+	if tc.size == 0 {
+		delta, wantNotifications = 0, 0
+	} else if target != tc.current {
+		wantFactory = 1
+		if playing {
+			delta++
+		}
+	}
+	wantStatus := before.status
+	wantStatus.CurrentIndex, wantStatus.Position = target, 0
+	wantStatus.StateSequence += delta
+	if returned != wantStatus || after.status != wantStatus || after.revision != before.revision+delta || device.mode != mode {
+		t.Errorf("manual navigation state: returned=%#v after=%#v wantStatus=%#v delta=%d mode=%q", returned, after, wantStatus, delta, device.mode)
+	}
+	if !slices.Equal(before.itemIDs, after.itemIDs) || factoryCalls != wantFactory || len(notifications) != wantNotifications {
+		t.Errorf("navigation reordered queue, reloaded rewind, or mispublished: before=%v after=%v factory=%d notifications=%v", before.itemIDs, after.itemIDs, factoryCalls, notifications)
+	}
+	if tc.size > 0 && target == tc.current && (after.track != before.track || after.token != before.token) {
+		t.Error("same-item reset replaced active output")
+	}
+}
+
 type skipSequenceCase struct {
 	name    string
 	index   int

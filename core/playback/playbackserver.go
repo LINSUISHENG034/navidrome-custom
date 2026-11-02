@@ -185,6 +185,8 @@ const (
 	CommandGain    = "gain"
 	CommandMute    = "mute"
 	CommandSetMode = "setMode"
+	CommandNext    = "next"
+	CommandPrev    = "prev"
 )
 
 // DeviceInfo represents an audio output device exposed via the API.

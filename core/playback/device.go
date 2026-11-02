@@ -384,6 +384,59 @@ func (pd *playbackDevice) skipLocked(ctx context.Context, index int, offset int)
 	return pd.getStatus(), changed, nil
 }
 
+func (pd *playbackDevice) rewindLocked() (DeviceStatus, bool, error) {
+	if pd.ActiveTrack != nil {
+		if err := pd.ActiveTrack.SetPosition(0); err != nil {
+			return pd.getStatus(), false, err
+		}
+	} else {
+		if pd.recoveryPosition == nil || *pd.recoveryPosition == 0 {
+			return pd.getStatus(), false, nil
+		}
+		position := 0
+		pd.recoveryPosition = &position
+	}
+	pd.incrementSceneRevisionLocked()
+	pd.incrementStateSequenceLocked()
+	return pd.getStatus(), true, nil
+}
+
+func (pd *playbackDevice) manualSkipLocked(ctx context.Context, previous bool) (DeviceStatus, bool, error) {
+	if pd.PlaybackQueue.IsEmpty() {
+		return pd.getStatus(), false, nil
+	}
+	if previous && pd.getStatus().Position > PrevRewindThresholdSeconds {
+		return pd.rewindLocked()
+	}
+	index, size := pd.PlaybackQueue.Index, pd.PlaybackQueue.Size()
+	target := (index + 1) % size
+	if previous {
+		target = (index - 1 + size) % size
+	}
+	if pd.mode == PlaybackModeShuffle {
+		target = pd.shuffleIndexLocked()
+	}
+	if target == index {
+		return pd.rewindLocked()
+	}
+	return pd.skipLocked(ctx, target, 0)
+}
+
+func (pd *playbackDevice) shuffleIndexLocked() int {
+	current := pd.PlaybackQueue.Index
+	if pd.PlaybackQueue.Size() <= 1 {
+		return current
+	}
+	pick := 0
+	if pd.randomFn != nil {
+		pick = pd.randomFn(pd.PlaybackQueue.Size() - 1)
+	}
+	if pick >= current {
+		pick++
+	}
+	return pick
+}
+
 func (pd *playbackDevice) Add(ctx context.Context, ids []string) (DeviceStatus, error) {
 	return pd.executeCommand(ctx, PlaybackCommand{Action: CommandAdd, IDs: ids})
 }
@@ -707,6 +760,8 @@ func (pd *playbackDevice) commandLocked(ctx context.Context, command PlaybackCom
 		return pd.skipLocked(ctx, command.Index, command.Offset)
 	case CommandSeek:
 		return pd.skipLocked(ctx, pd.PlaybackQueue.Index, command.Position)
+	case CommandNext, CommandPrev:
+		return pd.manualSkipLocked(ctx, command.Action == CommandPrev)
 	case CommandAdd, CommandInsert:
 		var status DeviceStatus
 		var err error
@@ -758,20 +813,7 @@ func (pd *playbackDevice) naturalEndIndexLocked() (int, bool) {
 	case PlaybackModeRepeatList:
 		return (current + 1) % pd.PlaybackQueue.Size(), true
 	case PlaybackModeShuffle:
-		if pd.PlaybackQueue.Size() == 1 {
-			return current, true
-		}
-		candidates := make([]int, 0, pd.PlaybackQueue.Size()-1)
-		for i := range pd.PlaybackQueue.Items {
-			if i != current {
-				candidates = append(candidates, i)
-			}
-		}
-		pick := 0
-		if pd.randomFn != nil {
-			pick = pd.randomFn(len(candidates))
-		}
-		return candidates[pick], true
+		return pd.shuffleIndexLocked(), true
 	case PlaybackModeOrder:
 		if current >= pd.PlaybackQueue.Size()-1 {
 			return current, false

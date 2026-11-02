@@ -351,6 +351,8 @@ func playbackAuthorityValidationCommands() []PlaybackCommand {
 		{Action: CommandSet, IDs: []string{"track", "track"}},
 		{Action: CommandGain, Gain: 0.25},
 		{Action: CommandStart},
+		{Action: CommandNext},
+		{Action: CommandPrev},
 		{Action: CommandSeek, Position: 17},
 		{Action: CommandPause},
 		{Action: CommandStart},
@@ -1823,6 +1825,25 @@ func TestPlaybackIdentityRemoveRejectionEnvelopes(t *testing.T) {
 		t.Fatalf("missing identity remove: %T %v", err, err)
 	} else if !lookupErr.Source || lookupErr.Status.QueueVersion != versionBefore {
 		t.Fatalf("missing identity remove envelope: %#v", lookupErr)
+	}
+}
+
+func TestPlaybackManualNavigationOperationReplay(t *testing.T) {
+	for _, action := range []string{CommandNext, CommandPrev} {
+		t.Run(action, func(t *testing.T) {
+			fixture := newIdentityEditFixture(t)
+			command := PlaybackCommand{Action: action}
+			first := fixture.run(t, "g1:first", command)
+			second := fixture.run(t, "g1:second", command)
+			if first.CurrentIndex == second.CurrentIndex || second.StateSequence != first.StateSequence+1 {
+				t.Fatalf("fresh navigation did not advance: first=%#v second=%#v", first, second)
+			}
+			replayed := fixture.run(t, "g1:first", command)
+			observed, err := fixture.device.Status(fixture.ctx)
+			if err != nil || replayed != first || observed != second {
+				t.Fatalf("navigation retry changed current state: replayed=%#v observed=%#v err=%v", replayed, observed, err)
+			}
+		})
 	}
 }
 
