@@ -109,6 +109,7 @@ var _ = Describe("JukeboxControl", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(commandErr).To(HaveOccurred(), "non-owner command accepted: response=%#v gain=%v->%v", resp, before.Gain, after.Gain)
 		Expect(after.Gain).To(Equal(before.Gain))
+		Expect(after.DesiredGain).To(Equal(before.DesiredGain))
 	})
 
 	It("enforces session authority for every mutation and bare legacy bypass", func() {
@@ -122,6 +123,10 @@ var _ = Describe("JukeboxControl", func() {
 		DeferCleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, "owner") })
 		before, err := device.Status(ctx)
 		Expect(err).ToNot(HaveOccurred())
+		// The fixture device is idle (no Start): the subsonic wire only maps
+		// the applied gain, so a desired-gain write commits DesiredGain while
+		// the applied Gain stays at the captured idle value.
+		appliedGain := before.Gain
 		serve := func(action, scope, userName string) (*responses.Subsonic, error) {
 			req := httptest.NewRequest("GET", "/rest/jukeboxControl?action="+action+scope, nil)
 			req = req.WithContext(request.WithUser(req.Context(), model.User{ID: userName, UserName: userName, IsAdmin: true}))
@@ -144,7 +149,11 @@ var _ = Describe("JukeboxControl", func() {
 		assertDenied("setGain&gain=0.25", ownerScope, "other-user")
 		response, err := serve("setGain&gain=0.25", ownerScope, "admin")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(response.JukeboxStatus.Gain).To(Equal(float32(0.25)))
+		Expect(response.JukeboxStatus.Gain).To(Equal(appliedGain))
+		ownerStatus, err := device.Status(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ownerStatus.DesiredGain).To(Equal(float32(0.25)))
+		Expect(ownerStatus.Gain).To(Equal(appliedGain))
 		attachment, err = ps.AttachSession(ctx, playback.AttachRequest{
 			SessionID: sessionID, ClientID: "new-owner", User: "admin", DeviceName: device.DeviceName, Takeover: true,
 		})
@@ -152,14 +161,19 @@ var _ = Describe("JukeboxControl", func() {
 		DeferCleanup(func() { _, _ = ps.DetachSession(context.Background(), sessionID, "new-owner") })
 		before, err = device.Status(ctx)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(before.Gain).To(Equal(float32(0.25)))
+		Expect(before.Gain).To(Equal(appliedGain))
+		Expect(before.DesiredGain).To(Equal(float32(0.25)))
 		for _, action := range subsonicMutationValidationActions() {
 			assertDenied(action, ownerScope, "admin")
 		}
 		newOwnerScope := "&sessionId=" + sessionID + "&clientId=new-owner&bindingGeneration=" + strconv.FormatUint(attachment.BindingGeneration, 10) + "&operationId=g2:subsonic-set-gain"
 		response, err = serve("setGain&gain=0.5", newOwnerScope, "admin")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(response.JukeboxStatus.Gain).To(Equal(float32(0.5)))
+		Expect(response.JukeboxStatus.Gain).To(Equal(appliedGain))
+		newOwnerStatus, err := device.Status(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(newOwnerStatus.DesiredGain).To(Equal(float32(0.5)))
+		Expect(newOwnerStatus.Gain).To(Equal(appliedGain))
 	})
 
 	It("returns failed response when jukebox is disabled", func() {

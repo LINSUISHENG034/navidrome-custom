@@ -2573,3 +2573,505 @@ func TestPlaybackDeviceFailedGainRetryAccounting(t *testing.T) {
 		t.Fatalf("gain attempts did not reach the output each time: %v", f.track.volumeValues)
 	}
 }
+
+// T14-AC06 compatibility characterization for the retained legacy physical
+// shuffle command (CommandShuffle). The ticket default retains the historical
+// physical reorder of the visible queue; these tests pin that behavior so it
+// cannot masquerade as the canonical shufflePlay mode selection: legacy
+// shuffle never changes the Playback Mode, never reissues the playback
+// instance, and is a bounded structural reorder. Canonical shufflePlay
+// selection itself is covered by TestPlaybackDeviceNaturalEndPlaybackModes.
+
+// T14-AC06: on empty and single-item queues the legacy shuffle is an exact
+// no-op — no structural/semantic/scene counter advances and no publication.
+func TestPlaybackDeviceLegacyShuffleNoOpSizes(t *testing.T) {
+	t.Run("empty queue", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+		var published []DeviceStatus
+		device.onStateChange = func(status DeviceStatus) {
+			if !device.mu.TryLock() {
+				t.Error("empty shuffle callback ran under the device lock")
+				return
+			}
+			device.mu.Unlock()
+			published = append(published, status)
+		}
+		before, err := device.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		status, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandShuffle})
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed, err := device.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status != before || observed != before {
+			t.Fatalf("empty shuffle was not a no-op: before=%#v returned=%#v observed=%#v", before, status, observed)
+		}
+		if len(published) != 0 {
+			t.Fatalf("empty shuffle published state: %#v", published)
+		}
+		if device.queueVersion != 0 || device.stateSequence != 0 || device.sceneRevision != 1 {
+			t.Fatalf("empty shuffle advanced counters: queueVersion=%d stateSequence=%d sceneRevision=%d",
+				device.queueVersion, device.stateSequence, device.sceneRevision)
+		}
+	})
+
+	t.Run("single item with active output", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+		device.PlaybackQueue.Add(model.MediaFiles{{ID: "1", Path: "/1.mp3"}})
+		device.PlaybackQueue.SetIndex(0)
+		track := &mockTrack{playing: true, position: 12}
+		device.mu.Lock()
+		device.ActiveTrack = track
+		device.activePlaybackToken = 41
+		device.playbackInstanceID = "instance-single"
+		device.mu.Unlock()
+		itemIDs := device.PlaybackQueue.ItemIDs()
+		var published []DeviceStatus
+		device.onStateChange = func(status DeviceStatus) {
+			if !device.mu.TryLock() {
+				t.Error("single-item shuffle callback ran under the device lock")
+				return
+			}
+			device.mu.Unlock()
+			published = append(published, status)
+		}
+		before, err := device.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sceneBefore := device.SceneFingerprint()
+
+		status, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandShuffle})
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed, err := device.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status != before || observed != before {
+			t.Fatalf("single-item shuffle was not a no-op: before=%#v returned=%#v observed=%#v", before, status, observed)
+		}
+		if len(published) != 0 {
+			t.Fatalf("single-item shuffle published state: %#v", published)
+		}
+		if device.queueVersion != before.QueueVersion || device.stateSequence != before.StateSequence {
+			t.Fatalf("single-item shuffle advanced ordering: before=%#v after=%#v", before, observed)
+		}
+		if device.SceneFingerprint() != sceneBefore {
+			t.Fatal("single-item shuffle advanced the scene revision")
+		}
+		if !slices.Equal(itemIDs, device.PlaybackQueue.ItemIDs()) {
+			t.Fatal("single-item shuffle changed the queue")
+		}
+		if device.ActiveTrack != track || !track.playing || track.position != 12 {
+			t.Fatalf("single-item shuffle touched the active output: track=%#v playing=%v position=%d",
+				device.ActiveTrack, track.playing, track.position)
+		}
+		if device.playbackInstanceID != "instance-single" {
+			t.Fatalf("single-item shuffle reissued the playback instance: %q", device.playbackInstanceID)
+		}
+		if device.mode != PlaybackModeOrder {
+			t.Fatalf("single-item shuffle changed the Playback Mode: %q", device.mode)
+		}
+	})
+}
+
+// T14-AC06: on a multi-item queue the retained legacy shuffle performs one
+// bounded physical reorder of the visible queue: structural version, semantic
+// sequence, and scene revision each advance exactly once, one fresh status is
+// published, the exact queue item set is preserved, and the current item,
+// active output, playing state, position, playback instance, and Playback
+// Mode are untouched. The reorder is random, so this test asserts invariants
+// across the actual queue item IDs — never a specific resulting order.
+func TestPlaybackDeviceLegacyShufflePreservesPlaybackContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+	device.PlaybackQueue.Add(model.MediaFiles{
+		{ID: "1", Path: "/1.mp3"},
+		{ID: "2", Path: "/2.mp3"},
+		{ID: "3", Path: "/3.mp3"},
+		{ID: "4", Path: "/4.mp3"},
+		{ID: "5", Path: "/5.mp3"},
+	})
+	device.PlaybackQueue.SetIndex(2)
+	track := &mockTrack{playing: true, position: 9}
+	device.mu.Lock()
+	device.ActiveTrack = track
+	device.activePlaybackToken = 41
+	device.playbackInstanceID = "instance-legacy"
+	device.mu.Unlock()
+
+	var published []DeviceStatus
+	device.onStateChange = func(status DeviceStatus) {
+		if !device.mu.TryLock() {
+			t.Error("legacy shuffle callback ran under the device lock")
+			return
+		}
+		device.mu.Unlock()
+		published = append(published, status)
+	}
+	before, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device.mu.Lock()
+	itemIDsBefore := slices.Clone(device.PlaybackQueue.ItemIDs())
+	currentIDBefore := device.PlaybackQueue.CurrentItem().QueueItemID
+	sceneBefore := device.sceneFingerprintLocked()
+	device.mu.Unlock()
+
+	status, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandShuffle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != observed {
+		t.Fatalf("legacy shuffle returned a stale status: returned=%#v observed=%#v", status, observed)
+	}
+	want := before
+	want.QueueVersion++
+	want.StateSequence++
+	want.CurrentIndex = observed.CurrentIndex
+	if observed != want {
+		t.Fatalf("legacy shuffle advanced state incorrectly: before=%#v observed=%#v want=%#v", before, observed, want)
+	}
+
+	device.mu.Lock()
+	itemIDsAfter := device.PlaybackQueue.ItemIDs()
+	currentAfter := device.PlaybackQueue.CurrentItem()
+	device.mu.Unlock()
+	sortedBefore, sortedAfter := slices.Clone(itemIDsBefore), slices.Clone(itemIDsAfter)
+	slices.Sort(sortedBefore)
+	slices.Sort(sortedAfter)
+	if !slices.Equal(sortedBefore, sortedAfter) {
+		t.Fatalf("legacy shuffle lost queue items: before=%v after=%v", itemIDsBefore, itemIDsAfter)
+	}
+	if len(itemIDsAfter) != len(itemIDsBefore) {
+		t.Fatalf("legacy shuffle changed the queue size: %d -> %d", len(itemIDsBefore), len(itemIDsAfter))
+	}
+	if currentAfter == nil || currentAfter.QueueItemID != currentIDBefore {
+		t.Fatalf("legacy shuffle did not preserve the current queue item: before=%q after=%#v", currentIDBefore, currentAfter)
+	}
+	if device.ActiveTrack != track || !track.playing || track.position != 9 {
+		t.Fatalf("legacy shuffle touched the active output: playing=%v position=%d", track.playing, track.position)
+	}
+	if track.pauseCalls != 0 || track.closeCalls != 0 || track.positionSetCalls != 0 || track.muteCalls != 0 || len(track.volumeValues) != 0 {
+		t.Fatalf("legacy shuffle issued an output command: %#v", track)
+	}
+	if device.playbackInstanceID != "instance-legacy" {
+		t.Fatalf("legacy shuffle reissued the playback instance: %q", device.playbackInstanceID)
+	}
+	if device.mode != PlaybackModeOrder {
+		t.Fatalf("legacy shuffle masqueraded as shufflePlay mode selection: mode=%q", device.mode)
+	}
+	if len(published) != 1 || published[0] != want {
+		t.Fatalf("legacy shuffle did not publish the changed state once: published=%#v want=%#v", published, want)
+	}
+	if device.SceneFingerprint() == sceneBefore {
+		t.Fatal("legacy shuffle did not advance the scene revision")
+	}
+}
+
+// T14-AC06: the retained legacy physical shuffle is not the canonical
+// shufflePlay mode selection. It leaves the Playback Mode untouched and
+// consumes no random selection: after a legacy reorder, manual next still
+// follows positional order semantics (the successor in the reordered visible
+// queue), while an explicit canonical mode write to shufflePlay is a separate
+// mode-authoritative command that never reorders the visible queue.
+func TestPlaybackDeviceLegacyShuffleIsNotModeSelection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+	device.PlaybackQueue.Add(model.MediaFiles{
+		{ID: "1", Path: "/1.mp3"},
+		{ID: "2", Path: "/2.mp3"},
+		{ID: "3", Path: "/3.mp3"},
+		{ID: "4", Path: "/4.mp3"},
+	})
+	device.PlaybackQueue.SetIndex(1)
+	previousNewTrack := newTrack
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		return &mockTrack{playing: true}, nil
+	}
+	t.Cleanup(func() {
+		_, _ = device.Shutdown(ctx)
+		device.preparing.Wait()
+		newTrack = previousNewTrack
+	})
+	device.mu.Lock()
+	device.randomFn = func(int) int { panic("legacy shuffle/next must not consume random selection") }
+	device.mu.Unlock()
+
+	legacy, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandShuffle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Mode != PlaybackModeOrder {
+		t.Fatalf("legacy shuffle changed the Playback Mode: %q", legacy.Mode)
+	}
+	device.mu.Lock()
+	orderAfterShuffle := slices.Clone(device.PlaybackQueue.ItemIDs())
+	indexAfterShuffle := device.PlaybackQueue.Index
+	device.mu.Unlock()
+
+	if _, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandNext}); err != nil {
+		t.Fatal(err)
+	}
+	device.mu.Lock()
+	successorID := orderAfterShuffle[(indexAfterShuffle+1)%len(orderAfterShuffle)]
+	current := device.PlaybackQueue.CurrentItem()
+	device.mu.Unlock()
+	if current == nil || current.QueueItemID != successorID {
+		t.Fatalf("manual next after legacy shuffle did not follow positional order: want=%q got=%#v", successorID, current)
+	}
+	if device.mode != PlaybackModeOrder {
+		t.Fatalf("manual next after legacy shuffle changed the mode: %q", device.mode)
+	}
+
+	// The canonical shufflePlay mode write is explicit and mode-authoritative:
+	// it changes only the mode (+1 semantic sequence) and never reorders the
+	// visible queue.
+	device.mu.Lock()
+	itemIDsBeforeMode := slices.Clone(device.PlaybackQueue.ItemIDs())
+	sequenceBeforeMode := device.stateSequence
+	device.mu.Unlock()
+	modeStatus, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandSetMode, Mode: PlaybackModeShuffle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modeStatus.Mode != PlaybackModeShuffle {
+		t.Fatalf("mode write did not select shufflePlay: %#v", modeStatus)
+	}
+	if modeStatus.StateSequence != sequenceBeforeMode+1 {
+		t.Fatalf("mode write did not advance the semantic sequence once: %#v", modeStatus)
+	}
+	if !slices.Equal(itemIDsBeforeMode, device.PlaybackQueue.ItemIDs()) {
+		t.Fatal("shufflePlay mode write reordered the visible queue")
+	}
+}
+
+// T14-AC06: after the retained legacy physical reorder, positional order-mode
+// semantics still govern Natural End — the reorder does not install shuffle
+// continuation. The terminal item stops playback and is retained, and the
+// natural stop does not reshuffle the visible queue.
+func TestPlaybackDeviceLegacyShuffleOrderModeTerminalNaturalEndStops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	repo := tests.CreateMockMediaFileRepo()
+	files := model.MediaFiles{{ID: "1", Path: "/1.mp3"}, {ID: "2", Path: "/2.mp3"}, {ID: "3", Path: "/3.mp3"}}
+	repo.SetData(files)
+	server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
+	device := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
+	if _, err := device.Set(ctx, []string{"1", "2", "3"}); err != nil {
+		t.Fatal(err)
+	}
+	previousNewTrack := newTrack
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		return &mockTrack{playing: true}, nil
+	}
+	t.Cleanup(func() {
+		_, _ = device.Shutdown(ctx)
+		device.preparing.Wait()
+		newTrack = previousNewTrack
+	})
+	if _, err := device.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Retained legacy physical reorder during playback.
+	if _, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandShuffle}); err != nil {
+		t.Fatal(err)
+	}
+	device.mu.Lock()
+	orderAfterShuffle := slices.Clone(device.PlaybackQueue.ItemIDs())
+	finalIndex := device.PlaybackQueue.Size() - 1
+	device.mu.Unlock()
+
+	if _, err := device.Skip(ctx, finalIndex, 0); err != nil {
+		t.Fatal(err)
+	}
+	device.mu.Lock()
+	token := device.activePlaybackToken
+	queueVersionAfterSkip := device.queueVersion
+	device.mu.Unlock()
+	initial, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device.PlaybackEvents <- model.PlaybackEvent{Token: token, Kind: model.PlaybackEventNaturalEnd}
+
+	deadline := time.Now().Add(time.Second)
+	var final DeviceStatus
+	for time.Now().Before(deadline) {
+		status, err := device.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !status.Playing && status.CurrentIndex == finalIndex && status.StateSequence >= initial.StateSequence+1 {
+			final = status
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if final.Playing || final.CurrentIndex != finalIndex {
+		t.Fatalf("terminal natural end after legacy shuffle did not stop and retain the final item: final=%#v", final)
+	}
+	device.mu.Lock()
+	current := device.PlaybackQueue.CurrentItem()
+	device.mu.Unlock()
+	if current == nil || current.QueueItemID != orderAfterShuffle[finalIndex] {
+		t.Fatalf("terminal natural end did not retain the final queue item: want=%q got=%#v", orderAfterShuffle[finalIndex], current)
+	}
+	if !slices.Equal(orderAfterShuffle, device.PlaybackQueue.ItemIDs()) {
+		t.Fatal("terminal natural end reshuffled the visible queue")
+	}
+	if device.queueVersion != queueVersionAfterSkip {
+		t.Fatalf("terminal natural end advanced the structural queue version: %d -> %d", queueVersionAfterSkip, device.queueVersion)
+	}
+	if device.mode != PlaybackModeOrder {
+		t.Fatalf("legacy shuffle installed a mode: %q", device.mode)
+	}
+}
+
+// T14-AC05/AC06: canonical shufflePlay selection is mode-authoritative. With
+// the existing injected deterministic random source it strictly excludes the
+// current queue item, and it never physically reorders the visible queue —
+// including after a prior retained legacy physical shuffle.
+func TestPlaybackDeviceShufflePlaySelectionDoesNotReorderVisibleQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	repo := tests.CreateMockMediaFileRepo()
+	files := model.MediaFiles{
+		{ID: "1", Path: "/1.mp3"},
+		{ID: "2", Path: "/2.mp3"},
+		{ID: "3", Path: "/3.mp3"},
+		{ID: "4", Path: "/4.mp3"},
+	}
+	repo.SetData(files)
+	server := &playbackServer{ctx: &ctx, datastore: &tests.MockDataStore{MockedMediaFile: repo}}
+	device := NewPlaybackDevice(ctx, server, "Speaker", "pulse/test")
+	if _, err := device.Set(ctx, []string{"1", "2", "3", "4"}); err != nil {
+		t.Fatal(err)
+	}
+	previousNewTrack := newTrack
+	newTrack = func(context.Context, chan<- model.PlaybackEvent, model.PlaybackToken, string, model.MediaFile) (Track, error) {
+		return &mockTrack{playing: true}, nil
+	}
+	t.Cleanup(func() {
+		_, _ = device.Shutdown(ctx)
+		device.preparing.Wait()
+		newTrack = previousNewTrack
+	})
+	device.mu.Lock()
+	device.mode = PlaybackModeShuffle
+	device.PlaybackQueue.SetIndex(1)
+	device.randomFn = func(int) int { return 0 }
+	device.mu.Unlock()
+	if _, err := device.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	device.mu.Lock()
+	orderBefore := slices.Clone(device.PlaybackQueue.ItemIDs())
+	queueVersionBefore := device.queueVersion
+	token := device.activePlaybackToken
+	device.mu.Unlock()
+	initial, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deterministic canonical selection: current index 1, injected pick 0
+	// excludes the current item and lands on index 0.
+	device.PlaybackEvents <- model.PlaybackEvent{Token: token, Kind: model.PlaybackEventNaturalEnd}
+	deadline := time.Now().Add(time.Second)
+	var advanced DeviceStatus
+	for time.Now().Before(deadline) {
+		status, err := device.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Playing && status.CurrentIndex == 0 && status.StateSequence >= initial.StateSequence+2 {
+			advanced = status
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if advanced.CurrentIndex != 0 || !advanced.Playing {
+		t.Fatalf("shufflePlay natural selection mismatch: advanced=%#v", advanced)
+	}
+	device.mu.Lock()
+	orderAfterAdvance := slices.Clone(device.PlaybackQueue.ItemIDs())
+	queueVersionAfterAdvance := device.queueVersion
+	token = device.activePlaybackToken
+	device.mu.Unlock()
+	if !slices.Equal(orderAfterAdvance, orderBefore) {
+		t.Fatal("shufflePlay natural selection reordered the visible queue")
+	}
+	if queueVersionAfterAdvance != queueVersionBefore {
+		t.Fatalf("shufflePlay natural selection advanced the structural queue version: %d -> %d", queueVersionBefore, queueVersionAfterAdvance)
+	}
+
+	// A retained legacy physical reorder may change the visible order; a
+	// subsequent canonical selection must leave that exact order untouched.
+	if _, err := device.executeCommand(ctx, PlaybackCommand{Action: CommandShuffle}); err != nil {
+		t.Fatal(err)
+	}
+	device.mu.Lock()
+	legacyOrder := slices.Clone(device.PlaybackQueue.ItemIDs())
+	legacyIndex := device.PlaybackQueue.Index
+	device.mu.Unlock()
+	legacyStatus, err := device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyStatus.Mode != PlaybackModeShuffle {
+		t.Fatalf("legacy shuffle changed the canonical mode: %q", legacyStatus.Mode)
+	}
+
+	device.PlaybackEvents <- model.PlaybackEvent{Token: token, Kind: model.PlaybackEventNaturalEnd}
+	deadline = time.Now().Add(time.Second)
+	var selected DeviceStatus
+	for time.Now().Before(deadline) {
+		status, err := device.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Playing && status.StateSequence >= legacyStatus.StateSequence+2 {
+			selected = status
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !selected.Playing {
+		t.Fatalf("shufflePlay selection after legacy shuffle did not continue playback: selected=%#v", selected)
+	}
+	device.mu.Lock()
+	finalOrder := slices.Clone(device.PlaybackQueue.ItemIDs())
+	current := device.PlaybackQueue.CurrentItem()
+	device.mu.Unlock()
+	if !slices.Equal(finalOrder, legacyOrder) {
+		t.Fatal("shufflePlay selection after a legacy shuffle reordered the visible queue")
+	}
+	// Deterministic exclusion: injected pick 0 skips the current index.
+	wantIndex := 0
+	if wantIndex >= legacyIndex {
+		wantIndex++
+	}
+	if selected.CurrentIndex != wantIndex || current == nil || current.QueueItemID != legacyOrder[wantIndex] {
+		t.Fatalf("shufflePlay selection did not exclude the current item: selected=%#v current=%#v wantIndex=%d", selected, current, wantIndex)
+	}
+}

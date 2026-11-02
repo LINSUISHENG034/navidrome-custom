@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -1627,5 +1628,118 @@ func TestDurableSessionReservationExpiryIsReadOnly(t *testing.T) {
 	st, err := h.server.SessionStatus(ctx, "s1")
 	if err != nil || st.OwnerClientID != "target-owner" || !st.Playing {
 		t.Fatalf("expiry disturbed the current owner: %#v, %v", st, err)
+	}
+}
+
+// T14-AC06: the retained legacy physical shuffle command cannot bypass the
+// protected-session guards. An unscoped legacy write is rejected while a
+// protected session owns the device, a stale binding generation is rejected
+// without queue, ordering, or context side effects, and the superseded owner
+// is fenced by ownership. The exact-generation owner retains the bounded
+// legacy behavior: one physical reorder that preserves the queue item set and
+// current item, advances structural/semantic ordering once, and never changes
+// the Playback Mode.
+func TestDurableSessionLegacyShuffleCompatibilityGuards(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2", "3", "4")
+	status := h.attach(t, "owner-tab")
+	if status.BindingGeneration != 1 {
+		t.Fatalf("expected initial generation 1, got %d", status.BindingGeneration)
+	}
+	ctx := h.ctx
+	sessionID := "s1"
+
+	queueOrder := func() []string {
+		h.device.mu.Lock()
+		defer h.device.mu.Unlock()
+		return h.device.PlaybackQueue.ItemIDs()
+	}
+	beforeOrder := queueOrder()
+	beforeStatus, err := h.device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeScene := h.device.SceneFingerprint()
+	beforeCurrent := h.device.PlaybackQueue.CurrentItem().QueueItemID
+	assertShuffleRejectedUnchanged := func(label string) {
+		t.Helper()
+		if got := queueOrder(); !slices.Equal(got, beforeOrder) {
+			t.Fatalf("%s changed the visible queue: before=%v after=%v", label, beforeOrder, got)
+		}
+		afterStatus, err := h.device.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if afterStatus != beforeStatus {
+			t.Fatalf("%s changed device state: before=%#v after=%#v", label, beforeStatus, afterStatus)
+		}
+		if current := h.device.SceneFingerprint(); current != beforeScene {
+			t.Fatalf("%s changed the scene fingerprint: %s -> %s", label, beforeScene, current)
+		}
+		if current := h.device.PlaybackQueue.CurrentItem().QueueItemID; current != beforeCurrent {
+			t.Fatalf("%s changed the current queue item: %s -> %s", label, beforeCurrent, current)
+		}
+	}
+
+	// 1. Unscoped legacy shuffle on a protected context is rejected.
+	legacyScope := CommandScope{User: "admin"}
+	if _, err := h.server.ExecuteCommand(ctx, legacyScope, PlaybackCommand{Action: CommandShuffle}); !errors.Is(err, ErrProtectedContextConflict) {
+		t.Fatalf("expected ErrProtectedContextConflict for unscoped shuffle, got %v", err)
+	}
+	assertShuffleRejectedUnchanged("unscoped shuffle")
+
+	// 2. Explicit takeover bumps the binding generation to 2.
+	takeover := h.attach(t, "new-tab", true)
+	if takeover.BindingGeneration != 2 {
+		t.Fatalf("takeover did not increment generation: %d", takeover.BindingGeneration)
+	}
+
+	// The takeover itself may legitimately mutate the target scene; the
+	// rejection invariants below compare against a post-takeover baseline.
+	beforeOrder = queueOrder()
+	beforeStatus, err = h.device.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeScene = h.device.SceneFingerprint()
+	beforeCurrent = h.device.PlaybackQueue.CurrentItem().QueueItemID
+
+	// 3. Stale-generation scoped shuffle is rejected without side effects.
+	stale := uint64(1)
+	scopeStale := CommandScope{User: "admin", SessionID: sessionID, ClientID: "new-tab", BindingGeneration: &stale, OperationID: "g2:stale-shuffle"}
+	if _, err := h.server.ExecuteCommand(ctx, scopeStale, PlaybackCommand{Action: CommandShuffle}); !errors.Is(err, ErrCommandSuperseded) {
+		t.Fatalf("expected ErrCommandSuperseded for stale-generation shuffle, got %v", err)
+	}
+	assertShuffleRejectedUnchanged("stale-generation shuffle")
+
+	// 4. The superseded owner is fenced by ownership.
+	scopeOldOwner := CommandScope{User: "admin", SessionID: sessionID, ClientID: "owner-tab", BindingGeneration: &stale, OperationID: "g1:old-owner-shuffle"}
+	if _, err := h.server.ExecuteCommand(ctx, scopeOldOwner, PlaybackCommand{Action: CommandShuffle}); !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("expected ErrSessionOwnership for old-owner shuffle, got %v", err)
+	}
+	assertShuffleRejectedUnchanged("old-owner shuffle")
+
+	// 5. The exact-generation owner retains the bounded legacy reorder.
+	gen2 := uint64(2)
+	scopeOwner := CommandScope{User: "admin", SessionID: sessionID, ClientID: "new-tab", BindingGeneration: &gen2, OperationID: "g2:legacy-shuffle"}
+	executed, err := h.server.ExecuteCommand(ctx, scopeOwner, PlaybackCommand{Action: CommandShuffle})
+	if err != nil {
+		t.Fatalf("exact-generation legacy shuffle failed: %v", err)
+	}
+	if executed.QueueVersion != beforeStatus.QueueVersion+1 || executed.StateSequence != beforeStatus.StateSequence+1 {
+		t.Fatalf("legacy shuffle did not advance ordering exactly once: before=%#v executed=%#v", beforeStatus, executed)
+	}
+	if executed.Mode != PlaybackModeOrder {
+		t.Fatalf("legacy shuffle changed the Playback Mode: %q", executed.Mode)
+	}
+	gotOrder := queueOrder()
+	sortedBefore, sortedAfter := slices.Clone(beforeOrder), slices.Clone(gotOrder)
+	slices.Sort(sortedBefore)
+	slices.Sort(sortedAfter)
+	if !slices.Equal(sortedBefore, sortedAfter) {
+		t.Fatalf("legacy shuffle lost queue items: before=%v after=%v", beforeOrder, gotOrder)
+	}
+	if current := h.device.PlaybackQueue.CurrentItem().QueueItemID; current != beforeCurrent {
+		t.Fatalf("legacy shuffle did not preserve the current queue item: %s -> %s", beforeCurrent, current)
 	}
 }
