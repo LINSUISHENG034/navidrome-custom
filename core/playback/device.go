@@ -307,22 +307,27 @@ func (pd *playbackDevice) stopLocked(ctx context.Context) (DeviceStatus, bool, e
 	return pd.getStatus(), changed, nil
 }
 
+// shutdownLocked contains the Shutdown logic and must be called with pd.mu held.
+// The output retire and recovery clearing are committed even when the final
+// Pause reports an error, so the changed state still advances scene and
+// sequence once and is published by the command loop with the original error.
 func (pd *playbackDevice) shutdownLocked(ctx context.Context) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing Shutdown action", "device", pd)
 	pd.cancelPreparationLocked()
-	changed := pd.ActiveTrack != nil
+	changed := pd.ActiveTrack != nil || pd.recoveryPosition != nil
 	var err error
 	if pd.ActiveTrack != nil {
 		err = pd.ActiveTrack.Pause()
 	}
 	pd.retireActiveTrackLocked()
 	pd.recoveryPosition = nil
-	if err != nil {
-		log.Error(ctx, "error pausing active track during shutdown", err)
-		return pd.getStatus(), false, err
-	}
 	if changed {
 		pd.incrementSceneRevisionLocked()
+		pd.incrementStateSequenceLocked()
+	}
+	if err != nil {
+		log.Error(ctx, "error pausing active track during shutdown", err)
+		return pd.getStatus(), changed, err
 	}
 	return pd.getStatus(), changed, nil
 }
@@ -682,43 +687,79 @@ func (pd *playbackDevice) SetGain(ctx context.Context, gain float32) (DeviceStat
 	return pd.executeCommand(ctx, PlaybackCommand{Action: CommandGain, Gain: gain})
 }
 
+// setGainLocked contains the SetGain logic and must be called with pd.mu held.
+// The desired gain always advances so a later output adoption can confirm it,
+// while the applied gain only changes after the active output confirms the
+// volume. Ordering follows committed mutations, never attempted intent: a
+// desired change is ordered and published once even when the output call
+// fails, while a retry of an already-committed but still-unconfirmed intent
+// only advances state when the output actually confirms it.
 func (pd *playbackDevice) setGainLocked(ctx context.Context, gain float32) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing SetGain action", "newGain", gain, "device", pd)
-	pd.DesiredGain = gain
+	desiredChanged := pd.DesiredGain != gain
+	confirmOnly := !desiredChanged && pd.ActiveTrack != nil && pd.Gain != gain
+	if !desiredChanged && !confirmOnly {
+		return pd.getStatus(), false, nil
+	}
+	changed := false
+	if desiredChanged {
+		pd.DesiredGain = gain
+		changed = true
+	}
 	if pd.ActiveTrack != nil {
 		if err := pd.ActiveTrack.SetVolume(gain); err != nil {
 			log.Error(ctx, "error setting active track volume", err)
-			return pd.getStatus(), false, err
+			if changed {
+				pd.incrementSceneRevisionLocked()
+				pd.incrementStateSequenceLocked()
+			}
+			return pd.getStatus(), changed, err
+		}
+		if pd.Gain != gain {
+			pd.Gain = gain
+			changed = true
 		}
 	}
-	changed := pd.Gain != gain
 	if changed {
 		pd.incrementSceneRevisionLocked()
+		pd.incrementStateSequenceLocked()
 	}
-	pd.Gain = gain
 	return pd.getStatus(), changed, nil
 }
 
+// setMuteLocked contains the SetMute logic and must be called with pd.mu held.
+// Muting never touches the applied gain; unmuting restores the desired gain
+// through the active output before the mute flag changes. A failure after a
+// partial applied mutation still advances scene and sequence once and is
+// published by the command loop with the original error.
 func (pd *playbackDevice) setMuteLocked(ctx context.Context, muted bool) (DeviceStatus, bool, error) {
 	log.Debug(ctx, "Processing SetMute action", "muted", muted, "device", pd)
-	if pd.ActiveTrack != nil {
-		if !muted {
-			if err := pd.ActiveTrack.SetVolume(pd.DesiredGain); err != nil {
-				return pd.getStatus(), false, err
-			}
-			pd.Gain = pd.DesiredGain
-		}
-		if err := pd.ActiveTrack.SetMute(muted); err != nil {
-			log.Error(ctx, "error setting active track mute", err)
+	changed := pd.Muted != muted
+	appliedGain := false
+	if pd.ActiveTrack != nil && !muted && pd.Gain != pd.DesiredGain {
+		if err := pd.ActiveTrack.SetVolume(pd.DesiredGain); err != nil {
 			return pd.getStatus(), false, err
 		}
+		pd.Gain = pd.DesiredGain
+		appliedGain = true
 	}
-	changed := pd.Muted != muted
-	if changed {
-		pd.Muted = muted
-		pd.incrementSceneRevisionLocked()
+	if pd.ActiveTrack != nil {
+		if err := pd.ActiveTrack.SetMute(muted); err != nil {
+			log.Error(ctx, "error setting active track mute", err)
+			if appliedGain {
+				pd.incrementSceneRevisionLocked()
+				pd.incrementStateSequenceLocked()
+			}
+			return pd.getStatus(), appliedGain, err
+		}
 	}
-	return pd.getStatus(), changed, nil
+	if !changed && !appliedGain {
+		return pd.getStatus(), false, nil
+	}
+	pd.Muted = muted
+	pd.incrementSceneRevisionLocked()
+	pd.incrementStateSequenceLocked()
+	return pd.getStatus(), true, nil
 }
 
 func (pd *playbackDevice) setModeLocked(mode PlaybackMode) (DeviceStatus, bool, error) {
@@ -918,6 +959,7 @@ func (pd *playbackDevice) handlePlaybackEvent(event model.PlaybackEvent) {
 		}
 		pd.retireActiveTrackLocked()
 		pd.incrementSceneRevisionLocked()
+		pd.incrementStateSequenceLocked()
 		notify = pd.stateChangeNotifierLocked()
 	default:
 		log.Warn("Ignoring unknown playback event", "kind", event.Kind, "token", event.Token)

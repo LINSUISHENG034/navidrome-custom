@@ -729,15 +729,19 @@ func TestPlaybackScopedSwitchRejectsBypassAndRebindsAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	scope.BindingGeneration = &snapAfterSwitch.SessionStatus.BindingGeneration
+	targetBefore, err := server.playbackDevices[1].Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandGain, Gain: 0.375}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := server.SessionSnapshot(ctx, "owner", "admin")
-	if err != nil || snapshot.SessionStatus.DeviceName != "new" || snapshot.SessionStatus.Gain != 0.375 || len(snapshot.JukeboxPlaylist.Entry) != 1 {
+	if err != nil || snapshot.SessionStatus.DeviceName != "new" || snapshot.SessionStatus.DesiredGain != 0.375 || snapshot.SessionStatus.Gain != targetBefore.Gain || len(snapshot.JukeboxPlaylist.Entry) != 1 {
 		t.Fatalf("scoped migration lost bound authority: %#v err=%v", snapshot, err)
 	}
 	oldStatus, _ := server.playbackDevices[0].Status(ctx)
-	if oldStatus.Gain != DefaultGain || !server.playbackDevices[0].PlaybackQueue.IsEmpty() {
+	if oldStatus.Gain != DefaultGain || oldStatus.DesiredGain != DefaultGain || !server.playbackDevices[0].PlaybackQueue.IsEmpty() {
 		t.Fatalf("follow-up scoped command modified retired device: %#v", oldStatus)
 	}
 }
@@ -1121,7 +1125,7 @@ func TestPlaybackSameOwnerLateCommandAcrossDeviceSwitchDoesNotMutateNewScene(t *
 	// Subsequent late mutations targeting the retired old device cannot mutate the new scene
 	_, _ = oldDev.SetGain(ctx, 0.99)
 	newStatusAfter, err := server.SessionStatus(ctx, "s1")
-	if err != nil || newStatusAfter.Gain == 0.99 || newStatusAfter.DeviceName != "new" {
+	if err != nil || newStatusAfter.Gain == 0.99 || newStatusAfter.DesiredGain == 0.99 || newStatusAfter.DeviceName != "new" {
 		t.Fatalf("late old device command corrupted new scene: %#v", newStatusAfter)
 	}
 }

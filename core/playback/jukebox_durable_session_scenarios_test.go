@@ -346,14 +346,14 @@ func TestDurableSessionGenerationMatrix(t *testing.T) {
 	if _, err := h.server.ExecuteCommand(ctx, scopeFuture, PlaybackCommand{Action: CommandGain, Gain: 0.125}); !errors.Is(err, ErrCommandSuperseded) {
 		t.Fatalf("expected ErrCommandSuperseded for future generation, got %v", err)
 	}
-	if h.device.Gain == 0.125 {
+	if h.device.Gain != DefaultGain || h.device.DesiredGain != DefaultGain {
 		t.Fatal("future generation modified target device side effects!")
 	}
 
 	// 4. Exact generation (1) -> succeeds
 	gen1 := uint64(1)
 	scope1 := CommandScope{User: "admin", SessionID: sessionID, ClientID: clientID, BindingGeneration: &gen1, OperationID: "g1:generation-exact"}
-	if st, err := h.server.ExecuteCommand(ctx, scope1, PlaybackCommand{Action: CommandGain, Gain: 0.5}); err != nil || st.Gain != 0.5 {
+	if st, err := h.server.ExecuteCommand(ctx, scope1, PlaybackCommand{Action: CommandGain, Gain: 0.5}); err != nil || st.DesiredGain != 0.5 || st.Gain != DefaultGain {
 		t.Fatalf("exact generation failed: %v", err)
 	}
 
@@ -379,14 +379,14 @@ func TestDurableSessionGenerationMatrix(t *testing.T) {
 	if _, err := h.server.ExecuteCommand(ctx, scopeNewOldGen, PlaybackCommand{Action: CommandGain, Gain: 0.75}); !errors.Is(err, ErrCommandSuperseded) {
 		t.Fatalf("expected ErrCommandSuperseded for older generation on new owner, got %v", err)
 	}
-	if h.device.Gain == 0.75 {
+	if h.device.Gain != DefaultGain || h.device.DesiredGain != 0.5 {
 		t.Fatal("older generation modified target device side effects!")
 	}
 
 	// 9. New owner with exact generation 2 -> succeeds
 	gen2 := uint64(2)
 	scopeNewExact := CommandScope{User: "admin", SessionID: sessionID, ClientID: "new-tab", BindingGeneration: &gen2, OperationID: "g2:generation-exact"}
-	if st, err := h.server.ExecuteCommand(ctx, scopeNewExact, PlaybackCommand{Action: CommandGain, Gain: 0.75}); err != nil || st.Gain != 0.75 {
+	if st, err := h.server.ExecuteCommand(ctx, scopeNewExact, PlaybackCommand{Action: CommandGain, Gain: 0.75}); err != nil || st.DesiredGain != 0.75 || st.Gain != DefaultGain {
 		t.Fatalf("exact generation 2 failed on new owner: %v", err)
 	}
 
@@ -514,13 +514,13 @@ func TestDurableSessionOperationStoreDeduplicationAndEviction(t *testing.T) {
 
 	// First execution applies
 	st1, err := h.server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandGain, Gain: 0.4})
-	if err != nil || st1.Gain != 0.4 {
+	if err != nil || st1.DesiredGain != 0.4 || st1.Gain != DefaultGain {
 		t.Fatalf("first execution failed: %v", err)
 	}
 
 	// Sequential retry with same OperationID returns identical result without re-executing
 	st2, err := h.server.ExecuteCommand(ctx, scope, PlaybackCommand{Action: CommandGain, Gain: 0.4})
-	if err != nil || st2.Gain != 0.4 {
+	if err != nil || st2 != st1 {
 		t.Fatalf("sequential retry failed: %v", err)
 	}
 
@@ -550,7 +550,7 @@ func TestDurableSessionOperationStoreDeduplicationAndEviction(t *testing.T) {
 	}
 	wg.Wait()
 	for i := 0; i < 10; i++ {
-		if errs[i] != nil || results[i].Gain != 0.6 {
+		if errs[i] != nil || results[i].DesiredGain != 0.6 || results[i].Gain != DefaultGain {
 			t.Fatalf("concurrent execution goroutine %d failed: %v, %#v", i, errs[i], results[i])
 		}
 	}
@@ -602,8 +602,8 @@ func TestDurableSessionOperationResultsDoNotSurviveRestart(t *testing.T) {
 	if _, err := restarted.ExecuteCommand(h.ctx, scope, PlaybackCommand{Action: CommandGain, Gain: .8}); !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("restart permitted a blind replay: %v", err)
 	}
-	if h.device.Gain != .4 {
-		t.Fatalf("blind replay changed the device after restart: gain=%v", h.device.Gain)
+	if h.device.DesiredGain != .4 || h.device.Gain != DefaultGain {
+		t.Fatalf("blind replay changed the device after restart: desired=%v gain=%v", h.device.DesiredGain, h.device.Gain)
 	}
 }
 
@@ -893,7 +893,7 @@ func TestDurableSessionRefreshHandoffContract(t *testing.T) {
 		BindingGeneration: &gen2,
 		OperationID:       "g2:handoff-write",
 	}
-	if st, err := h.server.ExecuteCommand(h.ctx, newDocScope, PlaybackCommand{Action: CommandGain, Gain: 0.1}); err != nil || st.Gain != 0.1 || st.Mode != PlaybackModeRepeatTrack {
+	if st, err := h.server.ExecuteCommand(h.ctx, newDocScope, PlaybackCommand{Action: CommandGain, Gain: 0.1}); err != nil || st.DesiredGain != 0.1 || st.Gain != DefaultGain || st.Mode != PlaybackModeRepeatTrack {
 		t.Fatalf("new document command failed or lost mode: status=%#v err=%v", st, err)
 	}
 }

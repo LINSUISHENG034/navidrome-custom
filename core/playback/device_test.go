@@ -481,7 +481,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		DesiredGain:        DefaultGain,
 		Position:           position,
 		QueueVersion:       1,
-		StateSequence:      2,
+		StateSequence:      3,
 		PlaybackInstanceID: device.playbackInstanceID,
 		Mode:               PlaybackModeOrder,
 	})
@@ -509,7 +509,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		DesiredGain:        DefaultGain,
 		Position:           position,
 		QueueVersion:       1,
-		StateSequence:      3,
+		StateSequence:      4,
 		PlaybackInstanceID: device.playbackInstanceID,
 		Mode:               PlaybackModeOrder,
 	}, 100*time.Millisecond)
@@ -530,7 +530,7 @@ func TestPlaybackDeviceFailureKeepsQueuePositionAndRejectsRetiredToken(t *testin
 		DesiredGain:        DefaultGain,
 		Position:           retiredPosition,
 		QueueVersion:       1,
-		StateSequence:      3,
+		StateSequence:      5,
 		PlaybackInstanceID: device.playbackInstanceID,
 		Mode:               PlaybackModeOrder,
 	})
@@ -579,7 +579,7 @@ func TestPlaybackDeviceUnknownFailurePositionDoesNotInventSeekOffset(t *testing.
 		DesiredGain:        DefaultGain,
 		Position:           0,
 		QueueVersion:       1,
-		StateSequence:      2,
+		StateSequence:      3,
 		PlaybackInstanceID: device.playbackInstanceID,
 		Mode:               PlaybackModeOrder,
 	})
@@ -948,7 +948,7 @@ func TestPlaybackDeviceCancelledNaturalAdvanceDoesNotDisplaceSuccessor(t *testin
 func TestPlaybackDevicePendingStartUsesLatestGainBeforeUnpause(t *testing.T) {
 	h := newPendingPlaybackHarness(t, "1", []string{"1"})
 	done := h.begin(t, h.device.Start)
-	if status, err := h.device.SetGain(h.ctx, 0.37); err != nil || status.Gain != float32(0.37) {
+	if status, err := h.device.SetGain(h.ctx, 0.37); err != nil || status.DesiredGain != float32(0.37) {
 		t.Fatalf("gain while preparing: status=%#v, err=%v", status, err)
 	}
 	if status := h.finish(t, done); !status.Playing || status.Gain != float32(0.37) {
@@ -2146,4 +2146,430 @@ func TestPlaybackDeviceClearResetsQueueCurrentAndOutput(t *testing.T) {
 		t.Fatal("playing clear left an output or recovery position")
 	}
 	device.mu.Unlock()
+}
+
+// semanticTransitionFixture builds a device with a captured publication log
+// for the T14-AC10 semantic transition matrix. The state change callback must
+// run outside the device lock and must observe exactly the status it published.
+type semanticTransitionFixture struct {
+	ctx       context.Context
+	device    *playbackDevice
+	track     *mockTrack
+	published []DeviceStatus
+}
+
+func newSemanticTransitionFixture(t *testing.T, withTrack, playing bool) *semanticTransitionFixture {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	device := NewPlaybackDevice(ctx, nil, "Speaker", "pulse/test")
+	f := &semanticTransitionFixture{ctx: ctx, device: device}
+	device.onStateChange = func(status DeviceStatus) {
+		if !device.mu.TryLock() {
+			t.Error("semantic transition callback ran under the device lock")
+			return
+		}
+		observed := device.getStatus()
+		device.mu.Unlock()
+		if observed != status {
+			t.Errorf("semantic transition published a stale status: published=%#v observed=%#v", status, observed)
+		}
+		f.published = append(f.published, status)
+	}
+	t.Cleanup(func() { device.onStateChange = nil })
+	device.mu.Lock()
+	device.Gain = 0.64
+	device.DesiredGain = 0.64
+	device.playbackInstanceID = "instance-semantic"
+	if withTrack {
+		f.track = &mockTrack{playing: playing}
+		device.ActiveTrack = f.track
+		device.activePlaybackToken = 41
+	}
+	device.mu.Unlock()
+	return f
+}
+
+func (f *semanticTransitionFixture) assertOrderingUnchanged(t *testing.T, before DeviceStatus) {
+	t.Helper()
+	if f.device.queueVersion != before.QueueVersion {
+		t.Errorf("semantic transition changed structural queue version: %d -> %d", before.QueueVersion, f.device.queueVersion)
+	}
+	if f.device.playbackInstanceID != "instance-semantic" {
+		t.Errorf("semantic transition reissued the playback instance: %q", f.device.playbackInstanceID)
+	}
+}
+
+// T14-AC10: asynchronous output Failure/Retired events are semantic state
+// changes. Each effective event retires the current output exactly once,
+// advances the independent state sequence exactly once, and publishes one
+// fresh unlocked status; stale, zero, or already-retired tokens stay no-ops.
+func TestPlaybackDeviceAsyncOutputEventStateSequence(t *testing.T) {
+	position := 17
+	cases := []struct {
+		name     string
+		kind     model.PlaybackEventKind
+		position *int
+	}{
+		{"failure with recovery position", model.PlaybackEventFailure, &position},
+		{"retired with recovery position", model.PlaybackEventRetired, &position},
+		{"retired without recovery position", model.PlaybackEventRetired, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSemanticTransitionFixture(t, true, true)
+			device := f.device
+			before, err := device.Status(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sceneBefore := device.SceneFingerprint()
+
+			device.handlePlaybackEvent(model.PlaybackEvent{Token: 41, Kind: tc.kind, Position: tc.position, Err: errors.New("output fault")})
+
+			want := before
+			want.Playing = false
+			want.StateSequence++
+			if tc.position != nil {
+				want.Position = *tc.position
+			} else {
+				want.Position = 0
+			}
+			observed, err := device.Status(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if observed != want {
+				t.Errorf("async %v did not advance semantic state exactly once: before=%#v observed=%#v want=%#v", tc.kind, before, observed, want)
+			}
+			if len(f.published) != 1 || f.published[0] != want {
+				t.Errorf("async %v did not publish the changed state once: published=%#v want=%#v", tc.kind, f.published, want)
+			}
+			if f.track.closeCalls != 1 {
+				t.Errorf("async %v retired the output %d times, want 1", tc.kind, f.track.closeCalls)
+			}
+			if device.SceneFingerprint() == sceneBefore {
+				t.Errorf("async %v did not advance the scene revision", tc.kind)
+			}
+			f.assertOrderingUnchanged(t, before)
+
+			// Stale, zero and already-retired tokens must not advance or republish.
+			stale := 99
+			device.handlePlaybackEvent(model.PlaybackEvent{Token: 42, Kind: model.PlaybackEventFailure, Position: &stale})
+			device.handlePlaybackEvent(model.PlaybackEvent{Token: 0, Kind: model.PlaybackEventRetired})
+			device.handlePlaybackEvent(model.PlaybackEvent{Token: 41, Kind: tc.kind, Position: &stale})
+			final, err := device.Status(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if final != want || len(f.published) != 1 || f.track.closeCalls != 1 {
+				t.Errorf("stale async events were not no-ops: final=%#v published=%#v closes=%d", final, f.published, f.track.closeCalls)
+			}
+		})
+	}
+}
+
+// T14-AC10: Shutdown is an effective retire of the current output. It advances
+// scene and state sequence exactly once and publishes once, including when the
+// final Pause returns an error after the internal retire mutation; an idle
+// device stays a strict no-op.
+func TestPlaybackDeviceShutdownStateSequence(t *testing.T) {
+	failure := errors.New("pause ipc rejected")
+	cases := []struct {
+		name    string
+		track   bool
+		playing bool
+		fail    bool
+	}{
+		{"playing retire", true, true, false},
+		{"paused retire", true, false, false},
+		{"pause error after retire mutation", true, true, true},
+		{"idle no-op", false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSemanticTransitionFixture(t, tc.track, tc.playing)
+			device := f.device
+			if tc.fail {
+				f.track.onPause = func() error { return failure }
+			}
+			before, err := device.Status(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sceneBefore := device.SceneFingerprint()
+
+			status, err := device.Shutdown(f.ctx)
+
+			if tc.fail {
+				if !errors.Is(err, failure) {
+					t.Errorf("failed shutdown lost the pause error: %v", err)
+				}
+			} else if err != nil {
+				t.Errorf("shutdown returned an error: %v", err)
+			}
+			want := before
+			want.Playing = false
+			want.Position = 0
+			if tc.track {
+				// The output retire mutation committed even when Pause failed.
+				want.StateSequence++
+			}
+			if status != want {
+				t.Errorf("shutdown state mismatch: status=%#v want=%#v", status, want)
+			}
+			observed, err := device.Status(f.ctx)
+			if err != nil || observed != want {
+				t.Errorf("shutdown returned a stale status: observed=%#v want=%#v error=%v", observed, want, err)
+			}
+			if tc.track {
+				if len(f.published) != 1 || f.published[0] != want {
+					t.Errorf("shutdown did not publish the changed state once: published=%#v want=%#v", f.published, want)
+				}
+				if f.track.closeCalls != 1 {
+					t.Errorf("shutdown retired the output %d times, want 1", f.track.closeCalls)
+				}
+				if device.SceneFingerprint() == sceneBefore {
+					t.Error("shutdown did not advance the scene revision")
+				}
+			} else {
+				if len(f.published) != 0 {
+					t.Errorf("idle shutdown published state: %#v", f.published)
+				}
+				if device.SceneFingerprint() != sceneBefore {
+					t.Error("idle shutdown advanced the scene revision")
+				}
+			}
+			f.assertOrderingUnchanged(t, before)
+		})
+	}
+}
+
+// T14-AC10: gain writes are semantic transitions. An effective change advances
+// the state sequence once and publishes once; without an active output only
+// DesiredGain changes and the confirmed Gain stays unchanged; a failed
+// SetVolume keeps the new desired value visible, reports the error, and still
+// orders the mutation; a true no-op changes nothing.
+func TestPlaybackDeviceGainStateSequence(t *testing.T) {
+	failure := errors.New("volume ipc rejected")
+	cases := []struct {
+		name        string
+		track       bool
+		fail        bool
+		gain        float32
+		wantGain    float32
+		wantDesired float32
+		wantDelta   uint64
+		wantPublish int
+	}{
+		{"idle desired gain only", false, false, 0.8, 0.64, 0.8, 1, 1},
+		{"effective gain with output", true, false, 0.8, 0.8, 0.8, 1, 1},
+		{"failed set volume keeps desired visible", true, true, 0.8, 0.64, 0.8, 1, 1},
+		{"same gain no-op", true, false, 0.64, 0.64, 0.64, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSemanticTransitionFixture(t, tc.track, true)
+			device := f.device
+			if tc.fail {
+				f.track.onSetVolume = func(float32) error { return failure }
+			}
+			before, err := device.Status(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sceneBefore := device.SceneFingerprint()
+
+			status, err := device.SetGain(f.ctx, tc.gain)
+
+			if tc.fail {
+				if !errors.Is(err, failure) {
+					t.Errorf("failed gain lost the volume error: %v", err)
+				}
+			} else if err != nil {
+				t.Errorf("gain returned an error: %v", err)
+			}
+			want := before
+			want.Gain = tc.wantGain
+			want.DesiredGain = tc.wantDesired
+			want.StateSequence += tc.wantDelta
+			if status != want {
+				t.Errorf("gain state mismatch: status=%#v want=%#v", status, want)
+			}
+			observed, err := device.Status(f.ctx)
+			if err != nil || observed != want {
+				t.Errorf("gain returned a stale status: observed=%#v want=%#v error=%v", observed, want, err)
+			}
+			if len(f.published) != tc.wantPublish || (tc.wantPublish == 1 && f.published[0] != want) {
+				t.Errorf("gain published %d statuses, want %d: %#v", len(f.published), tc.wantPublish, f.published)
+			}
+			if tc.wantDelta > 0 {
+				if device.SceneFingerprint() == sceneBefore {
+					t.Error("effective gain did not advance the scene revision")
+				}
+			} else if device.SceneFingerprint() != sceneBefore {
+				t.Error("gain no-op advanced the scene revision")
+			}
+			f.assertOrderingUnchanged(t, before)
+		})
+	}
+}
+
+// T14-AC10: mute writes are semantic transitions. Effective transitions advance
+// the state sequence once and publish once; an unmute failure after the applied
+// gain was already restored must still publish the changed state once with the
+// original error; a true no-op changes nothing.
+func TestPlaybackDeviceMuteStateSequence(t *testing.T) {
+	failure := errors.New("mute ipc rejected")
+	cases := []struct {
+		name        string
+		track       bool
+		initialMute bool
+		muted       bool
+		desired     float32
+		failUnmute  bool
+		wantMuted   bool
+		wantGain    float32
+		wantErr     bool
+		wantDelta   uint64
+		wantPublish int
+	}{
+		{"effective mute", true, false, true, 0.64, false, true, 0.64, false, 1, 1},
+		{"effective unmute", true, true, false, 0.64, false, false, 0.64, false, 1, 1},
+		{"unmute failure after applied gain", true, true, false, 0.8, true, true, 0.8, true, 1, 1},
+		{"same mute no-op", false, false, false, 0.64, false, false, 0.64, false, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSemanticTransitionFixture(t, tc.track, true)
+			device := f.device
+			device.mu.Lock()
+			device.Muted = tc.initialMute
+			device.DesiredGain = tc.desired
+			device.mu.Unlock()
+			if tc.failUnmute {
+				f.track.onSetMute = func(value bool) error {
+					if !value {
+						return failure
+					}
+					return nil
+				}
+			}
+			before, err := device.Status(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sceneBefore := device.SceneFingerprint()
+
+			status, err := device.executeCommand(f.ctx, PlaybackCommand{Action: CommandMute, Muted: tc.muted})
+
+			if tc.wantErr {
+				if !errors.Is(err, failure) {
+					t.Errorf("failed mute lost the output error: %v", err)
+				}
+			} else if err != nil {
+				t.Errorf("mute returned an error: %v", err)
+			}
+			want := before
+			want.Muted = tc.wantMuted
+			want.Gain = tc.wantGain
+			want.DesiredGain = tc.desired
+			want.StateSequence += tc.wantDelta
+			if status != want {
+				t.Errorf("mute state mismatch: status=%#v want=%#v", status, want)
+			}
+			observed, err := device.Status(f.ctx)
+			if err != nil || observed != want {
+				t.Errorf("mute returned a stale status: observed=%#v want=%#v error=%v", observed, want, err)
+			}
+			if len(f.published) != tc.wantPublish || (tc.wantPublish == 1 && f.published[0] != want) {
+				t.Errorf("mute published %d statuses, want %d: %#v", len(f.published), tc.wantPublish, f.published)
+			}
+			if tc.wantDelta > 0 {
+				if device.SceneFingerprint() == sceneBefore {
+					t.Error("effective mute did not advance the scene revision")
+				}
+			} else if device.SceneFingerprint() != sceneBefore {
+				t.Error("mute no-op advanced the scene revision")
+			}
+			f.assertOrderingUnchanged(t, before)
+		})
+	}
+}
+
+// T14-AC10: a repeated gain request whose desired value was already committed
+// by an earlier failed attempt must not advance ordering or republish when the
+// retry fails again — attempted intent alone is not a committed state change.
+// Once the output confirms the volume, the applied confirmation is ordered and
+// published exactly once with the original error preserved on every failure.
+func TestPlaybackDeviceFailedGainRetryAccounting(t *testing.T) {
+	f := newSemanticTransitionFixture(t, true, true)
+	device := f.device
+	failure := errors.New("volume ipc rejected")
+	failVolume := true
+	f.track.onSetVolume = func(float32) error {
+		if failVolume {
+			return failure
+		}
+		return nil
+	}
+	before, err := device.Status(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First attempt commits the desired change; the output failure leaves the
+	// applied gain unconfirmed, but the committed mutation is ordered and
+	// published once with the original error.
+	status, err := device.SetGain(f.ctx, 0.8)
+	if !errors.Is(err, failure) {
+		t.Fatalf("first gain lost the volume error: %v", err)
+	}
+	want := before
+	want.DesiredGain = 0.8
+	want.StateSequence++
+	if status != want {
+		t.Fatalf("first failed gain state mismatch: status=%#v want=%#v", status, want)
+	}
+	sceneAfterFirst := device.SceneFingerprint()
+	if len(f.published) != 1 || f.published[0] != want {
+		t.Fatalf("first failed gain did not publish the changed state once: %#v", f.published)
+	}
+
+	// Retry with the same value: the desired change was already committed and
+	// the applied gain is still unconfirmed, so a repeated failure commits
+	// nothing and must not advance scene/sequence or republish.
+	status, err = device.SetGain(f.ctx, 0.8)
+	if !errors.Is(err, failure) {
+		t.Fatalf("retry lost the original volume error: %v", err)
+	}
+	if status != want {
+		t.Fatalf("unconfirmed retry advanced ordering: status=%#v want=%#v", status, want)
+	}
+	if device.SceneFingerprint() != sceneAfterFirst || len(f.published) != 1 {
+		t.Fatalf("unconfirmed retry advanced scene or republished: published=%#v", f.published)
+	}
+	if f.device.Gain != 0.64 || f.device.DesiredGain != 0.8 {
+		t.Fatalf("unconfirmed retry changed gain state: gain=%v desired=%v", f.device.Gain, f.device.DesiredGain)
+	}
+
+	// Once the output confirms the volume, the applied confirmation is ordered
+	// and published exactly once.
+	failVolume = false
+	confirmed, err := device.SetGain(f.ctx, 0.8)
+	if err != nil {
+		t.Fatalf("confirmed gain returned an error: %v", err)
+	}
+	confirmedWant := want
+	confirmedWant.Gain = 0.8
+	confirmedWant.StateSequence++
+	if confirmed != confirmedWant {
+		t.Fatalf("confirmed gain state mismatch: status=%#v want=%#v", confirmed, confirmedWant)
+	}
+	if len(f.published) != 2 || f.published[1] != confirmedWant {
+		t.Fatalf("confirmed gain did not publish once: %#v", f.published)
+	}
+	if len(f.track.volumeValues) != 3 {
+		t.Fatalf("gain attempts did not reach the output each time: %v", f.track.volumeValues)
+	}
 }
