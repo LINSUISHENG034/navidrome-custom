@@ -1925,13 +1925,21 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		}
 		var carriedMode PlaybackMode
 		carriedModeReady := false
-		if req.Mode == nil && session.DeviceName != req.TargetDeviceName {
+		var carriedInstance string
+		var carriedSourceMediaID string
+		if session.DeviceName != req.TargetDeviceName {
 			sourceDevice := ps.deviceByNameLocked(session.DeviceName)
 			if sourceDevice != nil {
 				sourceDevice.mu.Lock()
-				carriedMode = sourceDevice.mode
+				if req.Mode == nil {
+					carriedMode = sourceDevice.mode
+					carriedModeReady = true
+				}
+				carriedInstance = sourceDevice.carryEligibleInstanceLocked()
+				if sourceItem := sourceDevice.PlaybackQueue.CurrentItem(); sourceItem != nil {
+					carriedSourceMediaID = sourceItem.MediaFile.ID
+				}
 				sourceDevice.mu.Unlock()
-				carriedModeReady = true
 			}
 		}
 		targetDevice.mu.Lock()
@@ -1963,6 +1971,11 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 
 		targetDevice.clearLocked(ctx)
 		applyMigrationQueueLocked(targetDevice, shape, legacyItems, identityItems, req.CurrentQueueItemID, req.CurrentIndex)
+		if carriedInstance != "" && carriedSourceMediaID != "" {
+			if importedItem := targetDevice.PlaybackQueue.CurrentItem(); importedItem != nil && importedItem.MediaFile.ID == carriedSourceMediaID {
+				targetDevice.stageCarriedInstanceLocked(carriedInstance)
+			}
+		}
 		if req.Mode != nil {
 			carriedMode = *req.Mode
 		}
@@ -2171,6 +2184,7 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 	var savedMode PlaybackMode
 	var savedQueue []QueueCandidateItem
 	var savedIndex int
+	var savedInstance string
 	var preparationVersion uint64
 	oldDeviceName := ""
 
@@ -2182,6 +2196,7 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 		savedMode = oldDev.mode
 		savedQueue = oldDev.PlaybackQueue.GetItems()
 		savedIndex = oldDev.PlaybackQueue.Index
+		savedInstance = oldDev.carryEligibleInstanceLocked()
 		if oldDev.ActiveTrack != nil {
 			position := oldDev.ActiveTrack.Position()
 			savedPosition = &position
@@ -2200,6 +2215,9 @@ func (ps *playbackServer) switchDevice(ctx context.Context, deviceName string, s
 			// Migration keeps the imported instance IDs stable instead of
 			// silently losing identity through legacy whole-queue replacement.
 			newDev.PlaybackQueue.ReplaceItems(savedQueue, savedIndex)
+			if savedInstance != "" {
+				newDev.stageCarriedInstanceLocked(savedInstance)
+			}
 			newDev.Gain = savedGain
 			newDev.DesiredGain = savedGain
 			newDev.recoveryPosition = savedPosition

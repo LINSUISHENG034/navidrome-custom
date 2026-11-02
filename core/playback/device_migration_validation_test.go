@@ -1760,6 +1760,452 @@ func assertMigrationIdentityRejections(t *testing.T, ctx context.Context, identi
 	}
 }
 
+func TestPlaybackMigrationPlaybackInstanceCarry(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+
+	// startSourceInstance drives the default ("old") source device to a known
+	// state and returns its exact playback instance identity.
+	startSourceInstance := func(t *testing.T, paused bool) (*playbackServer, *playbackDevice, SessionStatus, string) {
+		t.Helper()
+		_, server := newMigrationValidationServer(t)
+		source, err := server.GetDeviceForUser("admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Set(ctx, []string{"track"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if paused {
+			if _, err := source.Stop(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		status, err := source.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.PlaybackInstanceID == "" {
+			t.Fatalf("expected non-empty source playback instance: %#v", status)
+		}
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		return server, migrationTestTarget(t, server, "new"), attached, status.PlaybackInstanceID
+	}
+	currentOne := func() *string { s := "qi-1"; return &s }
+
+	t.Run("identity commit carries exact source instance into commit status snapshot and target start", func(t *testing.T) {
+		server, target, attached, sourceInstance := startSourceInstance(t, false)
+		before, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-carry", OperationID: "g1:commit-carry", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems:         &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}, {QueueItemID: "qi-2", MediaFileID: "track"}},
+			CurrentQueueItemID: currentOne(),
+		})
+		if err != nil {
+			t.Fatalf("identity carry commit: %v", err)
+		}
+		if committed.QueueVersion != before.QueueVersion+1 || committed.StateSequence != before.StateSequence+1 {
+			t.Fatalf("identity carry changed target-local ordering: before=%#v committed=%#v", before, committed)
+		}
+		if committed.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("identity commit did not carry exact source instance: want %q got %q", sourceInstance, committed.PlaybackInstanceID)
+		}
+		snapshot, err := server.SessionSnapshot(ctx, "src", "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.SessionStatus.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("snapshot lost carried instance: want %q got %q", sourceInstance, snapshot.SessionStatus.PlaybackInstanceID)
+		}
+		started, err := target.Start(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if started.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("target start did not keep carried instance: want %q got %q", sourceInstance, started.PlaybackInstanceID)
+		}
+	})
+
+	t.Run("legacy commit carries when imported current media matches", func(t *testing.T) {
+		server, target, attached, sourceInstance := startSourceInstance(t, false)
+		before, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry-legacy", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-carry-legacy", OperationID: "g1:commit-carry-legacy", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			Queue: []string{"track", "track"}, CurrentIndex: 0,
+		})
+		if err != nil {
+			t.Fatalf("legacy carry commit: %v", err)
+		}
+		if committed.QueueVersion != before.QueueVersion+1 || committed.StateSequence != before.StateSequence+1 {
+			t.Fatalf("legacy carry changed target-local ordering: before=%#v committed=%#v", before, committed)
+		}
+		if committed.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("legacy commit did not carry exact source instance: want %q got %q", sourceInstance, committed.PlaybackInstanceID)
+		}
+	})
+
+	t.Run("paused source stays paused with exact identity", func(t *testing.T) {
+		server, target, attached, sourceInstance := startSourceInstance(t, true)
+		before, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry-paused", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-carry-paused", OperationID: "g1:commit-carry-paused", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}}, CurrentQueueItemID: currentOne(),
+		})
+		if err != nil {
+			t.Fatalf("paused carry commit: %v", err)
+		}
+		if committed.QueueVersion != before.QueueVersion+1 || committed.StateSequence != before.StateSequence+1 {
+			t.Fatalf("paused carry changed target-local ordering: before=%#v committed=%#v", before, committed)
+		}
+		if committed.Playing {
+			t.Fatalf("paused source resumed on target: %#v", committed)
+		}
+		if committed.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("paused commit did not carry exact source instance: want %q got %q", sourceInstance, committed.PlaybackInstanceID)
+		}
+		targetStatus, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if targetStatus.PlaybackInstanceID != sourceInstance || targetStatus.Playing {
+			t.Fatalf("target did not retain paused carried identity: %#v", targetStatus)
+		}
+	})
+
+	t.Run("mismatched current media does not carry and first start mints fresh", func(t *testing.T) {
+		server, target, attached, sourceInstance := startSourceInstance(t, false)
+		repo := server.datastore.(*tests.MockDataStore).MockedMediaFile.(*tests.MockMediaFileRepo)
+		repo.SetData(model.MediaFiles{{ID: "track", Path: "/validation.wav"}, {ID: "other", Path: "/other.wav"}})
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry-mismatch", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-carry-mismatch", OperationID: "g1:commit-carry-mismatch", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "other"}}, CurrentQueueItemID: currentOne(),
+		})
+		if err != nil {
+			t.Fatalf("mismatched media commit: %v", err)
+		}
+		if committed.PlaybackInstanceID != "" {
+			t.Fatalf("mismatched media must not carry source instance: got %q", committed.PlaybackInstanceID)
+		}
+		started, err := target.Start(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if started.PlaybackInstanceID == "" || started.PlaybackInstanceID == sourceInstance {
+			t.Fatalf("first start must mint a fresh instance distinct from source: source=%q got=%q", sourceInstance, started.PlaybackInstanceID)
+		}
+	})
+
+	t.Run("source without instance does not carry and first start mints fresh", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		target := migrationTestTarget(t, server, "new")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry-idle", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-carry-idle", OperationID: "g1:commit-carry-idle", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}}, CurrentQueueItemID: currentOne(),
+		})
+		if err != nil {
+			t.Fatalf("idle source commit: %v", err)
+		}
+		if committed.PlaybackInstanceID != "" {
+			t.Fatalf("idle source must not issue or carry an instance: got %q", committed.PlaybackInstanceID)
+		}
+		started, err := target.Start(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if started.PlaybackInstanceID == "" {
+			t.Fatalf("first start must mint a fresh instance: %#v", started)
+		}
+	})
+
+	t.Run("empty import does not mint identity", func(t *testing.T) {
+		server, target, attached, _ := startSourceInstance(t, false)
+		before, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry-empty", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-carry-empty", OperationID: "g1:commit-carry-empty", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{},
+		})
+		if err != nil {
+			t.Fatalf("empty import commit: %v", err)
+		}
+		if committed.PlaybackInstanceID != "" || committed.Playing {
+			t.Fatalf("empty import must not mint identity or start playback: %#v", committed)
+		}
+		if after, _ := target.Status(ctx); after.PlaybackInstanceID != "" {
+			t.Fatalf("empty import minted target identity: before=%#v after=%#v", before, after)
+		}
+	})
+
+	t.Run("rejected commit does not mutate target identity", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		target := migrationTestTarget(t, server, "new")
+		if _, err := target.Set(ctx, []string{"track"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := target.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		targetStatus, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targetInstance := targetStatus.PlaybackInstanceID
+		if targetInstance == "" {
+			t.Fatalf("expected non-empty target playback instance: %#v", targetStatus)
+		}
+		attached := attachMigrationSource(t, server, "src", "tab", "old")
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry-reject", "new")
+		fingerprint := target.SceneFingerprint()
+		_, err = server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-carry-reject", OperationID: "g1:commit-carry-reject", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			Queue: []string{"track"}, QueueItems: &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}},
+		})
+		if !errors.Is(err, ErrMigrationProtocolConflict) {
+			t.Fatalf("expected ErrMigrationProtocolConflict, got %v", err)
+		}
+		after, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.PlaybackInstanceID != targetInstance {
+			t.Fatalf("rejected commit mutated target identity: before=%q after=%q", targetInstance, after.PlaybackInstanceID)
+		}
+		if target.SceneFingerprint() != fingerprint {
+			t.Fatal("rejected commit mutated target scene")
+		}
+		info, qErr := server.QueryReservation(ctx, "mig-carry-reject")
+		if qErr != nil || info.Status != string(ReservationActive) {
+			t.Fatalf("rejected commit consumed reservation: %#v %v", info, qErr)
+		}
+	})
+
+	t.Run("index-shifting queue edits before start keep carried instance on the exact occurrence", func(t *testing.T) {
+		currentTwo := func() *string { s := "qi-2"; return &s }
+		shifts := []struct {
+			name  string
+			apply func(t *testing.T, target *playbackDevice)
+		}{
+			{"insert before carried occurrence", func(t *testing.T, target *playbackDevice) {
+				if _, err := target.Insert(ctx, 0, []string{"track"}); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"remove before carried occurrence", func(t *testing.T, target *playbackDevice) {
+				if _, err := target.Remove(ctx, 0); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"move carried occurrence", func(t *testing.T, target *playbackDevice) {
+				if _, err := target.Move(ctx, 1, 2); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		}
+		for _, shift := range shifts {
+			t.Run(shift.name, func(t *testing.T) {
+				server, target, attached, sourceInstance := startSourceInstance(t, false)
+				reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry-shift", "new")
+				committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+					MigrationID: "mig-carry-shift", OperationID: "g1:commit-carry-shift", SessionID: "src", ClientID: "tab",
+					User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+					QueueItems:         &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}, {QueueItemID: "qi-2", MediaFileID: "track"}, {QueueItemID: "qi-3", MediaFileID: "track"}},
+					CurrentQueueItemID: currentTwo(),
+				})
+				if err != nil {
+					t.Fatalf("carry shift commit: %v", err)
+				}
+				if committed.PlaybackInstanceID != sourceInstance || committed.CurrentIndex != 1 {
+					t.Fatalf("carry shift commit did not stage exact source instance: want %q at index 1 got %#v", sourceInstance, committed)
+				}
+				shift.apply(t, target)
+				snapshot, err := server.SessionSnapshot(ctx, "src", "admin")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if snapshot.SessionStatus.QueueItemID != "qi-2" {
+					t.Fatalf("%s no longer selects the carried occurrence: %#v", shift.name, snapshot.SessionStatus)
+				}
+				started, err := target.Start(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if started.PlaybackInstanceID != sourceInstance {
+					t.Fatalf("%s before start dropped carried instance: want %q got %q", shift.name, sourceInstance, started.PlaybackInstanceID)
+				}
+			})
+		}
+	})
+
+	t.Run("selecting another track before start supersedes carried identity", func(t *testing.T) {
+		server, target, attached, sourceInstance := startSourceInstance(t, false)
+		reserveForCommit(t, server, "src", "tab", attached.BindingGeneration, "mig-carry-supersede", "new")
+		committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "mig-carry-supersede", OperationID: "g1:commit-carry-supersede", SessionID: "src", ClientID: "tab",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems:         &[]QueueItemRef{{QueueItemID: "qi-1", MediaFileID: "track"}, {QueueItemID: "qi-2", MediaFileID: "track"}},
+			CurrentQueueItemID: currentOne(),
+		})
+		if err != nil {
+			t.Fatalf("supersede carry commit: %v", err)
+		}
+		if committed.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("identity commit did not carry exact source instance: want %q got %q", sourceInstance, committed.PlaybackInstanceID)
+		}
+		if _, err := target.Skip(ctx, 1, 0); err != nil {
+			t.Fatal(err)
+		}
+		started, err := target.Start(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if started.PlaybackInstanceID == "" || started.PlaybackInstanceID == sourceInstance {
+			t.Fatalf("start after superseding selection must mint a new instance: source=%q got=%q", sourceInstance, started.PlaybackInstanceID)
+		}
+	})
+}
+
+func TestPlaybackSwitchDevicePlaybackInstanceCarry(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+
+	t.Run("playing source carries same instance through legacy switch", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		source, err := server.GetDeviceForUser("admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Set(ctx, []string{"track"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		sourceStatus, err := source.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sourceInstance := sourceStatus.PlaybackInstanceID
+		if sourceInstance == "" {
+			t.Fatalf("expected non-empty source playback instance: %#v", sourceStatus)
+		}
+		target := migrationTestTarget(t, server, "new")
+		before, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := server.SwitchDevice(ctx, "new"); err != nil {
+			t.Fatal(err)
+		}
+		after, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !after.Playing {
+			t.Fatalf("expected playing target after switch: %#v", after)
+		}
+		if after.QueueVersion != before.QueueVersion+1 {
+			t.Fatalf("legacy switch changed structural ordering: before=%#v after=%#v", before, after)
+		}
+		if after.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("playing switch did not carry exact source instance: want %q got %q", sourceInstance, after.PlaybackInstanceID)
+		}
+	})
+
+	t.Run("paused source carries same instance and stays paused", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		source, err := server.GetDeviceForUser("admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Set(ctx, []string{"track"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
+		sourceStatus, err := source.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sourceInstance := sourceStatus.PlaybackInstanceID
+		if sourceInstance == "" {
+			t.Fatalf("expected paused source to retain playback instance: %#v", sourceStatus)
+		}
+		target := migrationTestTarget(t, server, "new")
+		if err := server.SwitchDevice(ctx, "new"); err != nil {
+			t.Fatal(err)
+		}
+		after, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.Playing {
+			t.Fatalf("paused source must not start playing on target: %#v", after)
+		}
+		if after.PlaybackInstanceID != sourceInstance {
+			t.Fatalf("paused switch did not carry exact source instance: want %q got %q", sourceInstance, after.PlaybackInstanceID)
+		}
+	})
+
+	t.Run("idle source does not carry into occupied target", func(t *testing.T) {
+		_, server := newMigrationValidationServer(t)
+		target := migrationTestTarget(t, server, "new")
+		if _, err := target.Set(ctx, []string{"track"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := target.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		targetStatus, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targetInstance := targetStatus.PlaybackInstanceID
+		if targetInstance == "" {
+			t.Fatalf("expected non-empty target playback instance: %#v", targetStatus)
+		}
+		if err := server.SwitchDevice(ctx, "new"); err != nil {
+			t.Fatal(err)
+		}
+		after, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !after.Playing || after.PlaybackInstanceID != targetInstance {
+			t.Fatalf("idle source switch must not replace target identity: before=%q after=%#v", targetInstance, after)
+		}
+	})
+}
+
 func TestPlaybackCommitMigrationWireShapeValidation(t *testing.T) {
 	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
 	identityBody := `"queueItems":[{"queueItemId":"qi-1","mediaFileId":"track"}],"currentQueueItemId":"qi-1"`

@@ -55,8 +55,16 @@ type playbackDevice struct {
 	sceneRevision         uint64
 	stateSequence         uint64
 	playbackInstanceID    string
-	mode                  PlaybackMode
-	randomFn              func(int) int
+	// One-shot migration carry: carriedPlaybackInstanceID is the identity a
+	// migration staged for the exact imported queue occurrence identified by
+	// carryQueueItemID/carryMediaFileID. assignTrack consumes it exactly once,
+	// keeping the identity only when the loaded track is that occurrence; any
+	// other load mints a fresh identity.
+	carriedPlaybackInstanceID string
+	carryQueueItemID          string
+	carryMediaFileID          string
+	mode                      PlaybackMode
+	randomFn                  func(int) int
 }
 
 type DeviceStatus struct {
@@ -523,6 +531,9 @@ func (pd *playbackDevice) clearLocked(ctx context.Context) {
 	pd.recoveryPosition = nil
 	pd.PlaybackQueue.Clear()
 	pd.playbackInstanceID = ""
+	pd.carriedPlaybackInstanceID = ""
+	pd.carryQueueItemID = ""
+	pd.carryMediaFileID = ""
 }
 
 func (pd *playbackDevice) Remove(ctx context.Context, index int) (DeviceStatus, error) {
@@ -984,13 +995,71 @@ func (pd *playbackDevice) loadTrackLocked(ctx context.Context, index int) (Track
 // If another goroutine set ActiveTrack during the unlock window, the
 // orphaned process is closed before the new track is assigned.
 func (pd *playbackDevice) assignTrack(newTrack Track, token model.PlaybackToken) {
-	pd.playbackInstanceID = uuid.NewString()
+	pd.playbackInstanceID = pd.consumeCarriedInstanceLocked()
 	pd.retireActiveTrackLocked()
 	pd.ActiveTrack = newTrack
 	pd.activePlaybackToken = token
 	pd.activePrepareCancel = pd.pendingPrepareCancels[token]
 	delete(pd.pendingPrepareCancels, token)
 	pd.discardPendingTrack(token)
+}
+
+// carryEligibleInstanceLocked reports the playback instance that may be
+// carried to another device. Only an actually playing or paused-with-recovery
+// scene owns a transferable identity; an idle scene (queue stopped with no
+// active track and no recovery position) never carries one.
+func (pd *playbackDevice) carryEligibleInstanceLocked() string {
+	if pd.playbackInstanceID == "" {
+		return ""
+	}
+	if pd.isPlaying() || pd.ActiveTrack != nil || pd.recoveryPosition != nil {
+		return pd.playbackInstanceID
+	}
+	return ""
+}
+
+// stageCarriedInstanceLocked installs a one-shot carried playback identity on
+// the current queue occurrence and exposes it immediately in status. The
+// carry is bound to the exact queue occurrence (queue instance ID and media)
+// so that a later selection of a different occurrence — even of the same
+// media at another queue position — mints a fresh identity instead of
+// reusing the carried one. Structural queue edits that shift the occurrence's
+// index (insert/remove/move) do not invalidate the carry while the same
+// queue instance stays selected.
+func (pd *playbackDevice) stageCarriedInstanceLocked(instanceID string) {
+	item := pd.PlaybackQueue.CurrentItem()
+	if instanceID == "" || item == nil {
+		return
+	}
+	pd.carriedPlaybackInstanceID = instanceID
+	pd.carryQueueItemID = item.QueueItemID
+	pd.carryMediaFileID = item.MediaFile.ID
+	pd.playbackInstanceID = instanceID
+}
+
+// consumeCarriedInstanceLocked resolves the one-shot migration carry when a
+// track is assigned. The carried identity is applied only when the assigned
+// track is the exact imported queue occurrence; any other load mints a fresh
+// identity. The carry is always consumed, so at most one assignTrack can
+// reuse it.
+func (pd *playbackDevice) consumeCarriedInstanceLocked() string {
+	carried := pd.carriedPlaybackInstanceID
+	carryQueueItemID := pd.carryQueueItemID
+	carryMediaFileID := pd.carryMediaFileID
+	pd.carriedPlaybackInstanceID = ""
+	pd.carryQueueItemID = ""
+	pd.carryMediaFileID = ""
+	if carried == "" {
+		return uuid.NewString()
+	}
+	item := pd.PlaybackQueue.CurrentItem()
+	if item == nil || item.MediaFile.ID != carryMediaFileID || item.QueueItemID != carryQueueItemID {
+		return uuid.NewString()
+	}
+	// Queue instance IDs are generated unique per enqueue (legacy imports
+	// included), so matching ID+media already disambiguates the exact queue
+	// occurrence regardless of its current index.
+	return carried
 }
 
 func (pd *playbackDevice) retireActiveTrackLocked() {

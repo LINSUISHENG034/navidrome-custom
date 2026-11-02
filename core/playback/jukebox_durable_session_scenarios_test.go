@@ -898,6 +898,98 @@ func TestDurableSessionRefreshHandoffContract(t *testing.T) {
 	}
 }
 
+func TestDurableSessionRefreshHandoffPreservesPlaybackInstance(t *testing.T) {
+	h := newDurableScenarioHarness(t)
+	h.configureQueue("1", "2")
+	status := h.attach(t, "tab-1")
+	if status.ControlHandoffToken == "" {
+		t.Fatal("expected attach response to issue handoff token to owner")
+	}
+	initialToken := status.ControlHandoffToken
+
+	h.startPlayback(t)
+	deviceStatus, err := h.device.Status(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := deviceStatus.PlaybackInstanceID
+	if instance == "" {
+		t.Fatalf("expected non-empty playback instance before refresh: %#v", deviceStatus)
+	}
+
+	// Status and snapshot queries expose the exact identity without disclosing the token.
+	statusQuery, err := h.server.SessionStatus(h.ctx, "s1")
+	if err != nil || statusQuery.ControlHandoffToken != "" {
+		t.Fatalf("status query disclosed handoff token: %#v err=%v", statusQuery, err)
+	}
+	if statusQuery.PlaybackInstanceID != instance {
+		t.Fatalf("status query lost exact playback instance: want %q got %q", instance, statusQuery.PlaybackInstanceID)
+	}
+	snapQuery, err := h.server.SessionSnapshot(h.ctx, "s1", "admin")
+	if err != nil || snapQuery.SessionStatus.ControlHandoffToken != "" {
+		t.Fatalf("snapshot query disclosed handoff token: %#v err=%v", snapQuery, err)
+	}
+	if snapQuery.SessionStatus.PlaybackInstanceID != instance {
+		t.Fatalf("snapshot query lost exact playback instance: want %q got %q", instance, snapQuery.SessionStatus.PlaybackInstanceID)
+	}
+
+	// Refresh handoff to a new document retains the exact identity.
+	handoffStatus, err := h.server.HandoffSession(h.ctx, HandoffRequest{
+		SessionID:    "s1",
+		User:         "admin",
+		NewClientID:  "tab-2",
+		HandoffToken: initialToken,
+	})
+	if err != nil {
+		t.Fatalf("handoff failed: %v", err)
+	}
+	if handoffStatus.BindingGeneration != 2 {
+		t.Fatalf("expected generation 2 after handoff, got %d", handoffStatus.BindingGeneration)
+	}
+	if handoffStatus.ControlHandoffToken == "" || handoffStatus.ControlHandoffToken == initialToken {
+		t.Fatalf("expected rotated handoff token on handoff response: %s", handoffStatus.ControlHandoffToken)
+	}
+	if handoffStatus.PlaybackInstanceID != instance {
+		t.Fatalf("refresh handoff lost exact playback instance: want %q got %q", instance, handoffStatus.PlaybackInstanceID)
+	}
+
+	// SSE mapping retains the exact identity.
+	event := NewJukeboxStateUpdatedEvent(handoffStatus)
+	if event.PlaybackInstanceID != instance {
+		t.Fatalf("SSE event lost exact playback instance: want %q got %q", instance, event.PlaybackInstanceID)
+	}
+
+	// Clone competition has exactly one winner; the loser cannot reuse the token.
+	_, err = h.server.HandoffSession(h.ctx, HandoffRequest{
+		SessionID:    "s1",
+		User:         "admin",
+		NewClientID:  "tab-3",
+		HandoffToken: initialToken,
+	})
+	if !errors.Is(err, ErrHandoffInvalid) {
+		t.Fatalf("expected ErrHandoffInvalid on reused token, got: %v", err)
+	}
+
+	// Old document tab-1 cannot continue writing and stays read-only.
+	gen1 := uint64(1)
+	oldDocScope := CommandScope{
+		User:              "admin",
+		SessionID:         "s1",
+		ClientID:          "tab-1",
+		BindingGeneration: &gen1,
+	}
+	if _, err := h.server.ExecuteCommand(h.ctx, oldDocScope, PlaybackCommand{Action: CommandGain, Gain: 0.1}); !errors.Is(err, ErrSessionOwnership) {
+		t.Fatalf("expected ErrSessionOwnership for old document write, got: %v", err)
+	}
+	ownerStatus, err := h.server.SessionStatus(h.ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownerStatus.PlaybackInstanceID != instance || ownerStatus.OwnerClientID != "tab-2" {
+		t.Fatalf("post-handoff status lost identity or ownership: %#v", ownerStatus)
+	}
+}
+
 func newMigrationRepairFixture(t *testing.T) (*durableScenarioHarness, *playbackDevice, ReserveMigrationRequest, CommitMigrationRequest) {
 	t.Helper()
 	h := newDurableScenarioHarness(t)
