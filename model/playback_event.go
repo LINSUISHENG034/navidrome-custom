@@ -34,4 +34,9 @@ type QueueProtocolCapabilities struct {
 	IdentityMigration        bool `json:"identityMigration"`
 	AnchorVersionEnforcement bool `json:"anchorVersionEnforcement"`
 	OperationResults         bool `json:"operationResults"`
+	// MigrationProof advertises the immutable server-generated migration commit
+	// proof plus the separate atomic current snapshot on the original-operation
+	// query. It is purely additive: absence or false means clients must not
+	// assume proof support.
+	MigrationProof bool `json:"migrationProof"`
 }

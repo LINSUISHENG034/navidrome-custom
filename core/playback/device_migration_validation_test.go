@@ -3401,3 +3401,405 @@ func TestPlaybackQueueProtocolCapabilityContract(t *testing.T) {
 		t.Fatalf("SSE event dropped queue protocol: %#v", event.QueueProtocol)
 	}
 }
+
+// TestPlaybackMigrationCommitProofInlineAndQueryContract is the T13-I RED for
+// the immutable server-generated migration proof: the commit response must
+// carry an inline migrationProof bound to the original migration/operation/
+// session/owner/target plus source and committed binding generations and the
+// commit-time queue/current/context; the same-original-operation query must
+// return the identical historical proof plus a separate currentSnapshot, must
+// never recommit, and must not mutate the scene. All assertions decode the
+// existing exported status/record shapes to maps so the contract RED is a
+// missing additive proof field, never a compile failure.
+func TestPlaybackMigrationCommitProofInlineAndQueryContract(t *testing.T) {
+	ctx := request.WithUser(context.Background(), model.User{UserName: "admin"})
+	_, server := newMigrationValidationServer(t)
+	attached := attachMigrationSource(t, server, "proof-src", "owner", "old")
+	target := migrationTestTarget(t, server, "new")
+	target.mu.Lock()
+	target.stateSequence = 17
+	target.mu.Unlock()
+	before, err := target.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserveForCommit(t, server, "proof-src", "owner", attached.BindingGeneration, "proof-mig", "new")
+	position := 17
+	mode := PlaybackModeShuffle
+	committedAtStart := time.Now().Add(-time.Minute)
+	committed, err := server.CommitMigration(ctx, CommitMigrationRequest{
+		MigrationID: "proof-mig", OperationID: "g1:proof-mig", SessionID: "proof-src", ClientID: "owner",
+		User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+		QueueItems: &[]QueueItemRef{
+			{QueueItemID: "qi-1", MediaFileID: "track"},
+			{QueueItemID: "qi-2", MediaFileID: "track"},
+			{QueueItemID: "qi-3", MediaFileID: "track"},
+		},
+		CurrentQueueItemID: ptrString("qi-2"), Position: &position, Mode: &mode,
+	})
+	if err != nil {
+		t.Fatalf("proof commit: %v", err)
+	}
+	if committed.BindingGeneration != attached.BindingGeneration+1 || committed.DeviceName != "new" ||
+		committed.OwnerClientID != "owner" || committed.QueueItemID != "qi-2" || committed.CurrentIndex != 1 ||
+		committed.Position != 17 || committed.PlayMode != string(PlaybackModeShuffle) {
+		t.Fatalf("commit response lost committed context: %#v", committed)
+	}
+
+	proofOf := func(t *testing.T, label string, v any) map[string]any {
+		t.Helper()
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("%s marshal: %v", label, err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(encoded, &payload); err != nil {
+			t.Fatalf("%s decode: %v", label, err)
+		}
+		proof, ok := payload["migrationProof"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s missing migrationProof: %s", label, encoded)
+		}
+		return proof
+	}
+	assertProof := func(t *testing.T, label string, proof map[string]any) {
+		t.Helper()
+		if proof["migrationId"] != "proof-mig" || proof["operationId"] != "g1:proof-mig" ||
+			proof["sessionId"] != "proof-src" || proof["clientId"] != "owner" || proof["user"] != "admin" ||
+			proof["sourceDeviceName"] != "old" || proof["targetDeviceName"] != "new" ||
+			proof["sourceBindingGeneration"] != float64(attached.BindingGeneration) ||
+			proof["committedBindingGeneration"] != float64(attached.BindingGeneration+1) {
+			t.Errorf("%s proof lost original identity/generation binding: %#v", label, proof)
+		}
+		queue, ok := proof["queue"].([]any)
+		if !ok || len(queue) != 3 {
+			t.Fatalf("%s proof queue must carry the three committed occurrences: %#v", label, proof)
+		}
+		for i, want := range []struct{ item, media string }{{"qi-1", "track"}, {"qi-2", "track"}, {"qi-3", "track"}} {
+			entry, ok := queue[i].(map[string]any)
+			if !ok || entry["queueItemId"] != want.item || entry["mediaFileId"] != want.media {
+				t.Errorf("%s proof queue[%d] = %#v, want queueItemId=%s mediaFileId=%s", label, i, queue[i], want.item, want.media)
+			}
+		}
+		if proof["currentQueueItemId"] != "qi-2" || proof["currentIndex"] != float64(1) ||
+			proof["position"] != float64(17) || proof["mode"] != string(PlaybackModeShuffle) {
+			t.Errorf("%s proof lost commit-time current/context: %#v", label, proof)
+		}
+		if proof["gain"] != float64(1) || proof["desiredGain"] != float64(1) || proof["muted"] != false {
+			t.Errorf("%s proof lost commit-time gain/mute context: %#v", label, proof)
+		}
+		if proof["queueVersion"] != float64(committed.QueueVersion) ||
+			proof["stateSequence"] != float64(committed.StateSequence) {
+			t.Errorf("%s proof lost commit-time ordering: queueVersion=%v stateSequence=%v committed=%#v",
+				label, proof["queueVersion"], proof["stateSequence"], committed)
+		}
+		committedAt, ok := proof["committedAt"].(string)
+		if !ok || committedAt == "" {
+			t.Fatalf("%s proof missing committedAt: %#v", label, proof)
+		}
+		stamp, err := time.Parse(time.RFC3339Nano, committedAt)
+		if err != nil || stamp.Before(committedAtStart) || stamp.After(time.Now().Add(time.Minute)) {
+			t.Errorf("%s proof committedAt invalid: %q err=%v", label, committedAt, err)
+		}
+	}
+
+	t.Run("inline proof binds original ids and committed generations", func(t *testing.T) {
+		assertProof(t, "inline", proofOf(t, "commit response", committed))
+	})
+	t.Run("same operation query returns identical historical proof and separate current snapshot", func(t *testing.T) {
+		proof := proofOf(t, "operation record", mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig"))
+		assertProof(t, "query", proof)
+		record := mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig")
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(encoded, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(payload["migrationProof"], proofOf(t, "commit response", committed)) {
+			t.Errorf("queried historical proof differs from inline commit proof: query=%#v inline=%#v",
+				payload["migrationProof"], proofOf(t, "commit response", committed))
+		}
+		snapshot, ok := payload["currentSnapshot"].(map[string]any)
+		if !ok {
+			t.Fatalf("operation record missing separate currentSnapshot: %s", encoded)
+		}
+		sessionStatus, ok := snapshot["sessionStatus"].(map[string]any)
+		if !ok || sessionStatus["bindingGeneration"] != float64(attached.BindingGeneration+1) ||
+			sessionStatus["deviceName"] != "new" || sessionStatus["queueItemId"] != "qi-2" {
+			t.Errorf("currentSnapshot lost current session binding: %#v", snapshot)
+		}
+		playlist, ok := snapshot["jukeboxPlaylist"].(map[string]any)
+		if !ok {
+			t.Fatalf("currentSnapshot missing jukeboxPlaylist: %#v", snapshot)
+		}
+		entries, ok := playlist["entry"].([]any)
+		if !ok || len(entries) != 3 {
+			t.Fatalf("currentSnapshot must carry the full committed queue entries: %#v", playlist)
+		}
+		for i, want := range []string{"qi-1", "qi-2", "qi-3"} {
+			entry, ok := entries[i].(map[string]any)
+			if !ok || entry["queueItemId"] != want {
+				t.Errorf("currentSnapshot entry[%d] = %#v, want queueItemId=%s", i, entries[i], want)
+			}
+		}
+	})
+	t.Run("query never recommits and does not mutate the committed scene", func(t *testing.T) {
+		for i := 0; i < 3; i++ {
+			record := mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig")
+			if record.Status != OperationStatusApplied {
+				t.Fatalf("query %d changed operation status: %#v", i, record)
+			}
+			if record.SessionStatus == nil || record.SessionStatus.BindingGeneration != attached.BindingGeneration+1 {
+				t.Fatalf("query %d changed committed session status: %#v", i, record.SessionStatus)
+			}
+		}
+		after, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.QueueVersion != before.QueueVersion+1 || after.StateSequence != before.StateSequence+1 ||
+			after.CurrentIndex != 1 || after.Position != 17 || string(after.Mode) != string(PlaybackModeShuffle) ||
+			len(target.PlaybackQueue.ItemIDs()) != 3 {
+			t.Errorf("query mutated the committed scene: before=%#v after=%#v", before, after)
+		}
+	})
+	t.Run("duplicate original operation id never recommits the committed scene", func(t *testing.T) {
+		// The commit advanced the session binding generation, so re-POSTing the
+		// original operation identity either reconciles against the stored
+		// record or is rejected as superseded; in both cases the committed
+		// scene must not be applied a second time. The authoritative
+		// reconciliation channel for the original id is the read-only query.
+		_, _ = server.CommitMigration(ctx, CommitMigrationRequest{
+			MigrationID: "proof-mig", OperationID: "g1:proof-mig", SessionID: "proof-src", ClientID: "owner",
+			User: "admin", TargetDeviceName: "new", ExpectedGeneration: attached.BindingGeneration,
+			QueueItems: &[]QueueItemRef{
+				{QueueItemID: "qi-1", MediaFileID: "track"},
+				{QueueItemID: "qi-2", MediaFileID: "track"},
+				{QueueItemID: "qi-3", MediaFileID: "track"},
+			},
+			CurrentQueueItemID: ptrString("qi-2"), Position: &position, Mode: &mode,
+		})
+		after, err := target.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.QueueVersion != before.QueueVersion+1 || after.StateSequence != before.StateSequence+1 ||
+			len(target.PlaybackQueue.ItemIDs()) != 3 {
+			t.Errorf("duplicate original operation id recommitted: before=%#v after=%#v", before, after)
+		}
+		record := mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig")
+		if record.Status != OperationStatusApplied {
+			t.Fatalf("duplicate attempt corrupted the original operation record: %#v", record)
+		}
+		assertProof(t, "post-duplicate query", proofOf(t, "post-duplicate query record", record))
+	})
+	t.Run("unknown operation reads UNKNOWN without proof", func(t *testing.T) {
+		record, err := server.QueryOperation(ctx, "proof-src", "g1:never-executed")
+		if err != nil {
+			t.Fatalf("unknown operation query: %v", err)
+		}
+		if record.Status != OperationStatusUnknown || record.MigrationProof != nil || record.CurrentSnapshot != nil {
+			t.Errorf("unknown operation must read UNKNOWN without proof or snapshot: %#v", record)
+		}
+	})
+	t.Run("cross-user query is denied", func(t *testing.T) {
+		bobCtx := request.WithUser(context.Background(), model.User{UserName: "bob"})
+		if _, err := server.QueryOperation(bobCtx, "proof-src", "g1:proof-mig"); !errors.Is(err, ErrSessionOwnership) {
+			t.Errorf("cross-user query must fail closed with ErrSessionOwnership: %v", err)
+		}
+	})
+	t.Run("later legitimate edits leave historical proof unchanged and current snapshot newer", func(t *testing.T) {
+		gen := attached.BindingGeneration + 1
+		scope := CommandScope{User: "admin", SessionID: "proof-src", ClientID: "owner", BindingGeneration: &gen}
+		if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandSet, IDs: []string{"track"}}); err != nil {
+			t.Fatalf("later queue edit: %v", err)
+		}
+		if _, err := server.ExecuteCommand(ctx, migrationCommandScope(scope), PlaybackCommand{Action: CommandGain, Gain: 0.25}); err != nil {
+			t.Fatalf("later gain edit: %v", err)
+		}
+		record := mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig")
+		if record.Status != OperationStatusApplied {
+			t.Fatalf("later edits changed operation status: %#v", record)
+		}
+		assertProof(t, "post-edit query", proofOf(t, "post-edit query record", record))
+		proof := proofOf(t, "post-edit query", record)
+		if proof["queueVersion"] != float64(committed.QueueVersion) {
+			t.Errorf("historical proof recorded a newer queueVersion after later edits: %v", proof["queueVersion"])
+		}
+		if record.CurrentSnapshot == nil {
+			t.Fatal("post-edit query lost the separate current snapshot")
+		}
+		if len(record.CurrentSnapshot.JukeboxPlaylist.Entry) != 1 {
+			t.Errorf("current snapshot did not track the later queue edit: %#v", record.CurrentSnapshot.JukeboxPlaylist.Entry)
+		}
+		if record.CurrentSnapshot.SessionStatus.QueueVersion <= committed.QueueVersion {
+			t.Errorf("current snapshot must be newer than the commit: snapshot=%v committed=%v",
+				record.CurrentSnapshot.SessionStatus.QueueVersion, committed.QueueVersion)
+		}
+		if record.CurrentSnapshot.SessionStatus.DesiredGain != 0.25 {
+			t.Errorf("current snapshot did not track the later gain edit: %#v", record.CurrentSnapshot.SessionStatus)
+		}
+	})
+	t.Run("mutating returned Go objects cannot affect the cached record", func(t *testing.T) {
+		record := mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig")
+		record.MigrationProof.Queue[0].QueueItemID = "hacked"
+		record.MigrationProof.Position = 999
+		record.SessionStatus.MigrationProof.Queue[0].MediaFileID = "hacked"
+		record.CurrentSnapshot.SessionStatus.Position = 999
+		committed.MigrationProof.Queue[0].QueueItemID = "hacked-inline"
+		reRecord := mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig")
+		assertProof(t, "post-mutation query", proofOf(t, "post-mutation query record", reRecord))
+		nested := reRecord.SessionStatus.MigrationProof
+		if nested == nil || nested.Queue[0].QueueItemID != "qi-1" || nested.Queue[0].MediaFileID != "track" {
+			t.Errorf("cached record aliased through a returned Go object: %#v", nested)
+		}
+	})
+	t.Run("concurrent queries and snapshots stay coherent", func(t *testing.T) {
+		baselineRecord := mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig")
+		baseline, err := json.Marshal(baselineRecord.MigrationProof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		errs := make(chan error, 16)
+		var wg sync.WaitGroup
+		for worker := 0; worker < 4; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 25; i++ {
+					record, err := server.QueryOperation(ctx, "proof-src", "g1:proof-mig")
+					if err != nil {
+						errs <- err
+						return
+					}
+					encoded, err := json.Marshal(record.MigrationProof)
+					if err != nil {
+						errs <- err
+						return
+					}
+					if string(encoded) != string(baseline) {
+						errs <- fmt.Errorf("queried proof drifted under concurrency: %s", encoded)
+						return
+					}
+					if _, err := server.SessionSnapshot(ctx, "proof-src", "admin"); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Errorf("concurrent query: %v", err)
+		}
+	})
+	t.Run("takeover before query withholds proof on the response copy only", func(t *testing.T) {
+		proofOfRecord := func(t *testing.T, label string) (map[string]any, map[string]any) {
+			t.Helper()
+			record := mustQueryOperationRecord(t, ctx, server, "proof-src", "g1:proof-mig")
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("%s marshal: %v", label, err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				t.Fatalf("%s decode: %v", label, err)
+			}
+			proof, _ := payload["migrationProof"].(map[string]any)
+			return payload, proof
+		}
+		_, proof := proofOfRecord(t, "pre-takeover query")
+		if proof == nil {
+			t.Fatal("pre-takeover query must expose the committed proof")
+		}
+		takenOver, err := server.AttachSession(ctx, AttachRequest{
+			SessionID: "proof-src", User: "admin", ClientID: "intruder", DeviceName: "new", Takeover: true,
+		})
+		if err != nil || takenOver.OwnerClientID != "intruder" ||
+			takenOver.BindingGeneration != attached.BindingGeneration+2 {
+			t.Fatalf("explicit takeover did not rebind the session: %#v err=%v", takenOver, err)
+		}
+		payload, proof := proofOfRecord(t, "post-takeover query")
+		if proof != nil {
+			t.Errorf("post-takeover query must withhold the stale proof from the response copy: %v", payload)
+		}
+		if payload["migrationProofSuperseded"] != true {
+			t.Errorf("post-takeover query missing migrationProofSuperseded: %v", payload)
+		}
+		sessionStatus, ok := payload["sessionStatus"].(map[string]any)
+		if !ok || sessionStatus["bindingGeneration"] != float64(attached.BindingGeneration+1) ||
+			sessionStatus["ownerClientId"] != "owner" {
+			t.Errorf("response copy rewrote the canonical historical record: %v", payload)
+		}
+	})
+}
+
+// Characterizes the operation-store proof boundaries that the playback server
+// relies on: a pending operation reads PENDING without any proof until the same
+// original id completes APPLIED with the proof, Get egress never aliases the
+// cached proof, and TTL eviction reads UNKNOWN without proof and never retries
+// or recommits on its own.
+func TestPlaybackMigrationProofStoreBoundaries(t *testing.T) {
+	t.Run("pending gap reads PENDING without proof then completes APPLIED with proof", func(t *testing.T) {
+		clock := time.Now()
+		store := NewOperationStore(8, time.Minute, func() time.Time { return clock })
+		admission := store.acquire(OperationRecord{Status: OperationStatusUnknown, SessionID: "s", OperationID: "op"})
+		if !admission.first {
+			t.Fatal("expected first admission for a new operation")
+		}
+		rec, ok := store.Get("s", "op")
+		if !ok || rec.Status != OperationStatusPending || rec.MigrationProof != nil {
+			t.Fatalf("pending gap must read PENDING without proof: %#v ok=%v", rec, ok)
+		}
+		proof := &MigrationProof{
+			MigrationID: "m", OperationID: "op", SessionID: "s", ClientID: "owner", User: "admin",
+			SourceDeviceName: "old", TargetDeviceName: "new", CommittedAt: clock,
+			Queue: []MigrationProofItem{{QueueItemID: "qi-1", MediaFileID: "track"}},
+		}
+		store.Complete("s", "op", OperationRecord{Status: OperationStatusApplied, SessionID: "s", OperationID: "op", MigrationProof: proof})
+		rec, ok = store.Get("s", "op")
+		if !ok || rec.Status != OperationStatusApplied || rec.MigrationProof == nil || len(rec.MigrationProof.Queue) != 1 {
+			t.Fatalf("completion must read APPLIED with proof for the same original id: %#v ok=%v", rec, ok)
+		}
+		rec.MigrationProof.Queue[0].QueueItemID = "hacked"
+		again, _ := store.Get("s", "op")
+		if again.MigrationProof == nil || again.MigrationProof.Queue[0].QueueItemID != "qi-1" {
+			t.Errorf("Get egress aliases the cached proof: %#v", again.MigrationProof)
+		}
+	})
+	t.Run("TTL eviction reads UNKNOWN without proof and does not retry", func(t *testing.T) {
+		clock := time.Now()
+		store := NewOperationStore(8, time.Minute, func() time.Time { return clock })
+		proof := &MigrationProof{
+			MigrationID: "m", OperationID: "op", SessionID: "s", CommittedAt: clock,
+			Queue: []MigrationProofItem{{QueueItemID: "qi-1", MediaFileID: "track"}},
+		}
+		store.Complete("s", "op", OperationRecord{Status: OperationStatusApplied, SessionID: "s", OperationID: "op", MigrationProof: proof, CreatedAt: clock})
+		if _, ok := store.Get("s", "op"); !ok {
+			t.Fatal("record must be readable before its TTL expires")
+		}
+		clock = clock.Add(2 * time.Minute)
+		rec, ok := store.Get("s", "op")
+		if ok {
+			t.Fatalf("evicted record must not be readable: %#v", rec)
+		}
+		if rec.Status != OperationStatusUnknown || rec.MigrationProof != nil {
+			t.Errorf("eviction must read UNKNOWN without proof: %#v", rec)
+		}
+	})
+}
+
+func ptrString(s string) *string { return &s }
+
+func mustQueryOperationRecord(t *testing.T, ctx context.Context, server *playbackServer, sessionID, operationID string) OperationRecord {
+	t.Helper()
+	record, err := server.QueryOperation(ctx, sessionID, operationID)
+	if err != nil {
+		t.Fatalf("QueryOperation(%s, %s): %v", sessionID, operationID, err)
+	}
+	return record
+}

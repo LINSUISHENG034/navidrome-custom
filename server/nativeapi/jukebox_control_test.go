@@ -2114,3 +2114,281 @@ func TestJukeboxQueueProtocolCapabilityAdvertised(t *testing.T) {
 		t.Fatalf("session status dropped queue protocol: %s", response.Body.String())
 	}
 }
+
+// TestJukeboxMigrationCommitProofHTTPContract is the T13-I RED for the HTTP
+// mapping of the immutable migration proof: the migration commit response must
+// carry the inline migrationProof, the original-operation query must return
+// the historical proof plus a separate currentSnapshot, the attach/status
+// capability must advertise migrationProof, and the plain non-commit status
+// route must not leak a proof. Assertions decode the real HTTP JSON bodies to
+// maps so the contract RED is a missing additive proof field, never a compile
+// failure. The nil-datastore logical fixture cannot resolve media files, so
+// the commit vehicle is the valid empty identity queue; the duplicate-media
+// proof content contract is covered in core/playback.
+func TestJukeboxMigrationCommitProofHTTPContract(t *testing.T) {
+	_, ps := startJukeboxLogicalFixture(t, "Proof Default", []conf.AudioDeviceDefinition{
+		{"Proof Default", "http-default"},
+		{"Proof Target", "http-target"},
+	})
+	api := &Router{playback: ps}
+	router := chi.NewRouter()
+	api.addJukeboxControlRoute(router)
+	api.addJukeboxSessionRoute(router)
+
+	sessionID := uniqueSessionID("http-proof-src")
+	attachRes := serveJukeboxJSON(t, router, http.MethodPost, "/jukebox/session/attach", map[string]any{
+		"sessionId": sessionID, "clientId": "tab-1", "deviceName": "http-default",
+	})
+	if attachRes.Code != http.StatusOK {
+		t.Fatalf("attach failed: %d %s", attachRes.Code, attachRes.Body.String())
+	}
+	var attachPayload struct {
+		BindingGeneration uint64 `json:"bindingGeneration"`
+	}
+	if err := json.Unmarshal(attachRes.Body.Bytes(), &attachPayload); err != nil {
+		t.Fatal(err)
+	}
+	generation := attachPayload.BindingGeneration
+	attachBody := attachRes.Body.Bytes()
+	// The commit moves the source session onto the target device and the
+	// takeover subtest rebinds it to "intruder"; both bindings must be
+	// released or the process-global fixture keeps an owner on the target
+	// device and the next same-process iteration's target attach fails with
+	// SESSION_OWNERSHIP. DetachSession only removes a matching owner binding.
+	t.Cleanup(func() {
+		_, _ = ps.DetachSession(context.Background(), sessionID, "tab-1")
+		_, _ = ps.DetachSession(context.Background(), sessionID, "intruder")
+	})
+
+	targetOwnerID := uniqueSessionID("http-proof-target-owner")
+	targetAttach := serveJukeboxJSON(t, router, http.MethodPost, "/jukebox/session/attach", map[string]any{
+		"sessionId": targetOwnerID, "clientId": "target-owner", "deviceName": "http-target",
+	})
+	if targetAttach.Code != http.StatusOK {
+		t.Fatalf("target attach failed: %d %s", targetAttach.Code, targetAttach.Body.String())
+	}
+	// The commit revokes this owner, but an aborted iteration can leave it
+	// attached; release it so same-process repeats start from a clean device.
+	t.Cleanup(func() { _, _ = ps.DetachSession(context.Background(), targetOwnerID, "target-owner") })
+
+	// A migration reservation is single-use by contract: once its record exists
+	// (released or expired), re-reserving the same migrationId conflicts, so
+	// each run needs its own id — the same uniqueSessionID convention the
+	// session ids above already use for per-run resources.
+	migrationID := uniqueSessionID("mig-http-proof")
+	probe := serveJukeboxJSON(t, router, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+		"migrationId": migrationID, "operationId": "g1:" + migrationID + "-probe", "sessionId": sessionID, "clientId": "tab-1",
+		"deviceName": "http-target", "bindingGeneration": generation,
+	})
+	if probe.Code != http.StatusConflict {
+		t.Fatalf("expected occupied probe, got %d %s", probe.Code, probe.Body.String())
+	}
+	var probePayload map[string]any
+	_ = json.Unmarshal(probe.Body.Bytes(), &probePayload)
+	fp, ok := probePayload["sceneFingerprint"].(string)
+	if !ok || fp == "" {
+		t.Fatalf("probe did not return fingerprint: %#v", probePayload)
+	}
+	res := serveJukeboxJSON(t, router, http.MethodPost, "/jukebox/migration/reserve", map[string]any{
+		"migrationId": migrationID, "operationId": "g1:" + migrationID + "-take", "sessionId": sessionID, "clientId": "tab-1",
+		"deviceName": "http-target", "bindingGeneration": generation, "expectedFingerprint": fp, "forceTakeover": true,
+	})
+	if res.Code != http.StatusOK {
+		t.Fatalf("reserve failed: %d %s", res.Code, res.Body.String())
+	}
+
+	commitBody := fmt.Sprintf(`{"operationId":"g1:%s","migrationId":%q,"sessionId":%q,"clientId":"tab-1","targetDeviceName":"http-target","bindingGeneration":%d,"expectedFingerprint":%q,"queueItems":[]}`,
+		migrationID, migrationID, sessionID, generation, fp)
+	commitRes := serveRawJukeboxJSON(t, router, http.MethodPost, "/jukebox/migration/commit", commitBody)
+	if commitRes.Code != http.StatusOK {
+		t.Fatalf("commit failed: %d %s", commitRes.Code, commitRes.Body.String())
+	}
+	var commitPayload map[string]any
+	if err := json.Unmarshal(commitRes.Body.Bytes(), &commitPayload); err != nil {
+		t.Fatal(err)
+	}
+	proof, _ := commitPayload["migrationProof"].(map[string]any)
+
+	operationQuery := func(t *testing.T) map[string]any {
+		t.Helper()
+		response := serveJukeboxJSON(t, router, http.MethodGet, "/jukebox/operation?sessionId="+sessionID+"&operationId=g1:"+migrationID, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("operation query: %d %s", response.Code, response.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	t.Run("commit response carries inline proof bound to the original operation", func(t *testing.T) {
+		if proof == nil {
+			t.Fatalf("commit response missing inline migrationProof: %s", commitRes.Body.String())
+		}
+		if proof["migrationId"] != migrationID || proof["operationId"] != "g1:"+migrationID ||
+			proof["sessionId"] != sessionID || proof["clientId"] != "tab-1" || proof["user"] != "admin" ||
+			proof["sourceDeviceName"] != "http-default" || proof["targetDeviceName"] != "http-target" ||
+			proof["sourceBindingGeneration"] != float64(generation) ||
+			proof["committedBindingGeneration"] != float64(generation+1) {
+			t.Errorf("inline proof lost original identity/generation binding: %#v", proof)
+		}
+		queue, ok := proof["queue"].([]any)
+		if !ok || len(queue) != 0 {
+			t.Errorf("inline proof must carry the committed (empty) queue: %#v", proof)
+		}
+		if proof["gain"] != float64(1) || proof["desiredGain"] != float64(1) || proof["muted"] != false {
+			t.Errorf("inline proof lost commit-time gain/mute context: %#v", proof)
+		}
+		committedAt, ok := proof["committedAt"].(string)
+		if !ok || committedAt == "" {
+			t.Fatalf("inline proof missing committedAt: %#v", proof)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, committedAt); err != nil {
+			t.Errorf("inline proof committedAt invalid: %q err=%v", committedAt, err)
+		}
+	})
+
+	t.Run("operation query returns identical historical proof and separate current snapshot", func(t *testing.T) {
+		queried := operationQuery(t)
+		queriedProof, ok := queried["migrationProof"].(map[string]any)
+		if !ok {
+			t.Fatalf("operation query missing historical migrationProof: %v", queried)
+		}
+		if proof != nil && !reflect.DeepEqual(queriedProof, proof) {
+			t.Errorf("queried historical proof differs from inline proof: query=%#v inline=%#v", queriedProof, proof)
+		}
+		snapshot, ok := queried["currentSnapshot"].(map[string]any)
+		if !ok {
+			t.Fatalf("operation query missing separate currentSnapshot: %v", queried)
+		}
+		sessionStatus, ok := snapshot["sessionStatus"].(map[string]any)
+		if !ok || sessionStatus["bindingGeneration"] != float64(generation+1) ||
+			sessionStatus["deviceName"] != "http-target" {
+			t.Errorf("currentSnapshot lost current session binding: %#v", snapshot)
+		}
+		playlist, ok := snapshot["jukeboxPlaylist"].(map[string]any)
+		if !ok {
+			t.Fatalf("currentSnapshot missing jukeboxPlaylist: %#v", snapshot)
+		}
+		entries, ok := playlist["entry"].([]any)
+		if !ok || len(entries) != 0 {
+			t.Errorf("currentSnapshot must carry the committed queue entries: %#v", playlist)
+		}
+	})
+
+	t.Run("repeated original operation query stays read-only", func(t *testing.T) {
+		beforeSnapshot, err := ps.SessionSnapshot(context.Background(), sessionID, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 3; i++ {
+			payload := operationQuery(t)
+			if payload["status"] != "APPLIED" {
+				t.Fatalf("query %d changed operation status: %v", i, payload)
+			}
+		}
+		afterSnapshot, err := ps.SessionSnapshot(context.Background(), sessionID, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(beforeSnapshot, afterSnapshot) {
+			t.Errorf("operation query mutated the scene: before=%#v after=%#v", beforeSnapshot, afterSnapshot)
+		}
+	})
+
+	t.Run("later legitimate state edit leaves historical proof unchanged over HTTP", func(t *testing.T) {
+		volumeBody := fmt.Sprintf(`{"sessionId":%q,"clientId":"tab-1","bindingGeneration":%d,"operationId":"g%d:http-proof-volume","gain":0.25}`,
+			sessionID, generation+1, generation+1)
+		volumeRes := serveRawJukeboxJSON(t, router, http.MethodPost, "/jukebox/volume", volumeBody)
+		if volumeRes.Code != http.StatusOK {
+			t.Fatalf("later volume edit: %d %s", volumeRes.Code, volumeRes.Body.String())
+		}
+		queried := operationQuery(t)
+		queriedProof, ok := queried["migrationProof"].(map[string]any)
+		if !ok {
+			t.Fatalf("post-edit query missing historical migrationProof: %v", queried)
+		}
+		if proof != nil && !reflect.DeepEqual(queriedProof, proof) {
+			t.Errorf("historical proof changed after later edits: query=%#v inline=%#v", queriedProof, proof)
+		}
+		snapshot, ok := queried["currentSnapshot"].(map[string]any)
+		if !ok {
+			t.Fatalf("post-edit query missing currentSnapshot: %v", queried)
+		}
+		sessionStatus, ok := snapshot["sessionStatus"].(map[string]any)
+		if !ok || sessionStatus["desiredGain"] != float64(0.25) {
+			t.Errorf("current snapshot did not track the later gain edit: %#v", snapshot)
+		}
+	})
+
+	t.Run("cross-user operation query is denied over HTTP", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "/jukebox/operation?sessionId="+sessionID+"&operationId=g1:"+migrationID, nil)
+		r = r.WithContext(request.WithUser(r.Context(), model.User{ID: "bob", UserName: "bob"}))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, r)
+		if rec.Code == http.StatusOK {
+			t.Errorf("cross-user operation query must fail closed: %d %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("capability advertises migration proof support", func(t *testing.T) {
+		var capability struct {
+			QueueProtocol *struct {
+				MigrationProof bool `json:"migrationProof"`
+			} `json:"queueProtocol"`
+		}
+		if err := json.Unmarshal(attachBody, &capability); err != nil {
+			t.Fatal(err)
+		}
+		if capability.QueueProtocol == nil || !capability.QueueProtocol.MigrationProof {
+			t.Errorf("attach did not advertise migrationProof capability: %s", attachBody)
+		}
+	})
+
+	t.Run("plain status routes never carry a proof", func(t *testing.T) {
+		statusRes := serveJukeboxJSON(t, router, http.MethodGet, "/jukebox/status?sessionId="+sessionID, nil)
+		if statusRes.Code != http.StatusOK {
+			t.Fatalf("session status: %d %s", statusRes.Code, statusRes.Body.String())
+		}
+		var statusPayload map[string]any
+		if err := json.Unmarshal(statusRes.Body.Bytes(), &statusPayload); err != nil {
+			t.Fatal(err)
+		}
+		if _, leaked := statusPayload["migrationProof"]; leaked {
+			t.Errorf("plain session status leaked a migrationProof: %s", statusRes.Body.String())
+		}
+	})
+
+	t.Run("takeover before query withholds proof and marks superseded", func(t *testing.T) {
+		takeoverRes := serveJukeboxJSON(t, router, http.MethodPost, "/jukebox/session/attach", map[string]any{
+			"sessionId": sessionID, "clientId": "intruder", "deviceName": "http-target", "takeover": true,
+		})
+		if takeoverRes.Code != http.StatusOK {
+			t.Fatalf("takeover attach: %d %s", takeoverRes.Code, takeoverRes.Body.String())
+		}
+		payload := operationQuery(t)
+		if _, leaked := payload["migrationProof"]; leaked {
+			t.Errorf("post-takeover query must withhold the stale proof: %v", payload)
+		}
+		if payload["migrationProofSuperseded"] != true {
+			t.Errorf("post-takeover query missing migrationProofSuperseded: %v", payload)
+		}
+		sessionStatus, ok := payload["sessionStatus"].(map[string]any)
+		if !ok || sessionStatus["bindingGeneration"] != float64(generation+1) ||
+			sessionStatus["ownerClientId"] != "tab-1" {
+			t.Errorf("response copy rewrote the canonical historical record: %v", payload)
+		}
+	})
+}
+
+func serveRawJukeboxJSON(t *testing.T, router *chi.Mux, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+	r = r.WithContext(request.WithUser(r.Context(), model.User{
+		ID: "admin", UserName: "admin", IsAdmin: true,
+	}))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, r)
+	return rec
+}

@@ -85,6 +85,7 @@ func CurrentQueueProtocol() model.QueueProtocolCapabilities {
 		IdentityMigration:        true,
 		AnchorVersionEnforcement: true,
 		OperationResults:         true,
+		MigrationProof:           true,
 	}
 }
 
@@ -246,10 +247,99 @@ type OperationRecord struct {
 	SceneFingerprint  string         `json:"sceneFingerprint,omitempty"`
 	QueueCount        *int           `json:"queueCount,omitempty"`
 	CreatedAt         time.Time      `json:"createdAt"`
-	user              string
-	clientID          string
-	requestHash       string
-	err               error
+	// MigrationProof is the optional immutable historical proof of a committed
+	// Output Migration, bound to the original operation identity and the
+	// commit-time scene. Query responses withhold it (and set
+	// MigrationProofSuperseded) when the current session binding no longer
+	// matches the proof; the stored record is never rewritten.
+	MigrationProof *MigrationProof `json:"migrationProof,omitempty"`
+	// MigrationProofSuperseded marks a query response copy whose historical
+	// proof was withheld because the current binding mismatched. It is never
+	// persisted on the stored record.
+	MigrationProofSuperseded bool `json:"migrationProofSuperseded,omitempty"`
+	// CurrentSnapshot is the separate atomic current observation attached to
+	// query responses that expose a historical proof. It is built at query
+	// linearization and is distinct from the historical record.
+	CurrentSnapshot *SessionSnapshot `json:"currentSnapshot,omitempty"`
+	user            string
+	clientID        string
+	requestHash     string
+	err             error
+}
+
+// MigrationProofItem is one ordered committed queue occurrence in the
+// migration proof, separating queue instance identity from media identity.
+type MigrationProofItem struct {
+	QueueItemID string `json:"queueItemId"`
+	MediaFileID string `json:"mediaFileId"`
+}
+
+// MigrationProof is the immutable, server-generated proof of one committed
+// Output Migration. It records the original operation identity, the owner and
+// target binding on both sides of the commit, and the exact commit-time queue,
+// current item, and playback context. committedBindingGeneration is the
+// session binding generation established by the commit; gain/desiredGain/muted
+// are the recorded locked commit-state context; playbackInstanceId is opaque
+// recorded context and never implies the output reached PLAYING.
+type MigrationProof struct {
+	MigrationID                string               `json:"migrationId"`
+	OperationID                string               `json:"operationId"`
+	SessionID                  string               `json:"sessionId"`
+	ClientID                   string               `json:"clientId"`
+	User                       string               `json:"user"`
+	SourceDeviceName           string               `json:"sourceDeviceName"`
+	TargetDeviceName           string               `json:"targetDeviceName"`
+	SourceBindingGeneration    uint64               `json:"sourceBindingGeneration"`
+	CommittedBindingGeneration uint64               `json:"committedBindingGeneration"`
+	CommittedAt                time.Time            `json:"committedAt"`
+	Queue                      []MigrationProofItem `json:"queue"`
+	CurrentQueueItemID         string               `json:"currentQueueItemId,omitempty"`
+	CurrentIndex               int                  `json:"currentIndex"`
+	Position                   int                  `json:"position"`
+	Mode                       string               `json:"mode"`
+	Gain                       float32              `json:"gain"`
+	DesiredGain                float32              `json:"desiredGain"`
+	Muted                      bool                 `json:"muted"`
+	PlaybackInstanceID         string               `json:"playbackInstanceId,omitempty"`
+	StateSequence              uint64               `json:"stateSequence"`
+	QueueVersion               int                  `json:"queueVersion"`
+}
+
+// Clone deep-copies the proof, including the ordered queue slice, so stored
+// and returned proofs cannot be mutated through shared nested state.
+func (p *MigrationProof) Clone() *MigrationProof {
+	if p == nil {
+		return nil
+	}
+	cloned := *p
+	cloned.Queue = make([]MigrationProofItem, len(p.Queue))
+	copy(cloned.Queue, p.Queue)
+	return &cloned
+}
+
+// withClonedMigrationProof detaches an operation record's migration-proof
+// pointers at one storage or egress boundary. It is scoped to the
+// migration-proof DTO: the record value is already a copy, the top-level proof
+// is deep-cloned, and the nested SessionStatus, when it carries a proof, is
+// shallow-copied so it cannot alias the cached status either.
+func withClonedMigrationProof(rec OperationRecord) OperationRecord {
+	proof := rec.MigrationProof
+	if proof == nil && rec.SessionStatus != nil {
+		proof = rec.SessionStatus.MigrationProof
+	}
+	if proof == nil {
+		return rec
+	}
+	cloned := proof.Clone()
+	if rec.MigrationProof != nil {
+		rec.MigrationProof = cloned
+	}
+	if rec.SessionStatus != nil && rec.SessionStatus.MigrationProof != nil {
+		status := *rec.SessionStatus
+		status.MigrationProof = cloned
+		rec.SessionStatus = &status
+	}
+	return rec
 }
 
 type OperationHistoryError struct {
@@ -359,7 +449,7 @@ func (s *OperationStore) lookup(sessionID, operationID string) (OperationRecord,
 		if pending, inFlight := s.inflight[key]; inFlight {
 			rec = pending.record
 			rec.Status = OperationStatusPending
-			return rec, true
+			return withClonedMigrationProof(rec), true
 		}
 		rec = OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}
 	}
@@ -367,7 +457,7 @@ func (s *OperationStore) lookup(sessionID, operationID string) (OperationRecord,
 		queueCount := *rec.QueueCount
 		rec.QueueCount = &queueCount
 	}
-	return rec, ok
+	return withClonedMigrationProof(rec), ok
 }
 
 func (s *OperationStore) Get(sessionID, operationID string) (OperationRecord, bool) {
@@ -382,6 +472,7 @@ func (s *OperationStore) acquire(initial OperationRecord) operationAdmission {
 	admission := operationAdmission{retired: s.pruneLocked()}
 	key := operationKey{sessionID: initial.SessionID, operationID: initial.OperationID}
 	if rec, ok := s.records[key]; ok {
+		rec = withClonedMigrationProof(rec)
 		admission.record = &rec
 		return admission
 	}
@@ -404,7 +495,7 @@ func (s *OperationStore) abandon(sessionID, operationID string, rec OperationRec
 	defer s.mu.Unlock()
 	key := operationKey{sessionID: sessionID, operationID: operationID}
 	if pending, ok := s.inflight[key]; ok {
-		pending.record = rec
+		pending.record = withClonedMigrationProof(rec)
 		delete(s.inflight, key)
 		close(pending.done)
 	}
@@ -427,9 +518,9 @@ func (s *OperationStore) complete(sessionID, operationID string, rec OperationRe
 		}
 		s.order = append(s.order, key)
 	}
-	s.records[key] = rec
+	s.records[key] = withClonedMigrationProof(rec)
 	if pending, ok := s.inflight[key]; ok {
-		pending.record = rec
+		pending.record = s.records[key]
 		delete(s.inflight, key)
 		close(pending.done)
 	}
@@ -1112,7 +1203,15 @@ func (ps *playbackServer) SessionSnapshot(ctx context.Context, sessionID, user s
 		ps.mu.Unlock()
 		return SessionSnapshot{}, ErrSessionOwnership
 	}
+	return ps.currentSnapshotForSession(session), nil
+}
 
+// currentSnapshotForSession builds the atomic current snapshot for a session
+// whose existence and authorization were already verified by the caller under
+// ps.mu (caller must hold ps.mu). The device binding is kept stable by
+// acquiring the device lock before ps.mu is released; ps.mu is always
+// released before this function returns.
+func (ps *playbackServer) currentSnapshotForSession(session Session) SessionSnapshot {
 	var device *playbackDevice
 	for _, candidate := range ps.playbackDevices {
 		if candidate.DeviceName == session.DeviceName {
@@ -1123,7 +1222,7 @@ func (ps *playbackServer) SessionSnapshot(ctx context.Context, sessionID, user s
 	if device == nil {
 		ps.mu.Unlock()
 		status := newSessionStatus(session)
-		return sessionSnapshotFromStatus(status, []JukeboxEntrySnapshot{}), nil
+		return sessionSnapshotFromStatus(status, []JukeboxEntrySnapshot{})
 	}
 
 	// Keep the device binding stable until its state lock is held.
@@ -1143,7 +1242,7 @@ func (ps *playbackServer) SessionSnapshot(ctx context.Context, sessionID, user s
 			Duration:    item.MediaFile.Duration,
 		}
 	}
-	return sessionSnapshotFromStatus(status, entries), nil
+	return sessionSnapshotFromStatus(status, entries)
 }
 
 func sessionSnapshotFromStatus(status SessionStatus, entries []JukeboxEntrySnapshot) SessionSnapshot {
@@ -1968,6 +2067,8 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		if err != nil {
 			return OperationRecord{}, err
 		}
+		// Copy the source binding/device before the commit rebinds the session.
+		sourceDeviceName := session.DeviceName
 		reservations := ps.ensureReservationsLocked()
 		reservation, ok := ps.reservationLocked(req.MigrationID)
 		now := ps.getNow()
@@ -2064,7 +2165,42 @@ func (ps *playbackServer) CommitMigration(ctx context.Context, req CommitMigrati
 		targetDevice.incrementQueueVersionLocked()
 		targetDevice.incrementSceneRevisionLocked()
 		status := sessionStatusFromDevice(session, targetDevice)
-		return OperationRecord{SessionStatus: &status}, nil
+		// Capture the immutable commit proof while the target device lock is
+		// still held, after every committed mutation. The source device lock
+		// was already released before target acquisition; the source binding
+		// and device name were copied beforehand. The stored record and the
+		// inline response status each get their own deep copy so later
+		// mutation of either cannot corrupt the other.
+		proof := &MigrationProof{
+			MigrationID:                req.MigrationID,
+			OperationID:                req.OperationID,
+			SessionID:                  req.SessionID,
+			ClientID:                   req.ClientID,
+			User:                       req.User,
+			SourceDeviceName:           sourceDeviceName,
+			TargetDeviceName:           req.TargetDeviceName,
+			SourceBindingGeneration:    generation,
+			CommittedBindingGeneration: session.BindingGeneration,
+			CommittedAt:                now,
+			CurrentIndex:               targetDevice.PlaybackQueue.Index,
+			Mode:                       string(targetDevice.mode),
+			Gain:                       targetDevice.Gain,
+			DesiredGain:                targetDevice.DesiredGain,
+			Muted:                      targetDevice.Muted,
+			StateSequence:              targetDevice.stateSequence,
+			QueueVersion:               targetDevice.queueVersion,
+		}
+		for _, item := range targetDevice.PlaybackQueue.GetItems() {
+			proof.Queue = append(proof.Queue, MigrationProofItem{QueueItemID: item.QueueItemID, MediaFileID: item.MediaFile.ID})
+		}
+		if currentItem := targetDevice.PlaybackQueue.CurrentItem(); currentItem != nil {
+			proof.CurrentQueueItemID = currentItem.QueueItemID
+		}
+		deviceStatus := targetDevice.getStatus()
+		proof.Position = deviceStatus.Position
+		proof.PlaybackInstanceID = deviceStatus.PlaybackInstanceID
+		status.MigrationProof = proof.Clone()
+		return OperationRecord{SessionStatus: &status, MigrationProof: proof}, nil
 	}
 
 	rec, err := ps.executeProtectedOperation(ctx, scope, "migration.commit", normalized, execCommit)
@@ -2097,14 +2233,49 @@ func (ps *playbackServer) QueryOperation(ctx context.Context, sessionID, operati
 	retired := store.prune()
 	ps.retireOperationsLocked(retired)
 	rec, found := store.Get(sessionID, operationID)
-	ps.mu.Unlock()
-	if found {
-		if rec.Status == OperationStatusPending {
-			rec.Status = OperationStatusUnknown
-		}
+	if !found {
+		ps.mu.Unlock()
+		return OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}, nil
+	}
+	if rec.Status == OperationStatusPending {
+		rec.Status = OperationStatusUnknown
+	}
+	if rec.MigrationProof == nil {
+		ps.mu.Unlock()
 		return rec, nil
 	}
-	return OperationRecord{Status: OperationStatusUnknown, SessionID: sessionID, OperationID: operationID}, nil
+	// The stored record and its nested status are historical and must never be
+	// rewritten. Verify the full current binding (owner, user, target device,
+	// generation) while ps.mu is held; on mismatch the response copy withholds
+	// the proof and marks it superseded. On match, attach the separate atomic
+	// current snapshot built under the same ps.mu hold (store lock is a leaf
+	// and already released), leaving no unlocked verify-to-snapshot window.
+	proof := rec.MigrationProof
+	if session.OwnerClientID != proof.ClientID || session.User != proof.User ||
+		session.DeviceName != proof.TargetDeviceName || session.BindingGeneration != proof.CommittedBindingGeneration {
+		rec.MigrationProof = nil
+		rec.MigrationProofSuperseded = true
+		// The response copy also strips the nested historical status proof;
+		// the canonical stored record is never mutated.
+		if rec.SessionStatus != nil {
+			status := *rec.SessionStatus
+			status.MigrationProof = nil
+			rec.SessionStatus = &status
+		}
+		ps.mu.Unlock()
+		return rec, nil
+	}
+	rec.MigrationProof = proof.Clone()
+	if rec.SessionStatus != nil {
+		// Detach the nested status from the cached record; it may reference
+		// the same proof body, which now belongs to this response copy only.
+		status := *rec.SessionStatus
+		status.MigrationProof = rec.MigrationProof
+		rec.SessionStatus = &status
+	}
+	snapshot := ps.currentSnapshotForSession(session)
+	rec.CurrentSnapshot = &snapshot
+	return rec, nil
 }
 
 // mergeBluetoothDevices discovers Bluetooth sinks and appends any new ones to playbackDevices.

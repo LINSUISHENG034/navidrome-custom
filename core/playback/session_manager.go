@@ -80,6 +80,10 @@ type SessionStatus struct {
 	QueueProtocol         *model.QueueProtocolCapabilities `json:"queueProtocol,omitempty"`
 	OperationIDFormat     string                           `json:"operationIdFormat"`
 	RequiresNewGeneration bool                             `json:"requiresNewGeneration"`
+	// MigrationProof is the optional immutable server-generated proof of a
+	// committed Output Migration. It is set only on the migration commit
+	// response; ordinary status/SSE snapshots never carry it.
+	MigrationProof *MigrationProof `json:"migrationProof,omitempty"`
 }
 
 type HandoffRequest struct {
