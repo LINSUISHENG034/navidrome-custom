@@ -8,8 +8,10 @@ import {
 } from '../actions'
 import jukeboxClient from './jukeboxClient'
 import {
+  captureEligibleJukeboxScope,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
+  isCapturedJukeboxScopeCurrent,
 } from './jukeboxSession'
 
 export const extractTrackIds = (data) => {
@@ -35,6 +37,22 @@ const getScope = () => ({
   clientId: getOrCreateJukeboxClientId(),
 })
 
+// Capture the caller-scoped authority ONCE per intent and re-check the SAME
+// immutable capture against the CURRENT Redux state after every await: a
+// takeover, rebind, device move, disable, or token replacement that lands
+// mid-flight aborts the remaining continuation instead of redirecting
+// commands at the latest authority. The wire scope stays {sessionId,
+// clientId}; the local token/revision/binding never leave the document.
+function* captureCurrentScope() {
+  const state = yield select()
+  return captureEligibleJukeboxScope(state?.player, getScope())
+}
+
+function* assertCapturedScopeCurrent(captured) {
+  const state = yield select()
+  return isCapturedJukeboxScopeCurrent(state?.player, captured)
+}
+
 export function* handlePlayTracks(action) {
   const state = yield select()
   if (!state?.player?.jukeboxMode) return
@@ -45,11 +63,15 @@ export function* handlePlayTracks(action) {
   const cleanSelectedId = (action.id || '').toString().replace(/^_/, '')
   const selectedIndex = trackIds.findIndex((id) => id === cleanSelectedId)
   const playIndex = selectedIndex >= 0 ? selectedIndex : 0
-  const scope = getScope()
+  const captured = yield* captureCurrentScope()
+  if (!captured) return
+  const scope = { sessionId: captured.sessionId, clientId: captured.clientId }
 
   try {
     yield call(jukeboxClient.set, trackIds, scope)
+    if (!(yield* assertCapturedScopeCurrent(captured))) return
     yield call(jukeboxClient.skip, playIndex, 0, scope)
+    if (!(yield* assertCapturedScopeCurrent(captured))) return
     yield call(jukeboxClient.play, scope)
   } catch (err) {
     // Handled
@@ -63,10 +85,14 @@ export function* handleSetTrack(action) {
   const trackIds = extractTrackIds(action.data)
   if (trackIds.length === 0) return
 
-  const scope = getScope()
+  const captured = yield* captureCurrentScope()
+  if (!captured) return
+  const scope = { sessionId: captured.sessionId, clientId: captured.clientId }
   try {
     yield call(jukeboxClient.set, trackIds, scope)
+    if (!(yield* assertCapturedScopeCurrent(captured))) return
     yield call(jukeboxClient.skip, 0, 0, scope)
+    if (!(yield* assertCapturedScopeCurrent(captured))) return
     yield call(jukeboxClient.play, scope)
   } catch (err) {
     // Handled
@@ -79,12 +105,13 @@ export function* handlePlayNext(action) {
 
   const trackIds = extractTrackIds(action.data)
   if (trackIds.length === 0) return
-
   const currentIndex =
     state.player?.jukeboxRemote?.currentIndex ??
     state.player?.savedPlayIndex ??
     0
-  const scope = getScope()
+  const captured = yield* captureCurrentScope()
+  if (!captured) return
+  const scope = { sessionId: captured.sessionId, clientId: captured.clientId }
 
   try {
     yield call(jukeboxClient.add, trackIds, currentIndex + 1, scope)
@@ -100,7 +127,9 @@ export function* handleAddTracks(action) {
   const trackIds = extractTrackIds(action.data)
   if (trackIds.length === 0) return
 
-  const scope = getScope()
+  const captured = yield* captureCurrentScope()
+  if (!captured) return
+  const scope = { sessionId: captured.sessionId, clientId: captured.clientId }
   try {
     yield call(jukeboxClient.add, trackIds, -1, scope)
   } catch (err) {
@@ -112,9 +141,12 @@ export function* handleClearQueue() {
   const state = yield select()
   if (!state?.player?.jukeboxMode) return
 
-  const scope = getScope()
+  const captured = yield* captureCurrentScope()
+  if (!captured) return
+  const scope = { sessionId: captured.sessionId, clientId: captured.clientId }
   try {
     yield call(jukeboxClient.stop, scope)
+    if (!(yield* assertCapturedScopeCurrent(captured))) return
     yield call(jukeboxClient.set, [], scope)
   } catch (err) {
     // Handled

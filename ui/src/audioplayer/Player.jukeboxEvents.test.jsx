@@ -2,11 +2,15 @@
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import React from 'react'
-import { act, render, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { combineReducers, createStore } from 'redux'
 import { playerReducer } from '../reducers/playerReducer'
-import { setJukeboxMode, updateJukeboxSessionStatus } from '../actions'
+import {
+  setJukeboxMode,
+  updateJukeboxSessionStatus,
+  beginJukeboxEpisode,
+} from '../actions'
 
 vi.mock('react-admin', async (importOriginal) => ({
   ...(await importOriginal()),
@@ -32,12 +36,43 @@ vi.mock('./jukeboxClient', () => ({
     attachSession: vi.fn(() => Promise.resolve({})),
     heartbeatSession: vi.fn(() => Promise.resolve({})),
     sessionStatus: vi.fn(() => Promise.resolve({ sessionId: 's1' })),
+    sessionSnapshot: vi.fn(() => Promise.resolve(null)),
     detachSession: vi.fn(() => Promise.resolve({})),
   },
 }))
 
 vi.mock('./jukeboxCommandQueue', () => ({
   enqueueJukeboxCommand: vi.fn((fn) => fn()),
+}))
+
+// Minimal faithful GlobalHotKeys double: binds real document keydown events
+// and routes them by sequence to the current handler map (allowChanges), so
+// document-level keyboard authority is exercised through Player's real
+// wiring without react-hotkeys' internal matching.
+vi.mock('react-hotkeys', () => ({
+  GlobalHotKeys: ({ handlers = {}, keyMap = {} }) => {
+    React.useEffect(() => {
+      const sequences = {
+        ' ': 'space',
+        ArrowRight: 'right',
+        ArrowLeft: 'left',
+        '=': '=',
+        '-': '-',
+      }
+      const listener = (event) => {
+        const sequence = sequences[event.key]
+        if (!sequence) return
+        const match = Object.entries(keyMap).find(
+          ([, value]) => value.sequence === sequence,
+        )
+        const handler = match && handlers[match[0]]
+        if (handler) handler(event)
+      }
+      document.addEventListener('keydown', listener)
+      return () => document.removeEventListener('keydown', listener)
+    }, [handlers, keyMap])
+    return null
+  },
 }))
 
 import jukeboxClient from './jukeboxClient'
@@ -71,7 +106,28 @@ import {
   detachJukeboxSession,
 } from './Player'
 import keyHandlers from './keyHandlers'
+import { captureEligibleJukeboxScope } from './jukeboxSession'
 import { remoteGainToUiVolume, uiVolumeToRemoteGain } from './volumeProfiles'
+
+// Caller-scoped authority fixtures for direct keyHandlers tests: the admitted
+// owner IS this document's actual session/client identity, and the episode
+// record is reconciled to the admitted scene binding.
+const docAdmittedControl = () => ({
+  sessionId: getJukeboxSessionId(),
+  ownerClientId: getOrCreateJukeboxClientId(),
+  ownershipState: 'attached',
+  controlGranted: true,
+})
+const docAdmittedEpisodes = (device = 'pulse/test') => ({
+  'doc-episode': {
+    sessionId: getJukeboxSessionId(),
+    clientId: getOrCreateJukeboxClientId(),
+    requestedDeviceName: device,
+    revision: 0,
+    reconciledBinding: { bindingGeneration: 2, canonicalDevice: device },
+    disabled: false,
+  },
+})
 
 const buildJukeboxState = (overrides = {}) => ({
   jukeboxMode: true,
@@ -82,13 +138,16 @@ const buildJukeboxState = (overrides = {}) => ({
     { trackId: 't2', uuid: 'u2', song: { id: 't2' } },
     { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
   ],
-  jukeboxControl: { sessionId: 's1', ownershipState: 'attached' },
+  jukeboxControl: docAdmittedControl(),
   jukeboxRemote: {
     currentIndex: 1,
     trackId: 't2',
     playing: true,
     position: 41,
+    bindingGeneration: 2,
+    deviceName: 'pulse/test',
   },
+  jukeboxEpisodes: docAdmittedEpisodes(),
   ...overrides,
 })
 
@@ -372,6 +431,7 @@ describe('remote-state control safety', () => {
 describe('remote-state-first jukebox controls', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorage.setItem('username', 'admin')
   })
 
   it('uses remote session playing state for toggle play', () => {
@@ -381,8 +441,13 @@ describe('remote-state-first jukebox controls', () => {
         jukeboxMode: true,
         queue: [],
         current: {},
-        jukeboxControl: { ownershipState: 'attached' },
-        jukeboxRemote: { playing: true },
+        jukeboxControl: docAdmittedControl(),
+        jukeboxRemote: {
+          playing: true,
+          bindingGeneration: 2,
+          deviceName: 'pulse/test',
+        },
+        jukeboxEpisodes: docAdmittedEpisodes(),
       },
     )
 
@@ -402,8 +467,14 @@ describe('remote-state-first jukebox controls', () => {
           { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
         ],
         current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
-        jukeboxControl: { ownershipState: 'attached' },
-        jukeboxRemote: { currentIndex: 2, trackId: 't3' },
+        jukeboxControl: docAdmittedControl(),
+        jukeboxRemote: {
+          currentIndex: 2,
+          trackId: 't3',
+          bindingGeneration: 2,
+          deviceName: 'pulse/test',
+        },
+        jukeboxEpisodes: docAdmittedEpisodes(),
       },
     )
 
@@ -422,8 +493,17 @@ describe('remote-state-first jukebox controls', () => {
           { trackId: 't3', uuid: 'u3', song: { id: 't3' } },
         ],
         current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
-        jukeboxControl: { ownershipState: 'attached' },
-        jukeboxRemote: { currentIndex: 1, trackId: 't2' },
+        jukeboxControl: docAdmittedControl(),
+        jukeboxRemote: {
+          currentIndex: 1,
+          trackId: 't2',
+          bindingGeneration: 2,
+          deviceName: 'pulse/test',
+        },
+        jukeboxPlaylist: {
+          entry: [{ id: 't1' }, { id: 't2' }, { id: 't3' }],
+        },
+        jukeboxEpisodes: docAdmittedEpisodes(),
       },
     )
 
@@ -438,8 +518,13 @@ describe('remote-state-first jukebox controls', () => {
         jukeboxMode: true,
         queue: [],
         current: {},
-        jukeboxControl: { ownershipState: 'attached' },
-        jukeboxRemote: { gain: 0.64 },
+        jukeboxControl: docAdmittedControl(),
+        jukeboxRemote: {
+          gain: 0.64,
+          bindingGeneration: 2,
+          deviceName: 'pulse/test',
+        },
+        jukeboxEpisodes: docAdmittedEpisodes(),
       },
     )
 
@@ -457,8 +542,13 @@ describe('remote-state-first jukebox controls', () => {
         queue: [],
         current: {},
         jukeboxDevice: 'Bluetooth 24:C4:06:FA:00:37',
-        jukeboxControl: { ownershipState: 'attached' },
-        jukeboxRemote: { gain: 0.8, deviceName },
+        jukeboxControl: docAdmittedControl(),
+        jukeboxRemote: {
+          gain: 0.8,
+          deviceName,
+          bindingGeneration: 2,
+        },
+        jukeboxEpisodes: docAdmittedEpisodes(deviceName),
       },
     )
 
@@ -516,6 +606,157 @@ describe('remote-state-first jukebox controls', () => {
     handlers.PREV_SONG({ metaKey: false })
 
     expect(jukeboxClient.skip).not.toHaveBeenCalled()
+  })
+})
+
+describe('remote authority freshness for default keyboard and command callers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.setItem('username', 'admin')
+  })
+
+  // This document's actual identity: the fixtures admit THIS caller as owner.
+  const docIdentity = () => ({
+    token: 'doc-token',
+    sessionId: getJukeboxSessionId(),
+    clientId: getOrCreateJukeboxClientId(),
+  })
+  const docScopedMeta = (state, overrides = {}) => ({
+    source: 'atomic-session-snapshot',
+    sessionId: docIdentity().sessionId,
+    clientId: docIdentity().clientId,
+    token: docIdentity().token,
+    revision: state.jukeboxEpisodes?.[docIdentity().token]?.revision ?? 0,
+    requestBinding: {
+      bindingGeneration: state.jukeboxRemote?.bindingGeneration ?? null,
+      deviceName: state.jukeboxRemote?.deviceName ?? null,
+    },
+    ...overrides,
+  })
+
+  it('a raw attached observation grants no control: keyboard playback keys egress nothing', () => {
+    let state = playerReducer(undefined, { type: '@@INIT' })
+    state = playerReducer(state, setJukeboxMode(true, 'pulse/test'))
+    // Raw attach/status/SSE-shaped observation: no trusted atomic admission.
+    state = playerReducer(
+      state,
+      updateJukeboxSessionStatus({
+        sessionId: getJukeboxSessionId(),
+        ownerClientId: getOrCreateJukeboxClientId(),
+        ownershipState: 'attached',
+        currentIndex: 0,
+        trackId: 't1',
+        playing: true,
+        position: 3,
+      }),
+    )
+
+    expect(canControlJukebox(state)).toBe(false)
+
+    const handlers = keyHandlers({ togglePlay: vi.fn(), volume: 0.5 }, state)
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    handlers.NEXT_SONG({ metaKey: false })
+    handlers.PREV_SONG({ metaKey: false })
+    handlers.VOL_DOWN()
+
+    expect(jukeboxClient.play).not.toHaveBeenCalled()
+    expect(jukeboxClient.pause).not.toHaveBeenCalled()
+    expect(jukeboxClient.skip).not.toHaveBeenCalled()
+    expect(jukeboxClient.volume).not.toHaveBeenCalled()
+  })
+
+  it('after a takeover, a later raw attached observation cannot re-enable keyboard control', () => {
+    let state = playerReducer(undefined, { type: '@@INIT' })
+    state = playerReducer(state, setJukeboxMode(true, 'pulse/test'))
+    state = playerReducer(state, beginJukeboxEpisode(docIdentity()))
+    state = playerReducer(
+      state,
+      updateJukeboxSessionStatus(
+        {
+          sessionId: docIdentity().sessionId,
+          ownerClientId: docIdentity().clientId,
+          ownershipState: 'attached',
+          deviceName: 'pulse/test',
+          currentIndex: 0,
+          trackId: 't1',
+          playing: true,
+          position: 3,
+          bindingGeneration: 2,
+          stateSequence: 10,
+        },
+        docScopedMeta(state),
+      ),
+    )
+    expect(canControlJukebox(state)).toBe(true)
+
+    // Takeover (heartbeat 403 contract), then a raw claim of attach.
+    state = playerReducer(
+      state,
+      updateJukeboxSessionStatus({
+        sessionId: docIdentity().sessionId,
+        ownerClientId: 'tab-2',
+        ownershipState: 'taken_over',
+        terminationReason: 'taken_over',
+      }),
+    )
+    expect(canControlJukebox(state)).toBe(false)
+    state = playerReducer(
+      state,
+      updateJukeboxSessionStatus({
+        sessionId: docIdentity().sessionId,
+        ownerClientId: 'tab-2',
+        ownershipState: 'attached',
+      }),
+    )
+    expect(canControlJukebox(state)).toBe(false)
+
+    const handlers = keyHandlers({ togglePlay: vi.fn(), volume: 0.5 }, state)
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    handlers.NEXT_SONG({ metaKey: false })
+    handlers.VOL_DOWN()
+
+    expect(jukeboxClient.play).not.toHaveBeenCalled()
+    expect(jukeboxClient.pause).not.toHaveBeenCalled()
+    expect(jukeboxClient.skip).not.toHaveBeenCalled()
+    expect(jukeboxClient.volume).not.toHaveBeenCalled()
+  })
+
+  it('a keyboard handler reads current authority through its state getter at invocation and the local path still works', () => {
+    // The unified host builds keyhandlers with a live state getter as the
+    // fourth argument (after audioInstance, playerState, playbackController).
+    // The current implementation ignores it and captures authority at
+    // creation; this regression proves invocation-time reads are required.
+    const currentState = { player: buildJukeboxState() }
+    const audioInstance = { togglePlay: vi.fn(), volume: 0.5 }
+    const handlers = keyHandlers(
+      audioInstance,
+      currentState.player,
+      null,
+      () => currentState.player,
+    )
+
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    expect(jukeboxClient.pause).toHaveBeenCalledTimes(1)
+
+    // The authority changes after the handlers were created (e.g. a takeover
+    // lands in the same frame before the hotkey event is processed).
+    currentState.player = {
+      ...currentState.player,
+      jukeboxControl: { sessionId: 's1', ownershipState: 'taken_over' },
+    }
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    handlers.NEXT_SONG({ metaKey: false })
+    handlers.VOL_DOWN()
+
+    expect(jukeboxClient.pause).toHaveBeenCalledTimes(1)
+    expect(jukeboxClient.play).not.toHaveBeenCalled()
+    expect(jukeboxClient.skip).not.toHaveBeenCalled()
+    expect(jukeboxClient.volume).not.toHaveBeenCalled()
+
+    // Browser-local playback under the same handler still works.
+    currentState.player = { ...currentState.player, jukeboxMode: false }
+    handlers.TOGGLE_PLAY({ preventDefault: vi.fn() })
+    expect(audioInstance.togglePlay).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -1137,7 +1378,16 @@ describe('mounted Player control-session episodes', () => {
     await waitFor(() =>
       expect(jukeboxClient.detachSession).toHaveBeenCalledTimes(1),
     )
-    expect(dispatch).not.toHaveBeenCalled()
+    // Retirement may synchronously end the local episode lifecycle, but the
+    // canceled attachment must never dispatch stale session state.
+    expect(dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'jukeboxStateUpdated' }),
+    )
+    expect(
+      dispatch.mock.calls.every(
+        ([action]) => action?.type === 'PLAYER_JUKEBOX_EPISODE_END',
+      ),
+    ).toBe(true)
   })
 
   it('waits for an already-started heartbeat reattachment and retires its late result without stale state', async () => {
@@ -1183,6 +1433,154 @@ describe('mounted Player control-session episodes', () => {
     expect(jukeboxClient.attachSession).toHaveBeenCalledTimes(1)
     expect(store.getState().player.jukeboxMode).toBe(false)
     vi.useRealTimers()
+    unmount()
+  })
+})
+
+describe('document-level observer keyboard authority', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.setItem('username', 'admin')
+    sessionStorage.clear()
+  })
+
+  const clientId = () => getOrCreateJukeboxClientId()
+
+  const renderKeyboardPlayer = () => {
+    const store = createStore(
+      combineReducers({
+        player: playerReducer,
+        activity: () => ({ streamReconnected: false }),
+        settings: () => ({ notifications: false }),
+        replayGain: () => ({ gainMode: 'none' }),
+        theme: () => 'DarkTheme',
+      }),
+    )
+    store.dispatch(setJukeboxMode(true, 'Validation output'))
+    const view = render(
+      <Provider store={store}>
+        <Player />
+      </Provider>,
+    )
+    return { ...view, store }
+  }
+
+  const press = (key, code, keyCode) =>
+    fireEvent.keyDown(document, { key, code, keyCode, which: keyCode })
+
+  it('an admitted trusted observer snapshot naming another owner leaks zero keyboard commands from this document', async () => {
+    const { store, unmount } = renderKeyboardPlayer()
+    const documentClientId = clientId()
+    const observerIdentity = {
+      token: 'doc-observer-token',
+      sessionId: 'jukebox-session:admin',
+      clientId: documentClientId,
+    }
+    act(() => {
+      store.dispatch(beginJukeboxEpisode(observerIdentity))
+    })
+
+    // The observer's own atomic boundary admits the shared scene: the owner
+    // is a DIFFERENT attached client and the shared grant is true — the
+    // audit's observer leak is caller-scope eligibility, not admission.
+    act(() => {
+      store.dispatch(
+        updateJukeboxSessionStatus(
+          {
+            sessionId: 'jukebox-session:admin',
+            ownerClientId: 'tab-a',
+            ownershipState: 'attached',
+            deviceName: 'pulse/test',
+            currentIndex: 0,
+            trackId: 't1',
+            playing: true,
+            position: 3,
+            gain: 0.5,
+            bindingGeneration: 2,
+            stateSequence: 10,
+          },
+          {
+            source: 'atomic-session-snapshot',
+            sessionId: 'jukebox-session:admin',
+            deviceName: 'pulse/test',
+            clientId: documentClientId,
+            token: 'doc-observer-token',
+            revision: 0,
+            requestBinding: {
+              bindingGeneration: null,
+              deviceName: null,
+            },
+          },
+        ),
+      )
+    })
+
+    // The shared authority keeps the owner eligible on this same shared
+    // state — the observer's GET must not disable the sibling owner. Prove
+    // it through the explicit owner-scoped helper with a reconciled owner
+    // episode on the SAME state; the document's DEFAULT identity (the
+    // observer) must NOT be eligible.
+    const ownerIdentity = {
+      token: 'doc-owner-token',
+      sessionId: 'jukebox-session:admin',
+      clientId: 'tab-a',
+    }
+    act(() => {
+      store.dispatch(beginJukeboxEpisode(ownerIdentity))
+      store.dispatch(
+        updateJukeboxSessionStatus(
+          {
+            sessionId: 'jukebox-session:admin',
+            ownerClientId: 'tab-a',
+            ownershipState: 'attached',
+            deviceName: 'pulse/test',
+            currentIndex: 0,
+            trackId: 't1',
+            playing: true,
+            position: 3,
+            gain: 0.5,
+            bindingGeneration: 2,
+            stateSequence: 10,
+          },
+          {
+            source: 'atomic-session-snapshot',
+            sessionId: 'jukebox-session:admin',
+            clientId: 'tab-a',
+            token: 'doc-owner-token',
+            revision: 0,
+            requestBinding: {
+              bindingGeneration: 2,
+              deviceName: 'pulse/test',
+            },
+          },
+        ),
+      )
+    })
+
+    const shared = store.getState().player
+    expect(shared.jukeboxControl.ownerClientId).toBe('tab-a')
+    expect(shared.jukeboxControl.controlGranted).toBe(true)
+    expect(
+      captureEligibleJukeboxScope(shared, {
+        sessionId: 'jukebox-session:admin',
+        clientId: 'tab-a',
+      }),
+    ).not.toBeNull()
+    expect(canControlJukebox(shared)).toBe(false)
+
+    // But THIS document is the observer: every ordinary playback/gain key
+    // must egress zero POSTs.
+    press(' ', 'Space', 32) // TOGGLE_PLAY
+    press('ArrowRight', 'ArrowRight', 39) // NEXT_SONG
+    press('ArrowLeft', 'ArrowLeft', 37) // PREV_SONG
+    press('=', 'Equal', 187) // VOL_UP
+    press('-', 'Minus', 189) // VOL_DOWN
+    await act(async () => {})
+
+    expect(jukeboxClient.play).not.toHaveBeenCalled()
+    expect(jukeboxClient.pause).not.toHaveBeenCalled()
+    expect(jukeboxClient.skip).not.toHaveBeenCalled()
+    expect(jukeboxClient.volume).not.toHaveBeenCalled()
     unmount()
   })
 })

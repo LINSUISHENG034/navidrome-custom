@@ -22,6 +22,7 @@ import {
   playTracks,
   playNext,
   addTracks,
+  beginJukeboxEpisode,
 } from '../actions'
 import createSagaMiddleware from 'redux-saga'
 import jukeboxQueueSaga from './jukeboxQueueSaga'
@@ -80,6 +81,10 @@ vi.mock('navidrome-music-player', () => ({
   },
 }))
 
+// Controlled-server fixture with the server-issued ordering and identity
+// contract (bindingGeneration/stateSequence, stable queue item id, playback
+// instance, desired/applied gain and mute), matching core/playback
+// SessionStatus. Semantic transitions in a scenario advance stateSequence.
 const snapshot = (title = 'Server queue', position = 12) => ({
   sessionStatus: {
     sessionId: 'jukebox-session:admin',
@@ -88,10 +93,19 @@ const snapshot = (title = 'Server queue', position = 12) => ({
     deviceName: 'pulse/test',
     currentIndex: 0,
     trackId: 'song-a',
+    queueItemId: 'qi-a',
     playing: true,
     position,
     gain: 0.25,
-    queueVersion: 1,
+    desiredGain: 0.4,
+    muted: false,
+    attached: true,
+    queueVersion: 20,
+    stateSequence: 10,
+    playMode: 'orderLoop',
+    playbackInstanceId: 'inst-1',
+    bindingGeneration: 2,
+    lastHeartbeat: '2026-11-02T00:00:00Z',
   },
   jukeboxPlaylist: {
     currentIndex: 0,
@@ -101,6 +115,7 @@ const snapshot = (title = 'Server queue', position = 12) => ({
     entry: [
       {
         id: 'song-a',
+        queueItemId: 'qi-a',
         title,
         artist: 'Test artist',
         album: 'Test album',
@@ -108,6 +123,7 @@ const snapshot = (title = 'Server queue', position = 12) => ({
       },
       {
         id: 'song-b',
+        queueItemId: 'qi-b',
         title: 'Next song',
         artist: 'Test artist',
         album: 'Test album',
@@ -148,6 +164,70 @@ const deferred = () => {
     resolve = complete
   })
   return { promise, resolve }
+}
+
+// SessionStatus-shaped fixture carrying the server-issued ordering and
+// identity contract (bindingGeneration/stateSequence/queueVersion, stable
+// queue item id, raw playMode, playback instance, desired/applied gain and
+// mute), matching core/playback SessionStatus and the jukebox SSE event.
+const orderedStatus = (overrides = {}) => ({
+  sessionId: 'jukebox-session:admin',
+  ownerClientId: 'tab-a',
+  ownershipState: 'attached',
+  deviceName: 'pulse/test',
+  currentIndex: 0,
+  trackId: 'song-a',
+  queueItemId: 'qi-a',
+  playing: true,
+  position: 12,
+  gain: 0.25,
+  desiredGain: 0.4,
+  muted: false,
+  attached: true,
+  queueVersion: 20,
+  stateSequence: 10,
+  playMode: 'orderLoop',
+  playbackInstanceId: 'inst-1',
+  bindingGeneration: 2,
+  lastHeartbeat: '2026-11-02T00:00:00Z',
+  ...overrides,
+})
+
+const orderedSnapshot = (
+  title = 'Ordered server queue',
+  statusOverrides = {},
+) => {
+  const base = snapshot(title)
+  base.sessionStatus = orderedStatus(statusOverrides)
+  base.jukeboxPlaylist.entry = base.jukeboxPlaylist.entry.map(
+    (entry, index) => ({
+      ...entry,
+      queueItemId: `qi-${String.fromCharCode(97 + index)}`,
+    }),
+  )
+  return base
+}
+
+// Older-server snapshot: valid display payload without the ordered
+// generation/sequence contract.
+const unorderedSnapshot = (title = 'Unordered server queue', position = 12) => {
+  const base = snapshot(title, position)
+  delete base.sessionStatus.bindingGeneration
+  delete base.sessionStatus.stateSequence
+  delete base.sessionStatus.queueItemId
+  delete base.sessionStatus.playbackInstanceId
+  delete base.sessionStatus.playMode
+  delete base.sessionStatus.desiredGain
+  delete base.sessionStatus.muted
+  delete base.sessionStatus.attached
+  delete base.sessionStatus.lastHeartbeat
+  delete base.sessionStatus.queueVersion
+  base.jukeboxPlaylist.entry = base.jukeboxPlaylist.entry.map((entry) => {
+    const { queueItemId, ...legacyEntry } = entry
+    void queueItemId
+    return legacyEntry
+  })
+  return base
 }
 
 const makeTransport = (
@@ -199,7 +279,9 @@ const makeTransport = (
       const reply = snapshots[Math.min(snapshotIndex++, snapshots.length - 1)]
       return reply instanceof Promise
         ? reply
-        : Promise.resolve(reply instanceof Response ? reply : response(reply))
+        : Promise.resolve(
+            reply instanceof Response ? reply.clone() : response(reply),
+          )
     }
     if (!path.includes('/session/') && commandReply) {
       return Promise.resolve(commandReply).then((reply) => reply.clone())
@@ -347,9 +429,11 @@ describe('<RemotePlayerController />', () => {
     renderController({}, store)
     await screen.findByRole('heading', { name: 'Server queue' })
     await act(async () =>
-      EventSourceTransport.instances
-        .at(-1)
-        .emit('jukeboxStateUpdated', { position: 13 }),
+      EventSourceTransport.instances.at(-1).emit('jukeboxStateUpdated', {
+        position: 13,
+        bindingGeneration: 2,
+        stateSequence: 11,
+      }),
     )
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Session ownership changed',
@@ -388,10 +472,11 @@ describe('<RemotePlayerController />', () => {
   })
 
   it('reacquires the full queue after a missing heartbeat session is reattached', async () => {
-    const transport = makeTransport(
-      [snapshot(), snapshot('Reattached queue', 31)],
-      { heartbeatReply: response({ message: 'Session missing' }, 404) },
-    )
+    const reattached = snapshot('Reattached queue', 31)
+    reattached.sessionStatus.stateSequence = 11
+    const transport = makeTransport([snapshot(), reattached], {
+      heartbeatReply: response({ message: 'Session missing' }, 404),
+    })
     vi.useFakeTimers()
     renderController()
     await act(async () => {
@@ -451,6 +536,7 @@ describe('<RemotePlayerController />', () => {
     shared.sessionStatus.ownerClientId = 'tab-b'
     const advanced = snapshot('Shared server successor', 21)
     advanced.sessionStatus.ownerClientId = 'tab-b'
+    advanced.sessionStatus.stateSequence = 11
     const transport = makeTransport([shared, shared, advanced, advanced], {
       attachReply: ({ clientId }) =>
         clientId === 'tab-b'
@@ -485,9 +571,12 @@ describe('<RemotePlayerController />', () => {
       screen.getAllByRole('button', { name: 'Pause' })[1],
     ).not.toBeDisabled()
     await act(async () =>
-      EventSourceTransport.instances
-        .at(-1)
-        .emit('jukeboxStateUpdated', { currentIndex: 1, trackId: 'song-b' }),
+      EventSourceTransport.instances.at(-1).emit('jukeboxStateUpdated', {
+        currentIndex: 1,
+        trackId: 'song-b',
+        bindingGeneration: 2,
+        stateSequence: 11,
+      }),
     )
     await waitFor(() =>
       expect(
@@ -539,10 +628,9 @@ describe('<RemotePlayerController />', () => {
   })
 
   it('actively reacquires an atomic snapshot when the existing event stream reconnects', async () => {
-    const transport = makeTransport([
-      snapshot(),
-      snapshot('Restored after reconnect', 27),
-    ])
+    const restored = snapshot('Restored after reconnect', 27)
+    restored.sessionStatus.stateSequence = 11
+    const transport = makeTransport([snapshot(), restored])
     const store = createStore(
       combineReducers({ player: playerReducer, activity: activityReducer }),
     )
@@ -658,6 +746,7 @@ describe('<RemotePlayerController />', () => {
     const acknowledgement = deferred()
     const paused = snapshot('Authoritative paused queue', 12)
     paused.sessionStatus.playing = false
+    paused.sessionStatus.stateSequence = 11
     paused.jukeboxPlaylist.playing = false
     const transport = makeTransport([snapshot(), paused], {
       commandReply: acknowledgement.promise,
@@ -683,11 +772,9 @@ describe('<RemotePlayerController />', () => {
 
   it('ignores a late older HTTP snapshot after a newer invalidation has completed', async () => {
     const stale = deferred()
-    const transport = makeTransport([
-      snapshot(),
-      stale.promise,
-      snapshot('Newest server queue', 33),
-    ])
+    const newest = snapshot('Newest server queue', 33)
+    newest.sessionStatus.stateSequence = 12
+    const transport = makeTransport([snapshot(), stale.promise, newest])
     const store = createStore(
       combineReducers({ player: playerReducer, activity: activityReducer }),
     )
@@ -695,15 +782,19 @@ describe('<RemotePlayerController />', () => {
     renderController({}, store)
     await screen.findByRole('heading', { name: 'Server queue' })
     await act(async () =>
-      EventSourceTransport.instances
-        .at(-1)
-        .emit('jukeboxStateUpdated', { position: 20 }),
+      EventSourceTransport.instances.at(-1).emit('jukeboxStateUpdated', {
+        position: 20,
+        bindingGeneration: 2,
+        stateSequence: 11,
+      }),
     )
     await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(2))
     await act(async () =>
-      EventSourceTransport.instances
-        .at(-1)
-        .emit('jukeboxStateUpdated', { position: 33 }),
+      EventSourceTransport.instances.at(-1).emit('jukeboxStateUpdated', {
+        position: 33,
+        bindingGeneration: 2,
+        stateSequence: 12,
+      }),
     )
     await screen.findByRole('heading', { name: 'Newest server queue' })
     await act(async () => {
@@ -720,10 +811,9 @@ describe('<RemotePlayerController />', () => {
   })
 
   it('uses actual SSE dispatch only to invalidate and reacquire authoritative HTTP state', async () => {
-    const transport = makeTransport([
-      snapshot(),
-      snapshot('HTTP refreshed queue', 18),
-    ])
+    const refreshed = snapshot('HTTP refreshed queue', 18)
+    refreshed.sessionStatus.stateSequence = 11
+    const transport = makeTransport([snapshot(), refreshed])
     const store = createStore(
       combineReducers({ player: playerReducer, activity: activityReducer }),
     )
@@ -737,6 +827,8 @@ describe('<RemotePlayerController />', () => {
         playing: false,
         position: 55,
         gain: 1,
+        bindingGeneration: 2,
+        stateSequence: 11,
       }),
     )
     await screen.findByRole('heading', { name: 'HTTP refreshed queue' })
@@ -811,12 +903,17 @@ describe('<RemotePlayerController />', () => {
   it('takes control only after an explicit observer click and sends no successful old-owner mutation', async () => {
     let owner = 'tab-a'
     let playing = true
+    // Servers advance the state sequence on each accepted command, so the
+    // post-pause snapshot supersedes the equal-sequence scene instead of
+    // conflicting with it.
+    let stateSequence = 10
     const requests = []
     const deniedCommands = []
     const currentSnapshot = () => {
       const current = snapshot()
       current.sessionStatus.ownerClientId = owner
       current.sessionStatus.playing = playing
+      current.sessionStatus.stateSequence = stateSequence
       current.jukeboxPlaylist.playing = playing
       return current
     }
@@ -841,6 +938,7 @@ describe('<RemotePlayerController />', () => {
             return Promise.resolve(response({ message: 'Control denied' }, 403))
           }
           playing = false
+          stateSequence = 11
           return Promise.resolve(response({ playing }))
         }
         return Promise.resolve(response(currentSnapshot().sessionStatus))
@@ -887,14 +985,13 @@ describe('<RemotePlayerController />', () => {
         },
       },
     ])
+    // The superseded owner is fenced client-side: once the new-owner snapshot
+    // is admitted the old owner's controls are disabled and its click
+    // egresses NOTHING — no server 403 round-trip, no successful mutation.
+    expect(first.getByRole('button', { name: 'Pause' })).toBeDisabled()
     fireEvent.click(first.getByRole('button', { name: 'Pause' }))
-    await first.findByRole('alert')
-    await waitFor(() =>
-      expect(first.getByRole('button', { name: 'Pause' })).toBeDisabled(),
-    )
-    expect(deniedCommands).toEqual([
-      { sessionId: 'jukebox-session:admin', clientId: 'tab-a' },
-    ])
+    expect(commands({ requests })).toEqual([])
+    expect(deniedCommands).toEqual([])
     expect(playing).toBe(true)
     fireEvent.click(second.getByRole('button', { name: 'Pause' }))
     await second.findByText('Paused', { exact: true })
@@ -1080,6 +1177,1141 @@ describe('<RemotePlayerController />', () => {
   })
 })
 
+describe('remote atomic snapshot admission (binding generation and state sequence)', () => {
+  it('rejects a late lower-generation HTTP snapshot after the floor advanced', async () => {
+    const late = deferred()
+    const transport = makeTransport([orderedSnapshot(), late.promise], {
+      attachReply: () => response(orderedStatus()),
+    })
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 11 })),
+    )
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(2))
+
+    await act(async () => {
+      late.resolve(
+        response(
+          orderedSnapshot('Late stale generation queue', {
+            bindingGeneration: 1,
+            stateSequence: 1000,
+            queueVersion: 40,
+            playing: false,
+            position: 44,
+          }),
+        ),
+      )
+    })
+
+    expect(
+      screen.getByRole('heading', { name: 'Ordered server queue' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'Late stale generation queue' }),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText('Playing')).toBeInTheDocument()
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('admits a higher generation whose full snapshot restarts sequencing', async () => {
+    const transport = makeTransport([
+      orderedSnapshot(),
+      orderedSnapshot('Regenerated queue', {
+        bindingGeneration: 3,
+        stateSequence: 1,
+        queueVersion: 1,
+        playing: false,
+        position: 5,
+      }),
+    ])
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+
+    await act(async () =>
+      EventSourceTransport.instances.at(-1).emit(
+        'jukeboxStateUpdated',
+        orderedStatus({
+          bindingGeneration: 3,
+          stateSequence: 1,
+          position: 5,
+        }),
+      ),
+    )
+
+    await screen.findByRole('heading', { name: 'Regenerated queue' })
+    expect(screen.getByText('Paused')).toBeInTheDocument()
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('raises the floor from a partial higher-generation observation so a pending older-generation HTTP response is rejected', async () => {
+    const pendingGen2 = deferred()
+    const gen3Full = deferred()
+    const transport = makeTransport(
+      [orderedSnapshot(), pendingGen2.promise, gen3Full.promise],
+      { attachReply: () => response(orderedStatus()) },
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 11 })),
+    )
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(2))
+
+    // Partial observation: valid newer generation/sequence, no queue payload.
+    await act(async () =>
+      EventSourceTransport.instances.at(-1).emit(
+        'jukeboxStateUpdated',
+        orderedStatus({
+          bindingGeneration: 3,
+          stateSequence: 5,
+          position: 30,
+        }),
+      ),
+    )
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(3))
+
+    await act(async () => {
+      pendingGen2.resolve(
+        response(
+          orderedSnapshot('Superseded generation queue', {
+            stateSequence: 20,
+            playing: false,
+          }),
+        ),
+      )
+    })
+
+    expect(
+      screen.getByRole('heading', { name: 'Ordered server queue' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'Superseded generation queue' }),
+    ).not.toBeInTheDocument()
+
+    await act(async () => {
+      gen3Full.resolve(
+        response(
+          orderedSnapshot('Third generation queue', {
+            bindingGeneration: 3,
+            stateSequence: 6,
+            position: 31,
+          }),
+        ),
+      )
+    })
+    await screen.findByRole('heading', { name: 'Third generation queue' })
+    expect(store.getState().player.jukeboxRemote.bindingGeneration).toBe(3)
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('rejects a same-generation HTTP snapshot with an older sequence even at an equal queue version', async () => {
+    const late = deferred()
+    const transport = makeTransport([orderedSnapshot(), late.promise], {
+      attachReply: () => response(orderedStatus()),
+    })
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 11 })),
+    )
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(2))
+
+    await act(async () => {
+      late.resolve(
+        response(
+          orderedSnapshot('Older sequence queue', {
+            stateSequence: 9,
+            queueVersion: 20,
+            playing: false,
+            position: 44,
+          }),
+        ),
+      )
+    })
+
+    expect(
+      screen.getByRole('heading', { name: 'Ordered server queue' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'Older sequence queue' }),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText('Playing')).toBeInTheDocument()
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('suspends control once and coalesces a single bounded refresh on repeated equal-sequence conflicts without compensating commands', async () => {
+    const reconciled = deferred()
+    const transport = makeTransport(
+      [orderedSnapshot(), reconciled.promise, orderedSnapshot()],
+      { attachReply: () => response(orderedStatus()) },
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+
+    // Same generation and sequence, but conflicting semantic scene fields.
+    const conflict = orderedStatus({
+      playing: false,
+      trackId: 'song-b',
+      queueItemId: 'qi-b',
+      gain: 0.9,
+      desiredGain: 0.9,
+      muted: true,
+      playMode: 'singleLoop',
+      playbackInstanceId: 'inst-9',
+      position: 2,
+    })
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', conflict),
+    )
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', { ...conflict }),
+    )
+
+    expect(snapshotsRequested(transport)).toHaveLength(2)
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    expect(
+      screen.getByRole('heading', { name: 'Ordered server queue' }),
+    ).toBeInTheDocument()
+    expect(commands(transport)).toEqual([])
+
+    await act(async () => {
+      reconciled.resolve(
+        response(
+          orderedSnapshot('Reconciled queue', {
+            stateSequence: 12,
+            position: 18,
+          }),
+        ),
+      )
+    })
+    await screen.findByRole('heading', { name: 'Reconciled queue' })
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('keeps control available for equal-sequence position, heartbeat and handoff metadata observations', async () => {
+    const transport = makeTransport([
+      orderedSnapshot(),
+      orderedSnapshot('Ordered server queue', { position: 44 }),
+    ])
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+
+    await act(async () =>
+      EventSourceTransport.instances.at(-1).emit(
+        'jukeboxStateUpdated',
+        orderedStatus({
+          position: 44,
+          lastHeartbeat: '2026-11-02T00:05:00Z',
+          controlHandoffToken: 'handoff-1',
+        }),
+      ),
+    )
+
+    expect(await screen.findByText('Position: 44 seconds')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('promotes a strict scene only from the atomic snapshot handshake and drops a stale generation afterwards', async () => {
+    const attach = deferred()
+    const initial = deferred()
+    const transport = makeTransport(
+      [initial.promise, orderedSnapshot('Post-baseline probe', 77)],
+      { attachReply: attach.promise },
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    expect(screen.getByText('Loading remote state')).toBeInTheDocument()
+
+    // A pre-handshake partial observation cannot promote or block the scene.
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', { position: 99 }),
+    )
+    await act(async () => {
+      attach.resolve(response(orderedStatus()))
+    })
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(1))
+    await act(async () => {
+      initial.resolve(response(orderedSnapshot()))
+    })
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+
+    await act(async () =>
+      EventSourceTransport.instances.at(-1).emit(
+        'jukeboxStateUpdated',
+        orderedStatus({
+          bindingGeneration: 1,
+          stateSequence: 500,
+          queueVersion: 30,
+          trackId: 'song-z',
+          queueItemId: 'qi-z',
+          playing: false,
+          position: 55,
+          playbackInstanceId: 'inst-7',
+        }),
+      ),
+    )
+
+    expect(snapshotsRequested(transport)).toHaveLength(1)
+    expect(
+      screen.getByRole('heading', { name: 'Ordered server queue' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'Post-baseline probe' }),
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('uses SSE invalidation only to reacquire the atomic snapshot without replacing the Redux queue', async () => {
+    const transport = makeTransport([
+      orderedSnapshot(),
+      orderedSnapshot('Invalidated server queue', {
+        stateSequence: 11,
+        position: 26,
+      }),
+    ])
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+    expect(store.getState().player.queue).toEqual([])
+
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 11 })),
+    )
+
+    await screen.findByRole('heading', { name: 'Invalidated server queue' })
+    expect(store.getState().player.queue).toEqual([])
+    expect(commands(transport)).toEqual([])
+  })
+})
+
+describe('persistent remote-authority egress regressions', () => {
+  it('an unordered owned HTTP response after a floor advance cannot replace the accepted scene or issue commands', async () => {
+    const staleUnordered = deferred()
+    const transport = makeTransport(
+      [orderedSnapshot(), staleUnordered.promise],
+      {
+        attachReply: () => response(orderedStatus()),
+      },
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+
+    // A newer raw observation raises the shared ordering floor past the
+    // admitted scene while the next HTTP request is still pending.
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 11 })),
+    )
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(2))
+
+    // The late unordered response carries a stale title but no ordering.
+    const stale = unorderedSnapshot('Unordered stale queue')
+    stale.sessionStatus.ownerClientId = 'tab-a'
+    stale.sessionStatus.ownershipState = 'attached'
+    await act(async () => {
+      staleUnordered.resolve(response(stale))
+    })
+
+    // Command egress is fenced first: clicking the rendered Pause must send
+    // nothing while the accepted scene is retained by the authority.
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    expect(commands(transport)).toEqual([])
+
+    // Redux authority alone retaining the scene is not sufficient: the
+    // displayed scene must be retained as well.
+    expect(
+      screen.getByRole('heading', { name: 'Ordered server queue' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'Unordered stale queue' }),
+    ).not.toBeInTheDocument()
+    expect(store.getState().player.jukeboxRemote.stateSequence).toBe(11)
+    expect(store.getState().player.jukeboxRemote.trackId).toBe('song-a')
+  })
+
+  it('an HTTP snapshot pinned at the accepted anchor sequence but below the observed floor cannot render', async () => {
+    const belowFloor = deferred()
+    const transport = makeTransport([orderedSnapshot(), belowFloor.promise], {
+      attachReply: () => response(orderedStatus()),
+    })
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 11 })),
+    )
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(2))
+
+    // Same generation, sequence back at the accepted anchor (10), i.e.
+    // below the observed floor (11), with a stale playlist title.
+    await act(async () => {
+      belowFloor.resolve(
+        response(
+          orderedSnapshot('Below-floor anchor queue', { stateSequence: 10 }),
+        ),
+      )
+    })
+
+    expect(
+      screen.getByRole('heading', { name: 'Ordered server queue' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'Below-floor anchor queue' }),
+    ).not.toBeInTheDocument()
+    expect(commands(transport)).toEqual([])
+    expect(store.getState().player.jukeboxRemote.stateSequence).toBe(11)
+    expect(store.getState().player.jukeboxRemote.trackId).toBe('song-a')
+  })
+
+  it('a binding drift arms exactly one bounded follow-up snapshot GET that reconciles against the new binding', async () => {
+    const gen3 = orderedSnapshot('Generation 3 queue', {
+      bindingGeneration: 3,
+      stateSequence: 1,
+      deviceName: 'pulse/gen3',
+    })
+    const gen3Advanced = orderedSnapshot('Generation 3 queue', {
+      bindingGeneration: 3,
+      stateSequence: 2,
+      deviceName: 'pulse/gen3',
+    })
+    const transport = makeTransport([orderedSnapshot(), gen3, gen3Advanced], {
+      attachReply: () => response(orderedStatus()),
+    })
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+
+    // A raw observation announces the higher generation; the floor advance
+    // reacquires the atomic snapshot, which admits the new binding but cannot
+    // confer writes from the older request provenance.
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit(
+          'jukeboxStateUpdated',
+          orderedStatus({ bindingGeneration: 3, stateSequence: 1 }),
+        ),
+    )
+    await screen.findByRole('heading', { name: 'Generation 3 queue' })
+
+    // The intermediate suspension is asserted at the Redux authority level
+    // (grant suspended, owner eligibility null); React batches the drift
+    // admission and the bounded reconciliation, so the DOM may never commit
+    // a disabled frame here. The observable contract: exactly ONE bounded
+    // follow-up GET reconciles and confers writes — no 15s heartbeat wait,
+    // no takeover, no command egress, no request storm.
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled(),
+    )
+    expect(snapshotsRequested(transport)).toHaveLength(3)
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('a repeated missing-device drift answer stays readonly without a snapshot storm', async () => {
+    const gen3 = orderedSnapshot('Generation 3 queue', {
+      bindingGeneration: 3,
+      stateSequence: 1,
+      deviceName: 'pulse/gen3',
+    })
+    const gen3Missing = orderedSnapshot('Generation 3 queue', {
+      bindingGeneration: 3,
+      stateSequence: 2,
+      deviceName: null,
+    })
+    const transport = makeTransport(
+      [orderedSnapshot(), gen3, gen3Missing, gen3Missing],
+      {
+        attachReply: () => response(orderedStatus()),
+      },
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit(
+          'jukeboxStateUpdated',
+          orderedStatus({ bindingGeneration: 3, stateSequence: 1 }),
+        ),
+    )
+    await screen.findByRole('heading', { name: 'Generation 3 queue' })
+
+    // The ONE bounded follow-up answers without a canonical device again: the
+    // reconciliation is consumed, control stays suspended, and no further
+    // snapshot GETs are issued.
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(3))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(snapshotsRequested(transport)).toHaveLength(3)
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('a trusted snapshot omitting the device stays readonly, forbids command POSTs, and recovers on an explicit device', async () => {
+    const deviceless = orderedSnapshot('Deviceless advance queue', {
+      stateSequence: 11,
+      position: 20,
+    })
+    delete deviceless.sessionStatus.deviceName
+    const recovered = orderedSnapshot('Recovered device queue', {
+      stateSequence: 12,
+    })
+    const transport = makeTransport(
+      [orderedSnapshot(), deviceless, recovered],
+      {
+        attachReply: () => response(orderedStatus()),
+      },
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+
+    // A raw observation raises the floor; the controller reacquires the
+    // atomic snapshot, which OMITS the device field.
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 11 })),
+    )
+    await screen.findByRole('heading', { name: 'Deviceless advance queue' })
+
+    // Missing device is read-only: no inherited device may confer writes, no
+    // reconciliation may be armed against one, and user interaction must not
+    // egress a command.
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    expect(commands(transport)).toEqual([])
+    expect(store.getState().player.jukeboxControl.controlGranted).toBe(false)
+    expect(store.getState().player.jukeboxRemote.deviceName ?? null).toBeNull()
+    expect(store.getState().player.jukeboxControl.bindingReconcile).toBeNull()
+
+    // An explicit current valid device from a fresh live trusted episode
+    // recovers correctly: the grant is restored and a user command egresses.
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 12 })),
+    )
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled(),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    await waitFor(() => expect(commands(transport)).not.toHaveLength(0))
+    expect(commands(transport).at(-1).path).toContain('/pause')
+  })
+
+  it('a higher-generation snapshot omitting the device does not arm a reconciliation GET or egress commands', async () => {
+    const gen3Deviceless = orderedSnapshot('Generation 3 deviceless queue', {
+      bindingGeneration: 3,
+      stateSequence: 0,
+    })
+    delete gen3Deviceless.sessionStatus.deviceName
+    const transport = makeTransport(
+      [orderedSnapshot(), gen3Deviceless, gen3Deviceless],
+      {
+        attachReply: () => response(orderedStatus()),
+      },
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled()
+
+    // The server rebound to a new generation but the snapshot omits the
+    // device: the prior binding device must not be carried into the new
+    // generation nor armed as a reconciliation target.
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit(
+          'jukeboxStateUpdated',
+          orderedStatus({ bindingGeneration: 3, stateSequence: 0 }),
+        ),
+    )
+    await screen.findByRole('heading', {
+      name: 'Generation 3 deviceless queue',
+    })
+
+    // No bounded follow-up GET is armed: the request count stays bounded and
+    // command egress stays forbidden.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(snapshotsRequested(transport)).toHaveLength(2)
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+    expect(commands(transport)).toEqual([])
+    expect(store.getState().player.jukeboxControl.controlGranted).toBe(false)
+    expect(store.getState().player.jukeboxRemote.deviceName ?? null).toBeNull()
+    expect(store.getState().player.jukeboxControl.bindingReconcile).toBeNull()
+  })
+
+  it('two controllers keep the shared scene observable and pass control only through explicit takeover after the owner retires', async () => {
+    let owner = 'tab-a'
+    let playing = true
+    // Servers advance the state sequence on each accepted command, so the
+    // post-pause snapshot supersedes the equal-sequence scene instead of
+    // conflicting with it.
+    let stateSequence = 10
+    const requests = []
+    const currentStatus = () =>
+      orderedStatus({ ownerClientId: owner, playing, stateSequence })
+    const currentSnapshot = () => {
+      const next = orderedSnapshot('Shared ordered queue')
+      next.sessionStatus = currentStatus()
+      next.jukeboxPlaylist.playing = playing
+      return next
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url, options = {}) => {
+        const path = new URL(url, 'http://localhost').pathname
+        const body = options.body ? JSON.parse(options.body) : {}
+        requests.push({ path, body })
+        if (path.endsWith('/session/attach')) {
+          if (body.clientId !== owner && body.takeover !== true) {
+            return Promise.resolve(response({ message: 'Control denied' }, 403))
+          }
+          if (body.takeover === true) owner = body.clientId
+          return Promise.resolve(response(currentStatus()))
+        }
+        if (path.endsWith('/session/snapshot')) {
+          return Promise.resolve(response(currentSnapshot()))
+        }
+        if (path.endsWith('/pause')) {
+          if (body.clientId !== owner) {
+            return Promise.resolve(response({ message: 'Control denied' }, 403))
+          }
+          playing = false
+          stateSequence = 11
+          return Promise.resolve(response({ playing: false }))
+        }
+        return Promise.resolve(response({}))
+      }),
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    const ownerView = render(
+      <Provider store={store}>
+        <RemotePlayerController
+          sessionId="jukebox-session:admin"
+          clientId="tab-a"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    const observerView = render(
+      <Provider store={store}>
+        <RemotePlayerController
+          sessionId="jukebox-session:admin"
+          clientId="tab-b"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole('heading', { name: 'Shared ordered queue' }),
+      ).toHaveLength(2),
+    )
+    expect(screen.getAllByRole('button', { name: 'Pause' })[0]).toBeEnabled()
+    expect(screen.getAllByRole('button', { name: 'Pause' })[1]).toBeDisabled()
+
+    // The owner retires; the observer keeps observing the shared scene.
+    ownerView.unmount()
+    await waitFor(() =>
+      expect(
+        requests.filter(({ path }) => path.endsWith('/session/detach')),
+      ).toHaveLength(1),
+    )
+    expect(
+      requests.find(({ path }) => path.endsWith('/session/detach')).body,
+    ).toEqual(
+      expect.objectContaining({
+        sessionId: 'jukebox-session:admin',
+        clientId: 'tab-a',
+      }),
+    )
+    expect(
+      observerView.getByRole('heading', { name: 'Shared ordered queue' }),
+    ).toBeInTheDocument()
+    expect(observerView.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    expect(
+      observerView.getByRole('button', { name: 'Take control' }),
+    ).toBeEnabled()
+
+    // Control passes only through the observer's explicit takeover.
+    fireEvent.click(observerView.getByRole('button', { name: 'Take control' }))
+    await waitFor(() =>
+      expect(observerView.getByRole('button', { name: 'Pause' })).toBeEnabled(),
+    )
+    expect(owner).toBe('tab-b')
+    expect(requests.filter(({ body }) => body.takeover === true)).toHaveLength(
+      1,
+    )
+
+    fireEvent.click(observerView.getByRole('button', { name: 'Pause' }))
+    await observerView.findByText('Paused', { exact: true })
+    expect(playing).toBe(false)
+    expect(commands({ requests })).toHaveLength(1)
+    expect(commands({ requests })[0].path).toBe('/api/jukebox/pause')
+    expect(commands({ requests })[0].body).toEqual(
+      expect.objectContaining({
+        sessionId: 'jukebox-session:admin',
+        clientId: 'tab-b',
+      }),
+    )
+    observerView.unmount()
+  })
+
+  it('a same-identity remount rejects the old token but must admit an identical scene on the new token', async () => {
+    const pendingSnapshots = []
+    const requests = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url, options = {}) => {
+        const path = new URL(url, 'http://localhost').pathname
+        requests.push({ path })
+        if (path.endsWith('/session/attach')) {
+          return Promise.resolve(response(orderedStatus()))
+        }
+        if (path.endsWith('/session/snapshot')) {
+          const snapshotRequest = deferred()
+          pendingSnapshots.push(snapshotRequest)
+          return snapshotRequest.promise
+        }
+        return Promise.resolve(response({}))
+      }),
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+
+    const first = renderController({}, store)
+    await waitFor(() =>
+      expect(snapshotsRequested({ requests })).toHaveLength(1),
+    )
+    window.dispatchEvent(new Event('pagehide'))
+    first.unmount()
+
+    // A local<->remote transition clears the admitted pair, so the remounted
+    // same-identity episode is the only remaining display source.
+    await act(async () => {
+      store.dispatch(setJukeboxMode(false))
+      store.dispatch(setJukeboxMode(true, 'pulse/test'))
+    })
+
+    renderController({}, store)
+    await waitFor(() =>
+      expect(snapshotsRequested({ requests })).toHaveLength(2),
+    )
+
+    // The NEW token returns the IDENTICAL scene: a fresh fetch of unchanged
+    // server state must be admitted — the anti-ABA guard must not over-reject
+    // content merely because a retired same-identity episode observed it.
+    await act(async () => {
+      pendingSnapshots[1].resolve(
+        response(orderedSnapshot('Remount held queue')),
+      )
+    })
+    await screen.findByRole('heading', { name: 'Remount held queue' })
+
+    // The OLD token's late response now carries a CHANGED scene: it must not
+    // be adopted by the live episode.
+    await act(async () => {
+      pendingSnapshots[0].resolve(
+        response(
+          orderedSnapshot('Old token changed queue', { stateSequence: 12 }),
+        ),
+      )
+    })
+    expect(
+      screen.getByRole('heading', { name: 'Remount held queue' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'Old token changed queue' }),
+    ).not.toBeInTheDocument()
+    expect(commands({ requests })).toEqual([])
+  })
+
+  it('an observer GET admits the shared scene for both subscribers and never grants the observer eligibility', async () => {
+    const shared = orderedSnapshot('Shared observed queue')
+    const transport = makeTransport([shared, shared], {
+      attachReply: ({ clientId }) =>
+        clientId === 'tab-a'
+          ? response(orderedStatus())
+          : response({ message: 'Control denied' }, 403),
+    })
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    const ownerView = render(
+      <Provider store={store}>
+        <RemotePlayerController
+          sessionId="jukebox-session:admin"
+          clientId="tab-a"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    const observerView = render(
+      <Provider store={store}>
+        <RemotePlayerController
+          sessionId="jukebox-session:admin"
+          clientId="tab-b"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole('heading', { name: 'Shared observed queue' }),
+      ).toHaveLength(2),
+    )
+    const owner = within(ownerView.container)
+    const observer = within(observerView.container)
+
+    // The observer never gets command eligibility: only explicit takeover.
+    expect(observer.getByRole('button', { name: 'Pause' })).toBeDisabled()
+    expect(observer.getByRole('button', { name: 'Take control' })).toBeEnabled()
+    // The owner's eligibility survives the observer's GET entirely.
+    expect(owner.getByRole('button', { name: 'Pause' })).toBeEnabled()
+    expect(commands(transport)).toEqual([])
+    ownerView.unmount()
+    observerView.unmount()
+  })
+
+  it('a superseded owner emits zero POSTs once the new-owner snapshot is admitted', async () => {
+    let owner = 'tab-a'
+    let playing = true
+    let stateSequence = 10
+    const requests = []
+    const currentStatus = () =>
+      orderedStatus({ ownerClientId: owner, playing, stateSequence })
+    const currentSnapshot = () => {
+      const next = orderedSnapshot('Owner superseded queue')
+      next.sessionStatus = currentStatus()
+      next.jukeboxPlaylist.playing = playing
+      return next
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url, options = {}) => {
+        const path = new URL(url, 'http://localhost').pathname
+        const body = options.body ? JSON.parse(options.body) : {}
+        requests.push({ path, body })
+        if (path.endsWith('/session/attach')) {
+          if (body.clientId !== owner && body.takeover !== true) {
+            return Promise.resolve(response({ message: 'Control denied' }, 403))
+          }
+          if (body.takeover === true) owner = body.clientId
+          return Promise.resolve(response(currentStatus()))
+        }
+        if (path.endsWith('/session/snapshot')) {
+          return Promise.resolve(response(currentSnapshot()))
+        }
+        if (path.endsWith('/pause')) {
+          if (body.clientId !== owner) {
+            return Promise.resolve(response({ message: 'Control denied' }, 403))
+          }
+          playing = false
+          stateSequence = 11
+          return Promise.resolve(response({ playing: false }))
+        }
+        return Promise.resolve(response({}))
+      }),
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    const ownerView = render(
+      <Provider store={store}>
+        <RemotePlayerController
+          sessionId="jukebox-session:admin"
+          clientId="tab-a"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    const observerView = render(
+      <Provider store={store}>
+        <RemotePlayerController
+          sessionId="jukebox-session:admin"
+          clientId="tab-b"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole('heading', { name: 'Owner superseded queue' }),
+      ).toHaveLength(2),
+    )
+    const ownerUi = within(ownerView.container)
+    const observerUi = within(observerView.container)
+
+    // The observer takes over; the new-owner snapshot is admitted at the
+    // same ordering, so the shared scene stays identical for both.
+    fireEvent.click(observerUi.getByRole('button', { name: 'Take control' }))
+    await waitFor(() =>
+      expect(observerUi.getByRole('button', { name: 'Pause' })).toBeEnabled(),
+    )
+    expect(owner).toBe('tab-b')
+    await waitFor(() =>
+      expect(store.getState().player.jukeboxControl.ownerClientId).toBe(
+        'tab-b',
+      ),
+    )
+
+    // The superseded owner's forced command must egress NOTHING: the client
+    // fences it against the admitted owner instead of posting and receiving
+    // a server 403.
+    fireEvent.click(ownerUi.getByRole('button', { name: 'Pause' }))
+    await act(async () => {})
+    expect(commands({ requests })).toEqual([])
+
+    // The new owner remains fully usable.
+    fireEvent.click(observerUi.getByRole('button', { name: 'Pause' }))
+    await observerUi.findByText('Paused', { exact: true })
+    expect(commands({ requests })).toHaveLength(1)
+    expect(commands({ requests })[0].body).toEqual(
+      expect.objectContaining({
+        sessionId: 'jukebox-session:admin',
+        clientId: 'tab-b',
+      }),
+    )
+    ownerView.unmount()
+    observerView.unmount()
+  })
+
+  it('observer retirement never gates the attached owner: owner eligibility and control survive observer unmount', async () => {
+    let playing = true
+    // Servers advance the state sequence on each accepted command so the
+    // post-pause snapshot supersedes the scene instead of conflicting with it.
+    let stateSequence = 10
+    const requests = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url, options = {}) => {
+        const path = new URL(url, 'http://localhost').pathname
+        const body = options.body ? JSON.parse(options.body) : {}
+        requests.push({ path, body })
+        if (path.endsWith('/session/attach')) {
+          if (body.clientId !== 'tab-a') {
+            return Promise.resolve(response({ message: 'Control denied' }, 403))
+          }
+          return Promise.resolve(response(orderedStatus()))
+        }
+        if (path.endsWith('/session/snapshot')) {
+          const next = orderedSnapshot('Owner led queue', { stateSequence })
+          next.sessionStatus.playing = playing
+          next.jukeboxPlaylist.playing = playing
+          return Promise.resolve(response(next))
+        }
+        if (path.endsWith('/pause')) {
+          playing = false
+          stateSequence = 11
+          return Promise.resolve(response({ playing: false }))
+        }
+        return Promise.resolve(response({}))
+      }),
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    const ownerView = render(
+      <Provider store={store}>
+        <RemotePlayerController
+          sessionId="jukebox-session:admin"
+          clientId="tab-a"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    const observerView = render(
+      <Provider store={store}>
+        <RemotePlayerController
+          sessionId="jukebox-session:admin"
+          clientId="tab-b"
+          deviceName="pulse/test"
+        />
+      </Provider>,
+    )
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole('heading', { name: 'Owner led queue' }),
+      ).toHaveLength(2),
+    )
+    const owner = within(ownerView.container)
+    const observer = within(observerView.container)
+    expect(owner.getByRole('button', { name: 'Pause' })).toBeEnabled()
+    expect(observer.getByRole('button', { name: 'Pause' })).toBeDisabled()
+
+    // The denied observer retires: it never owned the session, so no detach
+    // is sent and the owner's eligibility must be untouched.
+    observerView.unmount()
+    await act(async () => {})
+    expect(
+      requests.filter(({ path }) => path.endsWith('/session/detach')),
+    ).toHaveLength(0)
+    expect(owner.getByRole('button', { name: 'Pause' })).toBeEnabled()
+    expect(
+      owner.getByRole('heading', { name: 'Owner led queue' }),
+    ).toBeInTheDocument()
+
+    fireEvent.click(owner.getByRole('button', { name: 'Pause' }))
+    await owner.findByText('Paused', { exact: true })
+    expect(commands({ requests })).toHaveLength(1)
+    expect(commands({ requests })[0].body).toEqual(
+      expect.objectContaining({
+        sessionId: 'jukebox-session:admin',
+        clientId: 'tab-a',
+      }),
+    )
+    ownerView.unmount()
+  })
+})
+
+describe('legacy unordered server read-only display', () => {
+  it('a pre-strict unordered snapshot displays read-only and never egresses commands', async () => {
+    const transport = makeTransport([
+      unorderedSnapshot('Legacy unordered queue'),
+    ])
+    renderController()
+    await screen.findByRole('heading', { name: 'Legacy unordered queue' })
+    const pause = screen.getByRole('button', { name: 'Pause' })
+    expect(pause).toBeDisabled()
+    fireEvent.click(pause)
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(commands(transport)).toEqual([])
+  })
+
+  it('a post-strict unordered HTTP response retains the accepted pair read-only', async () => {
+    const lateUnordered = deferred()
+    const transport = makeTransport(
+      [orderedSnapshot(), lateUnordered.promise],
+      {
+        attachReply: () => response(orderedStatus()),
+      },
+    )
+    const store = createStore(
+      combineReducers({ player: playerReducer, activity: activityReducer }),
+    )
+    await startEventStream(store.dispatch)
+    renderController({}, store)
+    await screen.findByRole('heading', { name: 'Ordered server queue' })
+
+    await act(async () =>
+      EventSourceTransport.instances
+        .at(-1)
+        .emit('jukeboxStateUpdated', orderedStatus({ stateSequence: 11 })),
+    )
+    await waitFor(() => expect(snapshotsRequested(transport)).toHaveLength(2))
+
+    await act(async () => {
+      lateUnordered.resolve(
+        response(unorderedSnapshot('Unordered replacement queue')),
+      )
+    })
+
+    expect(
+      screen.getByRole('heading', { name: 'Ordered server queue' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'Unordered replacement queue' }),
+    ).not.toBeInTheDocument()
+    const pause = screen.getByRole('button', { name: 'Pause' })
+    expect(pause).toBeDisabled()
+    fireEvent.click(pause)
+    expect(commands(transport)).toEqual([])
+    expect(store.getState().player.jukeboxRemote.stateSequence).toBe(11)
+    expect(store.getState().player.jukeboxRemote.trackId).toBe('song-a')
+  })
+})
+
 describe('default Player Remote route', () => {
   it('renders the authoritative Remote snapshot without mounting or feeding a browser playback engine', async () => {
     localStorage.setItem('subsonic-token', '0123456789abcdef0123456789abcdef')
@@ -1218,6 +2450,38 @@ describe('P0-B frontend control closure and session rehydration', () => {
     const addSpy = vi.spyOn(jukeboxClient, 'add').mockResolvedValue({})
 
     store.dispatch(setJukeboxMode(true, 'Bluetooth Output'))
+    // Reducer-admitted authority: the legacy saga handlers egress only while
+    // the shared authority grants control to this document's scope.
+    store.dispatch(
+      beginJukeboxEpisode({
+        token: 'p0b-token',
+        sessionId: 'jukebox-session:admin',
+        clientId: getOrCreateJukeboxClientId(),
+      }),
+    )
+    store.dispatch(
+      updateJukeboxSessionStatus(
+        {
+          sessionId: 'jukebox-session:admin',
+          ownerClientId: getOrCreateJukeboxClientId(),
+          ownershipState: 'attached',
+          deviceName: 'Bluetooth Output',
+          bindingGeneration: 2,
+          stateSequence: 10,
+        },
+        {
+          source: 'atomic-session-snapshot',
+          sessionId: 'jukebox-session:admin',
+          clientId: getOrCreateJukeboxClientId(),
+          token: 'p0b-token',
+          revision: 0,
+          requestBinding: {
+            bindingGeneration: null,
+            deviceName: null,
+          },
+        },
+      ),
+    )
 
     // 1. Play Tracks (Play Now / Play All)
     store.dispatch(

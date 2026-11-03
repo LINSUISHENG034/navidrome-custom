@@ -12,28 +12,46 @@ import {
 
 const VOLUME_KEY_STEP = 0.1
 
-const keyHandlers = (audioInstance, playerState, playbackController = null) => {
+const keyHandlers = (
+  audioInstance,
+  playerState,
+  playbackController = null,
+  getLiveState = null,
+) => {
+  // Remote-authority reads must happen at invocation time: a takeover or
+  // downgrade can land after these handlers were created. Callers that can
+  // supply the current state (fourth argument) get invocation-time reads;
+  // legacy callers keep the creation-time snapshot.
+  const liveState = () => getLiveState?.() || playerState
+  const readRemoteAuthority = () => {
+    const current = liveState()
+    const state = { player: current }
+    return {
+      current,
+      isJukebox: current?.jukeboxMode,
+      canControl: canControlJukebox(current),
+      effectiveCurrentTrack: selectEffectiveCurrentTrack(state),
+      effectiveCurrentIndex: selectEffectiveJukeboxCurrentIndex(state),
+      effectiveJukeboxPlaying: selectEffectiveJukeboxPlaying(state),
+      effectiveJukeboxGain: selectEffectiveJukeboxGain(state),
+    }
+  }
+
   const nextSong = () => {
-    const idx = playerState.queue.findIndex(
-      (item) => item.uuid === playerState.current.uuid,
+    const current = liveState()
+    const idx = current.queue.findIndex(
+      (item) => item.uuid === current.current.uuid,
     )
-    return idx !== null ? playerState.queue[idx + 1] : null
+    return idx !== null ? current.queue[idx + 1] : null
   }
 
   const prevSong = () => {
-    const idx = playerState.queue.findIndex(
-      (item) => item.uuid === playerState.current.uuid,
+    const current = liveState()
+    const idx = current.queue.findIndex(
+      (item) => item.uuid === current.current.uuid,
     )
-    return idx !== null ? playerState.queue[idx - 1] : null
+    return idx !== null ? current.queue[idx - 1] : null
   }
-
-  const isJukebox = playerState.jukeboxMode
-  const canControl = canControlJukebox(playerState)
-  const state = { player: playerState }
-  const effectiveCurrentTrack = selectEffectiveCurrentTrack(state)
-  const effectiveCurrentIndex = selectEffectiveJukeboxCurrentIndex(state)
-  const effectiveJukeboxPlaying = selectEffectiveJukeboxPlaying(state)
-  const effectiveJukeboxGain = selectEffectiveJukeboxGain(state)
 
   // Unified candidate path (Issue 05): when a playback controller is supplied,
   // every playback hotkey enters the Module exactly once; the audio element and
@@ -66,6 +84,7 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
         if (!e.metaKey) playbackController.skipPrev().catch(() => {})
       },
       CURRENT_SONG: () => {
+        const { effectiveCurrentTrack } = readRemoteAuthority()
         window.location.href = `#/album/${effectiveCurrentTrack?.song.albumId}/show`
       },
       NEXT_SONG: (e) => {
@@ -77,6 +96,8 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
   return {
     TOGGLE_PLAY: (e) => {
       e.preventDefault()
+      const { isJukebox, canControl, effectiveJukeboxPlaying } =
+        readRemoteAuthority()
       if (isJukebox) {
         if (!canControl) return
         if (effectiveJukeboxPlaying) {
@@ -89,11 +110,13 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
       }
     },
     VOL_UP: () => {
+      const { isJukebox, canControl, effectiveJukeboxGain } =
+        readRemoteAuthority()
       if (isJukebox) {
         if (!canControl) return
         jukeboxClient
           .volume(
-            stepRemoteGainByUiDelta(effectiveJukeboxGain, 0.1, playerState),
+            stepRemoteGainByUiDelta(effectiveJukeboxGain, 0.1, liveState()),
           )
           .catch(() => {})
       } else {
@@ -104,11 +127,13 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
       }
     },
     VOL_DOWN: () => {
+      const { isJukebox, canControl, effectiveJukeboxGain } =
+        readRemoteAuthority()
       if (isJukebox) {
         if (!canControl) return
         jukeboxClient
           .volume(
-            stepRemoteGainByUiDelta(effectiveJukeboxGain, -0.1, playerState),
+            stepRemoteGainByUiDelta(effectiveJukeboxGain, -0.1, liveState()),
           )
           .catch(() => {})
       } else {
@@ -119,6 +144,8 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
       }
     },
     PREV_SONG: (e) => {
+      const { isJukebox, canControl, effectiveCurrentIndex } =
+        readRemoteAuthority()
       if (isJukebox) {
         if (!canControl) return
         if (effectiveCurrentIndex > 0) {
@@ -129,14 +156,21 @@ const keyHandlers = (audioInstance, playerState, playbackController = null) => {
       }
     },
     CURRENT_SONG: () => {
+      const { effectiveCurrentTrack } = readRemoteAuthority()
       window.location.href = `#/album/${effectiveCurrentTrack?.song.albumId}/show`
     },
     NEXT_SONG: (e) => {
+      const { current, isJukebox, canControl, effectiveCurrentIndex } =
+        readRemoteAuthority()
       if (isJukebox) {
         if (!canControl) return
+        // The boundary is the ACCEPTED remote playlist, never the browser
+        // queue: server-side queue length is the only authoritative count.
+        const remotePlaylistLength =
+          current?.jukeboxPlaylist?.entry?.length ?? 0
         if (
           effectiveCurrentIndex >= 0 &&
-          effectiveCurrentIndex < playerState.queue.length - 1
+          effectiveCurrentIndex < remotePlaylistLength - 1
         ) {
           jukeboxClient.skip(effectiveCurrentIndex + 1, 0).catch(() => {})
         }

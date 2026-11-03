@@ -43,11 +43,205 @@ const dispatchJukeboxSessionStatus = (dispatch, status) => {
   return status
 }
 
+// --- Caller-scoped control eligibility ---
+//
+// One predicate drives every egress boundary (controller render+commands,
+// Player callbacks, keyboard, legacy saga). Eligibility requires the strict
+// reducer-admitted shared grant, the admitted owner to BE this caller's
+// actual session/client identity, and a live enabled episode — registered
+// and reconciled by the reducer — whose reconciled binding matches the
+// admitted scene binding. An observer's snapshot may therefore admit shared
+// facts without ever making the observer eligible, and never revokes a
+// genuine same-binding owner. The returned capture is immutable: callers
+// recheck it against fresh state after every await, never recapturing a
+// replacement token/owner/generation mid-intent.
+
+const captureEligibleJukeboxScope = (playerState, scope = {}) => {
+  const control = playerState?.jukeboxControl
+  if (!control) return null
+  const sessionId = scope.sessionId ?? getJukeboxSessionId()
+  const clientId = scope.clientId ?? getOrCreateJukeboxClientId()
+  if (!sessionId || !clientId) return null
+  if (control.controlGranted !== true) return null
+  if (control.ownershipState !== 'attached') return null
+  if (control.sessionId !== sessionId || control.ownerClientId !== clientId)
+    return null
+  const remote = playerState?.jukeboxRemote
+  const bindingGeneration = remote?.bindingGeneration ?? null
+  const device = remote?.deviceName ?? null
+  if (bindingGeneration == null) return null
+  const episodes = playerState?.jukeboxEpisodes || {}
+  const token = Object.keys(episodes)
+    .filter((candidate) => {
+      if (scope.token && candidate !== scope.token) return false
+      const episode = episodes[candidate]
+      return !!(
+        episode &&
+        episode.disabled === false &&
+        episode.sessionId === sessionId &&
+        episode.clientId === clientId &&
+        episode.reconciledBinding &&
+        episode.reconciledBinding.bindingGeneration === bindingGeneration &&
+        (episode.reconciledBinding.canonicalDevice ?? null) === device
+      )
+    })
+    .sort()[0]
+  if (!token) return null
+  return {
+    token,
+    revision: episodes[token].revision ?? 0,
+    sessionId,
+    clientId,
+    bindingGeneration,
+    device,
+  }
+}
+
+// The default control check resolves THIS document's actual session/client
+// identity — never an attached-only fallback.
 const canControlJukebox = (playerState) =>
-  !!(
-    playerState?.jukeboxMode &&
-    playerState?.jukeboxControl?.ownershipState === 'attached'
+  captureEligibleJukeboxScope(playerState) !== null
+
+// Mid-intent recheck: the SAME captured scope must still be capturable from
+// the CURRENT state — same token, revision, binding. Any takeover, rebind,
+// device move, disable, or token replacement breaks it.
+const isCapturedJukeboxScopeCurrent = (playerState, captured) => {
+  if (!captured) return false
+  const again = captureEligibleJukeboxScope(playerState, {
+    sessionId: captured.sessionId,
+    clientId: captured.clientId,
+    token: captured.token,
+  })
+  return !!(
+    again &&
+    again.revision === captured.revision &&
+    again.bindingGeneration === captured.bindingGeneration &&
+    again.device === captured.device
   )
+}
+
+// --- Ordered remote admission (binding generation / state sequence) ---
+//
+// One shared pure classifier for the reducer (single authority for the
+// accepted scene and the observed ordering floor) and the controller
+// (snapshot admission at the atomic HTTP boundary). Trust is always local
+// action.meta provenance ({source: 'atomic-session-snapshot', sessionId,
+// deviceName, clientId}); server payload fields such as a baseline flag
+// never grant trust. Attach/status/SSE observations are untrusted: they may
+// raise the generation/sequence floor and invalidate, but they can never
+// establish or replace the authoritative scene or enable control.
+
+const ATOMIC_SNAPSHOT_SOURCE = 'atomic-session-snapshot'
+
+// Generation must be a positive safe integer; sequence a non-negative safe
+// integer. An explicit 0 stateSequence/queueVersion is valid history.
+const isSafeOrderedInteger = (value, minimum) =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum
+
+const readOrderedFloor = (status) => {
+  if (!isSafeOrderedInteger(status?.bindingGeneration, 1)) return null
+  if (!isSafeOrderedInteger(status?.stateSequence, 0)) return null
+  return {
+    bindingGeneration: status.bindingGeneration,
+    stateSequence: status.stateSequence,
+  }
+}
+
+const isTrustedSnapshotMeta = (meta) =>
+  meta?.source === ATOMIC_SNAPSHOT_SOURCE &&
+  typeof meta.sessionId === 'string' &&
+  meta.sessionId !== '' &&
+  typeof meta.clientId === 'string' &&
+  meta.clientId !== ''
+
+// Semantic scene fields. An equal-generation/equal-sequence observation that
+// supplies different values for any of these conflicts with the accepted
+// scene; position, heartbeat and handoff metadata are harmless.
+const SCENE_SEMANTIC_FIELDS = [
+  'currentIndex',
+  'trackId',
+  'queueItemId',
+  'playing',
+  'gain',
+  'desiredGain',
+  'muted',
+  'playMode',
+  'playbackInstanceId',
+  'queueVersion',
+]
+
+const canonicalSceneValue = (value) => (value === undefined ? null : value)
+const conflictsWithScene = (status, scene) =>
+  SCENE_SEMANTIC_FIELDS.some(
+    (field) =>
+      status[field] !== undefined &&
+      canonicalSceneValue(status[field]) !==
+        canonicalSceneValue(scene?.[field]),
+  )
+
+const isSameOrdering = (a, b) =>
+  !!a &&
+  !!b &&
+  a.bindingGeneration === b.bindingGeneration &&
+  a.stateSequence === b.stateSequence
+
+const isOlderOrdering = (ordering, floor) =>
+  !!ordering &&
+  !!floor &&
+  (ordering.bindingGeneration < floor.bindingGeneration ||
+    (ordering.bindingGeneration === floor.bindingGeneration &&
+      ordering.stateSequence < floor.stateSequence))
+
+// How one SessionStatus-shaped payload relates to the current authority.
+// `remote` is the reducer's jukeboxRemote (observed floor + accepted scene).
+// Callers decide trust; this classifies ordering only, so there is a single
+// shared gate instead of per-source duplicates.
+const ORDERED_OBSERVATION = {
+  BESTEFFORT: 'besteffort', // no valid ordered fields, no floor: legacy merge
+  READONLY: 'readonly', // no valid ordered fields, floor exists: no scene change
+  ESTABLISH: 'establish', // valid ordered fields, no floor yet
+  STALE: 'stale', // lower generation, or same generation lower sequence
+  EQUAL: 'equal', // same generation and sequence as the floor
+  ADVANCED: 'advanced', // higher generation, or same generation higher sequence
+}
+
+const classifyJukeboxObservation = (status, remote) => {
+  const ordered = readOrderedFloor(status)
+  const floor = readOrderedFloor(remote)
+  if (!ordered)
+    return floor ? ORDERED_OBSERVATION.READONLY : ORDERED_OBSERVATION.BESTEFFORT
+  if (!floor) return ORDERED_OBSERVATION.ESTABLISH
+  if (isOlderOrdering(ordered, floor)) return ORDERED_OBSERVATION.STALE
+  if (isSameOrdering(ordered, floor)) return ORDERED_OBSERVATION.EQUAL
+  return ORDERED_OBSERVATION.ADVANCED
+}
+
+const buildAtomicSnapshotMeta = ({
+  sessionId,
+  clientId,
+  deviceName,
+  token,
+  revision,
+  requestBinding,
+}) => ({
+  source: ATOMIC_SNAPSHOT_SOURCE,
+  sessionId,
+  clientId,
+  deviceName: deviceName ?? null,
+  token,
+  revision,
+  requestBinding: {
+    bindingGeneration: requestBinding?.bindingGeneration ?? null,
+    deviceName: requestBinding?.deviceName ?? null,
+  },
+})
+
+// Local episode tokens are reducer-owned lifecycle state; this only mints
+// them. Anti-ABA is inherent: a retired token is unregistered, so its late
+// responses are rejected whole — no body fingerprints.
+const createJukeboxEpisodeToken = () =>
+  window.crypto?.randomUUID?.() ||
+  `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
 const attachJukeboxSession = async ({
   client,
@@ -286,11 +480,22 @@ const rehydrateJukeboxSession = async ({ client, dispatch }) => {
 
 export {
   attachJukeboxSession,
+  buildAtomicSnapshotMeta,
   canControlJukebox,
+  captureEligibleJukeboxScope,
+  classifyJukeboxObservation,
+  conflictsWithScene,
+  createJukeboxEpisodeToken,
   createJukeboxSessionEpisode,
   detachJukeboxSession,
   getJukeboxSessionId,
   getOrCreateJukeboxClientId,
+  isCapturedJukeboxScopeCurrent,
+  isOlderOrdering,
+  isSameOrdering,
+  isTrustedSnapshotMeta,
+  ORDERED_OBSERVATION,
+  readOrderedFloor,
   refreshJukeboxSessionStatus,
   rehydrateJukeboxSession,
   runJukeboxHeartbeat,

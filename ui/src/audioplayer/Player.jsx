@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useInterval } from '../common'
-import { useDispatch, useSelector } from 'react-redux'
+import { useDispatch, useSelector, useStore } from 'react-redux'
 import { useMediaQuery } from '@material-ui/core'
 import { ThemeProvider } from '@material-ui/core/styles'
 import {
@@ -887,13 +887,20 @@ const LocalPlayer = () => {
 const Player = () => {
   const theme = useCurrentTheme()
   const dispatch = useDispatch()
+  const store = useStore()
   const jukeboxMode = useSelector((state) => state.player.jukeboxMode)
   const playerState = useSelector((state) => state.player)
   const audioInstance = playerState.audioInstance
 
   const handlers = useMemo(
-    () => keyHandlers(audioInstance, playerState),
-    [audioInstance, playerState],
+    () =>
+      keyHandlers(
+        audioInstance,
+        playerState,
+        null,
+        () => store.getState().player,
+      ),
+    [audioInstance, playerState, store],
   )
 
   useEffect(() => {

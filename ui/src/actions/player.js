@@ -12,6 +12,9 @@ export const PLAYER_REFRESH_QUEUE = 'PLAYER_REFRESH_QUEUE'
 export const PLAYER_SET_JUKEBOX_MODE = 'PLAYER_SET_JUKEBOX_MODE'
 export const PLAYER_JUKEBOX_SESSION_STATUS = 'jukeboxStateUpdated'
 export const PLAYER_SET_AUDIO_INSTANCE = 'PLAYER_SET_AUDIO_INSTANCE'
+export const PLAYER_JUKEBOX_EPISODE_BEGIN = 'PLAYER_JUKEBOX_EPISODE_BEGIN'
+export const PLAYER_JUKEBOX_EPISODE_END = 'PLAYER_JUKEBOX_EPISODE_END'
+export const PLAYER_JUKEBOX_EPISODE_DISABLE = 'PLAYER_JUKEBOX_EPISODE_DISABLE'
 
 export const setTrack = (data) => ({
   type: PLAYER_SET_TRACK,
@@ -128,7 +131,37 @@ export const setAudioInstance = (instance) => ({
   data: instance,
 })
 
-export const updateJukeboxSessionStatus = (status) => ({
+// Provenance is local action metadata, never a server payload field: only
+// the atomic session-snapshot boundary inside the trusted controller
+// episode passes the atomic-session-snapshot meta.
+export const updateJukeboxSessionStatus = (status, meta) => ({
   type: PLAYER_JUKEBOX_SESSION_STATUS,
   data: status,
+  ...(meta ? { meta } : {}),
+})
+
+// Episode lifecycle, reducer-owned: the reducer is the single registry of
+// live control episodes. BEGIN registers a fresh token (disabled until its
+// first reconcile); END retires only the matching token synchronously before
+// async attachment retirement; DISABLE invalidates only the matching
+// reconciliation and bumps its revision so in-flight responses captured at
+// an older revision can never regrant.
+export const beginJukeboxEpisode = ({
+  token,
+  sessionId,
+  clientId,
+  deviceName = null,
+}) => ({
+  type: PLAYER_JUKEBOX_EPISODE_BEGIN,
+  data: { token, sessionId, clientId, deviceName },
+})
+
+export const endJukeboxEpisode = ({ token }) => ({
+  type: PLAYER_JUKEBOX_EPISODE_END,
+  data: { token },
+})
+
+export const disableJukeboxEpisode = ({ token }) => ({
+  type: PLAYER_JUKEBOX_EPISODE_DISABLE,
+  data: { token },
 })

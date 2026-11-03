@@ -1,10 +1,14 @@
 import React from 'react'
+import { Provider } from 'react-redux'
+import { combineReducers, createStore } from 'redux'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Player } from './Player'
+import { playerReducer } from '../reducers/playerReducer'
 import jukeboxClient from './jukeboxClient'
 import { uiVolumeToRemoteGain } from './volumeProfiles'
 
-const dispatchMock = vi.fn()
+// The remote authority renders through Redux, so these tests run against a
+// real store seeded with the remote-mode fixture instead of stub hooks.
 const playerState = {
   queue: [{ trackId: 't1', uuid: 'u1', song: { id: 't1' } }],
   current: { trackId: 't1', uuid: 'u1', song: { id: 't1' } },
@@ -20,6 +24,29 @@ const playerState = {
   },
   audioInstance: null,
 }
+
+const createFixtureStore = () =>
+  createStore(
+    combineReducers({
+      player: playerReducer,
+      settings: () => ({ notifications: false }),
+      replayGain: () => ({ gainMode: 'none' }),
+      activity: () => ({ streamReconnected: false }),
+    }),
+    {
+      player: {
+        ...playerReducer(undefined, { type: '@@INIT' }),
+        ...playerState,
+      },
+    },
+  )
+
+const renderPlayer = () =>
+  render(
+    <Provider store={createFixtureStore()}>
+      <Player />
+    </Provider>,
+  )
 
 vi.mock('@material-ui/core', async () => {
   const actual = await import('@material-ui/core')
@@ -37,17 +64,6 @@ vi.mock('react-admin', () => ({
   }),
   useTranslate: () => (key) => key,
   useNotify: () => vi.fn(),
-}))
-
-vi.mock('react-redux', () => ({
-  useDispatch: () => dispatchMock,
-  useSelector: (selector) =>
-    selector({
-      player: playerState,
-      settings: { notifications: false },
-      replayGain: { gainMode: 'none' },
-      activity: { streamReconnected: false },
-    }),
 }))
 
 vi.mock('react-ga', () => ({
@@ -118,8 +134,14 @@ vi.mock('./jukeboxClient', () => ({
             sessionStorage.getItem('jukebox-client-id') || 'test-client',
           ownershipState: 'attached',
           deviceName: 'pulse/bluez_output.24_C4_06_FA_00_37.a2dp-sink',
+          currentIndex: 0,
+          trackId: 't1',
+          playing: true,
           gain: 0.5,
           position: 10,
+          queueVersion: 1,
+          bindingGeneration: 2,
+          stateSequence: 10,
         },
         jukeboxPlaylist: {
           currentIndex: 0,
@@ -153,7 +175,7 @@ describe('<Player />', () => {
     const fetchMock = vi
       .spyOn(window, 'fetch')
       .mockResolvedValue(new Response())
-    const { unmount } = render(<Player />)
+    const { unmount } = renderPlayer()
 
     await waitFor(() => {
       expect(jukeboxClient.attachSession).toHaveBeenCalled()
@@ -173,7 +195,7 @@ describe('<Player />', () => {
   })
 
   it('maps outgoing jukebox volume changes through the Bluetooth profile', async () => {
-    render(<Player />)
+    renderPlayer()
 
     const slider = await screen.findByRole('slider', { name: 'Volume' })
     fireEvent.change(slider, { target: { value: '0.6' } })
