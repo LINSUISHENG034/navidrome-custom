@@ -40,7 +40,7 @@ Keep documentation for fork-specific or custom modifications under `fork/docs/` 
 
 ## Agent Execution
 
-Before changing code, configuration, or tracked guidance, read [the execution guide](fork/docs/agent-execution.md) to choose the verification scope, evidence, review, and delivery steps. Keep detailed procedures there rather than duplicating them in always-loaded instructions.
+Before changing code, configuration, or tracked guidance, read [the execution guide](fork/docs/agent-execution.md) to choose the verification scope, evidence, review, and delivery steps. For `.scratch/native-player-unified-control/issues`, use its [autonomous execution policy and loop prompt](fork/docs/agent-execution.md#6-native-player-ticket-autonomy): the user's 2026-11-03 authorization replaces fixed attempt caps for this ticket set. Keep detailed procedures there rather than duplicating them in always-loaded instructions.
 
 Use [CONTEXT.md](CONTEXT.md) for domain terminology, especially playback, control takeover, and output migration. Local tickets under `.scratch/` and instructions under `docs/agents/` may be available when supplied with a task, but are not checkout prerequisites.
 
